@@ -59,6 +59,7 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   // Hint for "MSHRTask and ReleaseAck" will fire@s1
   val mshr_GrantData_s1 = io.mshrHintQInfo.valid && (mshr_s1.fromA && (mshr_s1.opcode === GrantData || (mshr_s1.mergeA && mshrMerge_s1.opcode === GrantData)))
   val mshr_Grant_s1     = io.mshrHintQInfo.valid && (mshr_s1.fromA && (mshr_s1.opcode === Grant || (mshr_s1.mergeA && mshrMerge_s1.opcode === Grant)))
+  val mshr_AccessAckData_s1 = io.mshrHintQInfo.valid && mshr_s1.fromA && mshr_s1.opcode === AccessAckData
   val chn_Release_s1    = io.sinkCHintQInfo.valid
   assert(Mux(chn_Release_s1, sinkC_s1.fromC, true.B))
   assert(Mux(chn_Release_s1, sinkC_s1.opcode === Release || sinkC_s1.opcode === ReleaseData, true.B))
@@ -70,15 +71,16 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
     (io.mshrHintQInfo.valid && !mshr_s1.mergeA) -> mshr_s1.sourceId,
     io.sinkCHintQInfo.valid -> sinkC_s1.sourceId
   ))
-  OneHot.checkOneHot(Cat(io.mshrHintQInfo.valid && mshr_s1.mergeA, io.mshrHintQInfo.valid && !mshr_s1.mergeA, io.sinkCHintQInfo.valid))
+  assert(PopCount(Cat(io.mshrHintQInfo.valid && mshr_s1.mergeA, io.mshrHintQInfo.valid && !mshr_s1.mergeA, io.sinkCHintQInfo.valid)) <= 1.U)
   enqBits_s1.isKeyword := Mux(mshr_s1.mergeA, mshrMerge_s1.isKeyword.getOrElse(false.B), mshr_s1.isKeyword.getOrElse(false.B)) 
   enqBits_s1.isGrantData := mshr_GrantData_s1
 
   // Hint for "chnTask Hit" will fire@s3
   val chn_Grant_s3     = task_s3.valid && !mshrReq_s3 && !need_mshr_s3 && task_s3.bits.fromA && task_s3.bits.opcode === Grant
   val chn_GrantData_s3 = task_s3.valid && !mshrReq_s3 && !need_mshr_s3 && task_s3.bits.fromA && task_s3.bits.opcode === GrantData
+  val chn_AccessAckData_s3 = task_s3.valid && !mshrReq_s3 && !need_mshr_s3 && task_s3.bits.fromA && task_s3.bits.opcode === AccessAckData
   val enqBits_s3 = Wire(new HintQueueEntry)
-  val enqValid_s3 = chn_Grant_s3 || chn_GrantData_s3
+  val enqValid_s3 = chn_Grant_s3 || chn_GrantData_s3 || chn_AccessAckData_s3
   enqBits_s3.source := task_s3.bits.sourceId
   enqBits_s3.isKeyword := task_s3.bits.isKeyword.getOrElse(false.B)
   enqBits_s3.isGrantData := chn_GrantData_s3
@@ -88,7 +90,7 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   val hintEntriesWidth = log2Ceil(hintEntries)
   val hintQueue = Module(new Queue(new HintQueueEntry, hintEntries))
   val canFlow_s1 = !hintQueue.io.deq.valid || hintQueue.io.count === 1.U && hintQueue.io.deq.fire
-  val valid_s1 = mshr_GrantData_s1 || mshr_Grant_s1 || chn_Release_s1
+  val valid_s1 = mshr_GrantData_s1 || mshr_Grant_s1 || mshr_AccessAckData_s1 || chn_Release_s1
   val flow_s1, enq_s3 = Wire(Decoupled(new HintQueueEntry))
   // noSpaceForSinkReq in GrantBuffer may ensure that these queues will not overflow
   assert(enq_s3.ready || !enq_s3.valid)
