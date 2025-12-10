@@ -141,6 +141,7 @@ class Directory(implicit p: Parameters) extends L2Module {
     val wayOH = Output(UInt(cacheParams.ways.W))
     val replWayOH = Output(UInt(cacheParams.ways.W))
     val cmoHitInvalid = Output(Bool())
+    val retryFastFwd = Bool()
   })
 
   def invalid_way_sel(metaVec: Seq[MetaEntry]) = {
@@ -278,6 +279,7 @@ class Directory(implicit p: Parameters) extends L2Module {
     )
   )).reduceTree(_ | _)
 
+  io.retryFastFwd := occWayMask_s2.andR
   val freeWayMask_s3 = RegEnable(~occWayMask_s2, refillReqValid_s2)
   val refillRetry = RegEnable(occWayMask_s2.andR, refillReqValid_s2)
 
