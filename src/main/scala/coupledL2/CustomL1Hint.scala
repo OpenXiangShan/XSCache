@@ -123,9 +123,10 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   enq_s3.valid := enqValid_s3
   enq_s3.bits := enqBits_s3
   arb(Seq(enq_s3, drop_s1, flow_s1), hintQueue.io.enq, Some("Hint"))
-  hintQueue.io.deq.ready := io.l1Hint.ready
+  val respWithDataFire = io.l1Hint.valid && io.l1Hint.bits.hasData
+  hintQueue.io.deq.ready := io.l1Hint.ready && !RegNext(respWithDataFire, false.B)
 
-  io.l1Hint.valid := hintQueue.io.deq.valid && !(io.retry_s2 && !hint_s1Queue.io.out.valid)
+  io.l1Hint.valid := hintQueue.io.deq.valid && !(io.retry_s2 && !hint_s1Queue.io.out.valid) && !RegNext(respWithDataFire, false.B)
   io.l1Hint.bits.sourceId := hintQueue.io.deq.bits.source
   io.l1Hint.bits.isKeyword := hintQueue.io.deq.bits.isKeyword
   io.l1Hint.bits.hasData := hintQueue.io.deq.bits.hasData
