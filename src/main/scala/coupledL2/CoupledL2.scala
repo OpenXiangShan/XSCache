@@ -553,6 +553,7 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
           val arbValids = l1HintValids & contains
           val arbReadys = TLArbiter.roundRobin(arbValids.getWidth, arbValids, master.fire)
           val fires = arbValids & arbReadys
+          assert(PopCount(fires) <= 1.U, "Multiple hints from different slices for the same sourceId")
           master.valid := fires.orR
           val selectedHint = Mux1H(fires, slices_l1Hint.map(_.bits))
           if (client.supports.probe) {
@@ -561,7 +562,7 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
             io.l2_hint.bits.sourceId := selectedHint.sourceId - client.sourceId.start.U
           }
           hintChosen.valid := master.fire
-          hintChosen.bits.sliceId := OHToUInt(fires) // ! THIS IS NOT ONE-HOT !
+          hintChosen.bits.sliceId := OHToUInt(fires)
           hintChosen.bits.hasData := selectedHint.hasData
           readysToSlice := arbReadys & contains & Fill(arbValids.getWidth, master.ready)
 
