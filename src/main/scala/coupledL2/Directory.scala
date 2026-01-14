@@ -141,7 +141,7 @@ class Directory(implicit p: Parameters) extends L2Module {
     val wayOH = Output(UInt(cacheParams.ways.W))
     val replWayOH = Output(UInt(cacheParams.ways.W))
     val cmoHitInvalid = Output(Bool())
-    val retryFastFwd = Bool()
+    val retryFastFwd = Output(Bool())
   })
 
   def invalid_way_sel(metaVec: Seq[MetaEntry]) = {

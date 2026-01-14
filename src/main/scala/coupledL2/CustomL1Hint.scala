@@ -107,7 +107,6 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   // noSpaceForSinkReq in GrantBuffer may ensure that these queues will not overflow
   assert(enq_s3.ready || !enq_s3.valid)
 
-  // this will have at most 2 entries
   val hint_s1Queue = Module(new Pipeline(new HintQueueEntry))
   hint_s1Queue.io.in.valid := valid_s1 && (!canFlow_s1 || !flow_s1.ready)
   hint_s1Queue.io.in.bits  := enqBits_s1

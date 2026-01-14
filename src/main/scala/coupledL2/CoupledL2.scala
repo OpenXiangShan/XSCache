@@ -570,7 +570,6 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
       }
       slices_l1Hint.zipWithIndex.foreach {
         case (hint, i) =>
-          val sliceHintFire = hint.valid && hint.ready
           hint.ready := readysVec.map(_(i)).reduce(_||_)
       }
     }
