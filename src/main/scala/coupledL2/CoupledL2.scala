@@ -553,7 +553,7 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
           val arbValids = l1HintValids & contains
           val arbReadys = TLArbiter.roundRobin(arbValids.getWidth, arbValids, master.fire)
           val fires = arbValids & arbReadys
-          assert(PopCount(fires) <= 1.U, "Multiple hints from different slices for the same sourceId")
+          assert(PopCount(fires) <= 1.U, "At most one hint per client may fire per cycle")
           master.valid := fires.orR
           val selectedHint = Mux1H(fires, slices_l1Hint.map(_.bits))
           if (client.supports.probe) {
