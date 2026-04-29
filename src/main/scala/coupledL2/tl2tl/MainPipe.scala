@@ -387,7 +387,7 @@ class MainPipe(implicit p: Parameters) extends L2Module with HasPerfEvents {
 
   io.metaWReq.valid      := !resetFinish || task_s3.valid && (metaW_valid_s3_a || metaW_valid_s3_b || metaW_valid_s3_c || metaW_valid_s3_mshr)
   io.metaWReq.bits.set   := Mux(resetFinish, req_s3.set, resetIdx)
-  io.metaWReq.bits.wayOH := Mux(resetFinish, UIntToOH(metaW_way), Fill(cacheParams.ways, true.B))
+  io.metaWReq.bits.wayOH := Mux(resetFinish, UIntToOH(metaW_way, cacheParams.ways), Fill(cacheParams.ways, true.B))
   io.metaWReq.bits.wmeta := Mux(
     resetFinish,
     ParallelPriorityMux(
@@ -399,7 +399,7 @@ class MainPipe(implicit p: Parameters) extends L2Module with HasPerfEvents {
 
   io.tagWReq.valid     := task_s3.valid && req_s3.tagWen && mshr_refill_s3 && !retry
   io.tagWReq.bits.set  := req_s3.set
-  io.tagWReq.bits.way  := Mux(mshr_refill_s3 && req_s3.replTask, io.replResp.bits.way, req_s3.way)
+  io.tagWReq.bits.wayOH  := UIntToOH(Mux(mshr_refill_s3 && req_s3.replTask, io.replResp.bits.way, req_s3.way), cacheParams.ways)
   io.tagWReq.bits.wtag := req_s3.tag
 
   /* ======== Interact with Channels (C & D) ======== */
