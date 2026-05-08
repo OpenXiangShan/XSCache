@@ -13,11 +13,8 @@ init:
 	git submodule update --init
 	cd rocket-chip && git submodule update --init hardfloat cde
 
-compile-coupledl2:
-	mill -i CoupledL2.compile
-
-compile-openllc:
-	mill -i OpenLLC.compile
+compile:
+	mill -i XSCache.compile
 
 CHI_PASS_ARGS = ISSUE=$(ISSUE) NUM_CORE=$(NUM_CORE) NUM_TL_UL=$(NUM_TL_UL) NUM_SLICE=$(NUM_SLICE) \
 			    WITH_CHISELDB=$(WITH_CHISELDB) WITH_TLLOG=$(WITH_TLLOG) WITH_CHILOG=$(WITH_CHILOG) \
@@ -37,11 +34,11 @@ MEM_GEN = ./scripts/vlsi_mem_gen
 MEM_GEN_SEP = ./scripts/gen_sep_mem.sh
 
 gen-test-top:
-	mill -i CoupledL2.test.runMain coupledL2.$(TOP)_$(SYSTEM) -td $(BUILD_DIR_L2) --target systemverilog --split-verilog
+	mill -i XSCache.test.runMain coupledL2.$(TOP)_$(SYSTEM) -td $(BUILD_DIR_L2) --target systemverilog --split-verilog
 	$(MEM_GEN_SEP) "$(MEM_GEN)" "$(TOP_V_L2).conf" "$(BUILD_DIR_L2)"
 
 gen-test-top-chi:
-	mill -i CoupledL2.test.runMain coupledL2.$(TOP)_$(SYSTEM) -td $(BUILD_DIR_L2) $(CHI_TOP_ARGS) --target systemverilog --split-verilog
+	mill -i XSCache.test.runMain coupledL2.$(TOP)_$(SYSTEM) -td $(BUILD_DIR_L2) $(CHI_TOP_ARGS) --target systemverilog --split-verilog
 	$(MEM_GEN_SEP) "$(MEM_GEN)" "$(TOP_V_L2).conf" "$(BUILD_DIR_L2)"
 
 test-top-l2:
@@ -75,13 +72,13 @@ test-top-chi-quadcore-2ul:
 	$(MAKE) gen-test-top-chi SYSTEM=CHIL2 $(CHI_PASS_ARGS) NUM_CORE=4 NUM_TL_UL=2
 
 test-top-l3-openllc:
-	mill -i OpenLLC.test.runMain openLLC.TestTop_L3 -td build --target systemverilog --split-verilog
+	mill -i XSCache.test.runMain openLLC.TestTop_L3 -td build --target systemverilog --split-verilog
 
 test-top-l2l3-openllc:
-	mill -i OpenLLC.test.runMain openLLC.TestTopSoC_SingleCore -td $(BUILD_DIR_LLC) --target systemverilog --split-verilog
+	mill -i XSCache.test.runMain openLLC.TestTopSoC_SingleCore -td $(BUILD_DIR_LLC) --target systemverilog --split-verilog
 
 test-top-l2l3l2-openllc:
-	mill -i OpenLLC.test.runMain openLLC.TestTopSoC_DualCore -td $(BUILD_DIR_LLC) --target systemverilog --split-verilog
+	mill -i XSCache.test.runMain openLLC.TestTopSoC_DualCore -td $(BUILD_DIR_LLC) --target systemverilog --split-verilog
 
 clean:
 	rm -rf ./build

@@ -93,31 +93,15 @@ object openNCB extends HasChisel {
   override def moduleDeps = super.moduleDeps ++ Seq(rocketchip)
 }
 
-object CoupledL2 extends HasChisel with $file.common.CoupledL2Module {
+object XSCache extends HasChisel with $file.common.XSCacheModule {
 
-  override def millSourcePath = pwd / "CoupledL2"
+  override def millSourcePath = millOuterCtx.millSourcePath
 
   def rocketModule: ScalaModule = rocketchip
 
   def utilityModule: ScalaModule = utility
 
   def huancunModule: ScalaModule = huancun
-
-  object test extends SbtTests with TestModule.ScalaTest
-
-  override def scalacOptions = super.scalacOptions() ++ Agg("-deprecation", "-feature")
-
-}
-
-object OpenLLC extends HasChisel with $file.common.OpenLLCModule {
-
-  override def millSourcePath = pwd / "OpenLLC"
-
-  def coupledL2Module: ScalaModule = CoupledL2
-
-  def rocketModule: ScalaModule = rocketchip
-
-  def utilityModule: ScalaModule = utility
 
   def openNCBModule: ScalaModule = openNCB
 
