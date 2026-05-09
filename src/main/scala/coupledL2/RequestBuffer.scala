@@ -146,12 +146,6 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   val in      = io.in.bits
   val full    = Cat(buffer.map(_.valid)).andR
 
-  //
-  val mshrConflictMask = conflictMask(in)
-  val mshrConflictMaskFromA = conflictMaskFromA(in)
-  dontTouch(mshrConflictMask)
-  dontTouch(mshrConflictMaskFromA)
-
   // incoming Acquire can be merged with late_pf MSHR block
   val mergeAMask = VecInit(io.mshrInfo.map { case s =>
     val mshrInflight = !(s.bits.w_grantlast && s.bits.w_grant)

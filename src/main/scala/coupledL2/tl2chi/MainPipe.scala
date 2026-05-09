@@ -502,7 +502,7 @@ class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes
     io.replResp.bits.way,
     Mux(mshr_req_s3, req_s3.way, dirResult_s3.way)
   )
-  io.toDS.req_s3.bits.set := Mux(mshr_req_s3, req_s3.set, dirResult_s3.set)
+  io.toDS.req_s3.bits.set := req_s3.set
   io.toDS.req_s3.bits.wen := wen
   io.toDS.wdata_s3.data := Mux(
     !mshr_req_s3,
