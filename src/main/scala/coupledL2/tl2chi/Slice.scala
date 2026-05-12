@@ -24,6 +24,8 @@ import org.chipsalliance.cde.config.Parameters
 import coupledL2._
 import coupledL2.prefetch.PrefetchIO
 import utility.MemReqSource
+import coupledL2.prefetch.CDPDetectTrigger
+import coupledL2.prefetch.CDPParameters
 
 class OuterBundle(implicit p: Parameters) extends DecoupledPortIO with BaseOuterBundle
 
@@ -35,6 +37,8 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
     override val out: OuterBundle = new OuterBundle
   })
   val io_pCrd = IO(Vec(mshrsAll, new PCrdQueryBundle))
+
+  val io_cdp_triggers = Option.when(prefetchers.exists(_.isInstanceOf[CDPParameters])) (IO(ValidIO(new CDPDetectTrigger)))
 
   /* Upwards TileLink-related modules */
   val sinkA = Module(new SinkA)
@@ -220,6 +224,11 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   mainPipe.io.cmoAllBlock.foreach {_ := sinkA.io.cmoAll.map(_.cmoAllBlock).getOrElse(false.B)}
 
   io.l2FlushDone.foreach {_ := RegNext(sinkA.io.cmoAll.map(_.l2FlushDone).getOrElse(false.B))}
+
+  /* CDP Prefetcher Detect Trigger */
+  if (hasCDP) {
+    io_cdp_triggers.get <> mainPipe.io.cdp_trigger.get
+  }
 
   /* ===== Hardware Performance Monitor ===== */
   val perfEvents = Seq(mshrCtl, mainPipe).flatMap(_.getPerfEvents)
