@@ -25,7 +25,7 @@ import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLPermissions._
 import org.chipsalliance.cde.config.Parameters
 import xscache.coupledL2._
-import xscache.coupledL2.prefetch.{PrefetchTrain, PfSource}
+import xscache.coupledL2.prefetch.{PrefetchTrain, PfSource, CDPDetectTrigger, CDPParameters}
 import xscache.coupledL2.MetaData._
 import xscache.chi.{CHIREQ, HasCHIOpcodes}
 import xscache.chi.CHICohStates._
@@ -122,6 +122,9 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     /* l2 flush (CMO All) */
     val cmoAllBlock = Option.when(cacheParams.enableL2Flush) (Input(Bool()))
     val cmoLineDone = Option.when(cacheParams.enableL2Flush) (Output(Bool()))
+
+    /* to CDP for detection */
+    val cdp_trigger = Option.when(prefetchers.exists(_.isInstanceOf[CDPParameters])) (ValidIO(new CDPDetectTrigger))
   })
 
   require(chiOpt.isDefined)
@@ -549,14 +552,17 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     metaOnHit_s3.alias.getOrElse(0.U),
     req_s3.alias.getOrElse(0.U)
   )
+
   val metaW_s3_a = MetaEntry(
     dirty = metaOnHit_s3.dirty,
     state = Mux(req_needT_s3 || sink_resp_s3_a_promoteT, TRUNK, metaOnHit_s3.state),
     clients = Fill(clientBits, Mux(l2Error_s3, false.B, true.B)),
     alias = Some(metaW_s3_a_alias),
+    pfsrc = meta_s3.prefetchSrc.get,
     accessed = true.B,
     tagErr = metaOnHit_s3.tagErr,
-    dataErr = metaOnHit_s3.dataErr
+    dataErr = metaOnHit_s3.dataErr,
+    pfDepth = 0.U,
   )
   val metaW_s3_b = Mux(isSnpToN(req_s3.chiOpcode.get), MetaEntry(),
     MetaEntry(
@@ -566,7 +572,9 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       alias = metaOnHit_s3.alias,
       accessed = metaOnHit_s3.accessed,
       tagErr = metaOnHit_s3.tagErr,
-      dataErr = metaOnHit_s3.dataErr
+      dataErr = metaOnHit_s3.dataErr,
+      pfsrc = metaOnHit_s3.prefetchSrc.get,
+      pfDepth = metaOnHit_s3.pfDepth
     )
   )
   val metaW_s3_c = MetaEntry(
@@ -576,8 +584,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     alias = metaOnHit_s3.alias,
     accessed = metaOnHit_s3.accessed,
     tagErr = Mux(wen_c, req_s3.denied, metaOnHit_s3.tagErr),
-    dataErr = Mux(wen_c, req_s3.corrupt, metaOnHit_s3.dataErr) // update error when write DS
+    dataErr = Mux(wen_c, req_s3.corrupt, metaOnHit_s3.dataErr), // update error when write DS
+    pfsrc = metaOnHit_s3.prefetchSrc.get,
+    pfDepth = metaOnHit_s3.pfDepth
   )
+
   // use merge_meta if mergeA
   val metaW_s3_mshr = WireInit(Mux(req_s3.mergeA, req_s3.aMergeTask.meta, req_s3.meta))
   metaW_s3_mshr.tagErr := req_s3.denied
@@ -709,11 +720,37 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
   /* ======== prefetch ======== */
   io.prefetchTrain.foreach {
-    train =>
+    train =>      
+      // --------------------- CDP ---------------------
+      // for VpnTable, we train on both hit & miss
+      val cdp_vpn_train_valid = task_s3.valid && ((req_acquire_s3 || req_get_s3) && req_s3.needHint.getOrElse(false.B) || req_s3.mergeA)
+
+      // for FilterTable, we train on hit & evict
+      // TODO: narrow this down to train on hitting a CDP prefetched block
+      // Hit a block
+      val cdp_filter_train_hit = task_s3.valid && ((req_acquire_s3 || req_get_s3) && req_s3.needHint.getOrElse(false.B) && dirResult_s3.hit || req_s3.mergeA)
+
+      // Evict a unused CDP prefetched block
+      val cdp_filter_train_evict = task_s3.valid && mshr_refill_s3 && req_s3.replTask &&
+        !io.replResp.bits.meta.accessed && io.replResp.bits.meta.prefetch.getOrElse(false.B) && io.replResp.bits.meta.prefetchSrc.getOrElse(false.B) === PfSource.CDP.id.U
+
+      train.bits.cdp_vpn_train_valid    := cdp_vpn_train_valid
+      train.bits.cdp_filter_train_hit   := cdp_filter_train_hit
+      train.bits.cdp_filter_train_evict := cdp_filter_train_evict
+
+      val is_cdp_train  = cdp_vpn_train_valid || cdp_filter_train_hit || cdp_filter_train_evict
+
+      // --------------------- Other Prefetcher ---------------------
       // train on request(with needHint flag) miss or hit on prefetched block
       // trigger train also in a_merge here
-      train.valid := task_s3.valid && ((req_acquire_s3 || req_get_s3) && req_s3.needHint.getOrElse(false.B) &&
-        (!dirResult_s3.hit || metaOnHit_s3.prefetch.get) || req_s3.mergeA)
+      val is_other_train = task_s3.valid && 
+        (
+          (req_acquire_s3 || req_get_s3) && req_s3.needHint.getOrElse(false.B) && (!dirResult_s3.hit || metaOnHit_s3.prefetch.get) 
+          || req_s3.mergeA
+        )
+      
+      // --------------------- Train Detail ---------------------
+      train.valid := is_cdp_train || is_other_train
       train.bits.tag := req_s3.tag
       train.bits.set := req_s3.set
       train.bits.needT := Mux(
@@ -730,7 +767,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       train.bits.prefetched := Mux(req_s3.mergeA, true.B, metaOnHit_s3.prefetch.getOrElse(false.B))
       train.bits.pfsource := Mux(req_s3.mergeA, req_s3.meta.prefetchSrc.getOrElse(PfSource.NoWhere.id.U), metaOnHit_s3.prefetchSrc.getOrElse(PfSource.NoWhere.id.U)) // TODO
       train.bits.reqsource := req_s3.reqSource
-      
+      train.bits.is_cdp_train := is_cdp_train
+      train.bits.is_other_train := is_other_train
+
+      train.bits.evict_tag := io.replResp.bits.tag
+      train.bits.evict_set := io.replResp.bits.set
   }
 
   /* ======== Stage 4 ======== */
@@ -853,6 +894,40 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   txdat_s5.bits.task.denied := tagError_s5
   txdat_s5.bits.task.corrupt := task_s5.bits.corrupt || dataError_s5
   txdat_s5.bits.data.data := out_data_s5
+
+  /* ======== s5 CDP Detect Trigger ======== */
+  val dirResult_s5_hit      = RegNext(RegNext(dirResult_s3.hit))
+  val dirResult_s5_fromCDP  = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.get === PfSource.CDP.id.U))
+  val dirResult_s5_fromSMS  = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.get === PfSource.SMS.id.U))
+  val dirResult_s5_fromBOP  = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.get === PfSource.BOP.id.U))
+  val dirResult_s5_fromPBOP = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.get === PfSource.PBOP.id.U))
+  
+  val req_s5_sinkA = !task_s5.bits.mshrTask && task_s5.bits.fromA
+  val req_s5_acquire_block = req_s5_sinkA && task_s5.bits.opcode === GrantData
+
+  val is_hit_trigger_s5     = task_s5.valid && dirResult_s5_hit && req_s5_acquire_block &&
+    (dirResult_s5_fromCDP || dirResult_s5_fromSMS || dirResult_s5_fromBOP || dirResult_s5_fromPBOP)
+  val hit_trigger_data_s5   = out_data_s5
+  val hit_trigger_depth_s3  = dirResult_s3.meta.pfDepth
+  val hit_trigger_pfSrc_s3  = Mux(dirResult_s3.meta.accessed, PfSource.NoWhere.id.U, dirResult_s3.meta.prefetchSrc.get)
+  val hit_trigger_depth_s5  = RegNext(RegNext(hit_trigger_depth_s3))
+  val hit_trigger_pfsrc_s5  = RegNext(RegNext(hit_trigger_pfSrc_s3))
+
+  val is_refill_trigger_s3 = task_s3.valid && (mshr_grantdata_s3 || mshr_hintack_s3)
+  val is_refill_trigger_s5 = RegNext(RegNext(is_refill_trigger_s3))
+  val refill_trigger_data_s3  = Mux(req_s3.useProbeData, io.releaseBufResp_s3.bits.data, io.refillBufResp_s3.bits.data)
+  val refill_trigger_data_s5  = RegNext(RegNext(refill_trigger_data_s3))
+  val refill_trigger_depth_s5 = RegNext(RegNext(metaW_s3_mshr.pfDepth))
+  val refill_trigger_pfsrc_s5 = RegNext(RegNext(metaW_s3_mshr.prefetchSrc.get))
+
+  if (hasCDP) {
+    val cdp_trigger = io.cdp_trigger.get
+    cdp_trigger.valid := is_hit_trigger_s5 || is_refill_trigger_s5
+    cdp_trigger.bits.cacheblock  := Mux(is_hit_trigger_s5, hit_trigger_data_s5, refill_trigger_data_s5)
+    cdp_trigger.bits.pfDepth     := Mux(is_hit_trigger_s5, hit_trigger_depth_s5, refill_trigger_depth_s5)
+    cdp_trigger.bits.pfSource    := Mux(is_hit_trigger_s5, hit_trigger_pfsrc_s5, refill_trigger_pfsrc_s5)
+    cdp_trigger.bits.is_hit      := is_hit_trigger_s5
+  }
 
   /* ======== BlockInfo ======== */
   // if s2/s3 might write Dir, we must block s1 sink entrance
