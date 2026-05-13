@@ -885,9 +885,6 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   io.tlb_req.req_kill := false.B
   tlb_rsp.ready := true.B
 
-  val degree_buf = Module(new MIMOQueue(new PrefetchReq, 8, Degree, 1))
-  degree_buf.io.flush := reset.asBool
-
   // check same cacheline
   def block_addr(addr: UInt) = {
     addr(fullAddressBits - 1, log2Ceil(blockBytes))
@@ -1066,7 +1063,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   val sat_vec = ft_s1_rsp.sat_vec
   val can_pft = !hit || sat_vec(hit_idx) =/= 3.U
 
-  when (degree_buf.io.enq(0).fire || pft_s1_valid && !can_pft) {
+  when (out.fire || pft_s1_valid && !can_pft) {
     valids(pft_s1_chosen_idx) := false.B
   }
 
@@ -1074,29 +1071,8 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
     req_inflight(pft_s1_chosen_idx) := false.B
   }
 
-  // --------- degree buffer ---------
-  val base_addr = pft_s1_req.addr
-  def same_page(addr1: UInt, addr2: UInt): Bool = {
-    addr1(fullAddressBits - 1, 12) === addr2(fullAddressBits - 1, 12)
-  }
-
-  for (i <- 0 until Degree) {
-    val req = degree_buf.io.enq(i)
-    if (i == 0) {
-      req.valid := pft_s1_valid && can_pft
-      req.bits := pft_s1_req
-    }
-    else {
-      val new_addr = base_addr + (i * blockBytes).U
-
-      req.valid := pft_s1_valid && can_pft && same_page(base_addr, new_addr)
-      req.bits := pft_s1_req
-      req.bits.tag  := parseFullAddress(new_addr)._1
-      req.bits.set  := parseFullAddress(new_addr)._2
-    }
-  }
-
-  out <> degree_buf.io.deq(0)
+  out.valid := pft_s1_valid && can_pft
+  out.bits  := pft_s1_req
 
   // ----------------- Perf Counter -----------------
   XSPerfAccumulate("pf_req_drop_by_filter", pft_s1_valid && !can_pft)
@@ -1254,11 +1230,23 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   filter_table.io.query_rsp(0)  <> train_pipe.io.ft_query_rsp
   filter_table.io.train_req     <> train_pipe.io.ft_train_req
 
-  val cdp_pft_req_buffer = Module(new MIMOQueue(new CDPPrefetchReq, 8, DetectPipeNum, 1))
-  cdp_pft_req_buffer.io.flush := reset.asBool
+  // Degreed Buffer
+  val degree_buf_seq = Seq.fill(DetectPipeNum)(Module(new MIMOQueue(new CDPPrefetchReq, 8, Degree, 1)))
+  val degree_buf_arb = Module(new RRArbiterInit(new CDPPrefetchReq, DetectPipeNum))
   for (i <- 0 until DetectPipeNum) {
-    cdp_pft_req_buffer.io.enq(i).valid      := detect_pipe_seq(i).io.pft_req.valid
-    cdp_pft_req_buffer.io.enq(i).bits       := detect_pipe_seq(i).io.pft_req.bits
+    val buf = degree_buf_seq(i)
+    val req = detect_pipe_seq(i).io.pft_req
+    buf.io.flush := reset.asBool
+    for (j <- 0 until Degree) {
+      buf.io.enq(j).valid := req.valid
+      buf.io.enq(j).bits  := req.bits
+
+      if (j > 0) {
+        buf.io.enq(j).bits.pfAddr := req.bits.pfAddr + (j * blockBytes).U
+      }
+    }
+
+    degree_buf_arb.io.in(i) <> buf.io.deq(0)
   }
 
   // SendUnit
@@ -1266,6 +1254,6 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   send_unit.io.tlb_req <> io.tlb_req
   send_unit.io.ft_query_req <> filter_table.io.query_req(1)
   send_unit.io.ft_query_rsp <> filter_table.io.query_rsp(1)
-  send_unit.io.in   <> cdp_pft_req_buffer.io.deq(0)
+  send_unit.io.in   <> degree_buf_arb.io.out
   send_unit.io.out  <> io.pft_req
 }
