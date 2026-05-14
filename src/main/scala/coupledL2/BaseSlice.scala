@@ -33,7 +33,7 @@ abstract class BaseSliceIO[T_OUT <: BaseOuterBundle](implicit p: Parameters) ext
   val l1Hint = DecoupledIO(new L2ToL1HintInsideL2())
   val prefetch = prefetchOpt.map(_ => Flipped(new PrefetchIO))
   val pfMonitorStat = prefetchOpt.map(_ => Output(new PrefetchStatDelta))
-  val pfReplaceDemand = prefetchOpt.map(_ => ValidIO(new PrefetchReplaceDemandBundle))
+  val replaceRecord = prefetchOpt.map(_ => ValidIO(new ReplaceBundle))
   val dataRefill = prefetchOpt.map(_ => ValidIO(new DemandRefillBundle))
   val busContention = prefetchOpt.map(_ => ValidIO(new BusContentionBundle))
   val dirResult = topDownOpt.map(_ => ValidIO(new DirResult))
