@@ -41,21 +41,6 @@ gen-test-top-chi:
 	mill -i XSCache.test.runMain coupledL2.$(TOP)_$(SYSTEM) -td $(BUILD_DIR_L2) $(CHI_TOP_ARGS) --target systemverilog --split-verilog
 	$(MEM_GEN_SEP) "$(MEM_GEN)" "$(TOP_V_L2).conf" "$(BUILD_DIR_L2)"
 
-test-top-l2:
-	$(MAKE) gen-test-top SYSTEM=L2
-
-test-top-l2standalone:
-	$(MAKE) gen-test-top SYSTEM=L2_Standalone
-
-test-top-l2l3-huancun:
-	$(MAKE) gen-test-top SYSTEM=L2L3
-
-test-top-l2l3l2-huancun:
-	$(MAKE) gen-test-top SYSTEM=L2L3L2
-
-test-top-fullsys-huancun:
-	$(MAKE) gen-test-top SYSTEM=fullSys
-
 test-top-chi:
 	$(MAKE) gen-test-top-chi SYSTEM=CHIL2 $(CHI_PASS_ARGS)
 

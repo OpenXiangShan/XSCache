@@ -91,7 +91,6 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
                                           // If true, MSHR should send an ack to L2 prefetcher.
   val needHint = prefetchOpt.map(_ => Bool())
 
-  // For DirtyKey in Release
   val dirty = Bool()
 
   // if this is an mshr task and it needs to write dir
