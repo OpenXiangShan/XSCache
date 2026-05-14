@@ -1183,6 +1183,7 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   io.dataRefill.valid := rxdat.valid && rxdatLastValid
   io.dataRefill.bits.isDemand := req_acquire || req_get
   io.dataRefill.bits.isPrefetch := req_prefetch
+  io.dataRefill.bits.pfReqSrc := req.reqSource
   io.dataRefill.bits.addr := Cat(req.tag, req.set, 0.U(offsetBits.W))
   io.dataRefill.bits.latency := timer
 
