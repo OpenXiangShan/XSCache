@@ -221,6 +221,11 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
     stat.pfSentVec := sentInc
     stat.pfHitVec := VecInit((0 until pfSourceCount).map(i => dirHitInc(i) +& mshrHitInc(i)))
   }
+  prefetchOpt.foreach {
+    _ =>
+      io.pfReplaceDemand.get := mainPipe.io.pfReplaceDemand.get
+      io.dataRefill.get := mshrCtl.io.dataRefill.get
+  }
   topDownOpt.foreach (
     _ => {
       io.msStatus.get := mshrCtl.io.msStatus.get
