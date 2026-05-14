@@ -2,6 +2,7 @@ package coupledL2
 
 import chisel3._
 import circt.stage.ChiselStage
+import circt.stage.FirtoolOption
 import chisel3.util._
 import org.chipsalliance.cde.config._
 import chisel3.stage.ChiselGeneratorAnnotation
@@ -253,9 +254,11 @@ object TestTopCHIHelper {
 
     val top = DisableMonitors(p => LazyModule(fTop(p)))(config)
 
-    (new ChiselStage).execute(args,
-      ChiselGeneratorAnnotation(() => top.module) +: TestTopFirtoolOptions()
-    )
+    (new ChiselStage).execute(args, Seq(
+      ChiselGeneratorAnnotation(() => top.module),
+      FirtoolOption("--disable-annotation-unknown"),
+      FirtoolOption("--default-layer-specialization=enable")
+    ))
 
     ChiselDB.addToFileRegisters
     FileRegisters.write("./build")
