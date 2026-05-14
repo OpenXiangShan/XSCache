@@ -876,6 +876,10 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
     val ft_query_rsp = Input(new ftQueryRsp)
   })
 
+  def same_page(addr1: UInt, addr2: UInt): Bool = {
+    addr1(fullAddressBits - 1, pageOffsetBits) === addr2(fullAddressBits - 1, pageOffsetBits)
+  }
+
   val (in, out) = (io.in, io.out)
   val (ft_query_req, ft_query_rsp) = (io.ft_query_req, io.ft_query_rsp)
 
@@ -894,7 +898,6 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   val valids    = RegInit(VecInit(Seq.fill(ReqFilterEntryNum)(false.B)))
   val entries   = RegInit(VecInit(Seq.fill(ReqFilterEntryNum)(0.U.asTypeOf(new PrefetchFilterEntry))))
   
-  val tlb_inflight  = RegInit(VecInit(Seq.fill(ReqFilterEntryNum)(false.B)))
   val req_inflight  = RegInit(VecInit(Seq.fill(ReqFilterEntryNum)(false.B)))
 
   val tlb_arb = Module(new RRArbiterInit(new L2TlbReq, ReqFilterEntryNum))
@@ -939,9 +942,9 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   val tlb_s1_valid = Wire(Bool())
   val tlb_s2_valid = Wire(Bool())
 
-  val tlb_s0_chosen_idx = Wire(UInt(log2Ceil(ReqFilterEntryNum).W))
-  val tlb_s1_chosen_idx = RegNext(tlb_s0_chosen_idx)
-  val tlb_s2_chosen_idx = RegNext(tlb_s1_chosen_idx)
+  val tlb_s0_addr = Wire(UInt(fullAddressBits.W))
+  val tlb_s1_addr = RegNext(tlb_s0_addr)
+  val tlb_s2_addr = RegNext(tlb_s1_addr)
 
   // -------- tlb s0: arb tlb req --------
   for (i <- 0 until ReqFilterEntryNum) {
@@ -950,45 +953,31 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
 
     val entry_timer_ok = !entry.retry_en || entry.retry_timer >= 10.U
 
-    entry_tlb_req.valid := valids(i) && !entry.paddr_valid && entry_timer_ok && !tlb_inflight(i)
+    val req_vaddr = Cat(entry.vTag, 0.U(log2Ceil(blockBytes).W))
+    val s1_same_page = same_page(req_vaddr, tlb_s1_addr) && tlb_s1_valid
+    val s2_same_page = same_page(req_vaddr, tlb_s2_addr) && tlb_s2_valid
+    val page_conflict = s1_same_page || s2_same_page
+    assert(!(s1_same_page && s2_same_page), "two inflight tlb reqs should not target the same page!")
+
+    entry_tlb_req.valid := valids(i) && !entry.paddr_valid && entry_timer_ok && !page_conflict
     entry_tlb_req.bits  := DontCare
-    entry_tlb_req.bits.vaddr  := Cat(entry.vTag, 0.U(log2Ceil(blockBytes).W))
+    entry_tlb_req.bits.vaddr  := req_vaddr
     entry_tlb_req.bits.cmd    := TlbCmd.read
     entry_tlb_req.bits.isPrefetch := true.B
     entry_tlb_req.bits.size   := 3.U
-
-    when (entry_tlb_req.fire) {
-      tlb_inflight(i) := true.B
-    }
   }
 
   tlb_s0_valid := tlb_arb.io.out.valid
-  tlb_s0_chosen_idx := tlb_arb.io.chosen
+  tlb_s0_addr := tlb_arb.io.out.bits.vaddr
 
   // -------- tlb s1: recv tlb rsp --------
-  // check page/access fault, if fault, drop the req by clearing the entry
   // if miss, enable retry. If second miss, drop the req
   val tlb_s1_rsp = tlb_rsp
 
   tlb_s1_valid := RegNext(tlb_s0_valid)
 
-  val s1_drop = 
-    tlb_s1_rsp.valid && 
-    tlb_s1_rsp.bits.miss && entries(tlb_s1_chosen_idx).retry_en
-
-  // drop when second tlb miss
-  when (tlb_s1_valid && tlb_s1_rsp.valid && s1_drop) {
-    valids(tlb_s1_chosen_idx) := false.B
-    tlb_inflight(tlb_s1_chosen_idx) := false.B
-  }
-
-  // update when first tlb miss
-  when (tlb_s1_valid && tlb_s1_rsp.valid && tlb_s1_rsp.bits.miss && !entries(tlb_s1_chosen_idx).retry_en) {
-    entries(tlb_s1_chosen_idx).retry_en := true.B
-  }
-
   // -------- tlb s2: recv pmp rsp --------
-  tlb_s2_valid := RegNext(tlb_s1_valid && !s1_drop)
+  tlb_s2_valid := RegNext(tlb_s1_valid)
   val tlb_s2_pmp        = pmp_rsp
   val tlb_s2_rsp_valid  = RegNext(tlb_s1_rsp.valid)
   val tlb_s2_rsp_bits   = RegNext(tlb_s1_rsp.bits)
@@ -1000,18 +989,38 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
     tlb_s2_pmp.mmio || Pbmt.isUncache(tlb_s2_rsp_bits.pbmt) ||
     // pmp access fault
     tlb_s2_pmp.ld
-
-  when (tlb_s2_valid && tlb_s2_rsp_valid && !tlb_s2_rsp_bits.miss) {
-    when (s2_drop) {
-      valids(tlb_s2_chosen_idx) := false.B
-    }.otherwise {
-      entries(tlb_s2_chosen_idx).paddr_valid := true.B
-      entries(tlb_s2_chosen_idx).pTag := block_addr(tlb_s2_rsp_bits.paddr.head)
+  
+  // gather info from s1 and s2
+  for (i <- 0 until ReqFilterEntryNum) {
+    val entry = entries(i)
+    val entry_addr = Cat(entries(i).vTag, 0.U(log2Ceil(blockBytes).W))
+    
+    // s1: if first miss, enable retry; if second miss, drop
+    val s1_same_page = same_page(entry_addr, tlb_s1_addr) && tlb_s1_valid
+    when (s1_same_page && tlb_s1_rsp.valid && tlb_s1_rsp.bits.miss && valids(i)) {
+      when (entry.retry_en) {
+        // second miss, drop the req
+        valids(i) := false.B
+      }.otherwise {
+        // first miss, enable retry
+        entries(i).retry_en := true.B
+        entries(i).retry_timer := 0.U
+      }
     }
-  }
 
-  when (tlb_s2_valid) {
-    tlb_inflight(tlb_s2_chosen_idx) := false.B
+    // s2: check pf && pmp result, if fail, drop the req; otherwise, update the entry
+    val s2_same_page = same_page(entry_addr, tlb_s2_addr) && tlb_s2_valid
+    when (s2_same_page && tlb_s2_rsp_valid && !tlb_s2_rsp_bits.miss && valids(i)) {
+      when (s2_drop) {
+        valids(i) := false.B
+      }.otherwise {
+        entries(i).paddr_valid := true.B
+
+        val page_num    = tlb_s2_rsp_bits.paddr.head(fullAddressBits - 1, pageOffsetBits)
+        val page_offset = entry_addr(pageOffsetBits - 1, 0)
+        entries(i).pTag := block_addr(Cat(page_num, page_offset))
+      }
+    }
   }
 
   // --------------- prefetch req pipe ---------------
