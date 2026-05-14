@@ -25,7 +25,7 @@ import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLPermissions._
 import org.chipsalliance.cde.config.Parameters
 import xscache.coupledL2._
-import xscache.coupledL2.prefetch.{PrefetchTrain, PfSource, PrefetchReplaceDemandBundle}
+import xscache.coupledL2.prefetch.{PrefetchTrain, PfSource, ReplaceBundle}
 import xscache.coupledL2.MetaData._
 import xscache.chi.{CHIREQ, HasCHIOpcodes}
 import xscache.chi.CHICohStates._
@@ -112,7 +112,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
     /* send prefetchTrain to Prefetch to trigger a prefetch req */
     val prefetchTrain = prefetchOpt.map(_ => DecoupledIO(new PrefetchTrain))
-    val pfReplaceDemand = prefetchOpt.map(_ => Output(ValidIO(new PrefetchReplaceDemandBundle)))
+    val replaceRecord = prefetchOpt.map(_ => Output(ValidIO(new ReplaceBundle)))
 
     /* top-down monitor */
     // TODO
@@ -709,13 +709,12 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // TODO: add nested writeback from Snoop
 
   /* ======== prefetch ======== */
-  io.pfReplaceDemand.foreach { u =>
+  io.replaceRecord.foreach { u =>
     val refillVictim = task_s3.valid && mshr_req_s3 && mshr_refill_s3 && !retry && need_repl && req_s3.fromA
-    val reqIsPrefetch = MemReqSource.isL2Prefetch(req_s3.reqSource)
-    val victimNotPrefetch = !io.replResp.bits.meta.prefetch.getOrElse(false.B)
-    u.valid := refillVictim && replResp_valid_hold && reqIsPrefetch && victimNotPrefetch
-    u.bits.demandAddr := Cat(io.replResp.bits.tag, req_s3.set, 0.U(offsetBits.W))
-    u.bits.pfReqSrc := req_s3.reqSource
+    u.valid := refillVictim && replResp_valid_hold
+    u.bits.reqSource := req_s3.reqSource
+    u.bits.victimPAddr := Cat(io.replResp.bits.tag, req_s3.set, 0.U(offsetBits.W))
+    u.bits.victimPfSource := io.replResp.bits.meta.prefetchSrc.getOrElse(PfSource.NoWhere.id.U)
   }
 
   io.prefetchTrain.foreach {
