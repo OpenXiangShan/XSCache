@@ -122,7 +122,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   def conflictMaskFromA(a: TaskBundle): UInt =
     conflictMask(a) & VecInit(io.mshrInfo.map(_.bits.fromA)).asUInt
 
-  def latePrefetch(a: TaskBundle): (Bool, UInt) = {
+  def latePrefetch(a: TaskBundle): (Bool, UInt, UInt) = {
     val matchVec = VecInit(io.mshrInfo.map(s =>
     s.valid && s.bits.isPrefetch && sameAddr(a, s.bits) && !s.bits.willFree &&
       a.fromA && (a.opcode === AcquireBlock || a.opcode === AcquirePerm)
@@ -130,7 +130,8 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     val matched = matchVec.asUInt.orR
     assert(PopCount(matchVec) <= 1.U, "Multiple late prefetch MSHRs matched")
     val matchSrc = Mux1H(matchVec, io.mshrInfo.map(_.bits.reqSource))
-    (matched, matchSrc)
+    val matchLatency = Mux1H(matchVec, io.mshrInfo.map(_.bits.reqTimer))
+    (matched, matchSrc, matchLatency)
   }
 
   // count ways
@@ -202,6 +203,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   val latePrefetchRes = latePrefetch(in) // demand request hit entry of pf
   io.pfStatInMSHR.hitPf := latePrefetchRes._1 && io.in.valid && !sameAddr(in, RegNext(in))
   io.pfStatInMSHR.hitPfReqSrc := latePrefetchRes._2
+  io.pfStatInMSHR.hitPfLatency := latePrefetchRes._3
   io.pfStatInMSHR.pfLate := io.in.valid && dup
   io.pfStatInMSHR.pfLateReqSrc := io.in.bits.reqSource
   io.pfStatInMSHR.pfLateHitReqSrc := dupHitSrc

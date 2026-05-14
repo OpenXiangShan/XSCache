@@ -104,6 +104,7 @@ trait HasCoupledL2Parameters {
   def encDataPadBits = 0 // recaculate if any split changes
 
   // Prefetch
+  def timestampBits = 16
   def prefetchers = cacheParams.prefetch
   def prefetchOpt = if(prefetchers.nonEmpty) Some(true) else None
   def hasBOP = prefetchers.exists(_.isInstanceOf[BOPParameters])
@@ -418,6 +419,7 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     val io = IO(new Bundle {
       val hartId = Input(UInt(hartIdLen.W))
       val pfCtrlFromCore = Input(new PrefetchCtrlFromCore)
+      val l2_fdbk_pf_ctrl = Output(new L2ToL1PfCtrl)
       val l2_hint = Vec(hintChannelCount, ValidIO(new L2ToL1Hint()(l2ECCParams)))
       val l2_tlb_req = new L2ToL1TlbIO(nRespDups = 1)(l2TlbParams)
       val debugTopDown = new Bundle {
@@ -499,6 +501,11 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
         prefetcher.get.pfCtrlFromCore := io.pfCtrlFromCore
         prefetcher.get.io.resp <> prefetchResps.get
         prefetcher.get.io.tlb_req <> io.l2_tlb_req
+    }
+    if (prefetchOpt.isEmpty) {
+      io.l2_fdbk_pf_ctrl := L2ToL1PfCtrl.default()
+    } else {
+      io.l2_fdbk_pf_ctrl := prefetcher.get.l2ToL1PfCtrl
     }
     pf_recv_node match {
       case Some(x) =>
@@ -815,6 +822,15 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       for (ch <- 0 until hintChannelCount) {
         hintChosen(ch) := hintChosenVec(ch)
         hintFire(ch) := hintFireVec(ch)
+      }
+    }
+    // ==================== Prefetch replenish (after slice initilize)===================
+    prefetcher.foreach{ p =>
+      for ((f, s) <- p.pfFeedbackVec zip slices) {
+        f.pfReplaceDemand := s.io.pfReplaceDemand.get
+        f.dataRefill := s.io.dataRefill.get
+        f.dirResult := s.io.dirResult.get
+        f.pfStatInMSHR := s.io.pfStatInMSHR.get
       }
     }
 
