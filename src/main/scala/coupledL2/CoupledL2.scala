@@ -31,15 +31,14 @@ import org.chipsalliance.cde.config.{Field, Parameters}
 
 import scala.math.max
 import coupledL2.prefetch._
-import huancun.{BankBitsKey, TPmetaReq, TPmetaResp}
 import utility.mbist.{MbistInterface, MbistPipeline}
 import utility.sram.{SramBroadcastBundle, SramHelper}
 import freechips.rocketchip.tilelink.TLArbiter
+import coupledL2.utils._
+import xscache.common.{BankBitsKey, TPmetaReq, TPmetaResp}
 
 trait HasCoupledL2Parameters {
   val p: Parameters
-  // val tl2tlParams: HasTLL2Parameters = p(L2ParamKey)
-  def enableCHI = p(EnableCHI)
   def enableClockGate = p(EnableL2ClockGate)
   def cacheParams = p(L2ParamKey)
   def PrivateClintRange = cacheParams.PrivateClintRange
@@ -56,7 +55,6 @@ trait HasCoupledL2Parameters {
   def offsetBits = log2Ceil(blockBytes)
   def beatBits = offsetBits - log2Ceil(beatBytes)
   def stateBits = MetaData.stateBits
-  def chiOpt = if (enableCHI) Some(true) else None
   def aliasBitsOpt = if(cacheParams.clientCaches.isEmpty) None
                   else cacheParams.clientCaches.head.aliasBitsOpt
   // vaddr without offset bits
@@ -111,6 +109,7 @@ trait HasCoupledL2Parameters {
   def hasNLPrefetcher = prefetchers.exists(_.isInstanceOf[NLParameters])
   def hasPrefetchBit = prefetchers.exists(_.hasPrefetchBit) // !! TODO.test this
   def hasPrefetchSrc = prefetchers.exists(_.hasPrefetchSrc)
+  def chiOpt = Some(true)
   def topDownOpt = if(cacheParams.elaboratedTopDown) Some(true) else None
 
   def enableHintGuidedGrant = true
@@ -356,7 +355,7 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
     // Display info
     val sizeBytes = cacheParams.toCacheParams.capacity.toDouble
     val sizeStr = sizeBytesToStr(sizeBytes)
-    println(s"====== Inclusive TL-${if (enableCHI) "CHI" else "TL"} ${cacheParams.name} ($sizeStr * $banks-bank)  ======")
+    println(s"====== Inclusive CHI ${cacheParams.name} ($sizeStr * $banks-bank)  ======")
     println(s"prefetch: ${cacheParams.prefetch}")
     println(s"bankBits: ${bankBits}")
     println(s"replacement: ${cacheParams.replacement}")
@@ -441,21 +440,12 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
         require(in.params.dataBits == out.params.dataBits)
         val rst_L2 = reset
         val slice = withReset(rst_L2) {
-          if (enableCHI) {
-            Module(new tl2chi.Slice()(p.alterPartial {
-              case EdgeInKey => edgeIn
-              case EdgeOutKey => edgeOut
-              case BankBitsKey => bankBits
-              case SliceIdKey => i
-            }))
-          } else {
-            Module(new tl2tl.Slice()(p.alterPartial {
-              case EdgeInKey => edgeIn
-              case EdgeOutKey => edgeOut
-              case BankBitsKey => bankBits
-              case SliceIdKey => i
-            }))
-          }
+          Module(new tl2chi.Slice()(p.alterPartial {
+            case EdgeInKey => edgeIn
+            case EdgeOutKey => edgeOut
+            case BankBitsKey => bankBits
+            case SliceIdKey => i
+          }))
         }
         slice.io.in <> in
         if (enableHintGuidedGrant) {
@@ -572,18 +562,6 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
         case (hint, i) =>
           hint.ready := readysVec.map(_(i)).reduce(_||_)
       }
-    }
-
-    // Outer interface connection
-    slices.zip(node.out).zipWithIndex.foreach {
-      case ((slice, (out, _)), i) =>
-        slice match {
-          case slice: tl2tl.Slice =>
-            out <> slice.io.out
-            out.a.bits.address := restoreAddress(slice.io.out.a.bits.address, i)
-            out.c.bits.address := restoreAddress(slice.io.out.c.bits.address, i)
-          case slice: tl2chi.Slice =>
-        }
     }
 
     // ==================== TopDown ====================

@@ -66,7 +66,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   grantBuf.io.fromReqArb.status_s1 := reqArb.io.status_s1
   grantBuf.io.pipeStatusVec := reqArb.io.status_vec ++ mainPipe.io.status_vec_toD
 
-  val status_vec_toTX = reqArb.io.status_vec_toTX.get ++ mainPipe.io.status_vec_toTX
+  val status_vec_toTX = reqArb.io.status_vec_toTX ++ mainPipe.io.status_vec_toTX
   txreq.io.pipeReq <> mainPipe.io.toTXREQ
   txreq.io.mshrReq <> mshrCtl.io.toTXREQ
   txreq.io.pipeStatusVec := status_vec_toTX
@@ -99,9 +99,9 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   reqArb.io.fromMSHRCtl := mshrCtl.io.toReqArb
   reqArb.io.fromMainPipe := mainPipe.io.toReqArb
   reqArb.io.fromGrantBuffer := grantBuf.io.toReqArb
-  reqArb.io.fromTXDAT.foreach(_ := txdat.io.toReqArb)
-  reqArb.io.fromTXRSP.foreach(_ := txrsp.io.toReqArb)
-  reqArb.io.fromTXREQ.foreach(_ := txreq.io.toReqArb)
+  reqArb.io.fromTXDAT := txdat.io.toReqArb
+  reqArb.io.fromTXRSP := txrsp.io.toReqArb
+  reqArb.io.fromTXREQ := txreq.io.toReqArb
   reqArb.io.msInfo := mshrCtl.io.msInfo
 
   reqBuf.io.in <> sinkA.io.task
@@ -199,7 +199,6 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
 
   /* Connect upwards channels */
   val inBuf = cacheParams.innerBuf
-  // val outBuf = tl2tlParams.outerBuf
   sinkA.io.a <> inBuf.a(io.in.a)
   io.in.b <> inBuf.b(mshrCtl.io.toSourceB)
   sinkC.io.c <> inBuf.c(io.in.c)

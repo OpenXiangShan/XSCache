@@ -8,11 +8,11 @@ import chisel3.stage.ChiselGeneratorAnnotation
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tile.MaxHartIdBits
-import huancun._
 import coupledL2.prefetch._
 import coupledL2.tl2chi._
 import utility._
 import utility.chiron._
+import xscache.common.{AliasField, BankBitsKey, PrefetchField}
 import scala.collection.mutable.ArrayBuffer
 
 class TestTop_CHIL2(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, extTime: Boolean = false, vTime: Boolean = false)(implicit p: Parameters) extends LazyModule
@@ -77,7 +77,6 @@ class TestTop_CHIL2(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, ext
       hartId              = i,
     )
     case CHIIssue => p(CHIIssue)
-    case EnableCHI => p(EnableCHI)
     case BankBitsKey => log2Ceil(banks)
     case MaxHartIdBits => log2Up(numCores)
     case LogUtilsOptionsKey => LogUtilsOptions(
@@ -246,7 +245,6 @@ object TestTopCHIHelper {
         sam                 = Seq(AddressSet.everything -> 0)
       )
       case CHIIssue => issue
-      case EnableCHI => true
     })
 
     CLogB.init(true)

@@ -16,6 +16,7 @@ import cc.xiangshan.openncb._
 import cc.xiangshan.openncb.chi._
 import utility._
 import utility.chiron._
+import xscache.common.{AliasField, BankBitsKey}
 
 class TestTop_L3()(implicit p: Parameters) extends LazyModule with HasCHIMsgParameters {
   override lazy val desiredName: String = "TestTop_L3"
@@ -90,7 +91,7 @@ class TestTopSoC(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, issue:
         channelBytes = TLChannelBeatBytes(l2Params.blockBytes),
         minLatency = 1,
         echoFields = Nil,
-        requestFields = Seq(huancun.AliasField(2)),
+        requestFields = Seq(AliasField(2)),
         responseKeys = l2Params.respKey
       )
     ))
@@ -117,9 +118,8 @@ class TestTopSoC(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, issue:
       name                = s"L2_$i",
       hartId              = i,
     )
-    case EnableCHI => true
     case CHIIssue => issue
-    case huancun.BankBitsKey => log2Ceil(banks)
+    case BankBitsKey => log2Ceil(banks)
     case MaxHartIdBits => log2Up(numCores)
     case LogUtilsOptionsKey => LogUtilsOptions(
       false,

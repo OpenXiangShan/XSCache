@@ -24,8 +24,8 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLHints._
 import coupledL2.prefetch.PrefetchReq
-import huancun.{AliasKey, PrefetchKey}
 import utility.{MemReqSource, XSPerfAccumulate}
+import xscache.common.{AliasKey, PrefetchKey}
 
 class SinkA(implicit p: Parameters) extends L2Module {
   val io = IO(new Bundle() {

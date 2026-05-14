@@ -35,7 +35,7 @@ import utility.{ChiselDB, Constantin, MemReqSource}
 import utility.sram.SRAMTemplate
 import coupledL2.HasCoupledL2Parameters
 import coupledL2.utils.ReplacementPolicy
-import huancun.{TPmetaReq, TPmetaResp}
+import xscache.common.{TPmetaReq, TPmetaResp}
 
 case class TPParameters(
     tpTableEntries: Int = 16384,
