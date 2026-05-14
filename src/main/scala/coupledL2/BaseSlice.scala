@@ -35,6 +35,7 @@ abstract class BaseSliceIO[T_OUT <: BaseOuterBundle](implicit p: Parameters) ext
   val pfMonitorStat = prefetchOpt.map(_ => Output(new PrefetchStatDelta))
   val pfReplaceDemand = prefetchOpt.map(_ => ValidIO(new PrefetchReplaceDemandBundle))
   val dataRefill = prefetchOpt.map(_ => ValidIO(new DemandRefillBundle))
+  val busContention = prefetchOpt.map(_ => ValidIO(new BusContentionBundle))
   val dirResult = topDownOpt.map(_ => ValidIO(new DirResult))
   val pfSent = topDownOpt.map(_ => ValidIO(UInt(MemReqSource.reqSourceBits.W)))
   val pfStatInMSHR = topDownOpt.map(_ => Output(new PfStatInMSHRBundle()))
