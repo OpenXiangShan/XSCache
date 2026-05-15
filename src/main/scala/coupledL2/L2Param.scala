@@ -15,7 +15,7 @@
   * *************************************************************************************
   */
 
-package coupledL2
+package xscache.coupledL2
 
 import chisel3._
 import chisel3.util.log2Ceil
@@ -23,7 +23,7 @@ import freechips.rocketchip.diplomacy.{AddressSet, BufferParams}
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
 import org.chipsalliance.cde.config.Field
-import coupledL2.prefetch._
+import xscache.coupledL2.prefetch._
 import utility.{Code, MemReqSource, ReqSourceKey}
 import xscache.common.{AliasKey, CacheParameters, IsHitKey, PrefetchKey, BankBitsKey}
 

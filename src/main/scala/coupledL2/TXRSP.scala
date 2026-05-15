@@ -15,13 +15,13 @@
  * *************************************************************************************
  */
 
-package coupledL2
+package xscache.coupledL2
 
 import chisel3._
 import chisel3.util._
 import utility._
 import org.chipsalliance.cde.config.Parameters
-import coupledL2.TaskBundle
+import xscache.coupledL2.TaskBundle
 import xscache.chi.{CHIRSP, RespErrEncodings}
 
 class TXRSPBlockBundle(implicit p: Parameters) extends TXBlockBundle {

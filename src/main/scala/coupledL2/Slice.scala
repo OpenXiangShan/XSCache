@@ -15,14 +15,14 @@
   * *************************************************************************************
   */
 
-package coupledL2
+package xscache.coupledL2
 
 import chisel3._
 import chisel3.util._
 import utility.mbist.MbistPipeline
 import org.chipsalliance.cde.config.Parameters
-import coupledL2._
-import coupledL2.prefetch.PrefetchIO
+import xscache.coupledL2._
+import xscache.coupledL2.prefetch.PrefetchIO
 import utility.MemReqSource
 import xscache.chi.{DecoupledPortIO, HasCHIMsgParameters}
 

@@ -24,6 +24,10 @@ case object PrefetchKey extends ControlKey[Bool](name = "needHint")
 
 case class PrefetchField() extends BundleField[Bool](PrefetchKey, Output(Bool()), _ := false.B)
 
+case object DirtyKey extends ControlKey[Bool](name = "dirty")
+
+case class DirtyField() extends BundleField[Bool](DirtyKey, Output(Bool()), _ := false.B)
+
 case object AliasKey extends ControlKey[UInt]("alias")
 
 case class AliasField(width: Int) extends BundleField[UInt](AliasKey, Output(UInt(width.W)), _ := 0.U(width.W))

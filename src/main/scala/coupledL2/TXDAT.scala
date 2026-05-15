@@ -15,13 +15,13 @@
  * *************************************************************************************
  */
 
-package coupledL2
+package xscache.coupledL2
 
 import chisel3._
 import chisel3.util._
 import utility._
 import org.chipsalliance.cde.config.Parameters
-import coupledL2.{TaskWithData, TaskBundle, DSBlock, DSBeat}
+import xscache.coupledL2.{TaskWithData, TaskBundle, DSBlock, DSBeat}
 import xscache.chi.{CHIDAT, HasCHIOpcodes, RespErrEncodings}
 import xscache.chi.CHICohStates._
 

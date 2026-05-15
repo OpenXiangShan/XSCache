@@ -26,15 +26,15 @@
   * *************************************************************************************
   */
 
-package coupledL2.prefetch
+package xscache.coupledL2.prefetch
 
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import utility.{ChiselDB, Constantin, MemReqSource}
 import utility.sram.SRAMTemplate
-import coupledL2.HasCoupledL2Parameters
-import coupledL2.utils.ReplacementPolicy
+import xscache.coupledL2.HasCoupledL2Parameters
+import xscache.coupledL2.utils.ReplacementPolicy
 
 case class TPParameters(
     tpTableEntries: Int = 16384,

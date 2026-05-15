@@ -1,4 +1,4 @@
-package openLLC
+package xscache.openLLC
 
 import chisel3._
 import circt.stage.{ChiselStage, FirtoolOption}
@@ -10,7 +10,7 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tile.MaxHartIdBits
 import freechips.rocketchip.tilelink._
 import org.chipsalliance.cde.config._
-import coupledL2.{EdgeInKey, L1Param, L2Param, L2ParamKey, L2ToL1Hint, TL2CHICoupledL2}
+import xscache.coupledL2.{EdgeInKey, L1Param, L2Param, L2ParamKey, L2ToL1Hint, TL2CHICoupledL2}
 import cc.xiangshan.openncb._
 import cc.xiangshan.openncb.chi._
 import utility._

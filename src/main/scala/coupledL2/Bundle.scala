@@ -15,14 +15,14 @@
   * *************************************************************************************
   */
 
-package coupledL2
+package xscache.coupledL2
 
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.tilelink.TLPermissions._
 import utility.MemReqSource
-import coupledL2.{HasTLChannelBits, DirResult, PipeStatus}
+import xscache.coupledL2.{HasTLChannelBits, DirResult, PipeStatus}
 import xscache.chi.HasCHIOpcodes
 
 trait HasCHIChannelBits { this: Bundle =>

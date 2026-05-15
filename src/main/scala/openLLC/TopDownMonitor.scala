@@ -15,7 +15,7 @@
  * *************************************************************************************
  */
 
-package openLLC
+package xscache.openLLC
 
 import org.chipsalliance.cde.config.Parameters
 import chisel3._

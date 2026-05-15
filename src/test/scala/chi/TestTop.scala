@@ -1,4 +1,4 @@
-package coupledL2
+package xscache.coupledL2
 
 import chisel3._
 import circt.stage.ChiselStage
@@ -9,8 +9,8 @@ import chisel3.stage.ChiselGeneratorAnnotation
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tile.MaxHartIdBits
-import coupledL2.prefetch._
-import coupledL2._
+import xscache.coupledL2.prefetch._
+import xscache.coupledL2._
 import utility._
 import utility.chiron._
 import xscache.common.{AliasField, BankBitsKey, PrefetchField}

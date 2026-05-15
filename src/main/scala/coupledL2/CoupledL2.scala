@@ -17,7 +17,7 @@
 
 // See LICENSE.SiFive for license details.
 
-package coupledL2
+package xscache.coupledL2
 
 import chisel3._
 import chisel3.util._
@@ -30,12 +30,12 @@ import freechips.rocketchip.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 
 import scala.math.max
-import coupledL2.prefetch._
-import coupledL2.prefetch.{TPmetaReq, TPmetaResp}
+import xscache.coupledL2.prefetch._
+import xscache.coupledL2.prefetch.{TPmetaReq, TPmetaResp}
 import utility.mbist.{MbistInterface, MbistPipeline}
 import utility.sram.{SramBroadcastBundle, SramHelper}
 import freechips.rocketchip.tilelink.TLArbiter
-import coupledL2.utils._
+import xscache.coupledL2.utils._
 import xscache.common.BankBitsKey
 
 trait HasCoupledL2Parameters {

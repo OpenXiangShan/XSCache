@@ -15,7 +15,7 @@
  * *************************************************************************************
  */
 
-package coupledL2
+package xscache.coupledL2
 
 import chisel3._
 import chisel3.util._
@@ -24,9 +24,9 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLPermissions._
 import org.chipsalliance.cde.config.Parameters
-import coupledL2._
-import coupledL2.prefetch.{PrefetchTrain, PfSource}
-import coupledL2.MetaData._
+import xscache.coupledL2._
+import xscache.coupledL2.prefetch.{PrefetchTrain, PfSource}
+import xscache.coupledL2.MetaData._
 import xscache.chi.{CHIREQ, HasCHIOpcodes}
 import xscache.chi.CHICohStates._
 

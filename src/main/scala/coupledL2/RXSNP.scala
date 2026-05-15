@@ -15,15 +15,15 @@
  * *************************************************************************************
  */
 
-package coupledL2
+package xscache.coupledL2
 
 import chisel3._
 import chisel3.util._
 import utility._
 import org.chipsalliance.cde.config.Parameters
 import scala.collection.View.Fill
-import coupledL2.{TaskBundle, MSHRInfo, MetaEntry, MergeTaskBundle}
-import coupledL2.MetaData._
+import xscache.coupledL2.{TaskBundle, MSHRInfo, MetaEntry, MergeTaskBundle}
+import xscache.coupledL2.MetaData._
 import xscache.chi.CHISNP
 
 class RXSNP(

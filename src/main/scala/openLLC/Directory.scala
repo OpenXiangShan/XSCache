@@ -15,12 +15,12 @@
  * *************************************************************************************
  */
 
-package openLLC
+package xscache.openLLC
 
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
-import coupledL2.utils.{SRAMTemplate, ReplacementPolicy}
+import xscache.coupledL2.utils.{SRAMTemplate, ReplacementPolicy}
 import utility.{ParallelPriorityMux}
 import xscache.chi.HasCHIOpcodes
 

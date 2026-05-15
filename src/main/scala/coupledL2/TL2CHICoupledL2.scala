@@ -15,7 +15,7 @@
   * *************************************************************************************
   */
 
-package coupledL2
+package xscache.coupledL2
 
 import chisel3._
 import chisel3.util._
@@ -26,9 +26,9 @@ import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.util._
 import org.chipsalliance.cde.config.{Parameters, Field}
 import scala.math.max
-import coupledL2._
-import coupledL2.prefetch._
-import coupledL2.utils._
+import xscache.coupledL2._
+import xscache.coupledL2.prefetch._
+import xscache.coupledL2.utils._
 import xscache.chi._
 
 abstract class TL2CHIL2Bundle(implicit val p: Parameters) extends Bundle

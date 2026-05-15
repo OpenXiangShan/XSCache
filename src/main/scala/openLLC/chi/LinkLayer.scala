@@ -15,7 +15,7 @@
   * *************************************************************************************
   */
 
-package openLLC
+package xscache.openLLC
 
 import chisel3._
 import chisel3.util._
