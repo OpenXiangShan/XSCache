@@ -15,7 +15,7 @@
  * *************************************************************************************
  */
 
-package coupledL2.tl2chi
+package coupledL2
 
 import chisel3._
 import chisel3.util._
@@ -27,6 +27,7 @@ import freechips.rocketchip.tilelink.TLMessages._
 import coupledL2.prefetch.PrefetchTrain
 import coupledL2._
 import coupledL2.utils._
+import xscache.chi.{CHIREQ, CHIRSP, HasCHIOpcodes}
 
 class MSHRCtl(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes with HasPerfEvents {
   val io = IO(new Bundle() {
@@ -268,4 +269,3 @@ class MSHRCtl(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes 
   )
   generatePerfEvent()
 }
-

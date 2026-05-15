@@ -15,7 +15,7 @@
   * *************************************************************************************
   */
 
-package coupledL2.tl2chi
+package coupledL2
 
 import chisel3._
 import chisel3.util._
@@ -24,6 +24,7 @@ import org.chipsalliance.cde.config.Parameters
 import coupledL2._
 import coupledL2.prefetch.PrefetchIO
 import utility.MemReqSource
+import xscache.chi.{DecoupledPortIO, HasCHIMsgParameters}
 
 class OuterBundle(implicit p: Parameters) extends DecoupledPortIO with BaseOuterBundle
 

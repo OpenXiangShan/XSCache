@@ -10,11 +10,12 @@ import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tile.MaxHartIdBits
 import coupledL2.prefetch._
-import coupledL2.tl2chi._
+import coupledL2._
 import utility._
 import utility.chiron._
 import xscache.common.{AliasField, BankBitsKey, PrefetchField}
 import scala.collection.mutable.ArrayBuffer
+import xscache.chi._
 
 class TestTop_CHIL2(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, extTime: Boolean = false, vTime: Boolean = false)(implicit p: Parameters) extends LazyModule
   with HasCHIMsgParameters {

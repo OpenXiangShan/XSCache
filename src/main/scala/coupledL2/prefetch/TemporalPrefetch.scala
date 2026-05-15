@@ -35,7 +35,6 @@ import utility.{ChiselDB, Constantin, MemReqSource}
 import utility.sram.SRAMTemplate
 import coupledL2.HasCoupledL2Parameters
 import coupledL2.utils.ReplacementPolicy
-import xscache.common.{TPmetaReq, TPmetaResp}
 
 case class TPParameters(
     tpTableEntries: Int = 16384,
@@ -79,6 +78,19 @@ trait HasTPParams extends HasCoupledL2Parameters {
 
 abstract class TPBundle(implicit val p: Parameters) extends Bundle with HasTPParams
 abstract class TPModule(implicit val p: Parameters) extends Module with HasTPParams
+
+class TPmetaReq(hartIdLen: Int, fullAddressBits: Int, offsetBits: Int) extends Bundle {
+  val hartid = UInt(hartIdLen.W)
+  val set = UInt(10.W)
+  val way = UInt(4.W)
+  val wmode = Bool()
+  val rawData = Vec(512 / (fullAddressBits - offsetBits), UInt((fullAddressBits - offsetBits).W))
+}
+
+class TPmetaResp(hartIdLen: Int, fullAddressBits: Int, offsetBits: Int) extends Bundle {
+  val hartid = UInt(hartIdLen.W)
+  val rawData = Vec(512 / (fullAddressBits - offsetBits), UInt((fullAddressBits - offsetBits).W))
+}
 
 class tpMetaEntry(implicit p:Parameters) extends TPBundle {
   val valid = Bool()

@@ -15,7 +15,7 @@
   * *************************************************************************************
   */
 
-package coupledL2.tl2chi
+package coupledL2
 
 import chisel3._
 import chisel3.util._
@@ -29,6 +29,7 @@ import scala.math.max
 import coupledL2._
 import coupledL2.prefetch._
 import coupledL2.utils._
+import xscache.chi._
 
 abstract class TL2CHIL2Bundle(implicit val p: Parameters) extends Bundle
   with HasCoupledL2Parameters

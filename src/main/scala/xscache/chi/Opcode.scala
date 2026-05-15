@@ -15,7 +15,7 @@
   * *************************************************************************************
   */
 
-package coupledL2.tl2chi
+package xscache.chi
 
 import chisel3._
 import chisel3.util._

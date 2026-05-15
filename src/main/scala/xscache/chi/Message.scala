@@ -15,23 +15,26 @@
   * *************************************************************************************
   */
 
-package coupledL2.tl2chi
+package xscache.chi
 
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import org.chipsalliance.cde.config.Field
 import scala.math.max
-import coupledL2.{L2ParamKey, TaskBundle}
-import coupledL2.tl2chi.CHICohStates._
-import coupledL2.tl2chi.CHICohStateTrans._
-import coupledL2.tl2chi.CHICohStateFwdedTrans._
+import xscache.chi.CHICohStates._
+import xscache.chi.CHICohStateTrans._
+import xscache.chi.CHICohStateFwdedTrans._
 
 case object CHIIssue extends Field[String](Issue.B)
 
 case object NonSecureKey extends Field[Boolean](false)
 
 case object CHIAddrWidthKey extends Field[Int](48)
+
+case object CHIDataCheckKey extends Field[String]("oddparity")
+
+case object CHIPoisonKey extends Field[Boolean](true)
 
 object CHICohStates {
   val width = 3
@@ -223,7 +226,6 @@ trait HasCHIMsgParameters {
   implicit val p: Parameters
 
   val issue = p(CHIIssue)
-  val l2CacheParams = p(L2ParamKey)
 
   val DEFAULT_CONFIG = Map(
     "QOS_WIDTH" -> 4,
@@ -296,14 +298,14 @@ trait HasCHIMsgParameters {
   // def Ea_FIELD[T <: Data](x: T): Option[T] = if (after(issue, Issue.Ea)) Some(x) else None
   def Eb_FIELD[T <: Data](x: T): Option[T] = if (after(issue, Issue.Eb)) Some(x) else None
 
-  def dataCheckMethod : Int = l2CacheParams.dataCheck.getOrElse("none").toLowerCase match {
+  def dataCheckMethod : Int = p(CHIDataCheckKey).toLowerCase match {
     case "none" => 0
     case "oddparity" => 1
     case "secded" => 2
     case _ => 0
   }
   def enableDataCheck = dataCheckMethod != 0
-  def enablePoison = l2CacheParams.enablePoison
+  def enablePoison = p(CHIPoisonKey)
 
   def NODEID_WIDTH = CONFIG("NODEID_WIDTH")
 

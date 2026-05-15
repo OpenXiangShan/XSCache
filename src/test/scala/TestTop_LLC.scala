@@ -10,13 +10,13 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tile.MaxHartIdBits
 import freechips.rocketchip.tilelink._
 import org.chipsalliance.cde.config._
-import coupledL2._
-import coupledL2.tl2chi._
+import coupledL2.{EdgeInKey, L1Param, L2Param, L2ParamKey, L2ToL1Hint, TL2CHICoupledL2}
 import cc.xiangshan.openncb._
 import cc.xiangshan.openncb.chi._
 import utility._
 import utility.chiron._
 import xscache.common.{AliasField, BankBitsKey}
+import xscache.chi._
 
 class TestTop_L3()(implicit p: Parameters) extends LazyModule with HasCHIMsgParameters {
   override lazy val desiredName: String = "TestTop_L3"

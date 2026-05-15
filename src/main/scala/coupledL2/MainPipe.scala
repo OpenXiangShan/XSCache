@@ -15,7 +15,7 @@
  * *************************************************************************************
  */
 
-package coupledL2.tl2chi
+package coupledL2
 
 import chisel3._
 import chisel3.util._
@@ -26,8 +26,9 @@ import freechips.rocketchip.tilelink.TLPermissions._
 import org.chipsalliance.cde.config.Parameters
 import coupledL2._
 import coupledL2.prefetch.{PrefetchTrain, PfSource}
-import coupledL2.tl2chi.CHICohStates._
 import coupledL2.MetaData._
+import xscache.chi.{CHIREQ, HasCHIOpcodes}
+import xscache.chi.CHICohStates._
 
 class MainPipe(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes with HasPerfEvents {
   val io = IO(new Bundle() {

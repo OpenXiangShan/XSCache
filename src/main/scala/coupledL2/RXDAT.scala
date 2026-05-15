@@ -15,13 +15,14 @@
  * *************************************************************************************
  */
 
-package coupledL2.tl2chi
+package coupledL2
 
 import chisel3._
 import chisel3.util._
 import utility._
 import org.chipsalliance.cde.config.Parameters
 import coupledL2.{RespBundle, MSHRBufWrite}
+import xscache.chi.{CHIDAT, RespErrEncodings}
 
 class RXDAT(implicit p: Parameters) extends TL2CHIL2Module {
   val io = IO(new Bundle() {

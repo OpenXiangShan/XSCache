@@ -20,7 +20,7 @@ package openLLC
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
-import coupledL2.tl2chi._
+import xscache.chi._
 
 abstract class LLCModule(implicit val p: Parameters) extends Module
   with HasOpenLLCParameters

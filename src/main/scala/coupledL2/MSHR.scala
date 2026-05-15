@@ -15,7 +15,7 @@
  * *************************************************************************************
  */
 
-package coupledL2.tl2chi
+package coupledL2
 
 import chisel3._
 import chisel3.util._
@@ -26,11 +26,11 @@ import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLPermissions._
 import org.chipsalliance.cde.config.Parameters
 import coupledL2.prefetch.{PfSource, PrefetchTrain}
-import coupledL2.tl2chi.CHICohStates._
-import coupledL2.tl2chi.CHIChannel
-import coupledL2.tl2chi.RespErrEncodings._
 import coupledL2.MetaData._
 import coupledL2._
+import xscache.chi.CHICohStates._
+import xscache.chi.{CHIChannel, CHICohStateFwdedTransSet, CHICohStateTransSet, CHIDAT, CHIREQ, CHIRSP, HasCHIOpcodes, MPAM, MemAttr, OrderEncodings}
+import xscache.chi.RespErrEncodings._
 
 
 class MSHRTasks(implicit p: Parameters) extends TL2CHIL2Bundle {

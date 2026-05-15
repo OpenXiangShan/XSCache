@@ -16,7 +16,7 @@
   * *************************************************************************************
   */
 
-package coupledL2.tl2chi
+package coupledL2
 
 import chisel3._
 import chisel3.util._
@@ -28,6 +28,7 @@ import freechips.rocketchip.tilelink.TLMessages._
 import coupledL2.HasCoupledL2Parameters
 import coupledL2.{MemBackTypeMM, MemPageTypeNC}
 import coupledL2.utils._
+import xscache.chi.{CHIDAT, CHIIssue, CHIREQ, CHIRSP, DecoupledNoSnpPortIO, HasCHIMsgParameters, HasCHIOpcodes, MPAM, MemAttr, OrderEncodings, RespErrEncodings, SAM}
 
 class MMIOBridge()(implicit p: Parameters) extends LazyModule
   with HasCoupledL2Parameters

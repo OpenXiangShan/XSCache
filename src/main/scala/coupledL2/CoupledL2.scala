@@ -31,11 +31,12 @@ import org.chipsalliance.cde.config.{Field, Parameters}
 
 import scala.math.max
 import coupledL2.prefetch._
+import coupledL2.prefetch.{TPmetaReq, TPmetaResp}
 import utility.mbist.{MbistInterface, MbistPipeline}
 import utility.sram.{SramBroadcastBundle, SramHelper}
 import freechips.rocketchip.tilelink.TLArbiter
 import coupledL2.utils._
-import xscache.common.{BankBitsKey, TPmetaReq, TPmetaResp}
+import xscache.common.BankBitsKey
 
 trait HasCoupledL2Parameters {
   val p: Parameters
@@ -440,7 +441,7 @@ abstract class CoupledL2Base(implicit p: Parameters) extends LazyModule with Has
         require(in.params.dataBits == out.params.dataBits)
         val rst_L2 = reset
         val slice = withReset(rst_L2) {
-          Module(new tl2chi.Slice()(p.alterPartial {
+          Module(new Slice()(p.alterPartial {
             case EdgeInKey => edgeIn
             case EdgeOutKey => edgeOut
             case BankBitsKey => bankBits

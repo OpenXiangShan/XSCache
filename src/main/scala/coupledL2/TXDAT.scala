@@ -15,14 +15,15 @@
  * *************************************************************************************
  */
 
-package coupledL2.tl2chi
+package coupledL2
 
 import chisel3._
 import chisel3.util._
 import utility._
 import org.chipsalliance.cde.config.Parameters
 import coupledL2.{TaskWithData, TaskBundle, DSBlock, DSBeat}
-import coupledL2.tl2chi.CHICohStates._
+import xscache.chi.{CHIDAT, HasCHIOpcodes, RespErrEncodings}
+import xscache.chi.CHICohStates._
 
 class TXDATBlockBundle(implicit p: Parameters) extends TXBlockBundle {
   val blockSinkBReqEntrance = Bool()

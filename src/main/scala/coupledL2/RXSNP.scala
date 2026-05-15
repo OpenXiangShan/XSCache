@@ -15,7 +15,7 @@
  * *************************************************************************************
  */
 
-package coupledL2.tl2chi
+package coupledL2
 
 import chisel3._
 import chisel3.util._
@@ -24,6 +24,7 @@ import org.chipsalliance.cde.config.Parameters
 import scala.collection.View.Fill
 import coupledL2.{TaskBundle, MSHRInfo, MetaEntry, MergeTaskBundle}
 import coupledL2.MetaData._
+import xscache.chi.CHISNP
 
 class RXSNP(
   lCreditNum: Int = 4 // the number of L-Credits that a receiver can provide

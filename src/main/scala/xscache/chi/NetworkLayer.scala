@@ -15,37 +15,29 @@
   * *************************************************************************************
   */
 
-package coupledL2.tl2chi
+package xscache.chi
 
 import chisel3._
 import chisel3.util._
-import org.chipsalliance.cde.config.Parameters
-import freechips.rocketchip.tilelink.TLPermissions._
-import utility.MemReqSource
-import coupledL2.{HasTLChannelBits, DirResult, PipeStatus}
+import freechips.rocketchip.diplomacy.AddressSet
+import org.chipsalliance.cde.config.Field
+import utility.ParallelPriorityMux
 
-object CHIChannel {
-  def TXREQ = "b001".U
-  def TXRSP = "b010".U
-  def TXDAT = "b100".U
+/**
+  * System Address Map
+  * 
+  * Each Requester, that is, each RN and HN in the system, must have a System Address Map (SAM)
+  * to determine the target ID of a request.
+  */
+class SAM(sam: Seq[(AddressSet, Int)]) {
+  def check(x: UInt): Bool = Cat(sam.map(_._1.contains(x))).orR
+
+  def lookup(x: UInt): UInt = {
+    ParallelPriorityMux(sam.map(m => (m._1.contains(x), m._2.U)))
+  }
 }
 
-trait HasCHIChannelBits { this: Bundle =>
-  val txChannel = UInt(3.W)
-  def toTXREQ = txChannel(0).asBool
-  def toTXRSP = txChannel(1).asBool
-  def toTXDAT = txChannel(2).asBool
-}
-
-class PipeStatusWithCHI(implicit p: Parameters) extends PipeStatus
-  with HasCHIChannelBits {
-  val mshrTask = Bool()
-}
-
-class PCrdQueryBundle(implicit p: Parameters) extends TL2CHIL2Bundle with HasCHIOpcodes {
-  val query = Output(ValidIO(new Bundle() {
-    val pCrdType = UInt(PCRDTYPE_WIDTH.W)
-    val srcID = UInt(SRCID_WIDTH.W)
-  }))
-  val grant = Input(Bool())
+object SAM {
+  def apply(sam: Seq[(AddressSet, Int)]) = new SAM(sam)
+  def apply(sam: (AddressSet, Int)) = new SAM(Seq(sam))
 }

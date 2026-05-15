@@ -23,7 +23,8 @@ import utility._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tilelink.TLMessages._
 import org.chipsalliance.cde.config.Parameters
-import coupledL2.tl2chi._
+import coupledL2._
+import xscache.chi.HasCHIOpcodes
 
 class RequestArb(implicit p: Parameters) extends L2Module
   with HasCHIOpcodes {

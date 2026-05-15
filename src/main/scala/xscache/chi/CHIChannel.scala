@@ -15,24 +15,12 @@
   * *************************************************************************************
   */
 
-package xscache.common
+package xscache.chi
 
-import chisel3.util.log2Ceil
-import org.chipsalliance.cde.config.Field
+import chisel3._
 
-case class CacheParameters(
-  name: String,
-  sets: Int,
-  ways: Int,
-  blockGranularity: Int,
-  blockBytes: Int = 64,
-  aliasBitsOpt: Option[Int] = None,
-  inner: Seq[CacheParameters] = Nil
-) {
-  val capacity = sets * ways * blockBytes
-  val setBits = log2Ceil(sets)
-  val offsetBits = log2Ceil(blockBytes)
-  val needResolveAlias = aliasBitsOpt.nonEmpty
+object CHIChannel {
+  def TXREQ = "b001".U
+  def TXRSP = "b010".U
+  def TXDAT = "b100".U
 }
-
-case object BankBitsKey extends Field[Int]
