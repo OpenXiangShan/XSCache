@@ -10,7 +10,7 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tile.MaxHartIdBits
 import freechips.rocketchip.tilelink._
 import org.chipsalliance.cde.config._
-import xscache.coupledL2.{EdgeInKey, L1Param, L2Param, L2ParamKey, L2ToL1Hint, TL2CHICoupledL2}
+import xscache.coupledL2.{CoupledL2, EdgeInKey, L1Param, L2Param, L2ParamKey, L2ToL1Hint}
 import cc.xiangshan.openncb._
 import cc.xiangshan.openncb.chi._
 import utility._
@@ -112,8 +112,7 @@ class TestTopSoC(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, issue:
     }
   }
 
-  // val l2 = LazyModule(new TL2CHICoupledL2())
-  val l2_nodes = (0 until numCores).map(i => LazyModule(new TL2CHICoupledL2()(new Config((site, here, up) => {
+  val l2_nodes = (0 until numCores).map(i => LazyModule(new CoupledL2()(new Config((site, here, up) => {
     case L2ParamKey => l2Params.copy(
       name                = s"L2_$i",
       hartId              = i,
@@ -270,25 +269,25 @@ class TestTopSoC(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, issue:
           vTime = false,
           clock = l2.module.clock,
           reset = l2.module.reset,
-          rnId  = l2.module.io_nodeID,
-          txreqflit = l2.module.io_chi.tx.req.flit, txreqflitv = l2.module.io_chi.tx.req.flitv,
-          rxrspflit = l2.module.io_chi.rx.rsp.flit, rxrspflitv = l2.module.io_chi.rx.rsp.flitv,
-          rxdatflit = l2.module.io_chi.rx.dat.flit, rxdatflitv = l2.module.io_chi.rx.dat.flitv,
-          rxsnpflit = l2.module.io_chi.rx.snp.flit, rxsnpflitv = l2.module.io_chi.rx.snp.flitv,
-          txrspflit = l2.module.io_chi.tx.rsp.flit, txrspflitv = l2.module.io_chi.tx.rsp.flitv,
-          txdatflit = l2.module.io_chi.tx.dat.flit, txdatflitv = l2.module.io_chi.tx.dat.flitv,
+          rnId  = l2.module.io.nodeID,
+          txreqflit = l2.module.io.chi.tx.req.flit, txreqflitv = l2.module.io.chi.tx.req.flitv,
+          rxrspflit = l2.module.io.chi.rx.rsp.flit, rxrspflitv = l2.module.io.chi.rx.rsp.flitv,
+          rxdatflit = l2.module.io.chi.rx.dat.flit, rxdatflitv = l2.module.io.chi.rx.dat.flitv,
+          rxsnpflit = l2.module.io.chi.rx.snp.flit, rxsnpflitv = l2.module.io.chi.rx.snp.flitv,
+          txrspflit = l2.module.io.chi.tx.rsp.flit, txrspflitv = l2.module.io.chi.tx.rsp.flitv,
+          txdatflit = l2.module.io.chi.tx.dat.flit, txdatflitv = l2.module.io.chi.tx.dat.flitv,
           time = time_sim, timev = extTime.B
         )
       }
 
-      l2.module.io_chi <> l3.io.rn(i)
+      l2.module.io.chi <> l3.io.rn(i)
       dontTouch(l2.module.io)
 
       l2.module.io.l2_hint <> io_l1(i).l2Hint
 
       l2.module.io.hartId := i.U
       l2.module.io.pfCtrlFromCore := DontCare
-      l2.module.io_nodeID := i.U(NODEID_WIDTH.W)
+      l2.module.io.nodeID := i.U(NODEID_WIDTH.W)
       l2.module.io.debugTopDown := DontCare
       l2.module.io.l2_tlb_req <> DontCare
     }
