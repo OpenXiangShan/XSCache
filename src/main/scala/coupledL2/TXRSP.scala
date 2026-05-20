@@ -30,7 +30,7 @@ class TXRSPBlockBundle(implicit p: Parameters) extends TXBlockBundle {
   override def apply() = 0.U.asTypeOf(this)
 }
 
-class TXRSP(implicit p: Parameters) extends TL2CHIL2Module {
+class TXRSP(implicit p: Parameters) extends CoupledL2Module {
   val io = IO(new Bundle() {
     // val in = Flipped(DecoupledIO(new TaskBundle()))
     val pipeRsp = Flipped(DecoupledIO(new TaskBundle))

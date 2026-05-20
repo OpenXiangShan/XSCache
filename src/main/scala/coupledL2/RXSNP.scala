@@ -28,7 +28,7 @@ import xscache.chi.CHISNP
 
 class RXSNP(
   lCreditNum: Int = 4 // the number of L-Credits that a receiver can provide
-)(implicit p: Parameters) extends TL2CHIL2Module {
+)(implicit p: Parameters) extends CoupledL2Module {
   val io = IO(new Bundle() {
     val rxsnp = Flipped(DecoupledIO(new CHISNP()))
     val task = DecoupledIO(new TaskBundle())

@@ -24,7 +24,7 @@ import org.chipsalliance.cde.config.Parameters
 import xscache.coupledL2.{RespBundle, MSHRBufWrite}
 import xscache.chi.{CHIDAT, RespErrEncodings}
 
-class RXDAT(implicit p: Parameters) extends TL2CHIL2Module {
+class RXDAT(implicit p: Parameters) extends CoupledL2Module {
   val io = IO(new Bundle() {
     val out = Flipped(DecoupledIO(new CHIDAT()))
     val in = Output(new RespBundle())

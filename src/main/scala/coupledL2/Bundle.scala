@@ -37,7 +37,7 @@ class PipeStatusWithCHI(implicit p: Parameters) extends PipeStatus
   val mshrTask = Bool()
 }
 
-class PCrdQueryBundle(implicit p: Parameters) extends TL2CHIL2Bundle with HasCHIOpcodes {
+class PCrdQueryBundle(implicit p: Parameters) extends CoupledL2Bundle with HasCHIOpcodes {
   val query = Output(ValidIO(new Bundle() {
     val pCrdType = UInt(PCRDTYPE_WIDTH.W)
     val srcID = UInt(SRCID_WIDTH.W)

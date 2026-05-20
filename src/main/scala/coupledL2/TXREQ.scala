@@ -23,14 +23,14 @@ import utility._
 import org.chipsalliance.cde.config.Parameters
 import xscache.chi.{CHIREQ, SAM}
 
-class TXBlockBundle(implicit p: Parameters) extends TL2CHIL2Bundle {
+class TXBlockBundle(implicit p: Parameters) extends CoupledL2Bundle {
   // val blockSinkBReqEntrance = Bool()
   val blockMSHRReqEntrance = Bool()
 
   def apply() = 0.U.asTypeOf(this)
 }
 
-class TXREQ(implicit p: Parameters) extends TL2CHIL2Module {
+class TXREQ(implicit p: Parameters) extends CoupledL2Module {
   val io = IO(new Bundle() {
     val pipeReq = Flipped(DecoupledIO(new CHIREQ()))
     val mshrReq = Flipped(DecoupledIO(new CHIREQ()))

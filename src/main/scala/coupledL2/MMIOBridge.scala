@@ -66,7 +66,7 @@ class MMIOBridge()(implicit p: Parameters) extends LazyModule
 
 }
 
-class MMIOBridgeEntry(edge: TLEdgeIn)(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes {
+class MMIOBridgeEntry(edge: TLEdgeIn)(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
 
   val needRR = true
 

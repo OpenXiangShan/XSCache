@@ -29,7 +29,7 @@ import xscache.coupledL2._
 import xscache.coupledL2.utils._
 import xscache.chi.{CHIREQ, CHIRSP, HasCHIOpcodes}
 
-class MSHRCtl(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes with HasPerfEvents {
+class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes with HasPerfEvents {
   val io = IO(new Bundle() {
     /* interact with req arb */
     val fromReqArb = Input(new Bundle() {

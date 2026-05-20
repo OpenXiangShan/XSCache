@@ -33,7 +33,7 @@ import xscache.chi.{CHIChannel, CHICohStateFwdedTransSet, CHICohStateTransSet, C
 import xscache.chi.RespErrEncodings._
 
 
-class MSHRTasks(implicit p: Parameters) extends TL2CHIL2Bundle {
+class MSHRTasks(implicit p: Parameters) extends CoupledL2Bundle {
   // outer
   val txreq = DecoupledIO(new CHIREQ) //TODO: no need to use decoupled Shandshake
   val txrsp = DecoupledIO(new CHIRSP) //TODO: no need to use decoupled handshake
@@ -42,13 +42,13 @@ class MSHRTasks(implicit p: Parameters) extends TL2CHIL2Bundle {
   // val prefetchTrain = prefetchOpt.map(_ => DecoupledIO(new PrefetchTrain)) // To prefetcher
 }
 
-class MSHRResps(implicit p: Parameters) extends TL2CHIL2Bundle {
+class MSHRResps(implicit p: Parameters) extends CoupledL2Bundle {
   val sinkC = Flipped(ValidIO(new RespInfoBundle))
   val rxrsp = Flipped(ValidIO(new RespInfoBundle))
   val rxdat = Flipped(ValidIO(new RespInfoBundle))
 }
 
-class MSHR(implicit p: Parameters) extends TL2CHIL2Module with HasCHIOpcodes {
+class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   val io = IO(new Bundle() {
     val id = Input(UInt(mshrBits.W))
     val status = ValidIO(new MSHRStatus)
