@@ -70,6 +70,7 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   val mshr_GrantData_s1 = io.mshrHintQInfo.valid && (isGrantData(mshr_s1) || isMergeGrantData(mshr_s1))
   val mshr_Grant_s1     = io.mshrHintQInfo.valid && (isGrant(mshr_s1) || isMergeGrant(mshr_s1))
   val mshr_AccessAckData_s1 = io.mshrHintQInfo.valid && isAccessAckData(mshr_s1)
+  val mshr_CBOAck_s1    = io.mshrHintQInfo.valid && isCBOAck(mshr_s1)
   val chn_Release_s1    = io.sinkCHintQInfo.valid
   assert(Mux(chn_Release_s1, sinkC_s1.fromC, true.B))
   assert(Mux(chn_Release_s1, sinkC_s1.opcode === Release || sinkC_s1.opcode === ReleaseData, true.B))
@@ -102,7 +103,7 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   val hintEntriesWidth = log2Ceil(hintEntries)
   val hintQueue = Module(new Queue(new HintQueueEntry, hintEntries))
   val canFlow_s1 = !hintQueue.io.deq.valid || hintQueue.io.count === 1.U && hintQueue.io.deq.fire
-  val valid_s1 = mshr_GrantData_s1 || mshr_Grant_s1 || mshr_AccessAckData_s1 || chn_Release_s1
+  val valid_s1 = mshr_GrantData_s1 || mshr_Grant_s1 || mshr_AccessAckData_s1 || mshr_CBOAck_s1 || chn_Release_s1
   val flow_s1, drop_s1, enq_s3 = Wire(Decoupled(new HintQueueEntry))
   // noSpaceForSinkReq in GrantBuffer may ensure that these queues will not overflow
   assert(enq_s3.ready || !enq_s3.valid)
@@ -122,7 +123,7 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   enq_s3.valid := enqValid_s3
   enq_s3.bits := enqBits_s3
   arb(Seq(enq_s3, drop_s1, flow_s1), hintQueue.io.enq, Some("Hint"))
-  val respWithDataFire = io.l1Hint.valid && io.l1Hint.bits.hasData
+  val respWithDataFire = io.l1Hint.fire && io.l1Hint.bits.hasData
   hintQueue.io.deq.ready := io.l1Hint.ready && !RegNext(respWithDataFire, false.B)
 
   io.l1Hint.valid := hintQueue.io.deq.valid && !(io.retry_s2 && !hint_s1Queue.io.out.valid) && !RegNext(respWithDataFire, false.B)
