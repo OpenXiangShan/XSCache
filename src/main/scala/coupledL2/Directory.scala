@@ -216,6 +216,8 @@ class Directory(implicit p: Parameters) extends L2Module {
   val metaRead = Wire(Vec(ways, new MetaEntry()))
 
   // Replacer
+  val resetFinish = RegInit(false.B)
+  val resetIdx = RegInit((sets - 1).U)
   val repl = ReplacementPolicy.fromString(cacheParams.replacement, ways)
   val random_repl = cacheParams.replacement == "random"
   val replacer_sram_opt = if(random_repl) None else
