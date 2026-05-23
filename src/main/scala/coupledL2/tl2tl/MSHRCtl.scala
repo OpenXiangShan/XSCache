@@ -33,7 +33,7 @@ class MSHRSelector(implicit p: Parameters) extends L2Module {
   })
   io.out.valid := ParallelOR(io.idle)
   io.out.bits := ParallelPriorityMux(io.idle.zipWithIndex.map {
-    case (b, i) => (b, (1 << i).U)
+    case (b, i) => (b, (1.U(mshrsAll.W) << i))
   })
 }
 
