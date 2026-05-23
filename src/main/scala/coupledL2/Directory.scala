@@ -516,6 +516,12 @@ class Directory(implicit p: Parameters) extends L2Module {
   io.cmoHitInvalid := Mux1H(cmoWayOH_s3, metaAll_s3).state === MetaData.INVALID
 
   /* ====== Reset ====== */
+  when(resetIdx === 0.U) {
+    resetFinish := true.B
+  }
+  when(!resetFinish) {
+    resetIdx := resetIdx - 1.U
+  }
 
   XSPerfAccumulate("dirRead_cnt", io.read.fire)
   XSPerfAccumulate("choose_busy_way", reqValid_s3 && !Mux1H(chosenOH, req_s3.wayMask))
