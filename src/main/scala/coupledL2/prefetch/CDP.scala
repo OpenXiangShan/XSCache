@@ -1084,10 +1084,20 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   out.bits  := pft_s1_req
 
   // ----------------- Perf Counter -----------------
-  XSPerfAccumulate("pf_req_drop_by_filter", pft_s1_valid && !can_pft)
+  XSPerfAccumulate("in_drop_by_hit", in.valid && entry_hit)
+  XSPerfAccumulate("in_drop_by_full", in.valid && !entry_hit && !has_free_entry)
 
+  XSPerfAccumulate("pf_req_drop_by_filter", pft_s1_valid && !can_pft)
   XSPerfAccumulate("filter_hit", pft_s1_valid && hit)
-  XSPerfAccumulate("filter_miss", pft_s1_valid && !hit) 
+  XSPerfAccumulate("filter_miss", pft_s1_valid && !hit)
+
+  val chosen_entry = entries(pft_s1_chosen_idx)
+  XSPerfAccumulate("pf_req_fromCPU", out.fire && chosen_entry.pfSource === PfSource.NoWhere.id.U)
+  XSPerfAccumulate("pf_req_fromBOP", out.fire && (chosen_entry.pfSource === PfSource.BOP.id.U || chosen_entry.pfSource === PfSource.PBOP.id.U))
+  XSPerfAccumulate("pf_req_fromSMS", out.fire && chosen_entry.pfSource === PfSource.SMS.id.U)
+  XSPerfAccumulate("pf_req_fromStream", out.fire && chosen_entry.pfSource === PfSource.Stream.id.U)
+  XSPerfAccumulate("pf_req_fromStride", out.fire && chosen_entry.pfSource === PfSource.Stride.id.U)
+  XSPerfAccumulate("pf_req_fromCDP", out.fire && chosen_entry.pfSource === PfSource.CDP.id.U)
 }
 
 class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
