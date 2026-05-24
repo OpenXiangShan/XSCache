@@ -8,7 +8,7 @@ import utility._
 import xscache.coupledL2._
 
 case class CDPParameters(
-  UseFilteredDetect:  Boolean = false,
+  UseFilteredDetect:  Boolean = true,
 
   HotThreshold:   Int = 2,
   DepthThreshold: Int = 1,
