@@ -263,8 +263,6 @@ class MSHRInfo(implicit p: Parameters) extends L2Bundle with HasTLChannelBits {
   val mergeA = Bool() // whether the mshr already merge an acquire(avoid alias merge)
 
   val w_grantfirst = Bool()
-  val w_grantlast = Bool()
-  val w_grant = Bool()
   val s_release = Bool()
   val s_refill = Bool()
   val s_cmoresp = Bool()
@@ -402,8 +400,8 @@ class PrefetchRecv extends Bundle {
 }
 
 // custom l2 - l1 interface
-class L2ToL1Hint(implicit p: Parameters) extends L2Bundle {
-  val sourceId = UInt(sourceIdBits.W)    // tilelink sourceID
+class L2ToL1Hint(implicit p: Parameters) extends Bundle {
+  val sourceId = UInt(32.W)    // tilelink sourceID
   val isKeyword = Bool()       // miss entry keyword
 }
 
