@@ -110,7 +110,6 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle] {
   mainPipe.io.fromReqArb.status_s1 := reqArb.io.status_s1
   mainPipe.io.mshrHintQInfo := reqArb.io.mshrHintQInfo
   mainPipe.io.sinkCHintQInfo := reqArb.io.sinkCHintQInfo
-  mainPipe.io.retryFastFwd_s2 := directory.io.retryFastFwd
 
   // priority: nested-ReleaseData / probeAckData [NEW] > mainPipe DS rdata [OLD]
   // 0/1 might happen at the same cycle with 2
@@ -128,7 +127,10 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle] {
   sourceC.io.in <> mainPipe.io.toSourceC
   sourceC.io.pipeStatusVec := reqArb.io.status_vec ++ mainPipe.io.status_vec_toC
 
-  io.l1Hint <> mainPipe.io.l1Hint
+  io.l1Hint.valid := mainPipe.io.l1Hint.valid
+  io.l1Hint.bits.sourceId := mainPipe.io.l1Hint.bits.sourceId
+  io.l1Hint.bits.isKeyword := mainPipe.io.l1Hint.bits.isKeyword
+  mainPipe.io.l1Hint.ready := io.l1Hint.ready
   mshrCtl.io.grantStatus := grantBuf.io.grantStatus
 
   grantBuf.io.d_task <> mainPipe.io.toSourceD
