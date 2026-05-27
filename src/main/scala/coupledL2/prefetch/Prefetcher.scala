@@ -346,6 +346,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     pftQueueEnqArb.io.in(nl_idx).bits := nl.get.io.req.bits
   }
   pftQueue.io.enq <> pftQueueEnqArb.io.out
+  pftQueue.io.enq.valid := false.B
 
   pipe.io.in <> pftQueue.io.deq
   io.req <> pipe.io.out
