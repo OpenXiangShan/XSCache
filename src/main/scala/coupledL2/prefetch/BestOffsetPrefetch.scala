@@ -350,7 +350,6 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
 
 class BopReqBundle(implicit p: Parameters) extends BOPBundle{
   val full_vaddr = UInt(fullVAddrBits.W)
-  val base_vaddr = UInt(vaddrBitsOpt.getOrElse(0).W)
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
   val isBOP = Bool()
@@ -360,8 +359,7 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
   // for tlb req
   val paddrValid = Bool()
   val vaddrNoOffset = UInt((fullVAddrBits-offsetBits).W)
-  val baseVaddr = UInt((fullVAddrBits-offsetBits).W)
-  val paddrNoOffset = UInt(fullVAddrBits.W)
+  val paddrNoOffset = UInt((fullAddressBits-offsetBits).W)
   val replayEn = Bool()
   val replayCnt = UInt(4.W)
   // for pf req
@@ -370,8 +368,7 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
 
   def fromBopReqBundle(req: BopReqBundle) = {
     paddrValid := false.B
-    vaddrNoOffset := get_block_vaddr(req.full_vaddr)
-    baseVaddr := req.base_vaddr
+    vaddrNoOffset := get_block_addr(req.full_vaddr)
     replayEn := false.B
     replayCnt := 0.U
     paddrNoOffset := 0.U
@@ -383,7 +380,7 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
     val req = Wire(new PrefetchReq)
     req.tag := parseFullAddress(get_pf_paddr())._1
     req.set := parseFullAddress(get_pf_paddr())._2
-    req.vaddr.foreach(_ := baseVaddr)
+    req.vaddr.foreach(_ := vaddrNoOffset)
     req.needT := needT
     req.source := source
     req.pfSource := MemReqSource.Prefetch2L2BOP.id.U
@@ -426,8 +423,6 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
 
   def wayMap[T <: Data](f: Int => T) = VecInit((0 until REQ_FILTER_SIZE).map(f))
 
-  def get_flag(vaddr: UInt) = get_block_vaddr(vaddr)
-
   def alloc_entry(i: Int, e: BopReqBufferEntry): Unit = {
     valids(i) := true.B
     entries(i) := e
@@ -446,8 +441,7 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
     val v = valids(i)
     val e = entries(i)
     v &&
-      e.vaddrNoOffset === get_block_vaddr(req.full_vaddr) &&
-      e.baseVaddr === req.base_vaddr &&
+      e.vaddrNoOffset === get_block_addr(req.full_vaddr) &&
       e.needT === req.needT &&
       e.source === req.source
   }
@@ -476,19 +470,14 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
   /* s0: entries look up */
   val prev_in_valid = RegNext(io.in_req.valid, false.B)
   val prev_in_req = RegNext(io.in_req.bits)
-  val prev_in_flag = get_flag(prev_in_req.full_vaddr)
+  val prev_in_flag = get_block_addr(prev_in_req.full_vaddr)
   // s1 entry update
   val alloc = Wire(Vec(REQ_FILTER_SIZE, Bool()))
 
   val s0_in_req = io.in_req.bits
-  val s0_in_flag = get_flag(s0_in_req.full_vaddr)
+  val s0_in_flag = get_block_addr(s0_in_req.full_vaddr)
   val s0_conflict_prev = prev_in_valid && s0_in_flag === prev_in_flag
-  // FIXME lyq: the comparision logic is very complicated, is there a way to simplify
-  val s0_match_oh = VecInit(entries.indices.map(i =>
-    valids(i) && entries(i).vaddrNoOffset === s0_in_flag &&
-    entries(i).needT === s0_in_req.needT && entries(i).source === s0_in_req.source &&
-    entries(i).baseVaddr === s0_in_req.base_vaddr
-  )).asUInt
+  val s0_match_oh = VecInit(entries.indices.map(i => isEqualBopReq(i, s0_in_req))).asUInt
   val s0_match = Cat(s0_match_oh).orR
 
   val s0_invalid_vec = wayMap(w => !valids(w) && !alloc(w))
@@ -713,8 +702,6 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val s0_oldFullAddrNoOff = s0_oldFullAddr(s0_oldFullAddr.getWidth-1, offsetBits)
   val s0_newFullAddr = s0_oldFullAddr + signedExtend((prefetchOffset << offsetBits), fullAddrBits)
   val s0_crossPage = getPPN(s0_newFullAddr) =/= getPPN(s0_oldFullAddr) // unequal tags
-  val respFullAddr = if(virtualTrain) Cat(io.resp.bits.vaddr.getOrElse(0.U), 0.U(offsetBits.W))
-                 else io.resp.bits.addr - signedExtend((prefetchOffset << offsetBits), fullAddrBits)
 
   rrTable.io.r <> scoreTable.io.test
   rrTable.io.w <> delayQueue.io.out
@@ -728,7 +715,6 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val s1_needT = RegEnable(io.train.bits.needT, s0_fire)
   val s1_source = RegEnable(io.train.bits.source, s0_fire)
   val s1_newFullAddr = RegEnable(s0_newFullAddr, s0_fire)
-  val s1_reqVaddr = RegEnable(s0_reqVaddr, s0_fire)
   // val out_req = Wire(new PrefetchReq)
   // val out_req_valid = Wire(Bool())
   // val out_drop_req = WireInit(false.B)
@@ -760,7 +746,6 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   }.otherwise{
     reqFilter.io.in_req.valid := s1_req_valid
     reqFilter.io.in_req.bits.full_vaddr := s1_newFullAddr
-    reqFilter.io.in_req.bits.base_vaddr := s1_reqVaddr
     reqFilter.io.in_req.bits.needT := s1_needT
     reqFilter.io.in_req.bits.source := s1_source
     reqFilter.io.in_req.bits.isBOP := true.B
