@@ -742,8 +742,8 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     s1_ready := io.req.ready || !s1_req_valid
   }
   when(s0_fire) {
-    if(virtualTrain) s1_req_valid := !prefetchDisable && io.pbopCrossPage // now pbopCrossPage is true.B by default
-    else s1_req_valid := !prefetchDisable && !s0_crossPage // stop prefetch when prefetch req crosses pages
+    if(virtualTrain) s1_req_valid := enable && !prefetchDisable && io.pbopCrossPage // now pbopCrossPage is true.B by default
+    else s1_req_valid := enable && !prefetchDisable && !s0_crossPage // stop prefetch when prefetch req crosses pages
   }.elsewhen(s1_fire){
     s1_req_valid := false.B
   }
@@ -769,14 +769,14 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   if(virtualTrain){
     io.tlb_req <> reqFilter.io.tlb_req
     io.req <> reqFilter.io.out_req
-    io.req.valid := enable && reqFilter.io.out_req.valid
+    io.req.valid := reqFilter.io.out_req.valid
   } else {
     io.tlb_req.req.valid := false.B
     io.tlb_req.req.bits := DontCare
     io.tlb_req.req_kill := false.B
 
     /* s1 send prefetch req */
-    io.req.valid := enable && s1_req_valid
+    io.req.valid := s1_req_valid
     io.req.bits.tag := parseFullAddress(s1_newFullAddr)._1
     io.req.bits.set := parseFullAddress(s1_newFullAddr)._2
     io.req.bits.vaddr.foreach(_ := 0.U)
@@ -803,7 +803,8 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   }else{
     XSPerfAccumulate("bop_cross_page", scoreTable.io.req.fire && s0_crossPage)
   }
-  XSPerfAccumulate("bop_drop_for_disable", scoreTable.io.req.fire && prefetchDisable)
+  XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
+  XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && prefetchDisable)
 }
 
 class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
@@ -849,11 +850,11 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     req.set := parseFullAddress(newAddr)._2
     req.needT := io.train.bits.needT
     req.source := io.train.bits.source
-    req_valid := !crossPage && !prefetchDisable // stop prefetch when prefetch req crosses pages
+    req_valid := enable && !crossPage && !prefetchDisable // stop prefetch when prefetch req crosses pages
   }
 
   io.pbopCrossPage := crossPage
-  io.req.valid := enable && req_valid
+  io.req.valid := req_valid
   io.req.bits := req
   io.req.bits.pfSource := MemReqSource.Prefetch2L2PBOP.id.U
   io.train.ready := delayQueue.io.in.ready && scoreTable.io.req.ready && (!req_valid || io.req.ready)
@@ -871,5 +872,6 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   XSPerfAccumulate("bop_resp", io.resp.fire)
   XSPerfAccumulate("bop_train_stall_for_st_not_ready", io.train.valid && !scoreTable.io.req.ready)
   XSPerfAccumulate("bop_drop_for_cross_page", scoreTable.io.req.fire && crossPage)
-  XSPerfAccumulate("bop_drop_for_disable", scoreTable.io.req.fire && prefetchDisable)
+  XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
+  XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && prefetchDisable)
 }
