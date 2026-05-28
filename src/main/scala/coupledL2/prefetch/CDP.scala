@@ -967,7 +967,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
     entry_tlb_req.bits.size   := 3.U
   }
 
-  tlb_s0_valid := tlb_arb.io.out.valid
+  tlb_s0_valid := tlb_arb.io.out.fire
   tlb_s0_addr := tlb_arb.io.out.bits.vaddr
 
   // -------- tlb s1: recv tlb rsp --------
