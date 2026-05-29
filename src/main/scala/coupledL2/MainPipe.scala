@@ -558,7 +558,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     state = Mux(req_needT_s3 || sink_resp_s3_a_promoteT, TRUNK, metaOnHit_s3.state),
     clients = Fill(clientBits, Mux(l2Error_s3, false.B, true.B)),
     alias = Some(metaW_s3_a_alias),
-    pfsrc = meta_s3.prefetchSrc.get,
+    pfsrc = meta_s3.prefetchSrc.getOrElse(0.U),
     accessed = true.B,
     tagErr = metaOnHit_s3.tagErr,
     dataErr = metaOnHit_s3.dataErr,
@@ -573,7 +573,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       accessed = metaOnHit_s3.accessed,
       tagErr = metaOnHit_s3.tagErr,
       dataErr = metaOnHit_s3.dataErr,
-      pfsrc = metaOnHit_s3.prefetchSrc.get,
+      pfsrc = metaOnHit_s3.prefetchSrc.getOrElse(0.U),
       pfDepth = metaOnHit_s3.pfDepth
     )
   )
@@ -585,7 +585,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     accessed = metaOnHit_s3.accessed,
     tagErr = Mux(wen_c, req_s3.denied, metaOnHit_s3.tagErr),
     dataErr = Mux(wen_c, req_s3.corrupt, metaOnHit_s3.dataErr), // update error when write DS
-    pfsrc = metaOnHit_s3.prefetchSrc.get,
+    pfsrc = metaOnHit_s3.prefetchSrc.getOrElse(0.U),
     pfDepth = metaOnHit_s3.pfDepth
   )
 
@@ -897,10 +897,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
   /* ======== s5 CDP Detect Trigger ======== */
   val dirResult_s5_hit      = RegNext(RegNext(dirResult_s3.hit))
-  val dirResult_s5_fromCDP  = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.get === PfSource.CDP.id.U))
-  val dirResult_s5_fromSMS  = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.get === PfSource.SMS.id.U))
-  val dirResult_s5_fromBOP  = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.get === PfSource.BOP.id.U))
-  val dirResult_s5_fromPBOP = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.get === PfSource.PBOP.id.U))
+  val dirResult_s5_fromCDP  = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.getOrElse(0.U) === PfSource.CDP.id.U))
+  val dirResult_s5_fromSMS  = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.getOrElse(0.U) === PfSource.SMS.id.U))
+  val dirResult_s5_fromBOP  = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.getOrElse(0.U) === PfSource.BOP.id.U))
+  val dirResult_s5_fromPBOP = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.getOrElse(0.U) === PfSource.PBOP.id.U))
   
   val req_s5_sinkA = !task_s5.bits.mshrTask && task_s5.bits.fromA
   val req_s5_acquire_block = req_s5_sinkA && task_s5.bits.opcode === GrantData
@@ -909,7 +909,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     (dirResult_s5_fromCDP || dirResult_s5_fromSMS || dirResult_s5_fromBOP || dirResult_s5_fromPBOP)
   val hit_trigger_data_s5   = out_data_s5
   val hit_trigger_depth_s3  = dirResult_s3.meta.pfDepth
-  val hit_trigger_pfSrc_s3  = Mux(dirResult_s3.meta.accessed, PfSource.NoWhere.id.U, dirResult_s3.meta.prefetchSrc.get)
+  val hit_trigger_pfSrc_s3  = Mux(dirResult_s3.meta.accessed, PfSource.NoWhere.id.U, dirResult_s3.meta.prefetchSrc.getOrElse(0.U))
   val hit_trigger_depth_s5  = RegNext(RegNext(hit_trigger_depth_s3))
   val hit_trigger_pfsrc_s5  = RegNext(RegNext(hit_trigger_pfSrc_s3))
 
@@ -918,7 +918,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val refill_trigger_data_s3  = Mux(req_s3.useProbeData, io.releaseBufResp_s3.bits.data, io.refillBufResp_s3.bits.data)
   val refill_trigger_data_s5  = RegNext(RegNext(refill_trigger_data_s3))
   val refill_trigger_depth_s5 = RegNext(RegNext(metaW_s3_mshr.pfDepth))
-  val refill_trigger_pfsrc_s5 = RegNext(RegNext(metaW_s3_mshr.prefetchSrc.get))
+  val refill_trigger_pfsrc_s5 = RegNext(RegNext(metaW_s3_mshr.prefetchSrc.getOrElse(0.U)))
 
   if (hasCDP) {
     val cdp_trigger = io.cdp_trigger.get
