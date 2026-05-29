@@ -627,6 +627,10 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
             s.tlb_req.resp.ready := true.B
         }
 
+        if (hasCDP) {
+          prefetcher.get.cdpio.cdp_trigger.get(i) <> slice.io_cdp_triggers.get
+        }
+
         slice
     }
 
