@@ -365,6 +365,19 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     pftQueueEnqArb.io.in(nl_idx).valid := nl.get.io.req.valid
     pftQueueEnqArb.io.in(nl_idx).bits := nl.get.io.req.bits
   }
+  if (hasReceiver) {
+    pfRcv.get.io.req.ready := false.B
+  }
+  if (hasBOP) {
+    vbop.get.io.req.ready := false.B
+    pbop.get.io.req.ready := false.B
+  }
+  if (hasTPPrefetcher) {
+    tp.get.io.req.ready := false.B
+  }
+  if (hasNLPrefetcher) {
+    nl.get.io.req.ready := pftQueueEnqArb.io.in(nl_idx).ready
+  }
   pftQueue.io.enq <> pftQueueEnqArb.io.out
 
   pipe.io.in <> pftQueue.io.deq
