@@ -388,7 +388,7 @@ class TemporalPrefetch(implicit p: Parameters) extends TPModule {
     }
   }
 
-  io.req.valid := Mux(enable, sending_valid, false.B)
+  io.req.valid := false.B
   io.req.bits.tag := sendingTag
   io.req.bits.set := sendingSet
   io.req.bits.vaddr.foreach(_ := 0.U)

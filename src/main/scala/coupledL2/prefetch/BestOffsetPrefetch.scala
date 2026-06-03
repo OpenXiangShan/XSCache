@@ -1335,14 +1335,14 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   if(virtualTrain){
     io.tlb_req <> reqFilter.io.tlb_req
     io.req <> reqFilter.io.out_req
-    io.req.valid := enable && reqFilter.io.out_req.valid
+    io.req.valid := false.B
   } else {
     io.tlb_req.req.valid := false.B
     io.tlb_req.req.bits := DontCare
     io.tlb_req.req_kill := false.B
 
     /* s1 send prefetch req */
-    io.req.valid := enable && s1_req_valid
+    io.req.valid := false.B
     io.req.bits.tag := parseFullAddress(s1_newFullAddr)._1
     io.req.bits.set := parseFullAddress(s1_newFullAddr)._2
     io.req.bits.vaddr.foreach(_ := 0.U)
@@ -1442,7 +1442,7 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
 
   io.issueActive := enable && issueEnable
   io.issueOffset := issueOffset.asSInt
-  io.req.valid := enable && req_valid
+  io.req.valid := false.B
   io.req.bits := req
   io.req.bits.pfSource := MemReqSource.Prefetch2L2PBOP.id.U
   io.train.ready := delayQueue.io.in.ready && scoreTable.io.req.ready && (!req_valid || io.req.ready) && studentTrainReady
