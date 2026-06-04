@@ -386,7 +386,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     val pfsource = UInt(PfSource.pfSourceBits.W)
     val reqsource = UInt(MemReqSource.reqSourceBits.W)
   }
-  val trainTT = ChiselDB.createTable("L2PrefetchTrainTable", new TrainEntry, basicDB = true)
+  val trainTT = ChiselDB.createTable("L2PrefetchTrainTable", new TrainEntry, basicDB = false)
   val e1 = Wire(new TrainEntry)
   e1.paddr := io.train.bits.addr
   e1.vaddr := io.train.bits.vaddr.getOrElse(0.U) << offsetBits
@@ -408,7 +408,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     val needT = Bool()
     val pfsource = UInt(MemReqSource.reqSourceBits.W)
   }
-  val pfTT = ChiselDB.createTable("L2PrefetchReqTable", new PrefetchEntry, basicDB = true)
+  val pfTT = ChiselDB.createTable("L2PrefetchReqTable", new PrefetchEntry, basicDB = false)
   for (i <- 0 until banks) {
     val e2 = Wire(new PrefetchEntry)
     e2.paddr := io.req(i).bits.addr
