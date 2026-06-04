@@ -67,3 +67,13 @@ object PfSource extends Enumeration {
     pfsrc
   }
 }
+
+class PrefetchStat(implicit p: Parameters) extends PrefetchBundle {
+  val pfSentVec = Vec(PfSource.PfSourceCount.id, UInt(64.W))
+  val pfHitVec  = Vec(PfSource.PfSourceCount.id, UInt(64.W))
+}
+
+class PrefetchStatDelta(implicit p: Parameters) extends PrefetchBundle {
+  val pfSentVec = Vec(PfSource.PfSourceCount.id, UInt(2.W))
+  val pfHitVec  = Vec(PfSource.PfSourceCount.id, UInt(3.W))
+}

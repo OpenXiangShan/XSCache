@@ -1111,6 +1111,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
     // train
     val vpn_train     = Flipped(ValidIO(new PrefetchTrain))
     val filter_train  = Flipped(ValidIO(new PrefetchTrain))
+    val pfStat        = Input(new PrefetchStat)
 
     // tlb?
     val tlb_req = new L2ToL1TlbIO
@@ -1131,6 +1132,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
 
 
   private val cstEnable = Constantin.createRecord("cdp_enable"+cacheParams.hartId.toString, initValue = 1)
+  require(Degree > 0, "CDP degree must be positive")
 
   val enable = io.enable & cstEnable.orR
   val (vpn_train, filter_train) = (io.vpn_train, io.filter_train)
@@ -1249,6 +1251,12 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   filter_table.io.query_rsp(0)  <> train_pipe.io.ft_query_rsp
   filter_table.io.train_req     <> train_pipe.io.ft_train_req
 
+  val cdpPfSent = io.pfStat.pfSentVec(PfSource.CDP.id)
+  val cdpPfHit = io.pfStat.pfHitVec(PfSource.CDP.id)
+  val sentLt100 = cdpPfSent < 100.U
+  val accuracyGt5Pct = cdpPfHit * 100.U(7.W) > cdpPfSent * 5.U(3.W)
+  val issueDegree = Mux(sentLt100 || accuracyGt5Pct, Degree.U, 1.U)
+
   // Degreed Buffer
   val degree_buf_seq = Seq.fill(DetectPipeNum)(Module(new MIMOQueue(new CDPPrefetchReq, 8, Degree, 1)))
   val degree_buf_arb = Module(new RRArbiterInit(new CDPPrefetchReq, DetectPipeNum))
@@ -1257,7 +1265,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
     val req = detect_pipe_seq(i).io.pft_req
     buf.io.flush := reset.asBool
     for (j <- 0 until Degree) {
-      buf.io.enq(j).valid := req.valid
+      buf.io.enq(j).valid := req.valid && j.U < issueDegree
       buf.io.enq(j).bits  := req.bits
 
       if (j > 0) {

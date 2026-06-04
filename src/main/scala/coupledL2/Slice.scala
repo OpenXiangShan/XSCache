@@ -22,7 +22,7 @@ import chisel3.util._
 import utility.mbist.MbistPipeline
 import org.chipsalliance.cde.config.Parameters
 import xscache.coupledL2._
-import xscache.coupledL2.prefetch.{PrefetchIO, CDPDetectTrigger, CDPParameters}
+import xscache.coupledL2.prefetch.{PrefetchIO, CDPDetectTrigger, CDPParameters, PfSource}
 import utility.MemReqSource
 import xscache.chi.{DecoupledPortIO, HasCHIMsgParameters}
 
@@ -189,6 +189,38 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
 
   /* IO Connection */
   io.l1Hint <> mainPipe.io.l1Hint
+  io.pfMonitorStat.foreach { stat =>
+    val pfSourceCount = PfSource.PfSourceCount.id
+    val zeroVec = VecInit(Seq.fill(pfSourceCount)(0.U(2.W)))
+
+    val dirResult = directory.io.resp.bits
+    val dirPfHit = directory.io.resp.valid &&
+      !directory.io.replResp.valid &&
+      dirResult.replacerInfo.channel === 1.U &&
+      MemReqSource.isCPUReq(dirResult.replacerInfo.reqSource) &&
+      dirResult.hit &&
+      dirResult.meta.prefetch.getOrElse(false.B)
+    val dirPfSrc = dirResult.meta.prefetchSrc.getOrElse(PfSource.NoWhere.id.U)
+    val dirHitInc = VecInit((0 until pfSourceCount).map { i =>
+      Mux(dirPfHit && dirPfSrc === i.U, 1.U(2.W), 0.U(2.W))
+    })
+
+    val mshrPfHit = reqBuf.io.pfStatInMSHR.hitPf
+    val mshrPfSrc = PfSource.fromMemReqSource(reqBuf.io.pfStatInMSHR.hitPfReqSrc)
+    val mshrHitInc = VecInit((0 until pfSourceCount).map { i =>
+      Mux(mshrPfHit && mshrPfSrc === i.U, 1.U(2.W), 0.U(2.W))
+    })
+
+    val sentInc = io.prefetch.map { p =>
+      val sentPfSrc = PfSource.fromMemReqSource(p.req.bits.pfSource)
+      VecInit((0 until pfSourceCount).map { i =>
+        Mux(p.req.fire && sentPfSrc === i.U, 1.U(2.W), 0.U(2.W))
+      })
+    }.getOrElse(zeroVec)
+
+    stat.pfSentVec := sentInc
+    stat.pfHitVec := VecInit((0 until pfSourceCount).map(i => dirHitInc(i) +& mshrHitInc(i)))
+  }
   topDownOpt.foreach (
     _ => {
       io.msStatus.get := mshrCtl.io.msStatus.get

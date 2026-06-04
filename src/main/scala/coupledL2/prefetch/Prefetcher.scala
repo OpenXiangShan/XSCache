@@ -220,6 +220,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   })
   val cdpio = IO(new Bundle {
     val cdp_trigger = if (hasCDP) Some(Vec(4, Flipped(ValidIO(new CDPDetectTrigger)))) else None
+    val pfStat = if (hasCDP) Some(Input(new PrefetchStat)) else None
   })
   val hartId = IO(Input(UInt(hartIdLen.W)))
   val pfCtrlFromCore = IO(Input(new PrefetchCtrlFromCore))
@@ -374,6 +375,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
     // Trigger
     cdp.get.io.l2_detect_triggers <> cdpio.cdp_trigger.get
+    cdp.get.io.pfStat <> cdpio.pfStat.get
 
     // pft req
     cdp.get.io.pft_req.ready  := (if (hasReceiver) !pfRcv.get.io.req.valid else true.B) &&

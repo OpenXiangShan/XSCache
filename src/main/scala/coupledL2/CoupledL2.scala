@@ -835,6 +835,19 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       case EdgeOutKey => node.out.head._2
       case BankBitsKey => bankBits
     })))
+    val pfMonitor = prefetchOpt.map(_ => Module(new prefetch.PrefetcherMonitor()(p.alterPartial {
+      case EdgeInKey => node.in.head._2
+      case EdgeOutKey => node.out.head._2
+      case BankBitsKey => bankBits
+    })))
+    pfMonitor.foreach { m =>
+      for ((s, i) <- slices.zipWithIndex) {
+        m.io.sliceStat(i) := s.io.pfMonitorStat.get
+      }
+      if (hasCDP) {
+        prefetcher.foreach(_.cdpio.pfStat.get := m.io.stat)
+      }
+    }
     topDown match {
       case Some(t) =>
         for ((s, i) <- slices.zipWithIndex) {
