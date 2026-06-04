@@ -36,6 +36,7 @@ case class CDPParameters(
   FilterEntryGranularity: Int = 4096, // 4KB per slot
 
   Degree:   Int = 3,      // issue how many prefetch req?
+  UseDynamicDegree: Boolean = true,
 
   debug: Boolean = false
 
@@ -86,7 +87,8 @@ trait HasCDPParams extends HasPrefetcherHelper with HasCoupledL2Parameters {
 
   val DetectPipeNum = cdpParams.DetectPipeNum
 
-  val Degree    = cdpParams.Degree
+  val Degree            = cdpParams.Degree
+  val UseDynamicDegree  = cdpParams.UseDynamicDegree
 
   val replType  = cdpParams.replacer
 
@@ -1123,6 +1125,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   println(s"====== CDP Prefetcher Config (hart ${cacheParams.hartId}) ======")
   println(s"UseFilteredDetect:  $UseFilteredDetect")
   println(s"Degree:             $Degree")
+  println(s"UseDynamicDegree:   $UseDynamicDegree")
   println(s"VpnTableTagBits:    $vpnTabTagBits")
   println(s"VpnSubEntryBits:    $EntryBits")
   println(s"VpnResetPeriod:     $VpnResetPeriod")
@@ -1255,7 +1258,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   val cdpPfHit = io.pfStat.pfHitVec(PfSource.CDP.id)
   val sentLt100 = cdpPfSent < 100.U
   val accuracyGt5Pct = cdpPfHit * 100.U(7.W) > cdpPfSent * 5.U(3.W)
-  val issueDegree = Mux(sentLt100 || accuracyGt5Pct, Degree.U, 1.U)
+  val issueDegree = Mux(sentLt100 || accuracyGt5Pct || !UseDynamicDegree.asBool, Degree.U, 1.U)
 
   // Degreed Buffer
   val degree_buf_seq = Seq.fill(DetectPipeNum)(Module(new MIMOQueue(new CDPPrefetchReq, 8, Degree, 1)))
@@ -1274,6 +1277,8 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
     }
 
     degree_buf_arb.io.in(i) <> buf.io.deq(0)
+
+    XSPerfAccumulate(s"drop_by_acc_pipe$i", Mux(req.valid, Degree.U - issueDegree, 0.U))
   }
 
   // SendUnit
