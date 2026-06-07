@@ -23,7 +23,7 @@ import utility._
 import org.chipsalliance.cde.config.Parameters
 import utility.mbist.MbistPipeline
 import xscache.coupledL2._
-import xscache.coupledL2.utils.OverwriteQueue
+import xscache.coupledL2.utils._
 
 /* virtual address */
 trait HasPrefetcherHelper extends HasCircularQueuePtrHelper with HasCoupledL2Parameters {
@@ -183,10 +183,10 @@ class PrefetchIO(implicit p: Parameters) extends PrefetchBundle {
 }
 
 class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
-  val train = Flipped(DecoupledIO(new PrefetchTrain))
+  val train = Vec(1 << bankBits, Flipped(DecoupledIO(new PrefetchTrain)))
   val tlb_req = new L2ToL1TlbIO(nRespDups= 1)
   val req = Vec(1 << bankBits, DecoupledIO(new PrefetchReq))
-  val resp = Flipped(DecoupledIO(new PrefetchResp))
+  val resp = Vec(1 << bankBits, Flipped(DecoupledIO(new PrefetchResp)))
   val recv_addr = Flipped(ValidIO(new Bundle() {
     val addr = UInt(64.W)
     val pfSource = UInt(MemReqSource.reqSourceBits.W)
@@ -207,6 +207,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val vbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_vbop_en
   val tp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_tp_en
   val delay_latency = pfCtrlFromCore.l2_pf_delay_latency
+  val banks = 1 << bankBits
 
   // =================== Prefetchers =====================
   // TODO: consider separate VBOP and PBOP in prefetch param
@@ -256,24 +257,29 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   // prefetch from upper level
   val pfRcv = if (hasReceiver) Some(Module(new PrefetchReceiver())) else None
 
+  val train = Wire(DecoupledIO(new PrefetchTrain))
+  val resp = Wire(DecoupledIO(new PrefetchResp))
+  fastArb(io.train, train, Some("prefetch_train"))
+  fastArb(io.resp, resp, Some("prefetch_resp"))
+
   // =================== Connection for each Prefetcher =====================
   // Rcv > NL >VBOP > PBOP > TP
   if (hasBOP) {
     vbop.get.io.enable := vbop_en
     vbop.get.io.pfCtrlOfDelayLatency := delay_latency
-    vbop.get.io.train <> io.train
-    vbop.get.io.train.valid := io.train.valid && (io.train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U)
-    vbop.get.io.resp <> io.resp
-    vbop.get.io.resp.valid := io.resp.valid && io.resp.bits.isBOP
+    vbop.get.io.train <> train
+    vbop.get.io.train.valid := train.valid && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U)
+    vbop.get.io.resp <> resp
+    vbop.get.io.resp.valid := resp.valid && resp.bits.isBOP
     vbop.get.io.tlb_req <> io.tlb_req
     vbop.get.io.pbopCrossPage := true.B // pbop.io.pbopCrossPage // let vbop have noting to do with pbop
 
     pbop.get.io.enable := pbop_en
     pbop.get.io.pfCtrlOfDelayLatency := delay_latency
-    pbop.get.io.train <> io.train
-    pbop.get.io.train.valid := io.train.valid && (io.train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U)
-    pbop.get.io.resp <> io.resp
-    pbop.get.io.resp.valid := io.resp.valid && io.resp.bits.isPBOP
+    pbop.get.io.train <> train
+    pbop.get.io.train.valid := train.valid && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U)
+    pbop.get.io.resp <> resp
+    pbop.get.io.resp.valid := resp.valid && resp.bits.isPBOP
   }
   if (hasReceiver) {
     pfRcv.get.io_enable := pfRcv_en
@@ -296,14 +302,14 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   if (hasNLPrefetcher) {
     nl.get.io.enable := true.B
-    nl.get.io.train <> io.train
-    nl.get.io.resp <> io.resp
+    nl.get.io.train <> train
+    nl.get.io.resp <> resp
   }
 
   if (hasTPPrefetcher) {
     tp.get.io.enable := tp_en
-    tp.get.io.train <> io.train
-    tp.get.io.resp <> io.resp
+    tp.get.io.train <> train
+    tp.get.io.resp <> resp
     tp.get.io.hartid := hartId
 
     tp.get.io.tpmeta_port <> tpio.tpmeta_port.get
@@ -324,7 +330,6 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val reqsValid = reqs.map(_.map(_.valid).getOrElse(false.B))
   val reqsBits = reqs.map(_.map(_.bits).getOrElse(0.U.asTypeOf(new PrefetchReq)))
   val reqsSetAddr = reqsBits.map(_.setaddr)
-  val banks = 1 << bankBits
   val pftQueue = Seq.tabulate(banks) { _ =>
     Module(new OverwriteQueue(
       gen = new PrefetchReq,
@@ -355,7 +360,10 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   val reqsFire = reqs.map(_.map(_.fire).getOrElse(false.B))
 
-  XSPerfAccumulate("prefetch_train_valid", io.train.valid)
+  XSPerfAccumulate("prefetch_train_valid", train.valid)
+  XSPerfAccumulate("prefetch_train_in_valid", PopCount(io.train.map(_.valid)))
+  XSPerfAccumulate("prefetch_resp_valid", resp.valid)
+  XSPerfAccumulate("prefetch_resp_in_valid", PopCount(io.resp.map(_.valid)))
   XSPerfAccumulate("prefetch_req_fromL1", reqsValid(rcv_idx))
   XSPerfAccumulate("prefetch_req_fromVBOP", reqsValid(vbop_idx))
   XSPerfAccumulate("prefetch_req_fromPBOP", reqsValid(pbop_idx))
@@ -388,17 +396,17 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   }
   val trainTT = ChiselDB.createTable("L2PrefetchTrainTable", new TrainEntry, basicDB = false)
   val e1 = Wire(new TrainEntry)
-  e1.paddr := io.train.bits.addr
-  e1.vaddr := io.train.bits.vaddr.getOrElse(0.U) << offsetBits
-  e1.needT := io.train.bits.needT
-  e1.hit := io.train.bits.hit
-  e1.prefetched := io.train.bits.prefetched
-  e1.source := io.train.bits.source
-  e1.pfsource := io.train.bits.pfsource
-  e1.reqsource := io.train.bits.reqsource
+  e1.paddr := train.bits.addr
+  e1.vaddr := train.bits.vaddr.getOrElse(0.U) << offsetBits
+  e1.needT := train.bits.needT
+  e1.hit := train.bits.hit
+  e1.prefetched := train.bits.prefetched
+  e1.source := train.bits.source
+  e1.pfsource := train.bits.pfsource
+  e1.reqsource := train.bits.reqsource
   trainTT.log(
     data = e1,
-    en = io.train.valid,
+    en = train.valid,
     site = "L2Train",
     clock, reset
   )
