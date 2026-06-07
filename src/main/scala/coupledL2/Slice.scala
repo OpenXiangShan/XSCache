@@ -23,7 +23,7 @@ import utility.mbist.MbistPipeline
 import org.chipsalliance.cde.config.Parameters
 import xscache.coupledL2._
 import xscache.coupledL2.prefetch.PrefetchIO
-import utility.MemReqSource
+import utility.{MemReqSource, XSPerfAccumulate, XSPerfHistogram}
 import xscache.chi.{DecoupledPortIO, HasCHIMsgParameters}
 
 class OuterBundle(implicit p: Parameters) extends DecoupledPortIO with BaseOuterBundle
@@ -197,6 +197,10 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
     }
   )
   io.l2Miss := mshrCtl.io.l2Miss
+  val prefetchMSHRCount = PopCount(VecInit(mshrCtl.io.msInfo.map(s =>
+    s.valid && s.bits.isPrefetch && !s.bits.willFree
+  )).asUInt)
+  io.prefetchMSHRFull := prefetchMSHRCount >= cacheParams.nMaxPrefetchEntry.U
 
   /* Connect upwards channels */
   val inBuf = cacheParams.innerBuf
@@ -228,5 +232,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
 
   /* ===== Hardware Performance Monitor ===== */
   val perfEvents = Seq(mshrCtl, mainPipe).flatMap(_.getPerfEvents)
+  XSPerfAccumulate("prefetch_mshr_max", io.prefetchMSHRFull)
+  XSPerfHistogram("prefetch_mshr_count", prefetchMSHRCount, true.B, 0, cacheParams.nMaxPrefetchEntry + 1, 1)
   generatePerfEvent()
 }

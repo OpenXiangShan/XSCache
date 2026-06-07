@@ -76,6 +76,7 @@ case class L2Param(
   clientCaches: Seq[L1Param] = Nil,
   replacement: String = "drrip",
   mshrs: Int = 16,
+  nMaxPrefetchEntry: Int = 14,
   releaseData: Int = 3,
   /* 0 for dirty alone
    * 1 for dirty and accessed
@@ -140,6 +141,9 @@ case class L2Param(
   // both EnablePrivateClint and PrivateClintRange are from soc parameters.
   PrivateClintRange: Option[AddressSet] = None
 ) {
+  require(nMaxPrefetchEntry >= 0 && nMaxPrefetchEntry <= mshrs,
+    s"nMaxPrefetchEntry($nMaxPrefetchEntry) must be in [0, mshrs($mshrs)]")
+
   def toCacheParams: CacheParameters = CacheParameters(
     name = name,
     sets = sets,

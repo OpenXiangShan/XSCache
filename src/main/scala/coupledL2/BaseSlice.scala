@@ -34,6 +34,7 @@ abstract class BaseSliceIO[T_OUT <: BaseOuterBundle](implicit p: Parameters) ext
   val prefetch = prefetchOpt.map(_ => Flipped(new PrefetchIO))
   val dirResult = topDownOpt.map(_ => ValidIO(new DirResult))
   val pfSent = topDownOpt.map(_ => ValidIO(UInt(MemReqSource.reqSourceBits.W)))
+  val prefetchMSHRFull = Output(Bool())
   val pfStatInMSHR = topDownOpt.map(_ => Output(new PfStatInMSHRBundle()))
   val error = DecoupledIO(new L2CacheErrorInfo())
   val l2Miss = Output(Bool())
