@@ -183,10 +183,11 @@ class PrefetchIO(implicit p: Parameters) extends PrefetchBundle {
 }
 
 class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
-  val train = Vec(1 << bankBits, Flipped(DecoupledIO(new PrefetchTrain)))
+  val banks = 1 << bankBits
+  val train = Vec(banks, Flipped(DecoupledIO(new PrefetchTrain)))
   val tlb_req = new L2ToL1TlbIO(nRespDups= 1)
-  val req = Vec(1 << bankBits, DecoupledIO(new PrefetchReq))
-  val resp = Vec(1 << bankBits, Flipped(DecoupledIO(new PrefetchResp)))
+  val req = Vec(banks, DecoupledIO(new PrefetchReq))
+  val resp = Vec(banks, Flipped(DecoupledIO(new PrefetchResp)))
   val recv_addr = Flipped(ValidIO(new Bundle() {
     val addr = UInt(64.W)
     val pfSource = UInt(MemReqSource.reqSourceBits.W)
