@@ -1256,8 +1256,22 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
 
   val cdpPfSent = io.pfStat.pfSentVec(PfSource.CDP.id)
   val cdpPfHit = io.pfStat.pfHitVec(PfSource.CDP.id)
-  val sentLt100 = cdpPfSent < 100.U
-  val accuracyGt5Pct = cdpPfHit * 100.U(7.W) > cdpPfSent * 5.U(3.W)
+
+  val cdpPfSentPrev = RegInit(0.U(cdpPfSent.getWidth.W))
+  val cdpPfHitPrev = RegInit(0.U(cdpPfHit.getWidth.W))
+  val sentDelta = cdpPfSent - cdpPfSentPrev
+  val hitDelta = cdpPfHit - cdpPfHitPrev
+  cdpPfSentPrev := cdpPfSent
+  cdpPfHitPrev := cdpPfHit
+
+  val degreeEwmaShift = 9
+  val sentEwma = RegInit(0.U(cdpPfSent.getWidth.W))
+  val hitEwma = RegInit(0.U(cdpPfHit.getWidth.W))
+  sentEwma := sentEwma - (sentEwma >> degreeEwmaShift) + sentDelta
+  hitEwma := hitEwma - (hitEwma >> degreeEwmaShift) + hitDelta
+
+  val sentLt100 = cdpPfSent < 100.U(cdpPfSent.getWidth.W)
+  val accuracyGt5Pct = hitEwma * 100.U(7.W) > sentEwma * 5.U(3.W)
   val issueDegree = Mux(sentLt100 || accuracyGt5Pct || !UseDynamicDegree.asBool, Degree.U, 1.U)
 
   // Degreed Buffer
