@@ -311,21 +311,32 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   fastArb(io.resp, resp, Some("prefetch_resp"))
 
   // =================== Connection for each Prefetcher =====================
-  // Rcv > NL >VBOP > PBOP > TP > CDP
+  // Rcv > NL > VBOP > PBOP > TP > CDP
+  train.ready := true.B
   if (hasBOP) {
+    val vbop_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
+    vbop_train_buf.io.enq.valid := train.valid && train.bits.is_other_train
+    vbop_train_buf.io.enq.bits  := train.bits
+    XSPerfAccumulate("vbop_train_drop", vbop_train_buf.io.enq.valid && !vbop_train_buf.io.enq.ready)
+    XSPerfAccumulate("vbop_train_accept", vbop_train_buf.io.enq.fire)
+
     vbop.get.io.enable := vbop_en
     vbop.get.io.pfCtrlOfDelayLatency := delay_latency
-    vbop.get.io.train <> train
-    vbop.get.io.train.valid := train.valid && train.bits.is_other_train
+    vbop.get.io.train <> vbop_train_buf.io.deq
     vbop.get.io.resp <> resp
     vbop.get.io.resp.valid := resp.valid && resp.bits.isBOP
     vbop.get.io.tlb_req <> bop_tlb_req
     vbop.get.io.pbopCrossPage := true.B // pbop.io.pbopCrossPage // let vbop have noting to do with pbop
 
+    val pbop_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
+    pbop_train_buf.io.enq.valid := train.valid && train.bits.is_other_train
+    pbop_train_buf.io.enq.bits  := train.bits
+    XSPerfAccumulate("pbop_train_drop", pbop_train_buf.io.enq.valid && !pbop_train_buf.io.enq.ready)
+    XSPerfAccumulate("pbop_train_accept", pbop_train_buf.io.enq.fire)
+
     pbop.get.io.enable := pbop_en
     pbop.get.io.pfCtrlOfDelayLatency := delay_latency
-    pbop.get.io.train <> train
-    pbop.get.io.train.valid := train.valid && train.bits.is_other_train
+    pbop.get.io.train <> pbop_train_buf.io.deq
     pbop.get.io.resp <> resp
     pbop.get.io.resp.valid := resp.valid && resp.bits.isPBOP
   }
@@ -349,15 +360,26 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   }
 
   if (hasNLPrefetcher) {
+    val nl_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
+    nl_train_buf.io.enq.valid := train.valid && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U) && train.bits.is_other_train
+    nl_train_buf.io.enq.bits  := train.bits
+    XSPerfAccumulate("nl_train_drop", nl_train_buf.io.enq.valid && !nl_train_buf.io.enq.ready)
+    XSPerfAccumulate("nl_train_accept", nl_train_buf.io.enq.fire)
+
     nl.get.io.enable := true.B
-    nl.get.io.train <> train
+    nl.get.io.train <> nl_train_buf.io.deq
     nl.get.io.resp <> resp
   }
 
   if (hasTPPrefetcher) {
+    val tp_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
+    tp_train_buf.io.enq.valid := train.valid && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U) && train.bits.is_other_train
+    tp_train_buf.io.enq.bits  := train.bits
+    XSPerfAccumulate("tp_train_drop", tp_train_buf.io.enq.valid && !tp_train_buf.io.enq.ready)
+    XSPerfAccumulate("tp_train_accept", tp_train_buf.io.enq.fire)
+
     tp.get.io.enable := tp_en
-    tp.get.io.train <> train
-    tp.get.io.train.valid := train.valid && train.bits.is_other_train
+    tp.get.io.train <> tp_train_buf.io.deq
     tp.get.io.resp <> resp
     tp.get.io.hartid := hartId
 
