@@ -36,7 +36,7 @@ case class CDPParameters(
   FilterEntryGranularity: Int = 4096, // 4KB per slot
 
   Degree:   Int = 3,      // issue how many prefetch req?
-  UseDynamicDegree: Boolean = true,
+  UseDynamicDegree: Boolean = false,
 
   debug: Boolean = false
 
