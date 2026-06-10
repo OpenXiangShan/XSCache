@@ -28,6 +28,7 @@ import utility.{Code, MemReqSource, ReqSourceKey}
 import xscache.common.{AliasKey, CacheParameters, IsHitKey, PrefetchKey, BankBitsKey}
 
 case object EnableL2ClockGate extends Field[Boolean](true)
+case object EnableL2DecoupledDownstreamCHI extends Field[Boolean](false)
 
 // L1 Cache Params, used for TestTop generation
 case class L1Param
