@@ -1229,11 +1229,15 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   vpn_train_reqBuf.io.enq.valid := vpn_train.valid && enable
   vpn_train_reqBuf.io.enq.bits  := vpn_train.bits
   train_pipe.io.vt_train_trigger <> vpn_train_reqBuf.io.deq
+  XSPerfAccumulate("vpn_train_drop", vpn_train_reqBuf.io.enq.valid && !vpn_train_reqBuf.io.enq.ready)
+  XSPerfAccumulate("vpn_train_accept", vpn_train_reqBuf.io.enq.fire)
 
   val filter_train_reqBuf = Module(new Queue(new PrefetchTrain, 8))
   filter_train_reqBuf.io.enq.valid := filter_train.valid && enable
   filter_train_reqBuf.io.enq.bits  := filter_train.bits
   train_pipe.io.ft_train_trigger <> filter_train_reqBuf.io.deq
+  XSPerfAccumulate("filter_train_drop", filter_train_reqBuf.io.enq.valid && !filter_train_reqBuf.io.enq.ready)
+  XSPerfAccumulate("filter_train_accept", filter_train_reqBuf.io.enq.fire)
 
   val vpn_tab_query_req_seq = detect_pipe_seq.map(_.io.vt_query_req) ++ Seq(train_pipe.io.vt_query_req)
   val vpn_tab_query_rsp_seq = detect_pipe_seq.map(_.io.vt_query_rsp) ++ Seq(train_pipe.io.vt_query_rsp)
