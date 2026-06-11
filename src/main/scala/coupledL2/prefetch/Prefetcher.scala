@@ -389,10 +389,10 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     cdp.get.io.enable := true.B
 
     // Train
-    cdp.get.io.vpn_train.valid  := train.valid && train.bits.cdp_vpn_train_valid && (MemReqSource.isCPUReq(train.bits.reqsource))
+    cdp.get.io.vpn_train.valid  := train.valid && train.bits.cdp_vpn_train_valid && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U)
     cdp.get.io.vpn_train.bits   := train.bits
 
-    cdp.get.io.filter_train.valid := train.valid && (train.bits.cdp_filter_train_hit || train.bits.cdp_filter_train_evict) && (MemReqSource.isCPUReq(train.bits.reqsource))
+    cdp.get.io.filter_train.valid := train.valid && (train.bits.cdp_filter_train_hit || train.bits.cdp_filter_train_evict) && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U)
     cdp.get.io.filter_train.bits  := train.bits
 
     // Trigger
