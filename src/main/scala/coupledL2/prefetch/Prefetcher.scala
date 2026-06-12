@@ -214,12 +214,14 @@ class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
 }
 
 class Prefetcher(implicit p: Parameters) extends PrefetchModule {
+  val banks = 1 << bankBits
+
   val io = IO(new PrefetchTopIO)
   val tpio = IO(new Bundle() {
     val tpmeta_port = if (hasTPPrefetcher) Some(new tpmetaPortIO(hartIdLen, fullAddressBits, offsetBits)) else None
   })
   val cdpio = IO(new Bundle {
-    val cdp_trigger = if (hasCDP) Some(Vec(4, Flipped(ValidIO(new CDPDetectTrigger)))) else None
+    val cdp_trigger = if (hasCDP) Some(Vec(banks, Flipped(ValidIO(new CDPDetectTrigger)))) else None
     val pfStat = if (hasCDP) Some(Input(new PrefetchStat)) else None
   })
   val hartId = IO(Input(UInt(hartIdLen.W)))
@@ -231,7 +233,6 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val vbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_vbop_en
   val tp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_tp_en
   val delay_latency = pfCtrlFromCore.l2_pf_delay_latency
-  val banks = 1 << bankBits
 
   // tlb req wires
   // TODO: ugly. Any better solution?

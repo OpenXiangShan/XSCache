@@ -52,6 +52,8 @@ trait HasCDPParams extends HasPrefetcherHelper with HasCoupledL2Parameters {
     case _ => false
   }.get.asInstanceOf[CDPParameters]
 
+  val banks = 1 << bankBits
+
   val debug = cdpParams.debug
 
   val UseFilteredDetect = cdpParams.UseFilteredDetect
@@ -1106,9 +1108,8 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   val io = IO(new Bundle {
     val enable = Input(Bool())
 
-    // TODO: require Slice Num == 4
     // detect
-    val l2_detect_triggers = Flipped(Vec(4, ValidIO(new CDPDetectTrigger)))
+    val l2_detect_triggers = Flipped(Vec(banks, ValidIO(new CDPDetectTrigger)))
 
     // train
     val vpn_train     = Flipped(ValidIO(new PrefetchTrain))
@@ -1149,11 +1150,11 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
 
   // TODO: ugly...
   // Detect Req
-  val detect_trig_queue_seq = Seq.fill(4)(Module(new MIMOQueue(new CDPDetectEntry, 8, 2, 1)))
-  val detect_trig_arb = Module(new RRArbiterInit(new CDPDetectEntry, 4))
+  val detect_trig_queue_seq = Seq.fill(banks)(Module(new MIMOQueue(new CDPDetectEntry, 8, 2, 1)))
+  val detect_trig_arb = Module(new RRArbiterInit(new CDPDetectEntry, banks))
 
   // detect_trigs <> detect_trig_queue_seq <> detect_trig_arb <> detect_pipe_seq
-  for (i <- 0 until 4) {
+  for (i <- 0 until banks) {
     val detect_trig_queue = detect_trig_queue_seq(i)
 
     val detect_trig = l2_triggers(i)
