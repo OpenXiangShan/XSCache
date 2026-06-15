@@ -1014,6 +1014,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
         entries(i).retry_timer := 0.U
       }
     }
+    XSPerfAccumulate(s"s1_drop_tlb_miss_entry$i", s1_same_page && tlb_s1_rsp.valid && tlb_s1_rsp.bits.miss && valids(i) && entry.retry_en)
 
     // s2: check pf && pmp result, if fail, drop the req; otherwise, update the entry
     val s2_same_page = same_page(entry_addr, tlb_s2_addr) && tlb_s2_valid
@@ -1028,6 +1029,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
         entries(i).pTag := block_addr(Cat(page_num, page_offset))
       }
     }
+    XSPerfAccumulate(s"s2_drop_entry$i", s2_same_page && tlb_s2_rsp_valid && !tlb_s2_rsp_bits.miss && valids(i) && s2_drop)
   }
 
   // --------------- prefetch req pipe ---------------
@@ -1107,6 +1109,8 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   XSPerfAccumulate("pf_req_drop_by_filter", pft_s1_valid && !can_pft)
   XSPerfAccumulate("filter_hit", pft_s1_valid && hit)
   XSPerfAccumulate("filter_miss", pft_s1_valid && !hit)
+
+  
 
   val chosen_entry = entries(pft_s1_chosen_idx)
   XSPerfAccumulate("pf_req_fromCPU", out.fire && chosen_entry.pfSource === PfSource.NoWhere.id.U)
