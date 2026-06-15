@@ -38,7 +38,9 @@ case class CDPParameters(
   Degree:   Int = 3,      // issue how many prefetch req?
   UseDynamicDegree: Boolean = false,
 
-  debug: Boolean = false
+  debug: Boolean = false,
+
+  UseFilterTable: Boolean = true
 
 ) extends PrefetchParameters {
   override val hasPrefetchBit: Boolean = true
@@ -57,6 +59,7 @@ trait HasCDPParams extends HasPrefetcherHelper with HasCoupledL2Parameters {
   val debug = cdpParams.debug
 
   val UseFilteredDetect = cdpParams.UseFilteredDetect
+  val UseFilterTable    = cdpParams.UseFilterTable
 
   val hot_threshold   = cdpParams.HotThreshold
   val depth_threshold = cdpParams.DepthThreshold
@@ -1053,10 +1056,8 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
 
   val pft_s0_req = pft_arb.io.out.bits
 
-  // query the FilterTable
-  ft_query_req.valid := pft_s0_valid
-  ft_query_req.bits.set_idx := get_filter_set(pft_s0_req.addr)
-  ft_query_req.bits.offset  := get_filter_offset(pft_s0_req.addr)
+  ft_query_req.valid := false.B
+  ft_query_req.bits  := 0.U.asTypeOf(new ftQueryReq)
 
   // --------- req s1: recv filter table rsp ---------
   pft_s1_valid  := RegNext(pft_s0_valid)
@@ -1064,17 +1065,29 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   val pft_s1_req  = RegNext(pft_s0_req)
   val ft_s1_rsp   = RegNext(ft_query_rsp)
 
-  val valid_vec = ft_s1_rsp.valid_vec
-  val tag_vec   = ft_s1_rsp.tag_vec
-  val hit_vec   = valid_vec.zip(tag_vec).map{
-    case (v, t) =>
-      v && t === get_filter_tag(pft_s1_req.addr)
-  }
-  val hit = hit_vec.reduce(_ || _)
-  val hit_idx = PriorityEncoder(hit_vec)
+  val hit = Wire(Bool())
+  val can_pft = Wire(Bool())
+  if (UseFilterTable) {
+    // query the FilterTable
+    ft_query_req.valid := pft_s0_valid
+    ft_query_req.bits.set_idx := get_filter_set(pft_s0_req.addr)
+    ft_query_req.bits.offset  := get_filter_offset(pft_s0_req.addr)
 
-  val sat_vec = ft_s1_rsp.sat_vec
-  val can_pft = !hit || sat_vec(hit_idx) =/= 3.U
+    val valid_vec = ft_s1_rsp.valid_vec
+    val tag_vec   = ft_s1_rsp.tag_vec
+    val hit_vec   = valid_vec.zip(tag_vec).map{
+      case (v, t) =>
+        v && t === get_filter_tag(pft_s1_req.addr)
+    }
+    val hit_idx = PriorityEncoder(hit_vec)
+
+    val sat_vec = ft_s1_rsp.sat_vec
+    hit := hit_vec.reduce(_ || _)
+    can_pft := !hit || sat_vec(hit_idx) =/= 3.U
+  } else {
+    hit := false.B
+    can_pft := true.B
+  }
 
   when (out.fire || pft_s1_valid && !can_pft) {
     valids(pft_s1_chosen_idx) := false.B
@@ -1125,6 +1138,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
 
   println(s"====== CDP Prefetcher Config (hart ${cacheParams.hartId}) ======")
   println(s"UseFilteredDetect:  $UseFilteredDetect")
+  println(s"UseFilterTable:     $UseFilterTable")
   println(s"Degree:             $Degree")
   println(s"UseDynamicDegree:   $UseDynamicDegree")
   println(s"VpnTableTagBits:    $vpnTabTagBits")
@@ -1143,7 +1157,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
 
   val l2_triggers = io.l2_detect_triggers
 
-  val filter_table      = Module(new FilterTable)
+  val filter_table      = if (UseFilterTable) Some(Module(new FilterTable)) else None
   val vpn_table         = Module(new VpnTable)
   val train_pipe        = Module(new TrainPipeline)
   val detect_pipe_seq   = Seq.tabulate(DetectPipeNum)(i => Module(new DetectPipeline(s"dp$i")))
@@ -1233,12 +1247,17 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   XSPerfAccumulate("vpn_train_drop", vpn_train_reqBuf.io.enq.valid && !vpn_train_reqBuf.io.enq.ready)
   XSPerfAccumulate("vpn_train_accept", vpn_train_reqBuf.io.enq.fire)
 
-  val filter_train_reqBuf = Module(new Queue(new PrefetchTrain, 8))
-  filter_train_reqBuf.io.enq.valid := filter_train.valid && enable
-  filter_train_reqBuf.io.enq.bits  := filter_train.bits
-  train_pipe.io.ft_train_trigger <> filter_train_reqBuf.io.deq
-  XSPerfAccumulate("filter_train_drop", filter_train_reqBuf.io.enq.valid && !filter_train_reqBuf.io.enq.ready)
-  XSPerfAccumulate("filter_train_accept", filter_train_reqBuf.io.enq.fire)
+  if (UseFilterTable) {
+    val filter_train_reqBuf = Module(new Queue(new PrefetchTrain, 8))
+    filter_train_reqBuf.io.enq.valid := filter_train.valid && enable
+    filter_train_reqBuf.io.enq.bits  := filter_train.bits
+    train_pipe.io.ft_train_trigger <> filter_train_reqBuf.io.deq
+    XSPerfAccumulate("filter_train_drop", filter_train_reqBuf.io.enq.valid && !filter_train_reqBuf.io.enq.ready)
+    XSPerfAccumulate("filter_train_accept", filter_train_reqBuf.io.enq.fire)
+  } else {
+    train_pipe.io.ft_train_trigger.valid := false.B
+    train_pipe.io.ft_train_trigger.bits  := 0.U.asTypeOf(new PrefetchTrain)
+  }
 
   val vpn_tab_query_req_seq = detect_pipe_seq.map(_.io.vt_query_req) ++ Seq(train_pipe.io.vt_query_req)
   val vpn_tab_query_rsp_seq = detect_pipe_seq.map(_.io.vt_query_rsp) ++ Seq(train_pipe.io.vt_query_rsp)
@@ -1255,29 +1274,38 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   }
   vpn_table.io.train_req  <> train_pipe.io.vt_train_req
 
-  filter_table.io.query_req(0)  <> train_pipe.io.ft_query_req
-  filter_table.io.query_rsp(0)  <> train_pipe.io.ft_query_rsp
-  filter_table.io.train_req     <> train_pipe.io.ft_train_req
+  if (UseFilterTable) {
+    filter_table.get.io.query_req(0)  <> train_pipe.io.ft_query_req
+    filter_table.get.io.query_rsp(0)  <> train_pipe.io.ft_query_rsp
+    filter_table.get.io.train_req     <> train_pipe.io.ft_train_req
+  } else {
+    train_pipe.io.ft_query_rsp := 0.U.asTypeOf(new ftQueryRsp)
+  }
 
-  val cdpPfSent = io.pfStat.pfSentVec(PfSource.CDP.id)
-  val cdpPfHit = io.pfStat.pfHitVec(PfSource.CDP.id)
+  val issueDegree =
+    if (UseDynamicDegree) {
+      val cdpPfSent = io.pfStat.pfSentVec(PfSource.CDP.id)
+      val cdpPfHit = io.pfStat.pfHitVec(PfSource.CDP.id)
 
-  val cdpPfSentPrev = RegInit(0.U(cdpPfSent.getWidth.W))
-  val cdpPfHitPrev = RegInit(0.U(cdpPfHit.getWidth.W))
-  val sentDelta = cdpPfSent - cdpPfSentPrev
-  val hitDelta = cdpPfHit - cdpPfHitPrev
-  cdpPfSentPrev := cdpPfSent
-  cdpPfHitPrev := cdpPfHit
+      val cdpPfSentPrev = RegInit(0.U(cdpPfSent.getWidth.W))
+      val cdpPfHitPrev = RegInit(0.U(cdpPfHit.getWidth.W))
+      val sentDelta = cdpPfSent - cdpPfSentPrev
+      val hitDelta = cdpPfHit - cdpPfHitPrev
+      cdpPfSentPrev := cdpPfSent
+      cdpPfHitPrev := cdpPfHit
 
-  val degreeEwmaShift = 9
-  val sentEwma = RegInit(0.U(cdpPfSent.getWidth.W))
-  val hitEwma = RegInit(0.U(cdpPfHit.getWidth.W))
-  sentEwma := sentEwma - (sentEwma >> degreeEwmaShift) + sentDelta
-  hitEwma := hitEwma - (hitEwma >> degreeEwmaShift) + hitDelta
+      val degreeEwmaShift = 9
+      val sentEwma = RegInit(0.U(cdpPfSent.getWidth.W))
+      val hitEwma = RegInit(0.U(cdpPfHit.getWidth.W))
+      sentEwma := sentEwma - (sentEwma >> degreeEwmaShift) + sentDelta
+      hitEwma := hitEwma - (hitEwma >> degreeEwmaShift) + hitDelta
 
-  val sentLt100 = cdpPfSent < 100.U(cdpPfSent.getWidth.W)
-  val accuracyGt5Pct = hitEwma * 100.U(7.W) > sentEwma * 5.U(3.W)
-  val issueDegree = Mux(sentLt100 || accuracyGt5Pct || !UseDynamicDegree.asBool, Degree.U, 1.U)
+      val sentLt100 = cdpPfSent < 100.U(cdpPfSent.getWidth.W)
+      val accuracyGt5Pct = hitEwma * 100.U(7.W) > sentEwma * 5.U(3.W)
+      Mux(sentLt100 || accuracyGt5Pct, Degree.U, 1.U)
+    } else {
+      Degree.U
+    }
 
   // Degreed Buffer
   val degree_buf_seq = Seq.fill(DetectPipeNum)(Module(new MIMOQueue(new CDPPrefetchReq, 8, Degree, 1)))
@@ -1303,8 +1331,12 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   // SendUnit
   val send_unit = Module(new SentUnit)
   send_unit.io.tlb_req <> io.tlb_req
-  send_unit.io.ft_query_req <> filter_table.io.query_req(1)
-  send_unit.io.ft_query_rsp <> filter_table.io.query_rsp(1)
+  if (UseFilterTable) {
+    send_unit.io.ft_query_req <> filter_table.get.io.query_req(1)
+    send_unit.io.ft_query_rsp <> filter_table.get.io.query_rsp(1)
+  } else {
+    send_unit.io.ft_query_rsp := 0.U.asTypeOf(new ftQueryRsp)
+  }
   send_unit.io.in   <> degree_buf_arb.io.out
   send_unit.io.out  <> io.pft_req
 }
