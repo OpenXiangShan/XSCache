@@ -402,12 +402,15 @@ class PrefetchRecv extends Bundle {
 
 // custom l2 - l1 interface
 class L2ToL1Hint(implicit p: Parameters) extends L2Bundle {
-  val sourceId = UInt(sourceIdBits.W)    // tilelink sourceID
+  val sourceId = UInt(sourceIdBits.W)    // L1 missQueue mshrid
   val isKeyword = Bool()       // miss entry keyword
 }
 
 class L2ToL1HintInsideL2(implicit p: Parameters) extends L2ToL1Hint {
   val hasData = Bool()
+  val isDcache = Bool()
+  // false: port_0; true: prot_1
+  val dualPort = Bool()
 }
 
 // custom l2 - l1 tlb

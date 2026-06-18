@@ -105,6 +105,7 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   val canFlow_s1 = !hintQueue.io.deq.valid || hintQueue.io.count === 1.U && hintQueue.io.deq.fire
   val valid_s1 = mshr_GrantData_s1 || mshr_Grant_s1 || mshr_AccessAckData_s1 || mshr_CBOAck_s1 || chn_Release_s1
   val flow_s1, drop_s1, enq_s3 = Wire(Decoupled(new HintQueueEntry))
+  val dcacheClient = probeClients.head
   // noSpaceForSinkReq in GrantBuffer may ensure that these queues will not overflow
   assert(enq_s3.ready || !enq_s3.valid)
 
@@ -127,7 +128,9 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   hintQueue.io.deq.ready := io.l1Hint.ready && !RegNext(respWithDataFire, false.B)
 
   io.l1Hint.valid := hintQueue.io.deq.valid && !(io.retry_s2 && !hint_s1Queue.io.out.valid) && !RegNext(respWithDataFire, false.B)
-  io.l1Hint.bits.sourceId := hintQueue.io.deq.bits.source
+  io.l1Hint.bits.sourceId := hintQueue.io.deq.bits.source - dcacheClient.sourceId.start.U
   io.l1Hint.bits.isKeyword := hintQueue.io.deq.bits.isKeyword
   io.l1Hint.bits.hasData := hintQueue.io.deq.bits.hasData
+  io.l1Hint.bits.isDcache := dcacheClient.sourceId.contains(hintQueue.io.deq.bits.source).asInstanceOf[Bool]
+  io.l1Hint.bits.dualPort := (coherentClientChannelId(dcacheClient.name).contains(1)).B
 }

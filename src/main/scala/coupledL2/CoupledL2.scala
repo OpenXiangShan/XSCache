@@ -30,6 +30,7 @@ import freechips.rocketchip.util._
 import org.chipsalliance.cde.config.{Field, Parameters}
 
 import scala.math.max
+import scala.util.Try
 import xscache.coupledL2.prefetch._
 import xscache.coupledL2.prefetch.{TPmetaReq, TPmetaResp}
 import utility.mbist.{MbistInterface, MbistPipeline}
@@ -122,7 +123,38 @@ trait HasCoupledL2Parameters {
   def edgeOut = p(EdgeOutKey)
   def bankBits = p(BankBitsKey)
 
-  def clientBits = edgeIn.client.clients.count(_.supports.probe)
+  def allProbeClients = edgeIn.client.clients
+    .filter(c => c.supports.probe && c.visibility.nonEmpty)
+    .sortBy(_.sourceId.start)
+  def coherentClientChannelId(name: String): Option[Int] = name match {
+    case "dcache" => Some(0)
+    case "dcache_ch1" => Some(1)
+    case _ => None
+  }
+  def dcacheProbeClients = allProbeClients.filter(c => coherentClientChannelId(c.name).nonEmpty)
+  def selectedProbeClients = {
+    val sliceIdOpt = Try(p(SliceIdKey)).toOption
+    (cacheParams.sliceCoherentClientMap, sliceIdOpt) match {
+      case (Some(map), Some(sliceId)) =>
+        require(map.nonEmpty, "sliceCoherentClientMap must not be empty")
+        require(sliceId < map.length, s"sliceId $sliceId out of range for sliceCoherentClientMap")
+        val channelId = map(sliceId)
+        val matchedClients = allProbeClients.filter(c => coherentClientChannelId(c.name).contains(channelId))
+        require(
+          matchedClients.nonEmpty,
+          s"sliceCoherentClientMap($sliceId)=$channelId has no matching coherent client, candidates=${allProbeClients.map(_.name).mkString(",")}"
+        )
+        require(
+          matchedClients.size == 1,
+          s"sliceCoherentClientMap($sliceId)=$channelId matches multiple coherent clients=${matchedClients.map(_.name).mkString(",")}"
+        )
+        matchedClients
+      case _ =>
+        allProbeClients
+    }
+  }
+  def probeClients = selectedProbeClients
+  def clientBits = selectedProbeClients.size
   def sourceIdBits = edgeIn.bundle.sourceBits // ids of L1
   def msgSizeBits = edgeIn.bundle.sizeBits
   def sourceIdAll = 1 << sourceIdBits
@@ -158,8 +190,7 @@ trait HasCoupledL2Parameters {
       0.U
     } else {
       Cat(
-        edgeIn.client.clients
-          .filter(_.supports.probe)
+        probeClients
           .map(c => {
             c.sourceId.contains(sourceId).asInstanceOf[Bool]
           })
@@ -174,9 +205,7 @@ trait HasCoupledL2Parameters {
     } else {
       Mux1H(
         client,
-        edgeIn.client.clients
-          .filter(_.supports.probe)
-          .map(c => c.sourceId.start.U)
+        probeClients.map(c => c.sourceId.start.U)
       )
     }
   }
@@ -368,12 +397,28 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     } // currently only EdgeInKey is used
 
     require(banks == node.in.size)
+    private val hintProbeClients = node.in.head._2.client.clients
+      .filter(c => c.supports.probe && c.visibility.nonEmpty && coherentClientChannelId(c.name).nonEmpty)
+      .sortBy(_.sourceId.start)
+    private val hintSliceChannelMap = cacheParams.sliceCoherentClientMap
+    hintSliceChannelMap.foreach(map =>
+      require(map.length == banks, s"sliceCoherentClientMap length ${map.length} must match banks $banks")
+    )
+    private val hintChannelCount =
+      if (hintProbeClients.nonEmpty)
+        hintProbeClients.map(c => coherentClientChannelId(c.name).getOrElse(0)).foldLeft(0)(max) + 1
+      else
+        1
+    require(hintChannelCount <= 2, s"dualPort hint encoding only supports up to 2 channels, got $hintChannelCount")
+    require(
+      hintProbeClients.groupBy(c => coherentClientChannelId(c.name).get).forall(_._2.size == 1),
+      s"coherent hint channels must map to unique clients, got ${hintProbeClients.map(_.name).mkString(",")}"
+    )
 
     val io = IO(new Bundle {
       val hartId = Input(UInt(hartIdLen.W))
       val pfCtrlFromCore = Input(new PrefetchCtrlFromCore)
-    //  val l2_hint = Valid(UInt(32.W))
-      val l2_hint = ValidIO(new L2ToL1Hint()(l2ECCParams))
+      val l2_hint = Vec(hintChannelCount, ValidIO(new L2ToL1Hint()(l2ECCParams)))
       val l2_tlb_req = new L2ToL1TlbIO(nRespDups = 1)(l2TlbParams)
       val debugTopDown = new Bundle {
         val robTrueCommit = Input(UInt(64.W))
@@ -482,11 +527,8 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     // ** we need only [hintCycleAhead - 1] later
     val sliceAhead = hintCycleAhead - 1
 
-    val master_num = node.in.head._2.client.clients.size
-    val hintChosenVec = Wire(Vec(master_num, Valid(new Bundle {
-      val sliceId = UInt(banks.W)
-      val hasData = Bool()
-    })))
+    val hintChosen = Wire(Vec(hintChannelCount, UInt(banks.W)))
+    val hintFire = Wire(Vec(hintChannelCount, Bool()))
 
     def setSliceID(txnID: UInt, sliceID: UInt, mmioReq: Bool): UInt = {
       Mux(
@@ -509,10 +551,8 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     // then we releaseSourceD, enabling io.d.ready for other slices
     // TODO: if Hint for single slice is 100% accurate, may consider remove this
     val releaseSourceD = Wire(Vec(banks, Bool()))
-    val allCanFire = (
-        RegNextN(!hintChosenVec.map(_.valid).reduce(_ || _), sliceAhead) &&
-        RegNextN(!hintChosenVec.map(h => h.valid && h.bits.hasData).reduce(_ || _), sliceAhead + 1)
-      ) || Cat(releaseSourceD).orR
+    val anyHintFire = Cat(hintFire).orR
+    val allCanFire = (RegNextN(!anyHintFire, sliceAhead) && RegNextN(!anyHintFire, sliceAhead + 1)) || Cat(releaseSourceD).orR
 
     val slices = node.in.zip(node.out).zipWithIndex.map {
       case (((in, edgeIn), (out, edgeOut)), i) =>
@@ -532,8 +572,11 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
           // we will try our best to select the grant of slice X.
           // If slice X has no grant then, it means that the hint at cycle T is wrong,
           // so we relax the restriction on grant selection.
-          val sliceCanFire = RegNextN(hintChosenVec.map(h => h.valid && h.bits.sliceId === i.U).reduce(_ || _), sliceAhead) ||
-            RegNextN(hintChosenVec.map(h => h.valid && h.bits.sliceId === i.U && h.bits.hasData).reduce(_ || _), sliceAhead + 1)
+          val sliceMatched = Cat((0 until hintChannelCount).map { ch =>
+            hintFire(ch) && i.U === hintChosen(ch)
+          }).orR
+          val sliceCanFire = RegNextN(sliceMatched, sliceAhead) ||
+            RegNextN(sliceMatched, sliceAhead + 1)
 
           releaseSourceD(i) := sliceCanFire && !slice.io.in.d.valid
 
@@ -736,34 +779,42 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     if (enableHintGuidedGrant) {
       // for timing consideration, hint should latch one cycle before sending to L1
       // instead of adding a Pipeline/Queue to latch here, we just set hintQueue in GrantBuf & CustomL1Hint "flow=false"
-      val slices_l1Hint = VecInit(slices.map(_.io.l1Hint))
-      val l1HintValids = Cat(slices_l1Hint.map(_.valid).reverse)
-      val readysVec = Wire(Vec(node.in.head._2.client.clients.size, UInt(banks.W)))
-      (node.in.head._2.client.clients zip readysVec zip hintChosenVec).foreach {
-        case ((client, readysToSlice), hintChosen) =>
-          val master = Wire(Decoupled())
-          val contains = Cat(slices_l1Hint.map(hint => client.sourceId.contains(hint.bits.sourceId)).reverse)
-          val arbValids = l1HintValids & contains
-          val arbReadys = TLArbiter.roundRobin(arbValids.getWidth, arbValids, master.fire)
-          val fires = arbValids & arbReadys
-          assert(PopCount(fires) <= 1.U, "At most one hint per client may fire per cycle")
-          master.valid := fires.orR
-          val selectedHint = Mux1H(fires, slices_l1Hint.map(_.bits))
-          if (client.supports.probe) {
-            io.l2_hint.valid := master.fire && selectedHint.hasData
-            io.l2_hint.bits.isKeyword := selectedHint.isKeyword
-            io.l2_hint.bits.sourceId := selectedHint.sourceId - client.sourceId.start.U
-          }
-          hintChosen.valid := master.fire
-          hintChosen.bits.sliceId := OHToUInt(fires)
-          hintChosen.bits.hasData := selectedHint.hasData
-          readysToSlice := arbReadys & contains & Fill(arbValids.getWidth, master.ready)
+      val l1HintArbs = Seq.tabulate(hintChannelCount)(_ => Module(new Arbiter(new L2ToL1HintInsideL2()(l2ECCParams), slices.size)))
 
-          master.ready := !RegNext(master.fire && selectedHint.hasData)
+      slices.zipWithIndex.foreach { case (s, i) =>
+        val sliceHintChannelOH = if (hintChannelCount == 1) {
+          Seq(true.B)
+        } else {
+          Seq(!s.io.l1Hint.bits.dualPort, s.io.l1Hint.bits.dualPort)
+        }
+        for (ch <- 0 until hintChannelCount) {
+          l1HintArbs(ch).io.in(i).valid := s.io.l1Hint.valid && s.io.l1Hint.bits.isDcache && sliceHintChannelOH(ch)
+          l1HintArbs(ch).io.in(i).bits := s.io.l1Hint.bits
+        }
+        s.io.l1Hint.ready := Mux(
+          s.io.l1Hint.valid && s.io.l1Hint.bits.isDcache,
+          Mux1H(sliceHintChannelOH.take(hintChannelCount), l1HintArbs.map(_.io.in(i).ready)),
+          true.B
+        )
       }
-      slices_l1Hint.zipWithIndex.foreach {
-        case (hint, i) =>
-          hint.ready := readysVec.map(_(i)).reduce(_||_)
+
+      val hintFireVec = Wire(Vec(hintChannelCount, Bool()))
+      val hintChosenVec = Wire(Vec(hintChannelCount, UInt(banks.W)))
+      hintFireVec.foreach(_ := false.B)
+      hintChosenVec.foreach(_ := 0.U)
+
+      for (ch <- 0 until hintChannelCount) {
+        io.l2_hint(ch).valid := l1HintArbs(ch).io.out.fire && l1HintArbs(ch).io.out.bits.hasData
+        io.l2_hint(ch).bits.sourceId := l1HintArbs(ch).io.out.bits.sourceId
+        io.l2_hint(ch).bits.isKeyword := l1HintArbs(ch).io.out.bits.isKeyword
+        l1HintArbs(ch).io.out.ready := !RegNext(io.l2_hint(ch).valid, false.B)
+        hintFireVec(ch) := io.l2_hint(ch).valid
+        hintChosenVec(ch) := l1HintArbs(ch).io.chosen
+      }
+
+      for (ch <- 0 until hintChannelCount) {
+        hintChosen(ch) := hintChosenVec(ch)
+        hintFire(ch) := hintFireVec(ch)
       }
     }
 

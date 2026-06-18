@@ -133,6 +133,9 @@ case class L2Param(
   // Network layer SAM
   sam: Seq[(AddressSet, Int)] = Seq(AddressSet.everything -> 0),
 
+  // Map each slice to the coherent L1 client it serves.
+  sliceCoherentClientMap: Option[Seq[Int]] = None,
+
   // Enable sram test support
   hasMbist: Boolean = false,
   hasSramCtl: Boolean = false,
