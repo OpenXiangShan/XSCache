@@ -173,11 +173,15 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   }
   def noFreeWay(task: TaskBundle): Bool = noFreeWayForSet(task.set)
 
-  def prefetchBlocked(task: TaskBundle): Bool = task.fromA && task.opcode === Hint && io.blockA_s1_pf
+  def isHint(task: TaskBundle): Bool = task.fromA && task.opcode === Hint
+  def incomingPrefetchBlocked(task: TaskBundle): Bool = isHint(task) && io.blockA_s1_pf
+
+  val hasReadyDemand = Cat(buffer.map(e => e.valid && e.rdy && !isHint(e.task))).orR
+  def prefetchBlockedByDemand(task: TaskBundle): Bool = isHint(task) && io.blockA_s1_pf && hasReadyDemand
 
   // flow not allowed when full, or entries might starve
   val canFlow = flow.B && !full && !conflict(in) && !chosenQValid && !Cat(io.mainPipeBlock).orR && !noFreeWay(in) &&
-    !prefetchBlocked(in)
+    !incomingPrefetchBlocked(in)
   val doFlow  = canFlow && io.out.ready
 
   //  val depMask    = buffer.map(e => e.valid && sameAddr(io.in.bits, e.task))
@@ -207,10 +211,10 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   //!! TODO: we can also remove those that duplicate with mainPipe
 
   /* ======== Alloc ======== */
-  io.in.ready   := !prefetchBlocked(in) && (!full || doFlow) || mergeA || dup
+  io.in.ready   := !incomingPrefetchBlocked(in) && (!full || doFlow) || mergeA || dup
 
   val insertOH = MaskToOH(buffer.map(!_.valid))
-  val alloc = !full && io.in.valid && !prefetchBlocked(in) && !doFlow && !dup && !mergeA
+  val alloc = !full && io.in.valid && !incomingPrefetchBlocked(in) && !doFlow && !dup && !mergeA
   buffer.zip(insertOH.asBools).foreach { case (entry, sel) =>
     when(alloc && sel){
       val mpBlock = Cat(io.mainPipeBlock).orR
@@ -235,7 +239,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   /* ======== Issue ======== */
   issueArb.io.in zip buffer foreach {
     case(in, e) =>
-      in.valid := e.valid && e.rdy && !prefetchBlocked(e.task)
+      in.valid := e.valid && e.rdy && !prefetchBlockedByDemand(e.task)
       in.bits  := e
   }
 
@@ -294,7 +298,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   // when entry.rdy is no longer true,
   // we cancel req in chosenQ, with the entry still held in buffer to issue later
 //  val cancel = (canFlow && sameSet(chosenQ.io.deq.bits.bits.task, io.in.bits)) || !buffer(chosenQ.io.deq.bits.id).rdy
-  val cancel = !Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.rdy && !prefetchBlocked(e.task)))
+  val cancel = !Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.rdy && !prefetchBlockedByDemand(e.task)))
 
   chosenQ.io.deq.ready := io.out.ready || cancel
   io.out.valid := chosenQValid && !cancel || io.in.valid && canFlow
