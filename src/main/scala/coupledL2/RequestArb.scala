@@ -61,7 +61,7 @@ class RequestArb(implicit p: Parameters) extends L2Module
     val status_vec_toTX = Vec(2, ValidIO(new PipeStatusWithCHI))
 
     /* handle set conflict, capacity conflict */
-    val fromMSHRCtl = Input(new BlockInfo())
+    val fromMSHRCtl = Input(new ABlockInfo())
     val fromMainPipe = Input(new BlockInfo())
     val fromGrantBuffer = Input(new Bundle() {
       val blockSinkReqEntrance = new BlockInfo()

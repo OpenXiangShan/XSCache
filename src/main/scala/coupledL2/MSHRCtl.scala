@@ -35,7 +35,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val fromReqArb = Input(new Bundle() {
       val status_s1 = new PipeEntranceStatus()
     })
-    val toReqArb = Output(new BlockInfo())
+    val toReqArb = Output(new ABlockInfo())
 
     /* interact with mainpipe */
     val fromMainPipe = new Bundle() {
@@ -109,6 +109,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val mshrCount = PopCount(Cat(mshrs.map(_.io.status.valid)))
   val mshrFull = pipeReqCount + mshrCount >= mshrsAll.U
   val a_mshrFull = pipeReqCount + mshrCount >= (mshrsAll-1).U // the last idle mshr should not be allocated for channel A req
+  val a_mshr_pf_Full = pipeReqCount + mshrCount >= (mshrsAll-2).U
   val mshrSelector = Module(new MSHRSelector())
   val selectedMSHROH = mshrSelector.io.out.bits
 
@@ -160,6 +161,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   io.toReqArb.blockC_s1 := false.B
   io.toReqArb.blockB_s1 := mshrFull   // conflict logic in SinkB
   io.toReqArb.blockA_s1 := a_mshrFull // conflict logic in ReqBuf
+  io.toReqArb.blockA_s1_pf := a_mshr_pf_Full
   io.toReqArb.blockG_s1 := false.B
 
    /* Acquire downwards to TXREQ*/

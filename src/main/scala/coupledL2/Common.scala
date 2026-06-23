@@ -368,6 +368,14 @@ class BlockInfo(implicit p: Parameters) extends L2Bundle {
   val blockC_s1 = Bool()
 }
 
+class ABlockInfo(implicit p: Parameters) extends L2Bundle {
+  val blockG_s1 = Bool()
+  val blockA_s1 = Bool()
+  val blockB_s1 = Bool()
+  val blockC_s1 = Bool()
+  val blockA_s1_pf = Bool()
+}
+
 // used for nested C Release
 class NestedWriteback(implicit p: Parameters) extends L2Bundle {
   val set = UInt(setBits.W)

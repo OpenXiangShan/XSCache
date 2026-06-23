@@ -108,6 +108,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   reqBuf.io.in <> sinkA.io.task
   reqBuf.io.mshrInfo := mshrCtl.io.msInfo
   reqBuf.io.mainPipeBlock := mainPipe.io.toReqBuf
+  reqBuf.io.blockA_s1_pf := mshrCtl.io.toReqArb.blockA_s1_pf
   reqBuf.io.s1Entrance := reqArb.io.s1Entrance
   reqBuf.io.taskFromArb_s2 := reqArb.io.taskToPipe_s2
 
