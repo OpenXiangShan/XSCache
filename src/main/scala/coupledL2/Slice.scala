@@ -197,10 +197,10 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
     }
   )
   io.l2Miss := mshrCtl.io.l2Miss
-  val prefetchMSHRCount = PopCount(VecInit(mshrCtl.io.msInfo.map(s =>
+  val mshrCount = PopCount(VecInit(mshrCtl.io.msInfo.map(s =>
     s.valid && !s.bits.willFree
   )).asUInt)
-  io.prefetchMSHRFull := prefetchMSHRCount >= cacheParams.nMaxPrefetchEntry.U
+  io.prefetchMSHRFull := mshrCount >= cacheParams.nMaxPrefetchEntry.U
 
   /* Connect upwards channels */
   val inBuf = cacheParams.innerBuf
