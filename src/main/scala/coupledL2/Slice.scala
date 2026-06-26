@@ -233,6 +233,6 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   /* ===== Hardware Performance Monitor ===== */
   val perfEvents = Seq(mshrCtl, mainPipe).flatMap(_.getPerfEvents)
   XSPerfAccumulate("prefetch_mshr_max", io.prefetchMSHRFull)
-  XSPerfHistogram("prefetch_mshr_count", prefetchMSHRCount, true.B, 0, cacheParams.nMaxPrefetchEntry + 1, 1)
+  XSPerfHistogram("prefetch_mshr_count", mshrCount, true.B, 0, cacheParams.nMaxPrefetchEntry + 1, 1)
   generatePerfEvent()
 }

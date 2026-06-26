@@ -76,7 +76,7 @@ case class L2Param(
   clientCaches: Seq[L1Param] = Nil,
   replacement: String = "drrip",
   mshrs: Int = 16,
-  nMaxPrefetchEntry: Int = 14,
+  nMaxPrefetchEntry: Int = 15,
   releaseData: Int = 3,
   /* 0 for dirty alone
    * 1 for dirty and accessed
