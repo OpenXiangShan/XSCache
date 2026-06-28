@@ -25,6 +25,7 @@ case class CDPParameters(
   VpnTableWayNum:       Int = 4,
   VpnTableSubEntryNum:  Int = 4,
   VpnTableTagBits:      Int = 10,     // should be a val within (0, 18 - log2(VpnTableSubEntryNum)]
+  UseVpnTableHashIndex: Boolean = true,
   CounterBits:          Int = 10,
   VpnResetPeriod:       Int = 128,    // Every $VpnResetPeriod visits, VPN entries will be reset
   EntryBits:            Int = 21,     // Every SubEntry maintain for 2^21 Bits
@@ -115,29 +116,58 @@ trait HasCDPParams extends HasPrefetcherHelper with HasCoupledL2Parameters {
   val mainEntryBits = log2Ceil(VpnTableSetNum)
   val subEntryBits  = log2Ceil(VpnTableSubEntryNum)
   val vpnTabTagBits = cdpParams.VpnTableTagBits
+  val useVpnTableHashIndex = cdpParams.UseVpnTableHashIndex
   val vpnWayBits    = log2Ceil(VpnTableWayNum)
 
   // vaddr => [ Tag | MainEntryIdx | SubEntryIdx | EntryBits(1M Space) ]
   // vpn_addr => [ Tag | MainEntryIdx | SubEntryIdx ]
+  //
+  // Hash the narrow index fields with upper VPN bits to avoid skewed set/sub-entry access.
+  // Keep the main-entry hash independent of sub_idx so the four sub entries belonging to
+  // the same main entry still share one tag/way and can use alloc_sub normally.
 
   def get_vpn_addr(addr: UInt) = addr(addr.getWidth - 1, EntryBits)  // TODO: parameterize
 
-  def get_main_idx(addr: UInt) = {
+  def get_vpntab_origin_tag(addr: UInt) = {
     val vpn_addr = get_vpn_addr(addr)
+    vpn_addr(vpn_addr.getWidth - 1, subEntryBits + mainEntryBits) // TODO: parameterize
+  }
 
+  def get_vpntab_origin_main_idx(addr: UInt) = {
+    val vpn_addr = get_vpn_addr(addr)
     vpn_addr(subEntryBits + mainEntryBits - 1, subEntryBits)
   }
 
-  def get_sub_idx(addr: UInt) = {
+  def get_vpntab_origin_sub_idx(addr: UInt) = {
     val vpn_addr = get_vpn_addr(addr)
     vpn_addr(subEntryBits - 1, 0)
   }
 
-  def get_vpntab_tag(addr: UInt) = {
-    val vpn_addr = get_vpn_addr(addr)
+  def get_main_idx(addr: UInt) = {
+    val origin_tag      = get_vpntab_origin_tag(addr)
+    val origin_main_idx = get_vpntab_origin_main_idx(addr)
 
-    val origin_tag = vpn_addr(vpn_addr.getWidth - 1 ,subEntryBits + mainEntryBits) // TODO: parameterize
-    get_folded_hash(origin_tag, vpnTabTagBits)
+    if (useVpnTableHashIndex) {
+      origin_main_idx ^ get_folded_hash(origin_tag, mainEntryBits)
+    } else {
+      origin_main_idx
+    }
+  }
+
+  def get_sub_idx(addr: UInt) = {
+    val origin_tag      = get_vpntab_origin_tag(addr)
+    val origin_main_idx = get_vpntab_origin_main_idx(addr)
+    val origin_sub_idx  = get_vpntab_origin_sub_idx(addr)
+
+    if (useVpnTableHashIndex) {
+      origin_sub_idx ^ get_folded_hash(Cat(origin_tag, origin_main_idx), subEntryBits)
+    } else {
+      origin_sub_idx
+    }
+  }
+
+  def get_vpntab_tag(addr: UInt) = {
+    get_folded_hash(get_vpntab_origin_tag(addr), vpnTabTagBits)
   }
 
   // Filter Table Params
@@ -352,6 +382,33 @@ class VpnTable(implicit p: Parameters) extends CDPModule {
   XSPerfAccumulate("vt_alloc_main", train_req.valid && train_req.bits.alloc_main)
   XSPerfAccumulate("vt_alloc_sub", train_req.valid && train_req.bits.alloc_sub)
   XSPerfAccumulate("vt_no_alloc", train_req.valid && !train_req.bits.alloc_main && !train_req.bits.alloc_sub)
+
+  // VpnTable train index distribution.
+  for (i <- 0 until VpnTableSetNum) {
+    XSPerfAccumulate(s"vt_train_main_idx_$i", train_req.valid && !is_refresh && train_req.bits.main_idx === i.U)
+    XSPerfAccumulate(s"vt_alloc_main_idx_$i", train_req.valid && !is_refresh && train_req.bits.alloc_main && train_req.bits.main_idx === i.U)
+    XSPerfAccumulate(s"vt_alloc_sub_main_idx_$i", train_req.valid && !is_refresh && train_req.bits.alloc_sub && train_req.bits.main_idx === i.U)
+    XSPerfAccumulate(
+      s"vt_no_alloc_main_idx_$i",
+      train_req.valid && !is_refresh && !train_req.bits.alloc_main && !train_req.bits.alloc_sub && train_req.bits.main_idx === i.U
+    )
+  }
+  for (i <- 0 until VpnTableSubEntryNum) {
+    XSPerfAccumulate(s"vt_train_sub_idx_$i", train_req.valid && !is_refresh && train_req.bits.sub_idx === i.U)
+    XSPerfAccumulate(s"vt_alloc_sub_sub_idx_$i", train_req.valid && !is_refresh && train_req.bits.alloc_sub && train_req.bits.sub_idx === i.U)
+    XSPerfAccumulate(
+      s"vt_no_alloc_sub_idx_$i",
+      train_req.valid && !is_refresh && !train_req.bits.alloc_main && !train_req.bits.alloc_sub && train_req.bits.sub_idx === i.U
+    )
+  }
+  for (i <- 0 until VpnTableSetNum) {
+    for (j <- 0 until VpnTableSubEntryNum) {
+      XSPerfAccumulate(
+        s"vt_train_idx_${i}_$j",
+        train_req.valid && !is_refresh && train_req.bits.main_idx === i.U && train_req.bits.sub_idx === j.U
+      )
+    }
+  }
 
   // train trig data
   XSPerfAccumulate("in_train_trig_used", train_req.valid && !is_refresh)
