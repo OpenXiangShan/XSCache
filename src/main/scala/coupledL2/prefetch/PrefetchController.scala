@@ -168,10 +168,11 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
   )
 
   // ========== latency update ==========
-  // TODO lyq: timing
-  latencyAvg := dataRefill.map(x => 
+  val latencyAvgSliceVec = VecInit(dataRefill.map(x =>
     Mux(x.valid, avgLatency(latencyAvg, x.bits.latency), latencyAvg)
-  ).reduce(_ + _) >> bankBits
+  ))
+  val latencyAvgSliceVecReg = RegNext(latencyAvgSliceVec)
+  latencyAvg := latencyAvgSliceVecReg.reduce(_ + _) >> bankBits
 
   // record for debug //
   val refillRecordTable = ChiselDB.createTable("RefillRecordTable", new DemandRefillBundle, basicDB = true)
@@ -270,7 +271,10 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
   val deltaTbankVec = Wire(Vec(PF_NUM, Vec(banks, SInt(peBits.W))))
 
   for (i <- 0 until PF_NUM) {
-    val peDeltaSliceVec = RegInit(VecInit(Seq.fill(banks)(0.S(peBits.W))))
+    val peDeltaSliceVecReg = RegInit(VecInit(Seq.fill(banks)(0.S(peBits.W))))
+    val peDeltaPosSliceVecReg = RegInit(VecInit(Seq.fill(banks)(0.S(peBits.W))))
+    val peDeltaNegSliceVecReg = RegInit(VecInit(Seq.fill(banks)(0.S(peBits.W))))
+    val peDeltaSumReg = RegInit(0.S(peBits.W))
 
     // pe0: get the pe of each slice
     for (s <- 0 until banks) {
@@ -358,37 +362,45 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
         0.S(peBits.W)
       )
 
-      // TODO lyq: 确认方案后，利用 parm 的方式生成，避免时序压力
       when(controlMode === fpop.U) {
-        peDeltaSliceVec(s) := deltaMshrHitVec(i)(s) + deltaDemandCacheHitVec(i)(s) + deltaL1PrefetchCacheHitVec(i)(s) -
-          deltaPollutionHoldVec(i)(s) - deltaPfReqBufferHoldVec(i)(s) - deltaPfMshrHoldVec(i)(s)
-      }.elsewhen(controlMode === fpopUseless.U) {
-        peDeltaSliceVec(s) := deltaMshrHitVec(i)(s) + deltaDemandCacheHitVec(i)(s) + deltaL1PrefetchCacheHitVec(i)(s) -
-          deltaPollutionHoldVec(i)(s) - deltaPfReqBufferHoldVec(i)(s) - deltaPfUselessVec(i)(s)
-      }.elsewhen(controlMode === fpopLate.U) {
-        peDeltaSliceVec(s) := deltaMshrHitVec(i)(s) + deltaDemandCacheHitVec(i)(s) + deltaL1PrefetchCacheHitVec(i)(s) -
-          deltaPollutionHoldVec(i)(s) - deltaPfReqBufferHoldVec(i)(s) - deltaPfMshrHoldVec(i)(s) -
-          deltaPfLateInMshrVec(i)(s) - deltaPfLateInCacheVec(i)(s)
-      }.elsewhen(controlMode === ipop.U || controlMode === ipopNewctrl.U) {
-        peDeltaSliceVec(s) := deltaDemandCacheHitVec(i)(s) - deltaPollutionHoldVec(i)(s) -
-          deltaTnocVec(i)(s) - deltaTbusVec(i)(s) - deltaTbankVec(i)(s)
-      }.elsewhen(controlMode === ipopNewctrlHitfine.U) {
-        peDeltaSliceVec(s) := deltaMshrHitVec(i)(s) + deltaDemandCacheHitVec(i)(s) + deltaL1PrefetchCacheHitVec(i)(s) -
-          deltaPollutionHoldVec(i)(s) - deltaTnocVec(i)(s) - deltaTbusVec(i)(s) - deltaTbankVec(i)(s)
+        val peDeltaPos = deltaMshrHitVec(i)(s) + deltaDemandCacheHitVec(i)(s) + deltaL1PrefetchCacheHitVec(i)(s)
+        val peDeltaNeg = deltaPollutionHoldVec(i)(s) + deltaPfReqBufferHoldVec(i)(s) + deltaPfMshrHoldVec(i)(s)
+        peDeltaPosSliceVecReg(s) := peDeltaPos(peBits - 1, 0).asSInt
+        peDeltaNegSliceVecReg(s) := peDeltaNeg(peBits - 1, 0).asSInt
+      /* comment for timing; or use parameter-generation to avoid many conditions checking */
+      // }.elsewhen(controlMode === fpopUseless.U) {
+      //   peDeltaSliceVecReg(s) := deltaMshrHitVec(i)(s) + deltaDemandCacheHitVec(i)(s) + deltaL1PrefetchCacheHitVec(i)(s) -
+      //     deltaPollutionHoldVec(i)(s) - deltaPfReqBufferHoldVec(i)(s) - deltaPfUselessVec(i)(s)
+      // }.elsewhen(controlMode === fpopLate.U) {
+      //   peDeltaSliceVecReg(s) := deltaMshrHitVec(i)(s) + deltaDemandCacheHitVec(i)(s) + deltaL1PrefetchCacheHitVec(i)(s) -
+      //     deltaPollutionHoldVec(i)(s) - deltaPfReqBufferHoldVec(i)(s) - deltaPfMshrHoldVec(i)(s) -
+      //     deltaPfLateInMshrVec(i)(s) - deltaPfLateInCacheVec(i)(s)
+      // }.elsewhen(controlMode === ipop.U || controlMode === ipopNewctrl.U) {
+      //   peDeltaSliceVecReg(s) := deltaDemandCacheHitVec(i)(s) - deltaPollutionHoldVec(i)(s) -
+      //     deltaTnocVec(i)(s) - deltaTbusVec(i)(s) - deltaTbankVec(i)(s)
+      // }.elsewhen(controlMode === ipopNewctrlHitfine.U) {
+      //   peDeltaSliceVecReg(s) := deltaMshrHitVec(i)(s) + deltaDemandCacheHitVec(i)(s) + deltaL1PrefetchCacheHitVec(i)(s) -
+      //     deltaPollutionHoldVec(i)(s) - deltaTnocVec(i)(s) - deltaTbusVec(i)(s) - deltaTbankVec(i)(s)
       }.elsewhen(controlMode === none.U){
-        peDeltaSliceVec(s) := 0.S(peBits.W)
+        peDeltaPosSliceVecReg(s) := 0.S(peBits.W)
+        peDeltaNegSliceVecReg(s) := 0.S(peBits.W)
       }.otherwise {
         assert(false.B, "invalid control mode")
+        peDeltaPosSliceVecReg(s) := 0.S(peBits.W)
+        peDeltaNegSliceVecReg(s) := 0.S(peBits.W)
       }
+      // pe1
+      peDeltaSliceVecReg(s) := peDeltaPosSliceVecReg(s) - peDeltaNegSliceVecReg(s)
 
     }
     
-    // pe1: get the pe sum of all slices
-    val peDeltaSum = peDeltaSliceVec.reduce(_ + _)
-    val peDeltaSumNarrow = peDeltaSum(peBits - 1, 0).asSInt
-    val peNext = peVec(i) + peDeltaSumNarrow
+    // pe2: get the pe sum of all slices
+    val peDeltaSum = peDeltaSliceVecReg.reduce(_ + _)
+    peDeltaSumReg := peDeltaSum(peBits - 1, 0).asSInt
+    // pe3
+    val peNext = peVec(i) + peDeltaSumReg
     peVec(i) := peNext
-    statPeOverflowVec(i) := peDeltaSumNarrow(peBits - 1) === peVec(i)(peBits - 1) && peNext(peBits - 1) =/= peVec(i)(peBits - 1)
+    statPeOverflowVec(i) := peDeltaSumReg(peBits - 1) === peVec(i)(peBits - 1) && peNext(peBits - 1) =/= peVec(i)(peBits - 1)
   }
 
   // record for debug //
