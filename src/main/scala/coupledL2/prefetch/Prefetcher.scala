@@ -183,7 +183,6 @@ class PrefetchIO(implicit p: Parameters) extends PrefetchBundle {
 }
 
 class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
-  val banks = 1 << bankBits
   val train = Vec(banks, Flipped(DecoupledIO(new PrefetchTrain)))
   val tlb_req = new L2ToL1TlbIO(nRespDups= 1)
   val req = Vec(banks, DecoupledIO(new PrefetchReq))
@@ -205,9 +204,6 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val pfFeedbackVec = IO(Input(Vec(banks, new PrefetchFeedbackBundle())))
 
   val prefetchController = Module(new PrefetchController)
-  prefetchController.io.isDemandTrain := io.train.valid && (
-    MemReqSource.isCPUReq(io.train.bits.reqsource) || MemReqSource.isL1Prefetch(io.train.bits.reqsource)
-  )
   prefetchController.io.pfFeedbackVec := pfFeedbackVec
 
   // l2 receive need 2 cycles to transmit from core
@@ -229,7 +225,6 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val vbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_vbop_en
   val tp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_tp_en
   val delay_latency = pfCtrlFromCore.l2_pf_delay_latency
-  val banks = 1 << bankBits
 
   // =================== Prefetchers =====================
   // TODO: consider separate VBOP and PBOP in prefetch param
@@ -284,6 +279,9 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   fastArb(io.train, train, Some("prefetch_train"))
   fastArb(io.resp, resp, Some("prefetch_resp"))
 
+  prefetchController.io.isDemandTrain := train.valid && (
+    MemReqSource.isCPUReq(train.bits.reqsource) || MemReqSource.isL1Prefetch(train.bits.reqsource)
+  )
   // =================== Connection for each Prefetcher =====================
   // Rcv > NL >VBOP > PBOP > TP
   if (hasBOP) {

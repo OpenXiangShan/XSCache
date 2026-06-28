@@ -320,9 +320,9 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   }
 
   io.pfStatInMSHR.pfReleaseFromReqBuffer := chosenQ.io.deq.fire && !cancel &&
-    buffer(chosenQ.io.deq.bits.id).task.fromA && buffer(chosenQ.io.deq.bits.id).task.opcode === Hint
-  io.pfStatInMSHR.reqBufferPfReqSrc := buffer(chosenQ.io.deq.bits.id).task.reqSource
-  io.pfStatInMSHR.reqBufferHoldLatency := buffer(chosenQ.io.deq.bits.id).timer
+    Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.task.fromA && e.task.opcode === Hint))
+  io.pfStatInMSHR.reqBufferPfReqSrc := Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.task.reqSource))
+  io.pfStatInMSHR.reqBufferHoldLatency := Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.timer))
 
   // for Dir to choose a free way
   io.out.bits.wayMask := Fill(cacheParams.ways, 1.U(1.W))

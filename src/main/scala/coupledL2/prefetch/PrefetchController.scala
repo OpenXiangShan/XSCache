@@ -1,11 +1,11 @@
-package coupledL2.prefetch
+package xscache.coupledL2.prefetch
 
 import chisel3._
 import chisel3.util._
 import utility._
 import org.chipsalliance.cde.config.Parameters
 import utility.mbist.MbistPipeline
-import coupledL2._
+import xscache.coupledL2._
 
 class ReplaceBundle()(implicit p: Parameters) extends L2Bundle {
   val reqSource = UInt(MemReqSource.reqSourceBits.W)
