@@ -56,7 +56,7 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
   val io = IO(new PrefetchControllerIO)
 
   val hartId = p(L2ParamKey).hartId
-  private val Seq(none, ipop, default, defaultLate, defaultUseless, ipopNewctrl, ipopNewctrlHitfine) = Seq(0, 1, 2, 3, 4, 5, 6)
+  private val Seq(none, ipop, fpop, fpopLate, fpopUseless, ipopNewctrl, ipopNewctrlHitfine) = Seq(0, 1, 2, 3, 4, 5, 6)
   val controlMode = Constantin.createRecord(s"l2pf_controlMode$hartId", initValue = none)
 
   // control engine: ratio of last latency or other constant
@@ -359,13 +359,13 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
       )
 
       // TODO lyq: 确认方案后，利用 parm 的方式生成，避免时序压力
-      when(controlMode === default.U) {
+      when(controlMode === fpop.U) {
         peDeltaSliceVec(s) := deltaMshrHitVec(i)(s) + deltaDemandCacheHitVec(i)(s) + deltaL1PrefetchCacheHitVec(i)(s) -
           deltaPollutionHoldVec(i)(s) - deltaPfReqBufferHoldVec(i)(s) - deltaPfMshrHoldVec(i)(s)
-      }.elsewhen(controlMode === defaultUseless.U) {
+      }.elsewhen(controlMode === fpopUseless.U) {
         peDeltaSliceVec(s) := deltaMshrHitVec(i)(s) + deltaDemandCacheHitVec(i)(s) + deltaL1PrefetchCacheHitVec(i)(s) -
           deltaPollutionHoldVec(i)(s) - deltaPfReqBufferHoldVec(i)(s) - deltaPfUselessVec(i)(s)
-      }.elsewhen(controlMode === defaultLate.U) {
+      }.elsewhen(controlMode === fpopLate.U) {
         peDeltaSliceVec(s) := deltaMshrHitVec(i)(s) + deltaDemandCacheHitVec(i)(s) + deltaL1PrefetchCacheHitVec(i)(s) -
           deltaPollutionHoldVec(i)(s) - deltaPfReqBufferHoldVec(i)(s) - deltaPfMshrHoldVec(i)(s) -
           deltaPfLateInMshrVec(i)(s) - deltaPfLateInCacheVec(i)(s)
