@@ -189,7 +189,8 @@ class TemporalPrefetch(implicit p: Parameters) extends TPModule {
   private val trainOnVaddr = Constantin.createRecord("tp_trainOnVaddr"+hartid.toString, initValue = 0)
   // 0 / 1: whether to eliminate L1 prefetch request training
   private val trainOnL1PF = Constantin.createRecord("tp_trainOnL1PF"+hartid.toString, initValue = 0)
-  val enable = io.enable && cstEnable.orR
+  //val enable = io.enable && cstEnable.orR
+  val enable = false.B // TODO: remove this line after debug
 
   if (vaddrBitsOpt.isEmpty) {
     assert(!trainOnVaddr)
