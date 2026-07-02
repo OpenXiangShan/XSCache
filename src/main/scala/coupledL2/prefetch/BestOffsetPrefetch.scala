@@ -36,6 +36,7 @@ import xscache.coupledL2.{HasCoupledL2Parameters, L2TlbReq, L2ToL1TlbIO, TlbCmd,
 import xscache.coupledL2.utils.ReplacementPolicy
 import scopt.Read
 import freechips.rocketchip.util.SeqToAugmentedSeq
+import freechips.rocketchip.tilelink.TLMessages._
 import xscache.coupledL2.utils._
 
 case class BOPParameters(
@@ -733,8 +734,8 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
 
   // pipeline control signal
   when(s0_fire) {
-    if(virtualTrain) s1_req_valid := true.B
-    else s1_req_valid := !s0_crossPage // stop prefetch when prefetch req crosses pages
+    if(virtualTrain) s1_req_valid := true.B && (io.train.bits.opcode =/= AcquirePerm)
+    else s1_req_valid := !s0_crossPage && (io.train.bits.opcode =/= AcquirePerm) // stop prefetch when prefetch req crosses pages
   }.elsewhen(s1_fire){
     s1_req_valid := false.B
   }
@@ -852,7 +853,7 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     req.set := parseFullAddress(newAddr)._2
     req.needT := io.train.bits.needT
     req.source := io.train.bits.source
-    req_valid := !crossPage && !prefetchDisable // stop prefetch when prefetch req crosses pages
+    req_valid := !crossPage && !prefetchDisable && io.train.bits.opcode =/= AcquirePerm  // stop prefetch when prefetch req crosses pages
   }
 
   io.pbopCrossPage := crossPage
