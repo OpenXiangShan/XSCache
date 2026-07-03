@@ -61,27 +61,57 @@ class CacheLineLifeTime(implicit p: Parameters) extends L2Module {
   val acquirePrepareTime = WireInit(0.U(64.W))
   val activeTime = WireInit(0.U(64.W))
   val deadTime = WireInit(0.U(64.W))
-  val invalidTime = WireInit(0.U(64.W))
+  val snpInvTime = WireInit(0.U(64.W))
   val stateSeq = Seq.tabulate(cacheParams.sets, cacheParams.ways) { case (set, way) => states(set)(way) }.flatten
-  val invalidStateTime = PopCount(stateSeq.map(_ === sInvalid))
-  val prefetchWaitStateTime = PopCount(stateSeq.map(_ === sPrefetchWait))
-  val acquireWaitStateTime = PopCount(stateSeq.map(_ === sAcquireWait))
-  val accessedStateTime = PopCount(stateSeq.map(_ === sAccessed))
+  val invalidTime = PopCount(stateSeq.map(_ === sInvalid)).asUInt.pad(64)
+  val unknownPrefetchWaitTimeCorrection = WireInit(0.U(64.W))
+  val unknownAcquireWaitTimeCorrection = WireInit(0.U(64.W))
+  val unknownAccessedTimeCorrection = WireInit(0.U(64.W))
+  val unknownPrefetchWaitTime = PopCount(stateSeq.map(_ === sPrefetchWait)).asUInt.pad(64) + unknownPrefetchWaitTimeCorrection
+  val unknownAcquireWaitTime = PopCount(stateSeq.map(_ === sAcquireWait)).asUInt.pad(64) + unknownAcquireWaitTimeCorrection
+  val unknownAccessedTime = PopCount(stateSeq.map(_ === sAccessed)).asUInt.pad(64) + unknownAccessedTimeCorrection
+  val unknownTime = unknownPrefetchWaitTime + unknownAcquireWaitTime + unknownAccessedTime
 
-  when (io.fill.valid && fillState =/= sInvalid) {
-    deadTime := fillInterval
-  }
-  when (io.fill.valid && fillState === sInvalid) {
-    invalidTime := fillInterval
+  def minus(value: UInt): UInt = (-(value.asSInt)).asUInt
+
+  when (io.fill.valid) {
+    when (fillState =/= sInvalid) {
+      deadTime := fillInterval
+      when (fillState === sPrefetchWait) {
+        unknownPrefetchWaitTimeCorrection := minus(fillInterval)
+      }.elsewhen (fillState === sAcquireWait) {
+        unknownAcquireWaitTimeCorrection := minus(fillInterval)
+      }.elsewhen (fillState === sAccessed) {
+        unknownAccessedTimeCorrection := minus(fillInterval)
+      }
+    }
   }
 
   when (io.access.valid && !io.fill.valid && !io.snoopInvalid.valid) {
     when (accessState === sPrefetchWait) {
       prefetchPrepareTime := accessInterval
+      unknownPrefetchWaitTimeCorrection := minus(accessInterval)
     }.elsewhen (accessState === sAcquireWait) {
       acquirePrepareTime := accessInterval
+      unknownAcquireWaitTimeCorrection := minus(accessInterval)
     }.elsewhen (accessState === sAccessed) {
       activeTime := accessInterval
+      unknownAccessedTimeCorrection := minus(accessInterval)
+    }
+   }
+
+  when (io.snoopInvalid.valid) {
+    val snoopInvalidState = states(io.snoopInvalid.set)(snoopInvalidWay)
+    val snoopInvalidInterval = globalTimer - timestamps(io.snoopInvalid.set)(snoopInvalidWay)
+    when (snoopInvalidState === sPrefetchWait) {
+      snpInvTime := snoopInvalidInterval
+      unknownPrefetchWaitTimeCorrection := minus(snoopInvalidInterval)
+    }.elsewhen (snoopInvalidState === sAcquireWait) {
+      snpInvTime := snoopInvalidInterval
+      unknownAcquireWaitTimeCorrection := minus(snoopInvalidInterval)
+    }.elsewhen (snoopInvalidState === sAccessed) {
+      snpInvTime := snoopInvalidInterval
+      unknownAccessedTimeCorrection := minus(snoopInvalidInterval)
     }
   }
 
@@ -104,12 +134,12 @@ class CacheLineLifeTime(implicit p: Parameters) extends L2Module {
   XSPerfAccumulate("cacheline_acquire_prepare_time", acquirePrepareTime)
   XSPerfAccumulate("cacheline_active_time", activeTime)
   XSPerfAccumulate("cacheline_dead_time", deadTime)
+  XSPerfAccumulate("cacheline_snp_inv_time", snpInvTime)
   XSPerfAccumulate("cacheline_invalid_time", invalidTime)
-  // XSPerfAccumulate("cacheline_invalid_state_time", invalidStateTime)
-  // XSPerfAccumulate("cacheline_prefetch_wait_state_time", prefetchWaitStateTime)
-  // XSPerfAccumulate("cacheline_acquire_wait_state_time", acquireWaitStateTime)
-  // XSPerfAccumulate("cacheline_accessed_state_time", accessedStateTime)
+  XSPerfAccumulate("cacheline_unknown_prefetch_wait_time", unknownPrefetchWaitTime)
+  XSPerfAccumulate("cacheline_unknown_acquire_wait_time", unknownAcquireWaitTime)
+  XSPerfAccumulate("cacheline_unknown_accessed_time", unknownAccessedTime)
+  XSPerfAccumulate("cacheline_unknown_time", unknownTime)
   XSPerfAccumulate("total_time", (cacheParams.sets * cacheParams.ways).U)
-  XSPerfAccumulate("cacheline_accounted_state_time", invalidStateTime + prefetchWaitStateTime + acquireWaitStateTime + accessedStateTime)
-  XSPerfAccumulate("cacheline_accounted_time", prefetchPrepareTime + acquirePrepareTime + activeTime + deadTime + invalidTime)
+  XSPerfAccumulate("cacheline_accounted_time", prefetchPrepareTime + acquirePrepareTime + activeTime + deadTime + snpInvTime + invalidTime + unknownTime)
 }
