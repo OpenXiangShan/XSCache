@@ -990,6 +990,22 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val cmoLineDone = io.cmoAllBlock.getOrElse(false.B) && task_s3.valid && mshr_cmoresp_s3
   io.cmoLineDone.foreach { _ := RegNextN(cmoLineDone || cmoLineDrop, 2, Some(false.B)) }
 
+  /* ===== Cache line lifetime statistics ===== */
+  val cacheLineLifeTime = Module(new CacheLineLifeTime)
+  cacheLineLifeTime.io.fill.valid := task_s3.valid && mshr_refill_s3 && !retry && req_s3.tagWen
+  cacheLineLifeTime.io.fill.set := io.tagWReq.bits.set
+  cacheLineLifeTime.io.fill.way := OHToUInt(io.tagWReq.bits.wayOH)
+  cacheLineLifeTime.io.fill.isPrefetch := mshr_hintack_s3
+  cacheLineLifeTime.io.fill.isMergeA := req_s3.mergeA
+
+  cacheLineLifeTime.io.access.valid := task_s3.valid && !mshr_req_s3 && dirResult_s3.hit && (req_acquire_s3 || req_get_s3)
+  cacheLineLifeTime.io.access.set := req_s3.set
+  cacheLineLifeTime.io.access.way := dirResult_s3.way
+
+  cacheLineLifeTime.io.snoopInvalid.valid := task_s3.valid && metaW_valid_s3_b && metaW_s3_b.state === INVALID
+  cacheLineLifeTime.io.snoopInvalid.set := req_s3.set
+  cacheLineLifeTime.io.snoopInvalid.way := dirResult_s3.way
+
   /* ===== Performance counters ===== */
   // SinkA requests
   XSPerfAccumulate("acquireBlock", task_s3.valid && sinkA_req_s3 && req_s3.opcode === AcquireBlock)
