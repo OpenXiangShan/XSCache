@@ -127,10 +127,12 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   val cleanShared_s3        = !refill_task_s3 && opcode_s3 === CleanShared
   val writeCleanFull_s3     = !refill_task_s3 && opcode_s3 === WriteCleanFull
   val writeEvictOrEvict_s3  = !refill_task_s3 && afterIssueEbOrElse(opcode_s3 === WriteEvictOrEvict, false.B)
+  val stashOnceShared_s3    = !refill_task_s3 && opcode_s3 === StashOnceShared
 
   assert(!task_s3.valid || refill_task_s3 ||
     readNotSharedDirty_s3 || readUnique_s3 || makeUnique_s3 || writeBackFull_s3 || evict_s3 || makeInvalid_s3 ||
-    cleanInvalid_s3 || cleanShared_s3 || writeCleanFull_s3 || writeEvictOrEvict_s3, "Unsupported opcode")
+    cleanInvalid_s3 || cleanShared_s3 || writeCleanFull_s3 || writeEvictOrEvict_s3 || stashOnceShared_s3,
+    "Unsupported opcode")
 
   /**
     * Requests have different coherence states after processing
@@ -145,6 +147,8 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   val releaseReq_s3   = writeBackFull_s3 || evict_s3 || writeEvictOrEvict_s3
   val invalidReq_s3   = makeInvalid_s3 || cleanInvalid_s3
   val cleanReq_s3     = cleanInvalid_s3 || cleanShared_s3
+  val consumeStash_s3 = (readNotSharedDirty_s3 || readUnique_s3) && self_hit_s3 && self_meta_s3.stash
+  val unusedStashEvict_s3 = refill_task_s3 && !self_hit_s3 && self_meta_s3.valid && self_meta_s3.stash
 
   /** Directory update logic **/
   val clientsTagW_s3  = io.dirWReq_s3.clientTagWReq
@@ -159,9 +163,14 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   when(refill_task_s3) {
     new_self_meta_s3.valid := true.B
     new_self_meta_s3.dirty := passDirty_s3 || self_hit_s3 && selfDirty_s3
+    new_self_meta_s3.stash := opcode_s3 === StashOnceShared
+  }
+  when(consumeStash_s3) {
+    new_self_meta_s3.stash := false.B
   }
   when(exclusiveReq_s3 || invalidReq_s3) {
     new_self_meta_s3.valid := false.B
+    new_self_meta_s3.stash := false.B
   }
   when(cleanReq_s3) {
     new_self_meta_s3.dirty := false.B
@@ -216,11 +225,13 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     * metaArray is updated when:
     * 1. exclusive/invalid request where the directory access hits
     * 2. clean request where the required block is dirty
-    * 3. refill task
+    * 3. read request consumes the stash marker
+    * 4. refill task
     */
   selfMetaW_s3.valid := task_s3.valid && (
     (exclusiveReq_s3 || invalidReq_s3) && self_hit_s3 ||
     cleanReq_s3 && self_hit_s3 && selfDirty_s3 ||
+    consumeStash_s3 ||
     refill_task_s3
   )
   selfMetaW_s3.bits.apply(
@@ -260,6 +271,7 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   val cleanShared_s4        = RegNext(cleanShared_s3, false.B)
   val writeCleanFull_s4     = RegNext(writeCleanFull_s3, false.B)
   val writeEvictOrEvict_s4  = RegNext(writeEvictOrEvict_s3, false.B)
+  val stashOnceShared_s4    = RegNext(stashOnceShared_s3, false.B)
 
   val sharedReq_s4          = RegNext(sharedReq_s3, false.B)
   val exclusiveReq_s4       = RegNext(exclusiveReq_s3, false.B)
@@ -277,6 +289,8 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   val clients_hit_s4  = clientsDirResp_s4.hit
   val clients_meta_s4 = clientsDirResp_s4.meta
   val selfDirty_s4    = self_meta_s4.dirty
+  val stashMissRead_s4 = stashOnceShared_s4 && !self_hit_s4 && !clients_hit_s4
+  val stashMissRefill_s4 = stashMissRead_s4
 
   /** Send Snoop task **/
   val clients_valids_vec_s4 = VecInit(clients_meta_s4.map(_.valid))
@@ -360,7 +374,8 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   )
   refill_s4.valid := task_s4.valid && (
     (sharedReq_s4 || writeBackFull_s4 || writeEvictOrEvict_s4) && !self_hit_s4 ||
-    replace_snoop_s4
+    replace_snoop_s4 ||
+    stashMissRefill_s4
   )
   refill_s4.bits.state.s_refill := false.B
   refill_s4.bits.state.w_datRsp := false.B
@@ -379,7 +394,7 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   val respSC_s4 = sharedReq_s4
   val respUC_s4 = makeUnique_s4 || !makeUnique_s4 && exclusiveReq_s4 && (!selfDirty_s4 || !self_hit_s4)
   val respUD_s4 = !makeUnique_s4 && exclusiveReq_s4 && self_hit_s4 && selfDirty_s4
-  val respI_s4  = releaseReq_s4 || invalidReq_s4 || cleanReq_s4 || writeCleanFull_s4
+  val respI_s4  = releaseReq_s4 || invalidReq_s4 || cleanReq_s4 || writeCleanFull_s4 || stashOnceShared_s4
   val snpVec_comp_s4 = VecInit(
     Mux(
       request_snoop_s4,
@@ -400,11 +415,12 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
 
   comp_s4.valid := task_s4.valid && (
     releaseReq_s4 || invalidReq_s4 || cleanReq_s4 || makeUnique_s4 || writeCleanFull_s4 ||
-    (readNotSharedDirty_s4 || readUnique_s4) && !self_hit_s4
+    (readNotSharedDirty_s4 || readUnique_s4) && !self_hit_s4 ||
+    stashOnceShared_s4
   )
   comp_s4.bits.state.s_comp := false.B
   comp_s4.bits.state.s_urgentRead := true.B
-  comp_s4.bits.state.w_datRsp := !(readNotSharedDirty_s4 || readUnique_s4)
+  comp_s4.bits.state.w_datRsp := !(readNotSharedDirty_s4 || readUnique_s4 || stashMissRead_s4)
   comp_s4.bits.state.w_snpRsp := !Cat(snpVec_comp_s4).orR
   comp_s4.bits.state.w_compack := !(readUnique_s4 || readNotSharedDirty_s4 || makeUnique_s4 ||
     writeEvictOrEvict_s4 && self_hit_s4)
@@ -427,7 +443,8 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   mem_task_s4.expCompAck := false.B
 
   // need ReadNoSnp/WriteNoSnp downwards
-  val memRead_s4 = (readNotSharedDirty_s4 || readUnique_s4) && !self_hit_s4 && !peerRNs_hit_s4
+  val memRead_s4 = (readNotSharedDirty_s4 || readUnique_s4) && !self_hit_s4 && !peerRNs_hit_s4 ||
+    stashMissRead_s4
   val memWrite_s4 = cleanReq_s4 && unique_peerRN_s4 || writeCleanFull_s4
   mem_s4.valid := task_s4.valid && (memRead_s4 || memWrite_s4)
   mem_s4.bits.state.s_issueReq := false.B
@@ -505,4 +522,10 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   pipeInfo.s6_tag := task_s6.bits.tag
   pipeInfo.s6_set := task_s6.bits.set
   pipeInfo.s6_reqID := task_s6.bits.reqID
+
+  XSPerfAccumulate("stash_once_shared_req", task_s3.valid && stashOnceShared_s3)
+  XSPerfAccumulate("stash_once_shared_refill", task_s3.valid && refill_task_s3 && opcode_s3 === StashOnceShared)
+  XSPerfAccumulate("stash_once_shared_miss", task_s4.valid && stashMissRead_s4)
+  XSPerfAccumulate("stash_once_shared_read_hit", task_s3.valid && consumeStash_s3)
+  XSPerfAccumulate("stash_once_shared_unused_evict", task_s3.valid && unusedStashEvict_s3)
 }
