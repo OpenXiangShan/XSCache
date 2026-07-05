@@ -24,6 +24,7 @@ import org.chipsalliance.cde.config.Parameters
 import utility.mbist.MbistPipeline
 import xscache.coupledL2._
 import xscache.coupledL2.utils._
+import freechips.rocketchip.tilelink.TLMessages._
 
 /* virtual address */
 trait HasPrefetcherHelper extends HasCircularQueuePtrHelper with HasCoupledL2Parameters {
@@ -167,6 +168,7 @@ class PrefetchTrain(implicit p: Parameters) extends PrefetchBundle {
   val prefetched = Bool()
   val pfsource = UInt(PfSource.pfSourceBits.W)
   val reqsource = UInt(MemReqSource.reqSourceBits.W)
+  val opcode = UInt(4.W)
 
   def addr: UInt = Cat(tag, set, 0.U(offsetBits.W))
 }
@@ -269,7 +271,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     vbop.get.io.enable := vbop_en
     vbop.get.io.pfCtrlOfDelayLatency := delay_latency
     vbop.get.io.train <> train
-    vbop.get.io.train.valid := train.valid && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U)
+    vbop.get.io.train.valid := train.valid && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U) && (train.bits.opcode =/= AcquirePerm)
     vbop.get.io.resp <> resp
     vbop.get.io.resp.valid := resp.valid && resp.bits.isBOP
     vbop.get.io.tlb_req <> io.tlb_req
@@ -278,7 +280,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     pbop.get.io.enable := pbop_en
     pbop.get.io.pfCtrlOfDelayLatency := delay_latency
     pbop.get.io.train <> train
-    pbop.get.io.train.valid := train.valid && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U)
+    pbop.get.io.train.valid := train.valid && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U) && (train.bits.opcode =/= AcquirePerm)
     pbop.get.io.resp <> resp
     pbop.get.io.resp.valid := resp.valid && resp.bits.isPBOP
   }
