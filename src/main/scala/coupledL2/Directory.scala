@@ -360,6 +360,7 @@ class Directory(implicit p: Parameters) extends L2Module {
         e := Cat(repl_state_s3(2*i+1), metaAll_s3(i).clients, repl_state_s3(2*i))
     }
     replaceOH := (new DRRIP(ways)).get_replace_OH2(repl_state_tmp.asUInt, 3)
+    replaceWay := OHToUInt(replaceOH)
   } else {
     replaceOH := repl.get_replace_OH(repl_state_s3)
     assert(PopCount(replaceOH) === 1.U, "Replacement way should be one-hot")
