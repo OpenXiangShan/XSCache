@@ -410,6 +410,9 @@ class BRRIP(n_ways: Int) extends ReplacementPolicy {
     // rrpv: non-pref_hit/non-pref_refill(miss)/non-pref_release_reuse = 0;
     // pref_hit do nothing; pref_refill = 1; non-pref_release_firstuse/pref_release = 3;
     nextState.zip(State).zip(touch_wayOH.asBools).map { case ((e, s), w) =>
+      val incrementTmp = s +& increcement
+      val carry = incrementTmp(2)
+      val finals = Mux(carry, 3.U(2.W), incrementTmp(1,0))
       e := Mux(w,
         // for touch_way
         MuxCase(s, Seq(
@@ -418,7 +421,7 @@ class BRRIP(n_ways: Int) extends ReplacementPolicy {
           (req_type === 4.U || req_type(2,0) === 6.U) -> 3.U
         )),
         // for other ways
-        Mux(hit || invalid, s, s+increcement)
+        Mux(hit || invalid, s, finals)
       )
     }
     /* val random = (rand.nextInt(32)).U 
@@ -491,5 +494,23 @@ class DRRIP(n_ways: Int) extends ReplacementPolicy {
     MaskToOH(lrrWayVec.asUInt)
   }
 
+  def get_replace_OH2(state: UInt, bits: Int): UInt = {
+    val RRPVVec  = Wire(Vec(n_ways, UInt(bits.W)))
+    RRPVVec.zipWithIndex.map { case (e, i) =>
+        e := state(bits*i+bits-1,bits*i)
+    }
+    // scan each way's rrpv, find the least re-referenced way
+    val lrrWayVec = Wire(Vec(n_ways,Bool()))
+    lrrWayVec.zipWithIndex.map { case (e, i) =>
+      val isLarger = Wire(Vec(n_ways,Bool()))
+      for (j <- 0 until n_ways) {
+        isLarger(j) := RRPVVec(j) > RRPVVec(i)
+      }
+      e := !(isLarger.contains(true.B))
+    }
+    MaskToOH(lrrWayVec.asUInt)
+  }
+
   def get_replace_way(state: UInt): UInt = OHToUInt(get_replace_OH(state))
+  def get_replace_way2(state: UInt, bits: Int): UInt = OHToUInt(get_replace_OH2(state, bits))
 }
