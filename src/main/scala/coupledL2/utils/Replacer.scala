@@ -402,6 +402,7 @@ class BRRIP(n_ways: Int) extends ReplacementPolicy {
     State.zipWithIndex.map { case (e, i) =>
       e := state(2*i+1,2*i)
     }
+    val lfsr = LFSR(16, true.B)
     
     // hit-Promotion, miss-Insertion & Aging
     val increcement = 3.U(2.W) - Mux1H(touch_wayOH, State)
@@ -415,7 +416,7 @@ class BRRIP(n_ways: Int) extends ReplacementPolicy {
         MuxCase(s, Seq(
           ((req_type(2,0) === 0.U && hit) || req_type(2,0) === 1.U || req_type === 12.U) -> 0.U,
           (req_type(2,0) === 3.U) -> 1.U,
-          (req_type === 4.U || req_type(2,0) === 6.U) -> 3.U
+          (req_type === 4.U || req_type(2,0) === 6.U) -> Mux(Random(n_ways, lfsr) === 0.U, 1.U(2.W), 3.U(2.W))
         )),
         // for other ways
         Mux(hit || invalid, s, s+increcement)
