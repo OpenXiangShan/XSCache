@@ -33,6 +33,7 @@ import chisel3.util.random.LFSR
 import utility.MaskToOH
 import freechips.rocketchip.util.{Random, UIntToAugmentedUInt}
 import freechips.rocketchip.util.property.cover
+import utility.RRArbiterInit
 
 abstract class ReplacementPolicy {
   def nBits: Int
@@ -489,6 +490,28 @@ class DRRIP(n_ways: Int) extends ReplacementPolicy {
       e := !(isLarger.contains(true.B))
     }
     MaskToOH(lrrWayVec.asUInt)
+  }
+
+  def get_replace_OH1(state: UInt, valid: Bool): UInt = {
+    val RRPVVec  = Wire(Vec(n_ways, UInt(2.W)))
+    RRPVVec.zipWithIndex.map { case (e, i) =>
+        e := state(2*i+1,2*i)
+    }
+    // scan each way's rrpv, find the least re-referenced way
+    val lrrWayVec = Wire(Vec(n_ways,Bool()))
+    lrrWayVec.zipWithIndex.map { case (e, i) =>
+      val isLarger = Wire(Vec(n_ways,Bool()))
+      for (j <- 0 until n_ways) {
+        isLarger(j) := RRPVVec(j) > RRPVVec(i)
+      }
+      e := !(isLarger.contains(true.B))
+    }
+    val rrarb = Module(new RRArbiterInit(new Bundle {}, n_ways))
+    rrarb.io.in.zipWithIndex.map { case (in, i) =>
+      in.valid := lrrWayVec(i)
+    }
+    rrarb.io.out.ready := RegNext(valid, false.B)
+    UIntToOH(rrarb.io.chosen)
   }
 
   def get_replace_way(state: UInt): UInt = OHToUInt(get_replace_OH(state))
