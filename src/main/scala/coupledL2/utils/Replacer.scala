@@ -407,13 +407,13 @@ class BRRIP(n_ways: Int) extends ReplacementPolicy {
     val increcement = 3.U(2.W) - Mux1H(touch_wayOH, State)
     // req_type[3]: 0-firstuse, 1-reuse; req_type[2]: 0-acquire, 1-release;
     // req_type[1]: 0-non-prefetch, 1-prefetch; req_type[0]: 0-not-refill, 1-refill
-    // rrpv: non-pref_hit/non-pref_refill(miss)/non-pref_release_reuse = 0;
+    // rrpv: non-pref_hit/non-pref_refill(miss)/release_reuse = 0;
     // pref_hit do nothing; pref_refill = 1; non-pref_release_firstuse/pref_release = 3;
     nextState.zip(State).zip(touch_wayOH.asBools).map { case ((e, s), w) =>
       e := Mux(w,
         // for touch_way
         MuxCase(s, Seq(
-          ((req_type(2,0) === 0.U && hit) || req_type(2,0) === 1.U || req_type === 12.U) -> 0.U,
+          ((req_type(2,0) === 0.U && hit) || req_type(2,0) === 1.U || req_type(3) && req_type(2) && !req_type(0)) -> 0.U,
           (req_type(2,0) === 3.U) -> 1.U,
           (req_type === 4.U || req_type(2,0) === 6.U) -> 3.U
         )),
