@@ -205,11 +205,9 @@ class TestTopSoC(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, issue:
       val clean = Input(Bool())
     })
 
-    val io_l1 = (l2_nodes.map { l2_node =>
-      IO(new Bundle {
-        val l2Hint = Valid(new L2ToL1Hint()(p.alterPartial { case EdgeInKey => l2_node.node.in.head._2 }))
-      })
-    })
+    val io_l1 = l2_nodes.map { l2_node =>
+      IO(Output(chiselTypeOf(l2_node.module.io.l2_hint)))
+    }
 
     val cycle = RegInit(0.U(64.W))
     cycle := cycle + 1.U
@@ -283,7 +281,7 @@ class TestTopSoC(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, issue:
       l2.module.io.chi <> l3.io.rn(i)
       dontTouch(l2.module.io)
 
-      l2.module.io.l2_hint <> io_l1(i).l2Hint
+      l2.module.io.l2_hint <> io_l1(i)
 
       l2.module.io.hartId := i.U
       l2.module.io.pfCtrlFromCore := DontCare
