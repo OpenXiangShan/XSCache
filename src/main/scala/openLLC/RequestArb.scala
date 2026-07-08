@@ -21,6 +21,7 @@ import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import scala.math.min
+import utility.XSPerfAccumulate
 import xscache.chi.HasCHIOpcodes
 
 class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo with HasCHIOpcodes {
@@ -119,6 +120,26 @@ class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo wi
     Cat(memInfo.map(e => e.valid && e.bits.reqID === reqID_s1 && !task_s1.bits.refillTask)).orR ||
     (inflight_memAccess +& potential_memAccess) >= mshrs.memory.U
 
+  val busDemandRead_s1 = io.busTask_s1.valid && !io.busTask_s1.bits.refillTask &&
+    (io.busTask_s1.bits.chiOpcode === ReadNotSharedDirty || io.busTask_s1.bits.chiOpcode === ReadUnique)
+  val busDemandBlockAddr_s1 = Cat(io.busTask_s1.bits.tag, io.busTask_s1.bits.set)
+  val sameStashRefill_s1 = Cat(refillInfo.map(e =>
+    e.valid && e.bits.opcode === StashOnceShared && Cat(e.bits.tag, e.bits.set) === busDemandBlockAddr_s1
+  )).orR
+  val sameStashRefillPipe_s1 = Cat((0 until 5).map(i =>
+    pipeInfo.valids(i) && pipeInfo.refillTasks(i) && pipeInfo.opcodes(i) === StashOnceShared &&
+      Cat(pipeInfo.tags(i), pipeInfo.sets(i)) === busDemandBlockAddr_s1
+  )).orR
+  val l3PrefetchLateInRefillCycle = busDemandRead_s1 && sameStashRefill_s1
+  val l3PrefetchLateInPipeCycle = busDemandRead_s1 && !sameStashRefill_s1 && sameStashRefillPipe_s1
+  val prevBusDemandRead = RegNext(busDemandRead_s1, false.B)
+  val prevBusDemandBlockAddr = RegEnable(busDemandBlockAddr_s1, busDemandRead_s1)
+  val sameBusDemandAsPrev = prevBusDemandRead && prevBusDemandBlockAddr === busDemandBlockAddr_s1
+  val l3PrefetchLateInRefill = l3PrefetchLateInRefillCycle &&
+    !(RegNext(l3PrefetchLateInRefillCycle, false.B) && sameBusDemandAsPrev)
+  val l3PrefetchLateInPipe = l3PrefetchLateInPipeCycle &&
+    !(RegNext(l3PrefetchLateInPipeCycle, false.B) && sameBusDemandAsPrev)
+
   val blockEntrance = blockByMainPipe || blockByRefill || blockByResp || blockByMem
 
   task_s1.valid := io.dirRead_s1.ready && (io.busTask_s1.valid || io.refillTask_s1.valid) && !blockEntrance
@@ -152,4 +173,8 @@ class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo wi
   io.refillBufRead_s2.valid := task_s2.valid && task_s2.bits.refillTask
   io.refillBufRead_s2.bits.id := task_s2.bits.bufID
 
+  XSPerfAccumulate("l3_prefetch_late_in_refill", l3PrefetchLateInRefill)
+  XSPerfAccumulate("l3_prefetch_late_in_refill_cycles", l3PrefetchLateInRefillCycle)
+  XSPerfAccumulate("l3_prefetch_late_in_pipe", l3PrefetchLateInPipe)
+  XSPerfAccumulate("l3_prefetch_late_in_pipe_cycles", l3PrefetchLateInPipeCycle)
 }

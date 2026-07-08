@@ -86,6 +86,8 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   pipeInfo.s2_tag := task_s2.bits.tag
   pipeInfo.s2_set := task_s2.bits.set
   pipeInfo.s2_reqID := task_s2.bits.reqID
+  pipeInfo.s2_opcode := task_s2.bits.chiOpcode
+  pipeInfo.s2_refillTask := task_s2.bits.refillTask
 
   /* Stage 3 */
   val task_s3 = RegInit(0.U.asTypeOf(Valid(new Task())))
@@ -250,6 +252,8 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   pipeInfo.s3_tag := task_s3.bits.tag
   pipeInfo.s3_set := task_s3.bits.set
   pipeInfo.s3_reqID := task_s3.bits.reqID
+  pipeInfo.s3_opcode := task_s3.bits.chiOpcode
+  pipeInfo.s3_refillTask := task_s3.bits.refillTask
 
   /* Stage 4 */
   val task_s4 = RegInit(0.U.asTypeOf(Valid(new Task())))
@@ -473,6 +477,8 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   pipeInfo.s4_tag := task_s4.bits.tag
   pipeInfo.s4_set := task_s4.bits.set
   pipeInfo.s4_reqID := task_s4.bits.reqID
+  pipeInfo.s4_opcode := task_s4.bits.chiOpcode
+  pipeInfo.s4_refillTask := task_s4.bits.refillTask
 
   /* Stage 5 */
   val task_s5 = RegInit(0.U.asTypeOf(Valid(new Task())))
@@ -485,6 +491,8 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   pipeInfo.s5_tag := task_s5.bits.tag
   pipeInfo.s5_set := task_s5.bits.set
   pipeInfo.s5_reqID := task_s5.bits.reqID
+  pipeInfo.s5_opcode := task_s5.bits.chiOpcode
+  pipeInfo.s5_refillTask := task_s5.bits.refillTask
 
   /* Stage 6 */
   val task_s6 = RegInit(0.U.asTypeOf(Valid(new Task())))
@@ -522,7 +530,15 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   pipeInfo.s6_tag := task_s6.bits.tag
   pipeInfo.s6_set := task_s6.bits.set
   pipeInfo.s6_reqID := task_s6.bits.reqID
+  pipeInfo.s6_opcode := task_s6.bits.chiOpcode
+  pipeInfo.s6_refillTask := task_s6.bits.refillTask
 
+  val l3DemandRead_s3 = task_s3.valid && (readNotSharedDirty_s3 || readUnique_s3)
+  XSPerfAccumulate("l3_demand_read", l3DemandRead_s3)
+  XSPerfAccumulate("l3_demand_self_miss", l3DemandRead_s3 && !self_hit_s3)
+  XSPerfAccumulate("l3_demand_mem_miss", l3DemandRead_s3 && !self_hit_s3 && !peerRNs_hit_s3)
+  XSPerfAccumulate("l3_prefetch_demand_hit", task_s3.valid && consumeStash_s3)
+  XSPerfAccumulate("l3_prefetch_timely_hit", task_s3.valid && consumeStash_s3)
   XSPerfAccumulate("stash_once_shared_req", task_s3.valid && stashOnceShared_s3)
   XSPerfAccumulate("stash_once_shared_refill", task_s3.valid && refill_task_s3 && opcode_s3 === StashOnceShared)
   XSPerfAccumulate("stash_once_shared_miss", task_s4.valid && stashMissRead_s4)

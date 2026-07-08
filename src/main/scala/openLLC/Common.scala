@@ -170,6 +170,8 @@ class PipeStatus(implicit p: Parameters) extends LLCBundle {
   val tags = Vec(5, UInt(tagBits.W))
   val sets = Vec(5, UInt(setBits.W))
   val reqIDs = Vec(5, UInt(TXNID_WIDTH.W))
+  val opcodes = Vec(5, UInt(OPCODE_WIDTH.W))
+  val refillTasks = Vec(5, Bool())
   val valids = Vec(5, Bool())
 
   def s2_tag = tags(0)
@@ -189,6 +191,18 @@ class PipeStatus(implicit p: Parameters) extends LLCBundle {
   def s4_reqID = reqIDs(2)
   def s5_reqID = reqIDs(3)
   def s6_reqID = reqIDs(4)
+
+  def s2_opcode = opcodes(0)
+  def s3_opcode = opcodes(1)
+  def s4_opcode = opcodes(2)
+  def s5_opcode = opcodes(3)
+  def s6_opcode = opcodes(4)
+
+  def s2_refillTask = refillTasks(0)
+  def s3_refillTask = refillTasks(1)
+  def s4_refillTask = refillTasks(2)
+  def s5_refillTask = refillTasks(3)
+  def s6_refillTask = refillTasks(4)
 
   def s2_valid = valids(0)
   def s3_valid = valids(1)
