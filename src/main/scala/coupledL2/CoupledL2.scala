@@ -372,6 +372,7 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     val io = IO(new Bundle {
       val hartId = Input(UInt(hartIdLen.W))
       val pfCtrlFromCore = Input(new PrefetchCtrlFromCore)
+      val perfClean = Input(Bool())
     //  val l2_hint = Valid(UInt(32.W))
       val l2_hint = ValidIO(new L2ToL1Hint()(l2ECCParams))
       val l2_tlb_req = new L2ToL1TlbIO(nRespDups = 1)(l2TlbParams)
@@ -542,6 +543,7 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
         }
         in.b.bits.address := restoreAddress(slice.io.in.b.bits.address, i)
         slice.io.sliceId := i.U
+        slice.io.perfClean := io.perfClean
 
         slice.io.error.ready := enableECC.asBool // TODO: fix the datapath as optional
 

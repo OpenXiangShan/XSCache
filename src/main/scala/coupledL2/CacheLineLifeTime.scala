@@ -38,6 +38,7 @@ class CacheLineLifeTime(implicit p: Parameters) extends L2Module {
     val fill = Input(new CacheLineLifeTimeFillEvent)
     val access = Input(new CacheLineLifeTimeEvent)
     val snoopInvalid = Input(new CacheLineLifeTimeEvent)
+    val perfClean = Input(Bool())
   })
 
   val sInvalid :: sPrefetchWait :: sAcquireWait :: sAccessed :: Nil = Enum(4)
@@ -128,6 +129,11 @@ class CacheLineLifeTime(implicit p: Parameters) extends L2Module {
       states(io.access.set)(accessWay) := sAccessed
       timestamps(io.access.set)(accessWay) := globalTimer
     }
+  }
+
+  when (io.perfClean) {
+    globalTimer := 0.U
+    timestamps.foreach(_.foreach(_ := 0.U))
   }
 
   XSPerfAccumulate("cacheline_prefetch_prepare_time", prefetchPrepareTime)

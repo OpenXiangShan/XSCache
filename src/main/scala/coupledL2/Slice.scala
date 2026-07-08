@@ -131,6 +131,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   mainPipe.io.releaseBufResp_s3.bits := releaseBuf.io.resp.data
   mainPipe.io.toDS.rdata_s5 := dataStorage.io.rdata
   mainPipe.io.toDS.error_s5 := dataStorage.io.error
+  mainPipe.io.perfClean := io.perfClean
   // mainPipe.io.grantBufferHint := grantBuf.io.l1Hint
   // mainPipe.io.globalCounter := grantBuf.io.globalCounter
 

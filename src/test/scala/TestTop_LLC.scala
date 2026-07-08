@@ -218,10 +218,12 @@ class TestTopSoC(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, issue:
     val logEnable = WireDefault(false.B)
     val clean = WireDefault(false.B)
     val dump = WireDefault(false.B)
+    val cnt = RegInit(0.U(64.W))
+    cnt := cnt + 1.U
 
     timer := { if (extTime) time_sim else cycle }
     logEnable := true.B
-    clean := log.clean
+    clean := log.clean || cnt === 8000.U
     dump := log.dump
 
     dontTouch(timer)
@@ -290,6 +292,7 @@ class TestTopSoC(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, issue:
       l2.module.io.nodeID := i.U(NODEID_WIDTH.W)
       l2.module.io.debugTopDown := DontCare
       l2.module.io.l2_tlb_req <> DontCare
+      l2.module.io.perfClean := clean
     }
 
     if (!l3Params.FPGAPlatform && l3Params.enableCHILog) {
@@ -390,7 +393,8 @@ object TestTopSoCHelper {
     (new ChiselStage).execute(args, Seq(
       ChiselGeneratorAnnotation(() => top.module),
       FirtoolOption("--disable-annotation-unknown"),
-      FirtoolOption("--default-layer-specialization=enable")
+      FirtoolOption("--default-layer-specialization=enable"),
+      FirtoolOption("--preserve-values=all")
     ))
 
     ChiselDB.addToFileRegisters

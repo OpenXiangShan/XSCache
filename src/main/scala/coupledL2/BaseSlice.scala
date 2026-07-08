@@ -37,6 +37,7 @@ abstract class BaseSliceIO[T_OUT <: BaseOuterBundle](implicit p: Parameters) ext
   val pfStatInMSHR = topDownOpt.map(_ => Output(new PfStatInMSHRBundle()))
   val error = DecoupledIO(new L2CacheErrorInfo())
   val l2Miss = Output(Bool())
+  val perfClean = Input(Bool())
   val l2Flush = Option.when(cacheParams.enableL2Flush) (Input(Bool()))
   val l2FlushDone = Option.when(cacheParams.enableL2Flush) (Output(Bool()))
   // statistics

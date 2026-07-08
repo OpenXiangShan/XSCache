@@ -122,6 +122,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     /* l2 flush (CMO All) */
     val cmoAllBlock = Option.when(cacheParams.enableL2Flush) (Input(Bool()))
     val cmoLineDone = Option.when(cacheParams.enableL2Flush) (Output(Bool()))
+    val perfClean = Input(Bool())
   })
 
   require(chiOpt.isDefined)
@@ -1005,6 +1006,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   cacheLineLifeTime.io.snoopInvalid.valid := task_s3.valid && metaW_valid_s3_b && metaW_s3_b.state === INVALID
   cacheLineLifeTime.io.snoopInvalid.set := req_s3.set
   cacheLineLifeTime.io.snoopInvalid.way := dirResult_s3.way
+  cacheLineLifeTime.io.perfClean := io.perfClean
 
   /* ===== Performance counters ===== */
   // SinkA requests
