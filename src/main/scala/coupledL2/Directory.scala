@@ -27,6 +27,7 @@ import org.chipsalliance.cde.config.Parameters
 import xscache.coupledL2.prefetch.PfSource
 import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.util.SeqToAugmentedSeq
+import utility.XSPerfHistogram
 
 class MetaEntry(implicit p: Parameters) extends L2Bundle {
   val dirty = Bool()
@@ -451,6 +452,7 @@ class Directory(implicit p: Parameters) extends L2Module {
 
   XSPerfAccumulate("dirRead_cnt", io.read.fire)
   XSPerfAccumulate("choose_busy_way", reqValid_s3 && !Mux1H(chosenOH, req_s3.wayMask))
+  XSPerfHistogram("replWay", replaceWay, refillReqValid_s3 && !refillRetry, 0, ways)
 
   /* ====== ChiselDB logging for  prefetcher lifecycle ====== */
   if (cacheParams.enableMonitor && !cacheParams.FPGAPlatform) {
