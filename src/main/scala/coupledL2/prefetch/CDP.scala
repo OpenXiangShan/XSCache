@@ -5,6 +5,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import xscache.coupledL2.{HasCoupledL2Parameters, L2ToL1TlbIO}
 import utility._
+import utility.sram.SRAMTemplate
 import xscache.coupledL2._
 
 case class CDPParameters(
@@ -417,96 +418,72 @@ class VpnTable(implicit p: Parameters) extends CDPModule {
 
 class ftQueryReq(implicit p: Parameters) extends CDPBundle {
   val set_idx = UInt(FilterTableSetBits.W)
-  val offset  = UInt(FilterTableOffsetBits.W)
 }
 
 class ftQueryRsp(implicit p: Parameters) extends CDPBundle {
   val valid_vec = Vec(FilterTableWayNum, Bool())
   val tag_vec   = Vec(FilterTableWayNum, UInt(FilterTableTagBits.W))
-  val sat_vec   = Vec(FilterTableWayNum, UInt(2.W))
+  val sat_vec   = Vec(FilterTableWayNum, Vec(FilterEntryBlks, UInt(2.W)))
 }
 
 class ftTrainReq(implicit p: Parameters) extends CDPBundle {
-  val alloc   = Bool()
-  val set_idx = UInt(FilterTableSetBits.W)
-  val target_way  = UInt(log2Ceil(FilterTableWayNum).W)
+  val set     = UInt(FilterTableSetBits.W)
+  val way     = UInt(log2Ceil(FilterTableWayNum).W)
   val tag     = UInt(FilterTableTagBits.W)
-  val offset  = UInt(FilterTableOffsetBits.W)
-
-  val is_used   = Bool()
+  val sat     = Vec(FilterEntryBlks, UInt(2.W))
 }
 
 class FilterTable(implicit p: Parameters) extends CDPModule {
   val io = IO(new Bundle {
-    val query_req = Flipped(Vec(2, ValidIO(new ftQueryReq)))
-    val query_rsp = Vec(2, Output(new ftQueryRsp))
-    val train_req = Flipped(ValidIO(new ftTrainReq))
+    val query_req = Flipped(DecoupledIO(new ftQueryReq))
+    val query_rsp = ValidIO(new ftQueryRsp)
+    val train_req = Flipped(DecoupledIO(new ftTrainReq))
   })
 
   val (query_req, query_rsp) = (io.query_req, io.query_rsp)
   val train_req = io.train_req
 
-  // Tag Array
-  val tag_array = RegInit(VecInit(Seq.fill(FilterTableSetNum)(
-    VecInit(Seq.fill(FilterTableWayNum)(0.U(FilterTableTagBits.W)))
-  )))
+  def ftEntry() = new Bundle {
+    val valid = Bool()
+    val tag   = UInt(FilterTableTagBits.W)
+    val sat   = Vec(FilterEntryBlks, UInt(2.W))  // 2-bit saturating counter for each block
+  }
 
-  // Valid Array
-  val valid_array = RegInit(VecInit(Seq.fill(FilterTableSetNum)(
-    VecInit(Seq.fill(FilterTableWayNum)(false.B))
-  )))
-
-  // Sat Cnt Array
-  val sat_array = RegInit(VecInit(Seq.fill(FilterTableSetNum)(
-    VecInit(Seq.fill(FilterTableWayNum)(
-      VecInit(Seq.fill(FilterEntryBlks)(2.U(2.W)))
-    ))
-  )))
+  val ftTable = Module(
+    new SRAMTemplate(
+      ftEntry(),
+      set = FilterTableSetNum,
+      way = FilterTableWayNum,
+      shouldReset = true,
+      singlePort = true,
+      hasMbist = cacheParams.hasMbist,
+      hasSramCtl = cacheParams.hasSramCtl
+    )
+  )
 
   // query
-  for (i <- 0 until 2) {
-    val (req, rsp) = (query_req(i), query_rsp(i))
+  query_req.ready := ftTable.io.r.req.ready && !train_req.valid
+  val rData = Wire(Vec(FilterTableWayNum, ftEntry()))
+  ftTable.io.r.req.valid := query_req.fire
+  ftTable.io.r.req.bits.setIdx := query_req.bits.set_idx
+  rData := ftTable.io.r.resp.data
 
-    rsp.valid_vec := valid_array(req.bits.set_idx)
-    for (j <- 0 until FilterTableWayNum) {
-      rsp.tag_vec(j) := tag_array(req.bits.set_idx)(j)
-      rsp.sat_vec(j) := sat_array(req.bits.set_idx)(j)(req.bits.offset)
-    }
+  query_rsp.valid := RegNext(query_req.fire)
+  for (i <- 0 until FilterTableWayNum) {
+    query_rsp.bits.valid_vec(i) := rData(i).valid
+    query_rsp.bits.tag_vec(i)   := rData(i).tag
+    query_rsp.bits.sat_vec(i)   := rData(i).sat
   }
 
   // train
-  when (train_req.valid) {
-    val (set_idx, target_way) = (train_req.bits.set_idx, train_req.bits.target_way)
+  val wData = WireInit(0.U.asTypeOf(ftEntry()))
+  wData.valid := true.B
+  wData.tag   := train_req.bits.tag
+  wData.sat   := train_req.bits.sat
 
-    when (train_req.bits.alloc) {
-      // Update Tag
-      tag_array(set_idx)(target_way) := train_req.bits.tag
-
-      // Update Valid
-      valid_array(set_idx)(target_way) := true.B
-
-      // Update Sat Cnt
-      for (i <- 0 until FilterEntryBlks) {
-        when (i.U =/= train_req.bits.offset) {
-          sat_array(set_idx)(target_way)(i) := 2.U
-        }.otherwise {
-          sat_array(set_idx)(target_way)(i) := Mux(train_req.bits.is_used, 1.U, 3.U)
-        }
-      }
-    }.otherwise {
-      // only update the sat counter of the target way & offset
-      val offset = train_req.bits.offset
-      val sat_cnt = sat_array(set_idx)(target_way)(offset)
-
-      when (train_req.bits.is_used) {
-        // if this prefetch is used, it's a good sign, decrease the counter (saturate at 0)
-        sat_array(set_idx)(target_way)(offset) := Mux(sat_cnt === 0.U, 0.U, sat_cnt - 1.U)
-      }.otherwise {
-        // if this prefetch is not used, it's a bad sign, increase the counter (saturate at 3)
-        sat_array(set_idx)(target_way)(offset) := Mux(sat_cnt === 3.U, 3.U, sat_cnt + 1.U)
-      }
-    }
-  }
+  train_req.ready := ftTable.io.w.req.ready
+  ftTable.io.w.req.valid := train_req.valid
+  ftTable.io.w.req.bits.apply(wData, train_req.bits.set, UIntToOH(train_req.bits.way, FilterTableWayNum))
 }
 
 class CDPDetectReq(implicit p: Parameters) extends CDPBundle {
@@ -526,226 +503,226 @@ class CDPPrefetchReq(implicit p: Parameters) extends CDPBundle {
   val is_hit    = Bool()
 }
 
-class TrainPipeline(implicit p: Parameters) extends CDPModule {
+class ftTrainPipeline(implicit p: Parameters) extends CDPModule {
   val io = IO(new Bundle {
-    val vt_train_trigger = Flipped(DecoupledIO(new PrefetchTrain))
-    val ft_train_trigger = Flipped(DecoupledIO(new PrefetchTrain))
+    val train_trigger = Flipped(DecoupledIO(new PrefetchTrain))
 
-    // to VPN Table
-    val vt_query_req = ValidIO(new vtQueryReq)
-    val vt_query_rsp = Flipped(ValidIO(new vtQueryRsp))
-    val vt_train_req = ValidIO(new vtTrainReq)
-
-    // to Filter Table
-    val ft_query_req = ValidIO(new ftQueryReq)
-    val ft_query_rsp = Input(new ftQueryRsp)
-    val ft_train_req = ValidIO(new ftTrainReq)
+    // to FilterTable
+    val query_req = DecoupledIO(new ftQueryReq)
+    val query_rsp = Flipped(ValidIO(new ftQueryRsp))
+    val train_req = DecoupledIO(new ftTrainReq)
   })
 
-  val (vt_train_trigger, ft_train_trigger) = (io.vt_train_trigger, io.ft_train_trigger)
-  val (vt_query_req, vt_query_rsp, vt_train_req) = (io.vt_query_req, io.vt_query_rsp, io.vt_train_req)
-  val (ft_query_req, ft_query_rsp, ft_train_req) = (io.ft_query_req, io.ft_query_rsp, io.ft_train_req)
+  val (train_trigger, query_req, query_rsp, train_req) =
+    (io.train_trigger, io.query_req, io.query_rsp, io.train_req)
 
-  // Replacer
-  val vt_replacer = ReplacementPolicy.fromString(replType, VpnTableWayNum, VpnTableSetNum)
-  val ft_replacer = ReplacementPolicy.fromString(replType, FilterTableWayNum, FilterTableSetNum)
+  val replacer = ReplacementPolicy.fromString(replType, FilterTableWayNum, FilterTableSetNum)
 
-  // Pipeline Control Signals Def
-  val vt_stage_valid  = Wire(Vec(5, Bool()))
-  val ft_stage_valid  = Wire(Vec(5, Bool()))
+  val train_paddr = Mux(
+    train_trigger.bits.cdp_filter_train_evict,
+    train_trigger.bits.evict_addr,
+    train_trigger.bits.addr
+  )
+  val s0_set_idx = get_filter_set(train_paddr)
+  val s0_offset  = get_filter_offset(train_paddr)
+  val s0_tag     = get_filter_tag(train_paddr)
+  val s0_is_used = train_trigger.bits.cdp_filter_train_hit
 
-  val vt_same_vec = Wire(Vec(4, Bool()))
-  val ft_same_vec = Wire(Vec(4, Bool()))
+  val s1_valid = RegInit(false.B)
+  val s1_set_idx = Reg(UInt(FilterTableSetBits.W))
+  val s1_offset  = Reg(UInt(FilterTableOffsetBits.W))
+  val s1_tag     = Reg(UInt(FilterTableTagBits.W))
+  val s1_is_used = Reg(Bool())
 
-  // ----------- s0 -----------
-  val vt_same_addr  = vt_same_vec.reduce(_ || _)
-  val ft_same_addr  = ft_same_vec.reduce(_ || _)
-  
-  // VpnTable
-  vt_stage_valid(0) := vt_train_trigger.valid && !vt_same_addr
-  vt_train_trigger.ready := reset.asBool || !vt_same_addr
+  val s2_valid = query_rsp.valid
+  val s2_set_idx = RegEnable(s1_set_idx, query_req.fire)
+  val s2_offset  = RegEnable(s1_offset, query_req.fire)
+  val s2_tag     = RegEnable(s1_tag, query_req.fire)
+  val s2_is_used = RegEnable(s1_is_used, query_req.fire)
 
-  val vt_train_vaddr  = vt_train_trigger.bits.vaddr.getOrElse(0.U) << log2Ceil(blockBytes)
-  val vt_s0_main_idx = get_main_idx(vt_train_vaddr)
-  val vt_s0_sub_idx  = get_sub_idx(vt_train_vaddr)
-  val vt_s0_tag      = get_vpntab_tag(vt_train_vaddr)
+  val s3_valid = RegNext(s2_valid, false.B)
+  val s3_set_idx = RegEnable(s2_set_idx, s2_valid)
+  val s3_offset  = RegEnable(s2_offset, s2_valid)
+  val s3_tag     = RegEnable(s2_tag, s2_valid)
+  val s3_is_used = RegEnable(s2_is_used, s2_valid)
 
-  val vt_s0_is_hit_cdp  = vt_train_trigger.bits.hit && vt_train_trigger.bits.pfsource === PfSource.CDP.id.U
+  // ----------- s0: accept train trigger -----------
+  val same_vec = Wire(Vec(3, Bool()))
+  val same_addr = same_vec.reduce(_ || _)
+  val s1_ready = !s1_valid || query_req.ready && train_req.ready
 
-  // FilterTable
-  ft_stage_valid(0) := ft_train_trigger.valid && !ft_same_addr
-  ft_train_trigger.ready := reset.asBool || !ft_same_addr
+  train_trigger.ready := reset.asBool || (s1_ready && !same_addr)
 
-  val ft_train_paddr  = Mux(ft_train_trigger.bits.cdp_filter_train_evict, ft_train_trigger.bits.evict_addr, ft_train_trigger.bits.addr)
-  val ft_s0_set_idx   = get_filter_set(ft_train_paddr)
-  val ft_s0_offset    = get_filter_offset(ft_train_paddr)
-  val ft_s0_tag       = get_filter_tag(ft_train_paddr)
-  val ft_s0_is_used   = ft_train_trigger.bits.cdp_filter_train_hit
-
-  // ----------- s1 -----------
-  // VpnTable: query
-  vt_stage_valid(1) := RegNext(vt_stage_valid(0))
-
-  val vt_s1_main_idx  = RegNext(vt_s0_main_idx)
-  val vt_s1_sub_idx   = RegNext(vt_s0_sub_idx)
-  val vt_s1_tag       = RegNext(vt_s0_tag)
-  val vt_s1_tab_rsp   = vt_query_rsp.bits
-
-  val vt_s1_is_hit_cdp  = RegNext(vt_s0_is_hit_cdp)
-
-  vt_query_req.valid := vt_stage_valid(1)
-  vt_query_req.bits.main_idx := vt_s1_main_idx
-  vt_query_req.bits.sub_idx  := vt_s1_sub_idx
-
-  vt_same_vec(0) := vt_stage_valid(1) && vt_s1_main_idx === vt_s0_main_idx && vt_s1_tag === vt_s0_tag
-
-  // FilterTable: query
-  ft_stage_valid(1) := RegNext(ft_stage_valid(0))
-
-  val ft_s1_set_idx   = RegNext(ft_s0_set_idx)
-  val ft_s1_offset    = RegNext(ft_s0_offset)
-  val ft_s1_tag       = RegNext(ft_s0_tag)
-  val ft_s1_is_used   = RegNext(ft_s0_is_used)
-  val ft_s1_tab_rsp   = ft_query_rsp
-
-  ft_query_req.valid := ft_stage_valid(1)
-  ft_query_req.bits.set_idx := ft_s1_set_idx
-  ft_query_req.bits.offset  := ft_s1_offset
-  ft_same_vec(0) := ft_stage_valid(1) && ft_s1_set_idx === ft_s0_set_idx && ft_s1_tag === ft_s0_tag
-
-  // ----------- s2 -----------
-  // VpnTable: check miss
-  vt_stage_valid(2) := RegNext(vt_stage_valid(1))
-
-  val vt_s2_main_idx = RegNext(vt_s1_main_idx)
-  val vt_s2_sub_idx  = RegNext(vt_s1_sub_idx)
-  val vt_s2_tag      = RegNext(vt_s1_tag)
-  val vt_s2_tab_rsp  = RegNext(vt_s1_tab_rsp)
-
-  val vt_s2_is_hit_cdp  = RegNext(vt_s1_is_hit_cdp)
-
-  val vt_s2_tag_vec    = vt_s2_tab_rsp.tag_vec
-  val vt_s2_meta_vec   = vt_s2_tab_rsp.meta_vec
-  val vt_s2_valid_vec  = vt_s2_tab_rsp.valid_vec
-
-  val vt_s2_hit_main_vec = vt_s2_tag_vec.zip(vt_s2_valid_vec).map {
-    case (t, v) =>
-      t === vt_s2_tag && v
-  }
-  val vt_s2_hit_main_idx = PriorityEncoder(vt_s2_hit_main_vec)
-  val vt_s2_hit_main     = vt_s2_hit_main_vec.reduce(_ || _)
-  assert(PopCount(vt_s2_hit_main_vec) < 2.U || !vt_stage_valid(2), "Main entry multiple hit!")
-
-  val vt_s2_hit_sub_vec  = vt_s2_tag_vec.zip(vt_s2_meta_vec).zip(vt_s2_valid_vec).map {
-    case ((t, m), v) =>
-      t === vt_s2_tag && m.valid && v
-  }
-  val vt_s2_hit_sub      = vt_s2_hit_sub_vec.reduce(_ || _)
-
-  vt_same_vec(1) := vt_stage_valid(2) && vt_s2_main_idx === vt_s0_main_idx && vt_s2_tag === vt_s0_tag
-
-  // FilterTable: check miss
-  ft_stage_valid(2) := RegNext(ft_stage_valid(1))
-  val ft_s2_set_idx   = RegNext(ft_s1_set_idx)
-  val ft_s2_offset    = RegNext(ft_s1_offset)
-  val ft_s2_tag       = RegNext(ft_s1_tag)
-  val ft_s2_is_used   = RegNext(ft_s1_is_used)
-
-  val ft_s2_tab_rsp = RegNext(ft_s1_tab_rsp)
-  val ft_s2_valid_vec  = ft_s2_tab_rsp.valid_vec
-  val ft_s2_tag_vec    = ft_s2_tab_rsp.tag_vec
-
-  val ft_s2_hit_vec    = ft_s2_tag_vec.zip(ft_s2_valid_vec).map {
-    case (t, v) =>
-      t === ft_s2_tag && v
+  when (s1_ready) {
+    s1_valid := train_trigger.fire
+    when (train_trigger.fire) {
+      s1_set_idx := s0_set_idx
+      s1_offset  := s0_offset
+      s1_tag     := s0_tag
+      s1_is_used := s0_is_used
+    }
   }
 
-  val ft_s2_hit         = ft_s2_hit_vec.reduce(_ || _)
-  val ft_s2_hit_idx     = PriorityEncoder(ft_s2_hit_vec)
-
-  ft_same_vec(1) := ft_stage_valid(2) && ft_s2_set_idx === ft_s0_set_idx && ft_s2_tag === ft_s0_tag
-
-  // ----------- s3 -----------
-  // VpnTable: get replacement way & generate update info
-  vt_stage_valid(3) := RegNext(vt_stage_valid(2))
-
-  val vt_s3_main_idx = RegNext(vt_s2_main_idx)
-  val vt_s3_sub_idx  = RegNext(vt_s2_sub_idx)
-  val vt_s3_tag      = RegNext(vt_s2_tag)
-
-  val vt_s3_hit_main     = RegNext(vt_s2_hit_main)
-  val vt_s3_hit_sub      = RegNext(vt_s2_hit_sub)
-  val vt_s3_hit_main_idx = RegNext(vt_s2_hit_main_idx)
-
-  val vt_s3_is_hit_cdp  = RegNext(vt_s2_is_hit_cdp)
-
-  val vt_s3_update_info = WireInit(0.U.asTypeOf(new vtTrainReq))
-
-  val plru_way = vt_replacer.way(vt_s3_main_idx)
-
-  vt_s3_update_info.tag  := vt_s3_tag
-  vt_s3_update_info.main_idx := vt_s3_main_idx
-  vt_s3_update_info.sub_idx  := vt_s3_sub_idx
-
-  vt_s3_update_info.alloc_main := !vt_s3_hit_main
-  vt_s3_update_info.alloc_sub  := vt_s3_hit_main && !vt_s3_hit_sub
-  vt_s3_update_info.target_way := Mux(vt_s3_hit_main, vt_s3_hit_main_idx, plru_way)
-
-  vt_s3_update_info.is_hit_cdp := vt_s3_is_hit_cdp
-
-  vt_same_vec(2) := vt_stage_valid(3)  && vt_s3_main_idx === vt_s0_main_idx && vt_s3_tag === vt_s0_tag
-
-  // FilterTable: get replacement way & generate update info
-  ft_stage_valid(3) := RegNext(ft_stage_valid(2))
-  val ft_s3_set_idx   = RegNext(ft_s2_set_idx)
-  val ft_s3_offset    = RegNext(ft_s2_offset)
-  val ft_s3_tag       = RegNext(ft_s2_tag)
-  val ft_s3_is_used   = RegNext(ft_s2_is_used)
-
-  val ft_s3_hit        = RegNext(ft_s2_hit)
-  val ft_s3_hit_idx    = RegNext(ft_s2_hit_idx)
-
-  val ft_s3_update_info = WireInit(0.U.asTypeOf(new ftTrainReq))
-  val ft_plru_way = ft_replacer.way(ft_s3_set_idx)
-  ft_s3_update_info.set_idx := ft_s3_set_idx
-  ft_s3_update_info.offset  := ft_s3_offset
-  ft_s3_update_info.tag     := ft_s3_tag
-  ft_s3_update_info.alloc    := !ft_s3_hit && !ft_s3_is_used    // only alloc when input is a negative trigger
-  ft_s3_update_info.is_used  := ft_s3_is_used
-  ft_s3_update_info.target_way := Mux(ft_s3_hit, ft_s3_hit_idx, ft_plru_way)
-
-  ft_same_vec(2) := ft_stage_valid(3) && ft_s3_set_idx === ft_s0_set_idx && ft_s3_tag === ft_s0_tag
-
-  // ----------- s4 -----------
-  // VpnTable: update table & plru
-  vt_stage_valid(4) := RegNext(vt_stage_valid(3))
-
-  val vt_s4_update_info  = RegNext(vt_s3_update_info)
-
-  vt_train_req.valid  := vt_stage_valid(4)
-  vt_train_req.bits   := vt_s4_update_info
-
-  when (vt_stage_valid(4)) {
-    vt_replacer.access(vt_s4_update_info.main_idx, vt_s4_update_info.target_way)
+  // ----------- s1: query FilterTable -----------
+  query_req.valid := s1_valid
+  query_req.bits.set_idx := s1_set_idx
+  when (query_req.fire && !train_trigger.fire) {
+    s1_valid := false.B
   }
 
-  vt_same_vec(3) := vt_stage_valid(4) && vt_s4_update_info.main_idx === vt_s0_main_idx && vt_s4_update_info.tag === vt_s0_tag
+  same_vec(0) := s1_valid && s1_set_idx === s0_set_idx && s1_tag === s0_tag
 
-  // FilterTable: update table & plru
-  ft_stage_valid(4) := RegNext(ft_stage_valid(3) && (ft_s3_hit || !ft_s3_hit && !ft_s3_is_used))
-
-  val ft_s4_update_info = RegNext(ft_s3_update_info)
-
-  ft_train_req.valid := ft_stage_valid(4)
-  ft_train_req.bits  := ft_s4_update_info
-
-  when (ft_stage_valid(4)){
-    ft_replacer.access(ft_s4_update_info.set_idx, ft_s4_update_info.target_way)
+  // ----------- s2: receive FilterTable response -----------
+  val s2_hit_vec = query_rsp.bits.tag_vec.zip(query_rsp.bits.valid_vec).map {
+    case (tag, valid) => tag === s2_tag && valid
   }
-  
-  ft_same_vec(3) := ft_stage_valid(4) && ft_s4_update_info.set_idx === ft_s0_set_idx && ft_s4_update_info.tag === ft_s0_tag
+  val s2_hit = s2_hit_vec.reduce(_ || _)
+  val s2_hit_way = PriorityEncoder(s2_hit_vec)
+  assert(PopCount(s2_hit_vec) < 2.U || !s2_valid, "FilterTable entry multiple hit!")
 
-  // ----------- ChiselDB -----------
+  val s2_repl_way = replacer.way(s2_set_idx)
+  val s2_target_way = Mux(s2_hit, s2_hit_way, s2_repl_way)
+  val s2_old_sat_vec = query_rsp.bits.sat_vec(s2_target_way)
+  val s2_need_update = s2_hit || !s2_is_used
+
+  val s2_next_sat_vec = Wire(Vec(FilterEntryBlks, UInt(2.W)))
+  for (i <- 0 until FilterEntryBlks) {
+    val old_sat = s2_old_sat_vec(i)
+
+    when (!s2_hit) {
+      s2_next_sat_vec(i) := Mux(i.U === s2_offset, Mux(s2_is_used, 1.U, 3.U), 2.U)  // if not hit, set the accessed block to 1 or 3, others to 2
+    }.otherwise {
+      // if hit, update the accessed block's sat counter based on whether it is used or not
+      s2_next_sat_vec(i) := Mux(i.U === s2_offset,
+        Mux(s2_is_used, Mux(old_sat === 0.U, 0.U, old_sat - 1.U), Mux(old_sat === 3.U, 3.U, old_sat + 1.U)),
+        old_sat
+      )
+    }
+  }
+
+  val s2_update_info = WireInit(0.U.asTypeOf(new ftTrainReq))
+  s2_update_info.set := s2_set_idx
+  s2_update_info.way := s2_target_way
+  s2_update_info.tag := s2_tag
+  s2_update_info.sat := s2_next_sat_vec
+
+  same_vec(1) := s2_valid && s2_set_idx === s0_set_idx && s2_tag === s0_tag
+
+  // ----------- s3: drive FilterTable update -----------
+  val s3_update_info = RegEnable(s2_update_info, s2_valid)
+  val s3_need_update = RegEnable(s2_need_update, s2_valid)
+
+  train_req.valid := s3_valid && s3_need_update
+  train_req.bits  := s3_update_info
+
+  when (train_req.fire) {
+    replacer.access(s3_update_info.set, s3_update_info.way)
+  }
+
+  same_vec(2) := s3_valid && s3_set_idx === s0_set_idx && s3_tag === s0_tag
+}
+
+class vtTrainPipeline(implicit p: Parameters) extends CDPModule {
+  val io = IO(new Bundle {
+    val train_trigger = Flipped(DecoupledIO(new PrefetchTrain))
+
+    // to VPN Table
+    val query_req = ValidIO(new vtQueryReq)
+    val query_rsp = Flipped(ValidIO(new vtQueryRsp))
+    val train_req = ValidIO(new vtTrainReq)
+  })
+
+  val (train_trigger, query_req, query_rsp, train_req) =
+    (io.train_trigger, io.query_req, io.query_rsp, io.train_req)
+
+  val replacer = ReplacementPolicy.fromString(replType, VpnTableWayNum, VpnTableSetNum)
+
+  val stage_valid = Wire(Vec(5, Bool()))
+  val same_vec = Wire(Vec(4, Bool()))
+
+  val same_addr = same_vec.reduce(_ || _)
+
+  // ----------- s0: accept train trigger -----------
+  stage_valid(0) := train_trigger.valid && !same_addr
+  train_trigger.ready := reset.asBool || !same_addr
+
+  val train_vaddr = train_trigger.bits.vaddr.getOrElse(0.U) << log2Ceil(blockBytes)
+  val s0_main_idx = get_main_idx(train_vaddr)
+  val s0_sub_idx  = get_sub_idx(train_vaddr)
+  val s0_tag      = get_vpntab_tag(train_vaddr)
+  val s0_is_hit_cdp = train_trigger.bits.hit && train_trigger.bits.pfsource === PfSource.CDP.id.U
+
+  // ----------- s1: query VpnTable -----------
+  stage_valid(1) := RegNext(stage_valid(0))
+  val s1_main_idx = RegNext(s0_main_idx)
+  val s1_sub_idx  = RegNext(s0_sub_idx)
+  val s1_tag      = RegNext(s0_tag)
+  val s1_is_hit_cdp = RegNext(s0_is_hit_cdp)
+  val s1_tab_rsp = query_rsp.bits
+
+  query_req.valid := stage_valid(1)
+  query_req.bits.main_idx := s1_main_idx
+  query_req.bits.sub_idx  := s1_sub_idx
+
+  same_vec(0) := stage_valid(1) && s1_main_idx === s0_main_idx && s1_tag === s0_tag
+
+  // ----------- s2: check VpnTable hit -----------
+  stage_valid(2) := RegNext(stage_valid(1))
+  val s2_main_idx = RegNext(s1_main_idx)
+  val s2_sub_idx  = RegNext(s1_sub_idx)
+  val s2_tag      = RegNext(s1_tag)
+  val s2_is_hit_cdp = RegNext(s1_is_hit_cdp)
+  val s2_tab_rsp = RegNext(s1_tab_rsp)
+
+  val s2_hit_main_vec = s2_tab_rsp.tag_vec.zip(s2_tab_rsp.valid_vec).map {
+    case (tag, valid) => tag === s2_tag && valid
+  }
+  val s2_hit_main_idx = PriorityEncoder(s2_hit_main_vec)
+  val s2_hit_main = s2_hit_main_vec.reduce(_ || _)
+  assert(PopCount(s2_hit_main_vec) < 2.U || !stage_valid(2), "Main entry multiple hit!")
+
+  val s2_hit_sub_vec = s2_tab_rsp.tag_vec.zip(s2_tab_rsp.meta_vec).zip(s2_tab_rsp.valid_vec).map {
+    case ((tag, meta), valid) => tag === s2_tag && meta.valid && valid
+  }
+  val s2_hit_sub = s2_hit_sub_vec.reduce(_ || _)
+
+  same_vec(1) := stage_valid(2) && s2_main_idx === s0_main_idx && s2_tag === s0_tag
+
+  // ----------- s3: build VpnTable update -----------
+  stage_valid(3) := RegNext(stage_valid(2))
+  val s3_main_idx = RegNext(s2_main_idx)
+  val s3_sub_idx  = RegNext(s2_sub_idx)
+  val s3_tag      = RegNext(s2_tag)
+  val s3_is_hit_cdp = RegNext(s2_is_hit_cdp)
+  val s3_hit_main = RegNext(s2_hit_main)
+  val s3_hit_sub = RegNext(s2_hit_sub)
+  val s3_hit_main_idx = RegNext(s2_hit_main_idx)
+
+  val plru_way = replacer.way(s3_main_idx)
+  val s3_update_info = WireInit(0.U.asTypeOf(new vtTrainReq))
+  s3_update_info.tag := s3_tag
+  s3_update_info.main_idx := s3_main_idx
+  s3_update_info.sub_idx := s3_sub_idx
+  s3_update_info.alloc_main := !s3_hit_main
+  s3_update_info.alloc_sub := s3_hit_main && !s3_hit_sub
+  s3_update_info.target_way := Mux(s3_hit_main, s3_hit_main_idx, plru_way)
+  s3_update_info.is_hit_cdp := s3_is_hit_cdp
+
+  same_vec(2) := stage_valid(3) && s3_main_idx === s0_main_idx && s3_tag === s0_tag
+
+  // ----------- s4: drive VpnTable update -----------
+  stage_valid(4) := RegNext(stage_valid(3))
+  val s4_update_info = RegNext(s3_update_info)
+
+  train_req.valid := stage_valid(4)
+  train_req.bits := s4_update_info
+
+  when (stage_valid(4)) {
+    replacer.access(s4_update_info.main_idx, s4_update_info.target_way)
+  }
+
+  same_vec(3) := stage_valid(4) && s4_update_info.main_idx === s0_main_idx && s4_update_info.tag === s0_tag
+
   class trainTriggerEntry extends CDPBundle {
     val vaddr = UInt(fullAddressBits.W)
     val main_idx = UInt(mainEntryBits.W)
@@ -759,15 +736,15 @@ class TrainPipeline(implicit p: Parameters) extends CDPModule {
   val cdpTrainTriggerDB = ChiselDB.createTable("cdpTrain", new trainTriggerEntry, basicDB = debug)
 
   val train_trigger_entry = Wire(new trainTriggerEntry)
-  train_trigger_entry.vaddr := RegNext(RegNext(RegNext(RegNext(vt_train_vaddr))))     // vaddr in s4
-  train_trigger_entry.main_idx  := vt_s4_update_info.main_idx
-  train_trigger_entry.sub_idx   := vt_s4_update_info.sub_idx
-  train_trigger_entry.way       := vt_s4_update_info.target_way
-  train_trigger_entry.alloc_main := vt_s4_update_info.alloc_main
-  train_trigger_entry.alloc_sub  := vt_s4_update_info.alloc_sub
-  train_trigger_entry.no_alloc   := !vt_s4_update_info.alloc_main && !vt_s4_update_info.alloc_sub
+  train_trigger_entry.vaddr := RegNext(RegNext(RegNext(RegNext(train_vaddr))))
+  train_trigger_entry.main_idx := s4_update_info.main_idx
+  train_trigger_entry.sub_idx := s4_update_info.sub_idx
+  train_trigger_entry.way := s4_update_info.target_way
+  train_trigger_entry.alloc_main := s4_update_info.alloc_main
+  train_trigger_entry.alloc_sub := s4_update_info.alloc_sub
+  train_trigger_entry.no_alloc := !s4_update_info.alloc_main && !s4_update_info.alloc_sub
 
-  cdpTrainTriggerDB.log(train_trigger_entry, vt_stage_valid(4), "", clock, reset)
+  cdpTrainTriggerDB.log(train_trigger_entry, stage_valid(4), "", clock, reset)
 }
 
 class DetectPipeline(name:String)(implicit p: Parameters) extends CDPModule {
@@ -936,7 +913,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
     val tlb_req = new L2ToL1TlbIO
 
     // filter table
-    val ft_query_req = ValidIO(new ftQueryReq)
+    val ft_query_req = DecoupledIO(new ftQueryReq)
     val ft_query_rsp = Input(new ftQueryRsp)
   })
 
@@ -1094,7 +1071,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   val pft_s1_valid = Wire(Bool())
 
   val pft_s0_chosen_idx = Wire(UInt(log2Ceil(ReqFilterEntryNum).W))
-  val pft_s1_chosen_idx = RegNext(pft_s0_chosen_idx)
+  val pft_s1_chosen_idx = RegEnable(pft_s0_chosen_idx, ft_query_req.fire)
 
   // --------- req s0: arb prefetch req ---------
   for (i <- 0 until ReqFilterEntryNum) {
@@ -1110,39 +1087,38 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   }
 
   pft_s0_valid := pft_arb.io.out.valid
-  pft_arb.io.out.ready := true.B
+  pft_arb.io.out.ready := ft_query_req.ready
   pft_s0_chosen_idx := pft_arb.io.chosen
 
   val pft_s0_req = pft_arb.io.out.bits
 
-  ft_query_req.valid := false.B
+  ft_query_req.valid := pft_s0_valid
   ft_query_req.bits  := 0.U.asTypeOf(new ftQueryReq)
+  ft_query_req.bits.set_idx := get_filter_set(pft_s0_req.addr)
 
   // --------- req s1: recv filter table rsp ---------
-  pft_s1_valid  := RegNext(pft_s0_valid)
+  pft_s1_valid  := RegNext(ft_query_req.fire)
 
-  val pft_s1_req  = RegNext(pft_s0_req)
-  val ft_s1_rsp   = RegNext(ft_query_rsp)
+  val pft_s1_req  = RegEnable(pft_s0_req, ft_query_req.fire)
+  val ft_s1_rsp   = ft_query_rsp
 
   val hit = Wire(Bool())
   val can_pft = Wire(Bool())
   if (UseFilterTable) {
-    // query the FilterTable
-    ft_query_req.valid := pft_s0_valid
-    ft_query_req.bits.set_idx := get_filter_set(pft_s0_req.addr)
-    ft_query_req.bits.offset  := get_filter_offset(pft_s0_req.addr)
-
     val valid_vec = ft_s1_rsp.valid_vec
     val tag_vec   = ft_s1_rsp.tag_vec
     val hit_vec   = valid_vec.zip(tag_vec).map{
       case (v, t) =>
         v && t === get_filter_tag(pft_s1_req.addr)
     }
+
     val hit_idx = PriorityEncoder(hit_vec)
+    val offset  = get_filter_offset(pft_s1_req.addr)
 
     val sat_vec = ft_s1_rsp.sat_vec
     hit := hit_vec.reduce(_ || _)
-    can_pft := !hit || sat_vec(hit_idx) =/= 3.U
+    can_pft := !hit || sat_vec(hit_idx)(offset) =/= 3.U
+
   } else {
     hit := false.B
     can_pft := true.B
@@ -1220,7 +1196,8 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
 
   val filter_table      = if (UseFilterTable) Some(Module(new FilterTable)) else None
   val vpn_table         = Module(new VpnTable)
-  val train_pipe        = Module(new TrainPipeline)
+  val vt_train_pipe     = Module(new vtTrainPipeline)
+  val ft_train_pipe     = if (UseFilterTable) Some(Module(new ftTrainPipeline)) else None
   val detect_pipe_seq   = Seq.tabulate(DetectPipeNum)(i => Module(new DetectPipeline(s"dp$i")))
 
   // TODO: ugly...
@@ -1304,7 +1281,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   val vpn_train_reqBuf  = Module(new Queue(new PrefetchTrain, 8))
   vpn_train_reqBuf.io.enq.valid := vpn_train.valid && enable
   vpn_train_reqBuf.io.enq.bits  := vpn_train.bits
-  train_pipe.io.vt_train_trigger <> vpn_train_reqBuf.io.deq
+  vt_train_pipe.io.train_trigger <> vpn_train_reqBuf.io.deq
   XSPerfAccumulate("vpn_train_drop", vpn_train_reqBuf.io.enq.valid && !vpn_train_reqBuf.io.enq.ready)
   XSPerfAccumulate("vpn_train_accept", vpn_train_reqBuf.io.enq.fire)
 
@@ -1312,16 +1289,13 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
     val filter_train_reqBuf = Module(new Queue(new PrefetchTrain, 8))
     filter_train_reqBuf.io.enq.valid := filter_train.valid && enable
     filter_train_reqBuf.io.enq.bits  := filter_train.bits
-    train_pipe.io.ft_train_trigger <> filter_train_reqBuf.io.deq
+    ft_train_pipe.get.io.train_trigger <> filter_train_reqBuf.io.deq
     XSPerfAccumulate("filter_train_drop", filter_train_reqBuf.io.enq.valid && !filter_train_reqBuf.io.enq.ready)
     XSPerfAccumulate("filter_train_accept", filter_train_reqBuf.io.enq.fire)
-  } else {
-    train_pipe.io.ft_train_trigger.valid := false.B
-    train_pipe.io.ft_train_trigger.bits  := 0.U.asTypeOf(new PrefetchTrain)
   }
 
-  val vpn_tab_query_req_seq = detect_pipe_seq.map(_.io.vt_query_req) ++ Seq(train_pipe.io.vt_query_req)
-  val vpn_tab_query_rsp_seq = detect_pipe_seq.map(_.io.vt_query_rsp) ++ Seq(train_pipe.io.vt_query_rsp)
+  val vpn_tab_query_req_seq = detect_pipe_seq.map(_.io.vt_query_req) ++ Seq(vt_train_pipe.io.query_req)
+  val vpn_tab_query_rsp_seq = detect_pipe_seq.map(_.io.vt_query_rsp) ++ Seq(vt_train_pipe.io.query_rsp)
   require(vpn_tab_query_req_seq.size == vpn_table.io.query_req.size)
   vpn_table.io.query_req.zip(vpn_tab_query_req_seq).foreach{
     case (tab_req, pipe_req) =>
@@ -1333,15 +1307,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
       pipe_rsp.valid := tab_rsp.valid
       pipe_rsp.bits := tab_rsp.bits
   }
-  vpn_table.io.train_req  <> train_pipe.io.vt_train_req
-
-  if (UseFilterTable) {
-    filter_table.get.io.query_req(0)  <> train_pipe.io.ft_query_req
-    filter_table.get.io.query_rsp(0)  <> train_pipe.io.ft_query_rsp
-    filter_table.get.io.train_req     <> train_pipe.io.ft_train_req
-  } else {
-    train_pipe.io.ft_query_rsp := 0.U.asTypeOf(new ftQueryRsp)
-  }
+  vpn_table.io.train_req  <> vt_train_pipe.io.train_req
 
   val issueDegree =
     if (UseDynamicDegree) {
@@ -1393,9 +1359,23 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   val send_unit = Module(new SentUnit)
   send_unit.io.tlb_req <> io.tlb_req
   if (UseFilterTable) {
-    send_unit.io.ft_query_req <> filter_table.get.io.query_req(1)
-    send_unit.io.ft_query_rsp <> filter_table.get.io.query_rsp(1)
+    val ft_query_arb = Module(new RRArbiter(new ftQueryReq, 2))
+    ft_query_arb.io.in(0) <> ft_train_pipe.get.io.query_req
+    ft_query_arb.io.in(1) <> send_unit.io.ft_query_req
+    filter_table.get.io.query_req <> ft_query_arb.io.out
+
+    filter_table.get.io.train_req <> ft_train_pipe.get.io.train_req
+
+    val ft_query_chosen = RegEnable(ft_query_arb.io.chosen, ft_query_arb.io.out.fire)
+    ft_train_pipe.get.io.query_rsp.valid := filter_table.get.io.query_rsp.valid && ft_query_chosen === 0.U
+    ft_train_pipe.get.io.query_rsp.bits  := filter_table.get.io.query_rsp.bits
+    send_unit.io.ft_query_rsp := Mux(
+      filter_table.get.io.query_rsp.valid && ft_query_chosen === 1.U,
+      filter_table.get.io.query_rsp.bits,
+      0.U.asTypeOf(new ftQueryRsp)
+    )
   } else {
+    send_unit.io.ft_query_req.ready := true.B
     send_unit.io.ft_query_rsp := 0.U.asTypeOf(new ftQueryRsp)
   }
   send_unit.io.in   <> degree_buf_arb.io.out
