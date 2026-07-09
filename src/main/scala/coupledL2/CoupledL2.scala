@@ -753,6 +753,10 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
             io.l2_hint.valid := master.fire && selectedHint.hasData
             io.l2_hint.bits.isKeyword := selectedHint.isKeyword
             io.l2_hint.bits.sourceId := selectedHint.sourceId - client.sourceId.start.U
+            io.l2_hint.bits.l2Miss := selectedHint.l2Miss
+            io.l2_hint.bits.l2HitPrefetch := selectedHint.l2HitPrefetch
+            io.l2_hint.bits.reqSource := selectedHint.reqSource
+            io.l2_hint.bits.pfSource := selectedHint.pfSource
           }
           hintChosen.valid := master.fire
           hintChosen.bits.sliceId := OHToUInt(fires)

@@ -22,6 +22,7 @@ import chisel3.util._
 import utility._
 import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.tilelink.TLMessages._
+import xscache.coupledL2.prefetch.PfSource
 import xscache.coupledL2.utils._
 
 class HintQueueEntry(implicit p: Parameters) extends L2Bundle {
@@ -29,6 +30,10 @@ class HintQueueEntry(implicit p: Parameters) extends L2Bundle {
   val isGrantData = Bool()
   val isKeyword = Bool()
   val hasData = Bool()
+  val l2Miss = Bool()
+  val l2HitPrefetch = Bool()
+  val reqSource = UInt(MemReqSource.reqSourceBits.W)
+  val pfSource = UInt(PfSource.pfSourceBits.W)
 }
 
 class CustomL1HintIOBundle(implicit p: Parameters) extends L2Bundle {
@@ -40,6 +45,10 @@ class CustomL1HintIOBundle(implicit p: Parameters) extends L2Bundle {
   val s3 = new L2Bundle {
       val task      = Flipped(ValidIO(new TaskBundle()))
       val need_mshr = Input(Bool())
+      val dirHit = Input(Bool())
+      val metaPrefetch = Input(Bool())
+      val metaPfSource = Input(UInt(PfSource.pfSourceBits.W))
+      val reqSource = Input(UInt(MemReqSource.reqSourceBits.W))
   }
 
   // output hint
@@ -86,17 +95,30 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   enqBits_s1.isKeyword := Mux(mshr_s1.mergeA, mshrMerge_s1.isKeyword.getOrElse(false.B), mshr_s1.isKeyword.getOrElse(false.B)) 
   enqBits_s1.isGrantData := mshr_GrantData_s1
   enqBits_s1.hasData := mshr_GrantData_s1 || mshr_AccessAckData_s1
+  enqBits_s1.l2Miss := false.B
+  enqBits_s1.l2HitPrefetch := false.B
+  enqBits_s1.reqSource := MemReqSource.NoWhere.id.U
+  enqBits_s1.pfSource := PfSource.NoWhere.id.U
 
   // Hint for "chnTask Hit" will fire@s3
   val chn_Grant_s3     = task_s3.valid && !mshrReq_s3 && !need_mshr_s3 && task_s3.bits.fromA && task_s3.bits.opcode === Grant
   val chn_GrantData_s3 = task_s3.valid && !mshrReq_s3 && !need_mshr_s3 && task_s3.bits.fromA && task_s3.bits.opcode === GrantData
   val chn_AccessAckData_s3 = task_s3.valid && !mshrReq_s3 && !need_mshr_s3 && task_s3.bits.fromA && task_s3.bits.opcode === AccessAckData
   val enqBits_s3 = Wire(new HintQueueEntry)
-  val enqValid_s3 = chn_Grant_s3 || chn_GrantData_s3 || chn_AccessAckData_s3
+  val l1MissReqToL2_s3 = task_s3.valid && !mshrReq_s3 && task_s3.bits.fromA &&
+    (task_s3.bits.opcode === AcquireBlock || task_s3.bits.opcode === AcquirePerm || task_s3.bits.opcode === Get ||
+      task_s3.bits.opcode === Grant || task_s3.bits.opcode === GrantData || task_s3.bits.opcode === AccessAckData) &&
+    task_s3.bits.needHint.getOrElse(false.B)
+  val l2ResultTrigger_s3 = l1MissReqToL2_s3 && (!io.s3.dirHit || io.s3.metaPrefetch)
+  val enqValid_s3 = chn_Grant_s3 || chn_GrantData_s3 || chn_AccessAckData_s3 || l2ResultTrigger_s3
   enqBits_s3.source := task_s3.bits.sourceId
   enqBits_s3.isKeyword := task_s3.bits.isKeyword.getOrElse(false.B)
   enqBits_s3.isGrantData := chn_GrantData_s3
   enqBits_s3.hasData := chn_GrantData_s3 || chn_AccessAckData_s3
+  enqBits_s3.l2Miss := l2ResultTrigger_s3 && !io.s3.dirHit
+  enqBits_s3.l2HitPrefetch := l2ResultTrigger_s3 && io.s3.dirHit && io.s3.metaPrefetch
+  enqBits_s3.reqSource := io.s3.reqSource
+  enqBits_s3.pfSource := io.s3.metaPfSource
 
   // ==================== Hint Queue ====================
   val hintEntries = mshrsAll
@@ -130,4 +152,8 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   io.l1Hint.bits.sourceId := hintQueue.io.deq.bits.source
   io.l1Hint.bits.isKeyword := hintQueue.io.deq.bits.isKeyword
   io.l1Hint.bits.hasData := hintQueue.io.deq.bits.hasData
+  io.l1Hint.bits.l2Miss := hintQueue.io.deq.bits.l2Miss
+  io.l1Hint.bits.l2HitPrefetch := hintQueue.io.deq.bits.l2HitPrefetch
+  io.l1Hint.bits.reqSource := hintQueue.io.deq.bits.reqSource
+  io.l1Hint.bits.pfSource := hintQueue.io.deq.bits.pfSource
 }

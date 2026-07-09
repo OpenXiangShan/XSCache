@@ -22,6 +22,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.tilelink.TLPermissions._
 import utility.MemReqSource
+import xscache.coupledL2.prefetch.PfSource
 import xscache.chi.{CHIREQ, HasCHIMsgParameters, MemAttr, MPAM, OrderEncodings}
 
 abstract class L2Module(implicit val p: Parameters) extends Module with HasCoupledL2Parameters
@@ -404,6 +405,10 @@ class PrefetchRecv extends Bundle {
 class L2ToL1Hint(implicit p: Parameters) extends L2Bundle {
   val sourceId = UInt(sourceIdBits.W)    // tilelink sourceID
   val isKeyword = Bool()       // miss entry keyword
+  val l2Miss = Bool()
+  val l2HitPrefetch = Bool()
+  val reqSource = UInt(MemReqSource.reqSourceBits.W)
+  val pfSource = UInt(PfSource.pfSourceBits.W)
 }
 
 class L2ToL1HintInsideL2(implicit p: Parameters) extends L2ToL1Hint {

@@ -829,6 +829,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // overwrite opcode: if sinkReq can respond, use sink_resp_s3.bits.opcode = Grant/GrantData
   customL1Hint.io.s3.task.bits.opcode := Mux(sink_resp_s3.valid, sink_resp_s3.bits.opcode, task_s3.bits.opcode)
   customL1Hint.io.s3.need_mshr := need_mshr_s3_a
+  customL1Hint.io.s3.dirHit := dirResult_s3.hit
+  customL1Hint.io.s3.metaPrefetch := metaOnHit_s3.prefetch.getOrElse(false.B)
+  customL1Hint.io.s3.metaPfSource := metaOnHit_s3.prefetchSrc.getOrElse(PfSource.NoWhere.id.U)
+  customL1Hint.io.s3.reqSource := req_s3.reqSource
 
   customL1Hint.io.l1Hint <> io.l1Hint
 
