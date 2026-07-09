@@ -443,15 +443,18 @@ class FilterTable(implicit p: Parameters) extends CDPModule {
   val (query_req, query_rsp) = (io.query_req, io.query_rsp)
   val train_req = io.train_req
 
-  def ftEntry() = new Bundle {
+  require(FilterEntryBlks % 4 == 0, "FilterEntryBlks must be divisible by 4")
+  val SatBankNum = 4
+  val SatBankBlks = FilterEntryBlks / SatBankNum
+
+  def ftMetaEntry() = new Bundle {
     val valid = Bool()
     val tag   = UInt(FilterTableTagBits.W)
-    val sat   = Vec(FilterEntryBlks, UInt(2.W))  // 2-bit saturating counter for each block
   }
 
-  val ftTable = Module(
+  val metaArray = Module(
     new SRAMTemplate(
-      ftEntry(),
+      ftMetaEntry(),
       set = FilterTableSetNum,
       way = FilterTableWayNum,
       shouldReset = true,
@@ -460,30 +463,60 @@ class FilterTable(implicit p: Parameters) extends CDPModule {
       hasSramCtl = cacheParams.hasSramCtl
     )
   )
+  val satBanks = Seq.fill(SatBankNum) {
+    Module(
+      new SRAMTemplate(
+        Vec(SatBankBlks, UInt(2.W)),
+        set = FilterTableSetNum,
+        way = FilterTableWayNum,
+        singlePort = true,
+        hasMbist = cacheParams.hasMbist,
+        hasSramCtl = cacheParams.hasSramCtl
+      )
+    )
+  }
 
   // query
-  query_req.ready := ftTable.io.r.req.ready && !train_req.valid
-  val rData = Wire(Vec(FilterTableWayNum, ftEntry()))
-  ftTable.io.r.req.valid := query_req.fire
-  ftTable.io.r.req.bits.setIdx := query_req.bits.set_idx
-  rData := ftTable.io.r.resp.data
+  val queryReady = metaArray.io.r.req.ready && satBanks.map(_.io.r.req.ready).reduce(_ && _) && !train_req.valid
+  query_req.ready := queryReady
+  val queryFire = query_req.valid && queryReady
 
-  query_rsp.valid := RegNext(query_req.fire)
+  metaArray.io.r.req.valid := queryFire
+  metaArray.io.r.req.bits.setIdx := query_req.bits.set_idx
+  satBanks.foreach { bank =>
+    bank.io.r.req.valid := queryFire
+    bank.io.r.req.bits.setIdx := query_req.bits.set_idx
+  }
+
+  query_rsp.valid := RegNext(queryFire, false.B)
   for (i <- 0 until FilterTableWayNum) {
-    query_rsp.bits.valid_vec(i) := rData(i).valid
-    query_rsp.bits.tag_vec(i)   := rData(i).tag
-    query_rsp.bits.sat_vec(i)   := rData(i).sat
+    query_rsp.bits.valid_vec(i) := metaArray.io.r.resp.data(i).valid
+    query_rsp.bits.tag_vec(i)   := metaArray.io.r.resp.data(i).tag
+    for (j <- 0 until FilterEntryBlks) {
+      query_rsp.bits.sat_vec(i)(j) := satBanks(j / SatBankBlks).io.r.resp.data(i)(j % SatBankBlks)
+    }
   }
 
   // train
-  val wData = WireInit(0.U.asTypeOf(ftEntry()))
-  wData.valid := true.B
-  wData.tag   := train_req.bits.tag
-  wData.sat   := train_req.bits.sat
+  val trainReady = metaArray.io.w.req.ready && satBanks.map(_.io.w.req.ready).reduce(_ && _)
+  train_req.ready := trainReady
+  val trainFire = train_req.valid && trainReady
+  val trainWayOH = UIntToOH(train_req.bits.way, FilterTableWayNum)
 
-  train_req.ready := ftTable.io.w.req.ready
-  ftTable.io.w.req.valid := train_req.valid
-  ftTable.io.w.req.bits.apply(wData, train_req.bits.set, UIntToOH(train_req.bits.way, FilterTableWayNum))
+  val metaWData = WireInit(0.U.asTypeOf(ftMetaEntry()))
+  metaWData.valid := true.B
+  metaWData.tag   := train_req.bits.tag
+  metaArray.io.w.req.valid := trainFire
+  metaArray.io.w.req.bits.apply(metaWData, train_req.bits.set, trainWayOH)
+
+  for (bankIdx <- 0 until SatBankNum) {
+    val satWData = Wire(Vec(SatBankBlks, UInt(2.W)))
+    for (blkIdx <- 0 until SatBankBlks) {
+      satWData(blkIdx) := train_req.bits.sat(bankIdx * SatBankBlks + blkIdx)
+    }
+    satBanks(bankIdx).io.w.req.valid := trainFire
+    satBanks(bankIdx).io.w.req.bits.apply(satWData, train_req.bits.set, trainWayOH)
+  }
 }
 
 class CDPDetectReq(implicit p: Parameters) extends CDPBundle {
