@@ -560,18 +560,21 @@ class ftTrainPipeline(implicit p: Parameters) extends CDPModule {
   val s0_offset  = get_filter_offset(train_paddr)
   val s0_tag     = get_filter_tag(train_paddr)
   val s0_is_used = train_trigger.bits.cdp_filter_train_hit
+  val s0_is_evict = train_trigger.bits.cdp_filter_train_evict
 
   val s1_valid = RegInit(false.B)
   val s1_set_idx = Reg(UInt(FilterTableSetBits.W))
   val s1_offset  = Reg(UInt(FilterTableOffsetBits.W))
   val s1_tag     = Reg(UInt(FilterTableTagBits.W))
   val s1_is_used = Reg(Bool())
+  val s1_is_evict = Reg(Bool())
 
   val s2_valid = query_rsp.valid
   val s2_set_idx = RegEnable(s1_set_idx, query_req.fire)
   val s2_offset  = RegEnable(s1_offset, query_req.fire)
   val s2_tag     = RegEnable(s1_tag, query_req.fire)
   val s2_is_used = RegEnable(s1_is_used, query_req.fire)
+  val s2_is_evict = RegEnable(s1_is_evict, query_req.fire)
 
   val s3_valid = RegNext(s2_valid, false.B)
   val s3_set_idx = RegEnable(s2_set_idx, s2_valid)
@@ -593,6 +596,7 @@ class ftTrainPipeline(implicit p: Parameters) extends CDPModule {
       s1_offset  := s0_offset
       s1_tag     := s0_tag
       s1_is_used := s0_is_used
+      s1_is_evict := s0_is_evict
     }
   }
 
@@ -616,7 +620,7 @@ class ftTrainPipeline(implicit p: Parameters) extends CDPModule {
   val s2_repl_way = replacer.way(s2_set_idx)
   val s2_target_way = Mux(s2_hit, s2_hit_way, s2_repl_way)
   val s2_old_sat_vec = query_rsp.bits.sat_vec(s2_target_way)
-  val s2_need_update = s2_hit || !s2_is_used
+  val s2_need_update = s2_hit || s2_is_evict
 
   val s2_next_sat_vec = Wire(Vec(FilterEntryBlks, UInt(2.W)))
   for (i <- 0 until FilterEntryBlks) {
