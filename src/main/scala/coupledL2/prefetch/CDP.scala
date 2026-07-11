@@ -542,7 +542,7 @@ class ftTrainPipeline(implicit p: Parameters) extends CDPModule {
 
     // to FilterTable
     val query_req = DecoupledIO(new ftQueryReq)
-    val query_rsp = Flipped(ValidIO(new ftQueryRsp))
+    val query_rsp = Input(new ftQueryRsp)
     val train_req = DecoupledIO(new ftTrainReq)
   })
 
@@ -551,17 +551,6 @@ class ftTrainPipeline(implicit p: Parameters) extends CDPModule {
 
   val replacer = ReplacementPolicy.fromString(replType, FilterTableWayNum, FilterTableSetNum)
 
-  val train_paddr = Mux(
-    train_trigger.bits.cdp_filter_train_evict,
-    train_trigger.bits.evict_addr,
-    train_trigger.bits.addr
-  )
-  val s0_set_idx = get_filter_set(train_paddr)
-  val s0_offset  = get_filter_offset(train_paddr)
-  val s0_tag     = get_filter_tag(train_paddr)
-  val s0_is_used = train_trigger.bits.cdp_filter_train_hit
-  val s0_is_evict = train_trigger.bits.cdp_filter_train_evict
-
   val s1_valid = RegInit(false.B)
   val s1_set_idx = Reg(UInt(FilterTableSetBits.W))
   val s1_offset  = Reg(UInt(FilterTableOffsetBits.W))
@@ -569,85 +558,115 @@ class ftTrainPipeline(implicit p: Parameters) extends CDPModule {
   val s1_is_used = Reg(Bool())
   val s1_is_evict = Reg(Bool())
 
-  val s2_valid = query_rsp.valid
-  val s2_set_idx = RegEnable(s1_set_idx, query_req.fire)
-  val s2_offset  = RegEnable(s1_offset, query_req.fire)
-  val s2_tag     = RegEnable(s1_tag, query_req.fire)
-  val s2_is_used = RegEnable(s1_is_used, query_req.fire)
-  val s2_is_evict = RegEnable(s1_is_evict, query_req.fire)
+  val s2_valid = RegInit(false.B)
+  val s2_set_idx = Reg(UInt(FilterTableSetBits.W))
+  val s2_offset  = Reg(UInt(FilterTableOffsetBits.W))
+  val s2_tag     = Reg(UInt(FilterTableTagBits.W))
+  val s2_is_used = Reg(Bool())
+  val s2_is_evict = Reg(Bool())
 
-  val s3_valid = RegNext(s2_valid, false.B)
-  val s3_set_idx = RegEnable(s2_set_idx, s2_valid)
-  val s3_offset  = RegEnable(s2_offset, s2_valid)
-  val s3_tag     = RegEnable(s2_tag, s2_valid)
-  val s3_is_used = RegEnable(s2_is_used, s2_valid)
+  val s3_valid = Wire(Bool())
+  val s3_set_idx = Wire(UInt(FilterTableSetBits.W))
+  val s3_offset  = Wire(UInt(FilterTableOffsetBits.W))
+  val s3_tag     = Wire(UInt(FilterTableTagBits.W))
+  val s3_is_used = Wire(Bool())
+  val s3_is_evict = Wire(Bool())
 
-  // ----------- s0: accept train trigger -----------
   val same_vec = Wire(Vec(3, Bool()))
   val same_addr = same_vec.reduce(_ || _)
-  val s1_ready = !s1_valid || query_req.ready && train_req.ready
+  val s1_ready = !s1_valid || query_req.ready && train_req.ready    // s1 ready to recv req from s0
 
-  train_trigger.ready := reset.asBool || (s1_ready && !same_addr)
+  // ----------- s0: accept train trigger -----------
+  val s0_valid = train_trigger.valid && !same_addr
+  train_trigger.ready := !reset.asBool && s1_ready && !same_addr
 
-  when (s1_ready) {
-    s1_valid := train_trigger.fire
-    when (train_trigger.fire) {
-      s1_set_idx := s0_set_idx
-      s1_offset  := s0_offset
-      s1_tag     := s0_tag
-      s1_is_used := s0_is_used
-      s1_is_evict := s0_is_evict
-    }
-  }
+  val train_paddr = Mux(
+    train_trigger.bits.cdp_filter_train_evict,
+    train_trigger.bits.evict_addr,
+    train_trigger.bits.addr
+  )
+
+  val s0_set_idx = get_filter_set(train_paddr)
+  val s0_offset  = get_filter_offset(train_paddr)
+  val s0_tag     = get_filter_tag(train_paddr)
+  val s0_is_used = train_trigger.bits.cdp_filter_train_hit
+  val s0_is_evict = train_trigger.bits.cdp_filter_train_evict
 
   // ----------- s1: query FilterTable -----------
+  when (s1_ready) {
+    s1_valid   := s0_valid
+    s1_set_idx := s0_set_idx
+    s1_offset  := s0_offset
+    s1_tag     := s0_tag
+    s1_is_used := s0_is_used
+    s1_is_evict := s0_is_evict
+  }
+
   query_req.valid := s1_valid
   query_req.bits.set_idx := s1_set_idx
-  when (query_req.fire && !train_trigger.fire) {
-    s1_valid := false.B
-  }
 
   same_vec(0) := s1_valid && s1_set_idx === s0_set_idx && s1_tag === s0_tag
 
-  // ----------- s2: receive FilterTable response -----------
-  val s2_hit_vec = query_rsp.bits.tag_vec.zip(query_rsp.bits.valid_vec).map {
-    case (tag, valid) => tag === s2_tag && valid
+  // ----------- s2: receive FilterTable and latch -----------
+  when (query_req.fire) {
+    s2_valid := s1_valid
+    s2_set_idx := s1_set_idx
+    s2_offset  := s1_offset
+    s2_tag     := s1_tag
+    s2_is_used := s1_is_used
+    s2_is_evict := s1_is_evict
+  }.otherwise {
+    s2_valid := false.B
   }
-  val s2_hit = s2_hit_vec.reduce(_ || _)
-  val s2_hit_way = PriorityEncoder(s2_hit_vec)
-  assert(PopCount(s2_hit_vec) < 2.U || !s2_valid, "FilterTable entry multiple hit!")
 
-  val s2_repl_way = replacer.way(s2_set_idx)
-  val s2_target_way = Mux(s2_hit, s2_hit_way, s2_repl_way)
-  val s2_old_sat_vec = query_rsp.bits.sat_vec(s2_target_way)
-  val s2_need_update = s2_hit || s2_is_evict
+  val ft_s2_rsp = query_rsp
 
-  val s2_next_sat_vec = Wire(Vec(FilterEntryBlks, UInt(2.W)))
+  same_vec(1) := s2_valid && s2_set_idx === s0_set_idx && s2_tag === s0_tag
+
+  // ----------- s3: chk hit and update -----------
+  s3_valid := RegNext(s2_valid, false.B)
+  s3_set_idx  := RegNext(s2_set_idx)
+  s3_offset   := RegNext(s2_offset)
+  s3_tag      := RegNext(s2_tag)
+  s3_is_used  := RegNext(s2_is_used)
+  s3_is_evict := RegNext(s2_is_evict)
+
+  val ft_s3_rsp = RegNext(ft_s2_rsp)
+
+  val s3_hit_vec = ft_s3_rsp.tag_vec.zip(ft_s3_rsp.valid_vec).map {
+    case (tag, valid) => tag === s3_tag && valid
+  }
+
+  val s3_hit = s3_hit_vec.reduce(_ || _)
+  val s3_hit_way = PriorityEncoder(s3_hit_vec)
+  assert(PopCount(s3_hit_vec) < 2.U || !s3_valid, "FilterTable entry multiple hit!")
+
+  val s3_repl_way = replacer.way(s3_set_idx)
+  val s3_target_way = Mux(s3_hit, s3_hit_way, s3_repl_way)
+  val s3_old_sat_vec = ft_s3_rsp.sat_vec(s3_target_way)
+  val s3_need_update = s3_hit || s3_is_evict
+
+  val s3_next_sat_vec = Wire(Vec(FilterEntryBlks, UInt(2.W)))
   for (i <- 0 until FilterEntryBlks) {
-    val old_sat = s2_old_sat_vec(i)
-
-    when (!s2_hit) {
-      s2_next_sat_vec(i) := Mux(i.U === s2_offset, Mux(s2_is_used, 1.U, 3.U), 2.U)  // if not hit, set the accessed block to 1 or 3, others to 2
+    val old_sat = s3_old_sat_vec(i)
+    when (!s3_hit) {
+      s3_next_sat_vec(i) := Mux(i.U === s3_offset, Mux(s3_is_used, 1.U, 3.U), 2.U)  // if not hit, set the accessed block to 1 or 3, others to 2
     }.otherwise {
       // if hit, update the accessed block's sat counter based on whether it is used or not
-      s2_next_sat_vec(i) := Mux(i.U === s2_offset,
-        Mux(s2_is_used, Mux(old_sat === 0.U, 0.U, old_sat - 1.U), Mux(old_sat === 3.U, 3.U, old_sat + 1.U)),
+      s3_next_sat_vec(i) := Mux(i.U === s3_offset,
+        Mux(s3_is_used, Mux(old_sat === 0.U, 0.U, old_sat - 1.U), Mux(old_sat === 3.U, 3.U, old_sat + 1.U)),
         old_sat
       )
     }
   }
 
-  val s2_update_info = WireInit(0.U.asTypeOf(new ftTrainReq))
-  s2_update_info.set := s2_set_idx
-  s2_update_info.way := s2_target_way
-  s2_update_info.tag := s2_tag
-  s2_update_info.sat := s2_next_sat_vec
+  val s3_update_info = WireInit(0.U.asTypeOf(new ftTrainReq))
+  s3_update_info.set := s3_set_idx
+  s3_update_info.way := s3_target_way
+  s3_update_info.tag := s3_tag
+  s3_update_info.sat := s3_next_sat_vec
 
-  same_vec(1) := s2_valid && s2_set_idx === s0_set_idx && s2_tag === s0_tag
-
-  // ----------- s3: drive FilterTable update -----------
-  val s3_update_info = RegEnable(s2_update_info, s2_valid)
-  val s3_need_update = RegEnable(s2_need_update, s2_valid)
+  same_vec(2) := s3_valid && s3_set_idx === s0_set_idx && s3_tag === s0_tag
 
   train_req.valid := s3_valid && s3_need_update
   train_req.bits  := s3_update_info
@@ -655,8 +674,6 @@ class ftTrainPipeline(implicit p: Parameters) extends CDPModule {
   when (train_req.fire) {
     replacer.access(s3_update_info.set, s3_update_info.way)
   }
-
-  same_vec(2) := s3_valid && s3_set_idx === s0_set_idx && s3_tag === s0_tag
 }
 
 class vtTrainPipeline(implicit p: Parameters) extends CDPModule {
@@ -1105,10 +1122,21 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
 
   // --------------- prefetch req pipe ---------------
   val pft_s0_valid = Wire(Bool())
-  val pft_s1_valid = Wire(Bool())
+  val pft_s1_valid = RegInit(false.B)
+  val pft_s2_valid = RegInit(false.B)
+  val pft_s3_valid = Wire(Bool())
+
+  val pft_s1_ready = Wire(Bool())   // s1 ready to accept new req from buf
 
   val pft_s0_chosen_idx = Wire(UInt(log2Ceil(ReqFilterEntryNum).W))
-  val pft_s1_chosen_idx = RegEnable(pft_s0_chosen_idx, ft_query_req.fire)
+  val pft_s1_chosen_idx = Reg(UInt(log2Ceil(ReqFilterEntryNum).W))
+  val pft_s2_chosen_idx = Reg(UInt(log2Ceil(ReqFilterEntryNum).W))
+  val pft_s3_chosen_idx = Wire(UInt(log2Ceil(ReqFilterEntryNum).W))
+
+  val pft_s0_req = Wire(new PrefetchReq)
+  val pft_s1_req = Reg(new PrefetchReq)
+  val pft_s2_req = Reg(new PrefetchReq)
+  val pft_s3_req = Wire(new PrefetchReq)
 
   // --------- req s0: arb prefetch req ---------
   for (i <- 0 until ReqFilterEntryNum) {
@@ -1124,35 +1152,57 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   }
 
   pft_s0_valid := pft_arb.io.out.valid
-  pft_arb.io.out.ready := ft_query_req.ready
+  pft_arb.io.out.ready := pft_s1_ready
+
   pft_s0_chosen_idx := pft_arb.io.chosen
+  pft_s0_req := pft_arb.io.out.bits
 
-  val pft_s0_req = pft_arb.io.out.bits
+  // --------- req s1: query filter table ---------
+  pft_s1_ready := !pft_s1_valid || ft_query_req.fire
 
-  ft_query_req.valid := pft_s0_valid
+  when (pft_s1_ready) {
+    pft_s1_valid := pft_s0_valid
+    pft_s1_chosen_idx := pft_s0_chosen_idx
+    pft_s1_req := pft_s0_req
+  }
+
+  ft_query_req.valid := pft_s1_valid
   ft_query_req.bits  := 0.U.asTypeOf(new ftQueryReq)
-  ft_query_req.bits.set_idx := get_filter_set(pft_s0_req.addr)
+  ft_query_req.bits.set_idx := get_filter_set(pft_s1_req.addr)
 
-  // --------- req s1: recv filter table rsp ---------
-  pft_s1_valid  := RegNext(ft_query_req.fire)
+  // --------- req s2: recv filter table rsp & latch ---------
+  when (ft_query_req.fire) {
+    pft_s2_valid := pft_s1_valid
+    pft_s2_chosen_idx := pft_s1_chosen_idx
+    pft_s2_req := pft_s1_req
+  }.otherwise {
+    pft_s2_valid := false.B
+  }
 
-  val pft_s1_req  = RegEnable(pft_s0_req, ft_query_req.fire)
-  val ft_s1_rsp   = ft_query_rsp
+  val ft_s2_rsp = ft_query_rsp
+
+  // --------- req s3: chk hit & sent req ---------
+  pft_s3_valid := RegNext(pft_s2_valid, false.B)
+  pft_s3_chosen_idx := RegNext(pft_s2_chosen_idx)
+  pft_s3_req := RegNext(pft_s2_req)
+
+  val ft_s3_rsp = RegNext(ft_s2_rsp)
 
   val hit = Wire(Bool())
   val can_pft = Wire(Bool())
+
   if (UseFilterTable) {
-    val valid_vec = ft_s1_rsp.valid_vec
-    val tag_vec   = ft_s1_rsp.tag_vec
+    val valid_vec = ft_s3_rsp.valid_vec
+    val tag_vec   = ft_s3_rsp.tag_vec
     val hit_vec   = valid_vec.zip(tag_vec).map{
       case (v, t) =>
-        v && t === get_filter_tag(pft_s1_req.addr)
+        v && t === get_filter_tag(pft_s3_req.addr)
     }
 
     val hit_idx = PriorityEncoder(hit_vec)
-    val offset  = get_filter_offset(pft_s1_req.addr)
+    val offset  = get_filter_offset(pft_s3_req.addr)
 
-    val sat_vec = ft_s1_rsp.sat_vec
+    val sat_vec = ft_s3_rsp.sat_vec
     hit := hit_vec.reduce(_ || _)
     can_pft := !hit || sat_vec(hit_idx)(offset) =/= 3.U
 
@@ -1161,28 +1211,27 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
     can_pft := true.B
   }
 
-  when (out.fire || pft_s1_valid && !can_pft) {
-    valids(pft_s1_chosen_idx) := false.B
+  // send req
+  out.valid := pft_s3_valid && can_pft
+  out.bits  := pft_s3_req
+
+  when (out.fire || pft_s3_valid && !can_pft) {
+    valids(pft_s3_chosen_idx) := false.B
   }
 
-  when (pft_s1_valid) {
-    req_inflight(pft_s1_chosen_idx) := false.B
+  when (pft_s3_valid) {
+    req_inflight(pft_s3_chosen_idx) := false.B
   }
-
-  out.valid := pft_s1_valid && can_pft
-  out.bits  := pft_s1_req
 
   // ----------------- Perf Counter -----------------
   XSPerfAccumulate("in_drop_by_hit", in.valid && entry_hit)
   XSPerfAccumulate("in_drop_by_full", in.valid && !entry_hit && !has_free_entry)
 
-  XSPerfAccumulate("pf_req_drop_by_filter", pft_s1_valid && !can_pft)
-  XSPerfAccumulate("filter_hit", pft_s1_valid && hit)
-  XSPerfAccumulate("filter_miss", pft_s1_valid && !hit)
+  XSPerfAccumulate("pf_req_drop_by_filter", pft_s3_valid && !can_pft)
+  XSPerfAccumulate("filter_hit", pft_s3_valid && hit)
+  XSPerfAccumulate("filter_miss", pft_s3_valid && !hit)
 
-  
-
-  val chosen_entry = entries(pft_s1_chosen_idx)
+  val chosen_entry = entries(pft_s3_chosen_idx)
   XSPerfAccumulate("pf_req_fromCPU", out.fire && chosen_entry.pfSource === PfSource.NoWhere.id.U)
   XSPerfAccumulate("pf_req_fromBOP", out.fire && (chosen_entry.pfSource === PfSource.BOP.id.U || chosen_entry.pfSource === PfSource.PBOP.id.U))
   XSPerfAccumulate("pf_req_fromSMS", out.fire && chosen_entry.pfSource === PfSource.SMS.id.U)
@@ -1404,8 +1453,11 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
     filter_table.get.io.train_req <> ft_train_pipe.get.io.train_req
 
     val ft_query_chosen = RegEnable(ft_query_arb.io.chosen, ft_query_arb.io.out.fire)
-    ft_train_pipe.get.io.query_rsp.valid := filter_table.get.io.query_rsp.valid && ft_query_chosen === 0.U
-    ft_train_pipe.get.io.query_rsp.bits  := filter_table.get.io.query_rsp.bits
+    ft_train_pipe.get.io.query_rsp := Mux(
+      filter_table.get.io.query_rsp.valid && ft_query_chosen === 0.U,
+      filter_table.get.io.query_rsp.bits,
+      0.U.asTypeOf(new ftQueryRsp)
+    )
     send_unit.io.ft_query_rsp := Mux(
       filter_table.get.io.query_rsp.valid && ft_query_chosen === 1.U,
       filter_table.get.io.query_rsp.bits,
