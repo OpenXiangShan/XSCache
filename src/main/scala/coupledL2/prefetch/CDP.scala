@@ -671,6 +671,8 @@ class ftTrainPipeline(implicit p: Parameters) extends CDPModule {
   train_req.valid := s3_valid && s3_need_update
   train_req.bits  := s3_update_info
 
+  assert(!train_req.valid || train_req.ready, "FilterTable train req should be ready when valid!")
+
   when (train_req.fire) {
     replacer.access(s3_update_info.set, s3_update_info.way)
   }
@@ -995,9 +997,10 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   
   val req_inflight  = RegInit(VecInit(Seq.fill(ReqFilterEntryNum)(false.B)))
 
-  val tlb_arb = Module(new RRArbiterInit(new L2TlbReq, ReqFilterEntryNum))
-  val pft_arb = Module(new RRArbiterInit(new PrefetchReq, ReqFilterEntryNum))
-  tlb_arb.io.out <> tlb_req
+  val tlb_arb = Module(new TwoLevelRRArbiter(new L2TlbReq, ReqFilterEntryNum))
+  val pft_arb = Module(new TwoLevelRRArbiter(new PrefetchReq, ReqFilterEntryNum))
+  ArbPerf(tlb_arb, "cdp_tlb_arb")
+  ArbPerf(pft_arb, "cdp_pft_arb")
 
   // enq buf logic
   in.ready := true.B  // TODO: backpressure when buffer full
@@ -1033,15 +1036,16 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   }
 
   // --------------- tlb pipe ---------------
-  val tlb_s0_valid = Wire(Bool())
-  val tlb_s1_valid = Wire(Bool())
-  val tlb_s2_valid = Wire(Bool())
+  val tlb_s1_valid = RegInit(false.B)
+  val tlb_s2_valid = RegNext(tlb_req.fire, false.B)
+  val tlb_s3_valid = RegNext(tlb_s2_valid, false.B)
 
-  val tlb_s0_addr = Wire(UInt(fullAddressBits.W))
-  val tlb_s1_addr = RegNext(tlb_s0_addr)
-  val tlb_s2_addr = RegNext(tlb_s1_addr)
+  val tlb_s1_req = RegEnable(tlb_arb.io.out.bits, tlb_arb.io.out.fire)
+  val tlb_s1_addr = Wire(UInt(fullAddressBits.W))
+  val tlb_s2_addr = RegEnable(tlb_s1_addr, tlb_req.fire)
+  val tlb_s3_addr = RegEnable(tlb_s2_addr, tlb_s2_valid)
 
-  // -------- tlb s0: arb tlb req --------
+  // -------- tlb s0: arb tlb req from buffer --------
   for (i <- 0 until ReqFilterEntryNum) {
     val entry = entries(i)
     val entry_tlb_req = tlb_arb.io.in(i)
@@ -1051,8 +1055,12 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
     val req_vaddr = Cat(entry.vTag, 0.U(log2Ceil(blockBytes).W))
     val s1_same_page = same_page(req_vaddr, tlb_s1_addr) && tlb_s1_valid
     val s2_same_page = same_page(req_vaddr, tlb_s2_addr) && tlb_s2_valid
-    val page_conflict = s1_same_page || s2_same_page
-    assert(!(s1_same_page && s2_same_page), "two inflight tlb reqs should not target the same page!")
+    val s3_same_page = same_page(req_vaddr, tlb_s3_addr) && tlb_s3_valid
+    val page_conflict = s1_same_page || s2_same_page || s3_same_page
+    assert(
+      PopCount(Seq(s1_same_page, s2_same_page, s3_same_page)) <= 1.U,
+      "multiple inflight tlb reqs should not target the same page!"
+    )
 
     entry_tlb_req.valid := valids(i) && !entry.paddr_valid && entry_timer_ok && !page_conflict
     entry_tlb_req.bits  := DontCare
@@ -1060,39 +1068,46 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
     entry_tlb_req.bits.cmd    := TlbCmd.read
     entry_tlb_req.bits.isPrefetch := true.B
     entry_tlb_req.bits.size   := 3.U
+    entry_tlb_req.bits.kill   := false.B
+    entry_tlb_req.bits.no_translate := false.B
   }
 
-  tlb_s0_valid := tlb_arb.io.out.fire
-  tlb_s0_addr := tlb_arb.io.out.bits.vaddr
+  // -------- tlb s1: send tlb req --------
+  val tlb_s1_ready = !tlb_s1_valid || tlb_req.ready
+  tlb_arb.io.out.ready := tlb_s1_ready
+  when (tlb_s1_ready) {
+    tlb_s1_valid := tlb_arb.io.out.valid
+  }
 
-  // -------- tlb s1: recv tlb rsp --------
-  // if miss, enable retry. If second miss, drop the req
-  val tlb_s1_rsp = tlb_rsp
+  tlb_req.valid := tlb_s1_valid
+  tlb_req.bits := tlb_s1_req
+  tlb_s1_addr := tlb_s1_req.vaddr
 
-  tlb_s1_valid := RegNext(tlb_s0_valid)
+  // -------- tlb s2: recv tlb rsp --------
+  // If miss, enable retry. If the retry also misses, drop the req.
+  val tlb_s2_rsp = tlb_rsp
 
-  // -------- tlb s2: recv pmp rsp --------
-  tlb_s2_valid := RegNext(tlb_s1_valid)
-  val tlb_s2_pmp        = pmp_rsp
-  val tlb_s2_rsp_valid  = RegNext(tlb_s1_rsp.valid)
-  val tlb_s2_rsp_bits   = RegNext(tlb_s1_rsp.bits)
+  // -------- tlb s3: recv pmp rsp --------
+  val tlb_s3_pmp       = pmp_rsp
+  val tlb_s3_rsp_valid = RegNext(tlb_s2_rsp.valid, false.B)
+  val tlb_s3_rsp_bits  = RegNext(tlb_s2_rsp.bits)
 
-  val s2_drop = 
+  val s3_drop =
     // page/access fault
-    tlb_s2_rsp_bits.excp.head.pf.ld || tlb_s2_rsp_bits.excp.head.gpf.ld || tlb_s2_rsp_bits.excp.head.af.ld ||
+    tlb_s3_rsp_bits.excp.head.pf.ld || tlb_s3_rsp_bits.excp.head.gpf.ld || tlb_s3_rsp_bits.excp.head.af.ld ||
     // uncache
-    tlb_s2_pmp.mmio || Pbmt.isUncache(tlb_s2_rsp_bits.pbmt) ||
+    tlb_s3_pmp.mmio || Pbmt.isUncache(tlb_s3_rsp_bits.pbmt) ||
     // pmp access fault
-    tlb_s2_pmp.ld
+    tlb_s3_pmp.ld
   
-  // gather info from s1 and s2
+  // gather info from s2 and s3
   for (i <- 0 until ReqFilterEntryNum) {
     val entry = entries(i)
     val entry_addr = Cat(entries(i).vTag, 0.U(log2Ceil(blockBytes).W))
     
-    // s1: if first miss, enable retry; if second miss, drop
-    val s1_same_page = same_page(entry_addr, tlb_s1_addr) && tlb_s1_valid
-    when (s1_same_page && tlb_s1_rsp.valid && tlb_s1_rsp.bits.miss && valids(i)) {
+    // s2: if first miss, enable retry; if second miss, drop
+    val s2_same_page = same_page(entry_addr, tlb_s2_addr) && tlb_s2_valid
+    when (s2_same_page && tlb_s2_rsp.valid && tlb_s2_rsp.bits.miss && valids(i)) {
       when (entry.retry_en) {
         // second miss, drop the req
         valids(i) := false.B
@@ -1102,43 +1117,44 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
         entries(i).retry_timer := 0.U
       }
     }
-    XSPerfAccumulate(s"s1_drop_tlb_miss_entry$i", s1_same_page && tlb_s1_rsp.valid && tlb_s1_rsp.bits.miss && valids(i) && entry.retry_en)
+    XSPerfAccumulate(
+      s"s2_drop_tlb_miss_entry$i",
+      s2_same_page && tlb_s2_rsp.valid && tlb_s2_rsp.bits.miss && valids(i) && entry.retry_en
+    )
 
-    // s2: check pf && pmp result, if fail, drop the req; otherwise, update the entry
-    val s2_same_page = same_page(entry_addr, tlb_s2_addr) && tlb_s2_valid
-    when (s2_same_page && tlb_s2_rsp_valid && !tlb_s2_rsp_bits.miss && valids(i)) {
-      when (s2_drop) {
+    // s3: check pf && pmp result, if fail, drop the req; otherwise, update the entry
+    val s3_same_page = same_page(entry_addr, tlb_s3_addr) && tlb_s3_valid
+    when (s3_same_page && tlb_s3_rsp_valid && !tlb_s3_rsp_bits.miss && valids(i)) {
+      when (s3_drop) {
         valids(i) := false.B
       }.otherwise {
         entries(i).paddr_valid := true.B
 
-        val page_num    = tlb_s2_rsp_bits.paddr.head(fullAddressBits - 1, pageOffsetBits)
+        val page_num    = tlb_s3_rsp_bits.paddr.head(fullAddressBits - 1, pageOffsetBits)
         val page_offset = entry_addr(pageOffsetBits - 1, 0)
         entries(i).pTag := block_addr(Cat(page_num, page_offset))
       }
     }
-    XSPerfAccumulate(s"s2_drop_entry$i", s2_same_page && tlb_s2_rsp_valid && !tlb_s2_rsp_bits.miss && valids(i) && s2_drop)
+    XSPerfAccumulate(
+      s"s3_drop_entry$i",
+      s3_same_page && tlb_s3_rsp_valid && !tlb_s3_rsp_bits.miss && valids(i) && s3_drop
+    )
   }
 
   // --------------- prefetch req pipe ---------------
   val pft_s0_valid = Wire(Bool())
-  val pft_s1_valid = RegInit(false.B)
-  val pft_s2_valid = RegInit(false.B)
-  val pft_s3_valid = Wire(Bool())
-
-  val pft_s1_ready = Wire(Bool())   // s1 ready to accept new req from buf
+  val pft_s1_valid = RegNext(ft_query_req.fire, false.B)
+  val pft_s2_valid = RegNext(pft_s1_valid, false.B)
 
   val pft_s0_chosen_idx = Wire(UInt(log2Ceil(ReqFilterEntryNum).W))
-  val pft_s1_chosen_idx = Reg(UInt(log2Ceil(ReqFilterEntryNum).W))
-  val pft_s2_chosen_idx = Reg(UInt(log2Ceil(ReqFilterEntryNum).W))
-  val pft_s3_chosen_idx = Wire(UInt(log2Ceil(ReqFilterEntryNum).W))
+  val pft_s1_chosen_idx = RegEnable(pft_s0_chosen_idx, ft_query_req.fire)
+  val pft_s2_chosen_idx = RegEnable(pft_s1_chosen_idx, pft_s1_valid)
 
   val pft_s0_req = Wire(new PrefetchReq)
-  val pft_s1_req = Reg(new PrefetchReq)
-  val pft_s2_req = Reg(new PrefetchReq)
-  val pft_s3_req = Wire(new PrefetchReq)
+  val pft_s1_req = RegEnable(pft_s0_req, ft_query_req.fire)
+  val pft_s2_req = RegEnable(pft_s1_req, pft_s1_valid)
 
-  // --------- req s0: arb prefetch req ---------
+  // --------- req s0: arb prefetch req & query filter table ---------
   for (i <- 0 until ReqFilterEntryNum) {
     val entry = entries(i)
     val entry_pft_req = pft_arb.io.in(i)
@@ -1152,57 +1168,36 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   }
 
   pft_s0_valid := pft_arb.io.out.valid
-  pft_arb.io.out.ready := pft_s1_ready
+  pft_arb.io.out.ready := ft_query_req.ready
 
   pft_s0_chosen_idx := pft_arb.io.chosen
   pft_s0_req := pft_arb.io.out.bits
 
-  // --------- req s1: query filter table ---------
-  pft_s1_ready := !pft_s1_valid || ft_query_req.fire
-
-  when (pft_s1_ready) {
-    pft_s1_valid := pft_s0_valid
-    pft_s1_chosen_idx := pft_s0_chosen_idx
-    pft_s1_req := pft_s0_req
-  }
-
-  ft_query_req.valid := pft_s1_valid
+  ft_query_req.valid := pft_s0_valid
   ft_query_req.bits  := 0.U.asTypeOf(new ftQueryReq)
-  ft_query_req.bits.set_idx := get_filter_set(pft_s1_req.addr)
+  ft_query_req.bits.set_idx := get_filter_set(pft_s0_req.addr)
 
-  // --------- req s2: recv filter table rsp & latch ---------
-  when (ft_query_req.fire) {
-    pft_s2_valid := pft_s1_valid
-    pft_s2_chosen_idx := pft_s1_chosen_idx
-    pft_s2_req := pft_s1_req
-  }.otherwise {
-    pft_s2_valid := false.B
-  }
+  // --------- req s1: recv filter table rsp ---------
+  val ft_s1_rsp = ft_query_rsp
 
-  val ft_s2_rsp = ft_query_rsp
-
-  // --------- req s3: chk hit & sent req ---------
-  pft_s3_valid := RegNext(pft_s2_valid, false.B)
-  pft_s3_chosen_idx := RegNext(pft_s2_chosen_idx)
-  pft_s3_req := RegNext(pft_s2_req)
-
-  val ft_s3_rsp = RegNext(ft_s2_rsp)
+  // --------- req s2: chk hit & send req ---------
+  val ft_s2_rsp = RegEnable(ft_s1_rsp, pft_s1_valid)
 
   val hit = Wire(Bool())
   val can_pft = Wire(Bool())
 
   if (UseFilterTable) {
-    val valid_vec = ft_s3_rsp.valid_vec
-    val tag_vec   = ft_s3_rsp.tag_vec
+    val valid_vec = ft_s2_rsp.valid_vec
+    val tag_vec   = ft_s2_rsp.tag_vec
     val hit_vec   = valid_vec.zip(tag_vec).map{
       case (v, t) =>
-        v && t === get_filter_tag(pft_s3_req.addr)
+        v && t === get_filter_tag(pft_s2_req.addr)
     }
 
     val hit_idx = PriorityEncoder(hit_vec)
-    val offset  = get_filter_offset(pft_s3_req.addr)
+    val offset  = get_filter_offset(pft_s2_req.addr)
 
-    val sat_vec = ft_s3_rsp.sat_vec
+    val sat_vec = ft_s2_rsp.sat_vec
     hit := hit_vec.reduce(_ || _)
     can_pft := !hit || sat_vec(hit_idx)(offset) =/= 3.U
 
@@ -1212,26 +1207,26 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   }
 
   // send req
-  out.valid := pft_s3_valid && can_pft
-  out.bits  := pft_s3_req
+  out.valid := pft_s2_valid && can_pft
+  out.bits  := pft_s2_req
 
-  when (out.fire || pft_s3_valid && !can_pft) {
-    valids(pft_s3_chosen_idx) := false.B
+  when (out.fire || pft_s2_valid && !can_pft) {
+    valids(pft_s2_chosen_idx) := false.B
   }
 
-  when (pft_s3_valid) {
-    req_inflight(pft_s3_chosen_idx) := false.B
+  when (pft_s2_valid) {
+    req_inflight(pft_s2_chosen_idx) := false.B
   }
 
   // ----------------- Perf Counter -----------------
   XSPerfAccumulate("in_drop_by_hit", in.valid && entry_hit)
   XSPerfAccumulate("in_drop_by_full", in.valid && !entry_hit && !has_free_entry)
 
-  XSPerfAccumulate("pf_req_drop_by_filter", pft_s3_valid && !can_pft)
-  XSPerfAccumulate("filter_hit", pft_s3_valid && hit)
-  XSPerfAccumulate("filter_miss", pft_s3_valid && !hit)
+  XSPerfAccumulate("pf_req_drop_by_filter", pft_s2_valid && !can_pft)
+  XSPerfAccumulate("filter_hit", pft_s2_valid && hit)
+  XSPerfAccumulate("filter_miss", pft_s2_valid && !hit)
 
-  val chosen_entry = entries(pft_s3_chosen_idx)
+  val chosen_entry = entries(pft_s2_chosen_idx)
   XSPerfAccumulate("pf_req_fromCPU", out.fire && chosen_entry.pfSource === PfSource.NoWhere.id.U)
   XSPerfAccumulate("pf_req_fromBOP", out.fire && (chosen_entry.pfSource === PfSource.BOP.id.U || chosen_entry.pfSource === PfSource.PBOP.id.U))
   XSPerfAccumulate("pf_req_fromSMS", out.fire && chosen_entry.pfSource === PfSource.SMS.id.U)
