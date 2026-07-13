@@ -41,7 +41,7 @@ class MetaEntry(implicit p: Parameters) extends L2Bundle {
   val dataErr = Bool()
 
   // for CDP
-  val pfDepth = UInt(4.W)
+  val pfDepth = UInt(pfDepthBits.W)
 
   def =/=(entry: MetaEntry): Bool = {
     this.asUInt =/= entry.asUInt

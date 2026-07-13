@@ -120,7 +120,7 @@ class PrefetchReq(implicit p: Parameters) extends PrefetchBundle {
   val pfSource = UInt(MemReqSource.reqSourceBits.W)
 
   // CDP
-  val pfDepth = UInt(4.W)
+  val pfDepth = UInt(pfDepthBits.W)
 
   def addr: UInt = Cat(tag, set, 0.U(offsetBits.W))
   def setaddr: UInt = Cat(tag, set)
