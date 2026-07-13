@@ -24,6 +24,12 @@ case object PrefetchKey extends ControlKey[Bool](name = "needHint")
 
 case class PrefetchField() extends BundleField[Bool](PrefetchKey, Output(Bool()), _ := false.B)
 
+// L1 DCache writes this TileLink A user field for an MDP-hinted demand load;
+// SinkA consumes it and stores the marker in the L2 task.
+case object MdpHintKey extends ControlKey[Bool](name = "mdpHint")
+
+case class MdpHintField() extends BundleField[Bool](MdpHintKey, Output(Bool()), _ := false.B)
+
 case object DirtyKey extends ControlKey[Bool](name = "dirty")
 
 case class DirtyField() extends BundleField[Bool](DirtyKey, Output(Bool()), _ := false.B)

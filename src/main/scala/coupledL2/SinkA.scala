@@ -25,7 +25,7 @@ import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLHints._
 import xscache.coupledL2.prefetch.PrefetchReq
 import utility.{MemReqSource, XSPerfAccumulate}
-import xscache.common.{AliasKey, PrefetchKey}
+import xscache.common.{AliasKey, MdpHintKey, PrefetchKey}
 
 class SinkA(implicit p: Parameters) extends L2Module {
   val io = IO(new Bundle() {
@@ -74,6 +74,9 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task.mshrRetry := false.B
     task.fromL2pft.foreach(_ := false.B)
     task.needHint.foreach(_ := a.user.lift(PrefetchKey).getOrElse(false.B))
+    // Consume the marker produced by the L1 DCache; default false preserves
+    // compatibility when an upstream client does not negotiate MdpHintKey.
+    task.mdpHint := a.user.lift(MdpHintKey).getOrElse(false.B)
     task.dirty := false.B
     task.way := Mux(cmoAllValid, wayVal, 0.U(wayBits.W))
     task.meta := 0.U.asTypeOf(new MetaEntry)
