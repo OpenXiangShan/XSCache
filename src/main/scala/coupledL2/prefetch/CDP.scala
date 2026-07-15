@@ -29,7 +29,7 @@ case class CDPParameters(
   UseVpnTableHashIndex: Boolean = true,
   CounterBits:          Int = 10,
   VpnResetPeriod:       Int = 128,    // Every $VpnResetPeriod visits, VPN entries will be reset
-  EntryBits:            Int = 21,     // Every SubEntry maintain for 2^21 Bits
+  EntryBits:            Int = 21,     // Every SubEntry maintain for 2^$(EntryBits) Bits
 
   // FilterTable Params
   FilterTableSetNum:  Int = 64,
@@ -201,27 +201,36 @@ trait HasCDPParams extends HasPrefetcherHelper with HasCoupledL2Parameters {
     filter_addr(filter_addr.getWidth - 1, FilterTableSetBits + FilterTableOffsetBits)
   }
 
-  // Req Filter Params
+  // SentUnit Params
   val ReqFilterEntryNum = cdpParams.ReqFilterEntryNum
-  val ReqFilterTagBits  = fullAddressBits - log2Ceil(blockBytes)
+  val ReqFilterVTagBits = fullVAddrBits - log2Ceil(blockBytes)
+  val ReqFilterPTagBits = fullAddressBits - log2Ceil(blockBytes)
 }
 
 abstract class CDPBundle(implicit val p: Parameters) extends Bundle with HasCDPParams
 abstract class CDPModule(implicit val p: Parameters) extends Module with HasCDPParams
 
 class CDPDetectTrigger(implicit p: Parameters) extends CDPBundle {
+  /**
+    * Raw detectTrigger from Hit/Refill
+    * Data width == blockBytes
+    */
   val cacheblock  = UInt(blockBits.W)
   val pfDepth     = UInt(pfDepthBits.W)
   val pfSource    = UInt(PfSource.pfSourceBits.W)
-  val is_hit     = Bool()
+  val is_hit      = Bool()    // is this trigger from req hitting l2?
 }
 
 class CDPDetectEntry(implicit p: Parameters) extends CDPBundle {
+  /**
+    * Entry that records the split trigger
+    * Saved in DetectTrigBuffer
+    * Data width == half blockBytes
+    */
   val half_cacheblock = UInt((blockBits / 2).W)
   val pfDepth         = UInt(pfDepthBits.W)
   val pfSource        = UInt(PfSource.pfSourceBits.W)
-
-  val is_hit  = Bool()
+  val is_hit  = Bool()        // is this trigger from req hitting l2?
 }
 
 class VpnTableMetaInfo(implicit p: Parameters) extends CDPBundle {
@@ -521,20 +530,27 @@ class FilterTable(implicit p: Parameters) extends CDPModule {
 }
 
 class CDPDetectReq(implicit p: Parameters) extends CDPBundle {
-  val vaddr     = UInt(fullAddressBits.W)
+  /**
+    * Request Task processed in DetectPipe
+    * Data width == 8 byte
+    */
+  val data      = UInt(64.W)  // 8 byte
   val pfDepth   = UInt(pfDepthBits.W)
   val pfSource  = UInt(PfSource.pfSourceBits.W)
-
-  val is_hit    = Bool()
+  val is_hit    = Bool()  // is this trigger from req hitting l2?
 }
 
 class CDPPrefetchReq(implicit p: Parameters) extends CDPBundle {
-  val pfAddr  = UInt(fullAddressBits.W)
+  /**
+    * Internal prefetchReq
+    * Used in DetectPipe <> degreeBuf <> SentUnit
+    */
+  val pfVAddr  = UInt(fullVAddrBits.W)
   val pfDepth = UInt(pfDepthBits.W)
 
   // Only for monitor
   val pfSource  = UInt(PfSource.pfSourceBits.W)
-  val is_hit    = Bool()
+  val is_hit    = Bool()    // Req triggered by hitting l2
 }
 
 class ftTrainPipeline(implicit p: Parameters) extends CDPModule {
@@ -781,7 +797,7 @@ class vtTrainPipeline(implicit p: Parameters) extends CDPModule {
   same_vec(3) := stage_valid(4) && s4_update_info.main_idx === s0_main_idx && s4_update_info.tag === s0_tag
 
   class trainTriggerEntry extends CDPBundle {
-    val vaddr = UInt(fullAddressBits.W)
+    val vaddr = UInt(fullVAddrBits.W)
     val main_idx = UInt(mainEntryBits.W)
     val sub_idx  = UInt(subEntryBits.W)
     val way      = UInt(vpnWayBits.W)
@@ -833,10 +849,12 @@ class DetectPipeline(name:String)(implicit p: Parameters) extends CDPModule {
   s0_req.bits   := detect_req.bits
 
   // ------------------ s1 ------------------
+  // query VpnTable
   s1_req.valid  := RegNext(s0_req.valid)
   s1_req.bits   := RegNext(s0_req.bits)
 
-  val s1_addr     = s1_req.bits.vaddr
+  val s1_data     = s1_req.bits.data
+  val s1_addr     = s1_data(fullVAddrBits - 1, 0)
   val s1_main_idx = get_main_idx(s1_addr)
   val s1_sub_idx  = get_sub_idx(s1_addr)
 
@@ -847,10 +865,12 @@ class DetectPipeline(name:String)(implicit p: Parameters) extends CDPModule {
   val s1_vt_query_rsp = vt_query_rsp.bits
 
   // ------------------ s2 ------------------
+  // check conditions
   s2_req.valid  := RegNext(s1_req.valid)
   s2_req.bits   := RegNext(s1_req.bits)
 
-  val s2_addr   = s2_req.bits.vaddr
+  val s2_data   = s2_req.bits.data
+  val s2_addr   = s2_data(fullVAddrBits - 1, 0)
   val s2_depth  = s2_req.bits.pfDepth
   val s2_is_hit = s2_req.bits.is_hit
   
@@ -870,16 +890,17 @@ class DetectPipeline(name:String)(implicit p: Parameters) extends CDPModule {
   val s2_vpn0 = get_vpn0(s2_addr)
   val s2_vpn0_is_nzero    = s2_vpn0 =/= 0.U
 
-  val s2_low_bit  = s2_addr(1, 0)
+  val s2_low_bit  = s2_data(1, 0)
   val s2_low_bit_is_zero  = s2_low_bit === 0.U
 
-  val s2_high_bit = s2_addr(fullAddressBits - 1, 39)
+  val s2_high_bit = s2_data(63, 48)
   val s2_high_bit_is_zero = s2_high_bit === 0.U
 
   // TODO: maybe we should move depth control totally to the entrance?
   val s2_can_pft  = s2_high_bit_is_zero && s2_low_bit_is_zero && s2_vpn0_is_nzero && s2_vt_hit && s2_vt_hit_hot
 
   // ------------------ s3 ------------------
+  // generate prefetch req
   s3_req.valid  := RegNext(s2_req.valid && s2_can_pft)
   s3_req.bits   := RegNext(s2_req.bits)
 
@@ -892,10 +913,10 @@ class DetectPipeline(name:String)(implicit p: Parameters) extends CDPModule {
     Mux(s2_depth === 0.U, pfDepthMax.U, s2_depth + 1.U)
   ))
 
-  val s3_addr = s3_req.bits.vaddr
+  val s3_data = s3_req.bits.data
 
   pft_req.valid := s3_req.valid
-  pft_req.bits.pfAddr   := s3_addr
+  pft_req.bits.pfVAddr  := s3_data(fullVAddrBits - 1, 0)
   pft_req.bits.pfDepth  := s3_depth
   pft_req.bits.pfSource := s3_req.bits.pfSource
   pft_req.bits.is_hit   := s3_req.bits.is_hit
@@ -907,7 +928,7 @@ class DetectPipeline(name:String)(implicit p: Parameters) extends CDPModule {
 
   // ----------- ChiselDB -----------
   class detectTriggerEntry extends CDPBundle {
-    val vaddr     = UInt(fullAddressBits.W)
+    val vaddr     = UInt(64.W)
     val pfDepth   = UInt(pfDepthBits.W)
     val pfSource  = UInt(PfSource.pfSourceBits.W)
     val main_idx    = UInt(mainEntryBits.W)
@@ -920,7 +941,7 @@ class DetectPipeline(name:String)(implicit p: Parameters) extends CDPModule {
   val cdpDetectTriggerDB = ChiselDB.createTable(name + "_cdpDetect", new detectTriggerEntry, basicDB = debug)
 
   val detect_trigger_entry = Wire(new detectTriggerEntry)
-  detect_trigger_entry.vaddr := s2_addr
+  detect_trigger_entry.vaddr := s2_data
   detect_trigger_entry.pfDepth := s2_depth
   detect_trigger_entry.pfSource := s2_req.bits.pfSource
   detect_trigger_entry.main_idx := RegNext(s1_main_idx)
@@ -935,8 +956,8 @@ class DetectPipeline(name:String)(implicit p: Parameters) extends CDPModule {
 
 class PrefetchFilterEntry(implicit p: Parameters) extends CDPBundle {
   val paddr_valid = Bool()
-  val pTag  = UInt(ReqFilterTagBits.W)
-  val vTag  = UInt(ReqFilterTagBits.W)
+  val pTag  = UInt(ReqFilterPTagBits.W)   // paddr = [ pTag | blockOffset ]
+  val vTag  = UInt(ReqFilterVTagBits.W)   // vaddr = [ vTag | blockOffset ]
   val pfDepth = UInt(pfDepthBits.W)
 
   // for TLB retry
@@ -945,7 +966,7 @@ class PrefetchFilterEntry(implicit p: Parameters) extends CDPBundle {
   
   // Only for monitor
   val pfSource = UInt(PfSource.pfSourceBits.W)
-  val is_hit   = Bool()
+  val is_hit   = Bool() // is this trigger from req hitting l2?
 
   def toPrefetchReq(): PrefetchReq = {
     val req = Wire(new PrefetchReq)
@@ -975,7 +996,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   })
 
   def same_page(addr1: UInt, addr2: UInt): Bool = {
-    addr1(fullAddressBits - 1, pageOffsetBits) === addr2(fullAddressBits - 1, pageOffsetBits)
+    addr1(fullVAddrBits - 1, pageOffsetBits) === addr2(fullVAddrBits - 1, pageOffsetBits)
   }
 
   val (in, out) = (io.in, io.out)
@@ -989,7 +1010,8 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
 
   // check same cacheline
   def block_addr(addr: UInt) = {
-    addr(fullAddressBits - 1, log2Ceil(blockBytes))
+    require(addr.getWidth >= log2Ceil(blockBytes), "Address width is smaller than block size")
+    addr(addr.getWidth - 1, log2Ceil(blockBytes))
   }
 
   // buffer
@@ -1008,7 +1030,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
 
   val entry_hit_vec = entries.zip(valids).map{
     case (e, v) =>
-      v && e.vTag === block_addr(in.bits.pfAddr)
+      v && e.vTag === block_addr(in.bits.pfVAddr)
   }
   val entry_hit = entry_hit_vec.reduce(_ || _)
 
@@ -1020,7 +1042,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   val entry = entries(idx)
   when (in.valid && !entry_hit && has_free_entry) {
     val alloc_entry = WireInit(0.U.asTypeOf(new PrefetchFilterEntry))
-    alloc_entry.vTag := block_addr(in.bits.pfAddr)
+    alloc_entry.vTag := block_addr(in.bits.pfVAddr)
     alloc_entry.pfDepth   := in.bits.pfDepth
     alloc_entry.pfSource  := in.bits.pfSource
     alloc_entry.is_hit    := in.bits.is_hit
@@ -1042,7 +1064,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   val tlb_s3_valid = RegNext(tlb_s2_valid, false.B)
 
   val tlb_s1_req = RegEnable(tlb_arb.io.out.bits, tlb_arb.io.out.fire)
-  val tlb_s1_addr = Wire(UInt(fullAddressBits.W))
+  val tlb_s1_addr = Wire(UInt(fullVAddrBits.W))
   val tlb_s2_addr = RegEnable(tlb_s1_addr, tlb_req.fire)
   val tlb_s3_addr = RegEnable(tlb_s2_addr, tlb_s2_valid)
 
@@ -1373,7 +1395,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
     val detect_pipe = detect_pipe_seq(i)
 
     detect_pipe.io.detect_req.valid := detect_trig_arb.io.out.valid
-    detect_pipe.io.detect_req.bits.vaddr    := detect_trig_arb.io.out.bits.half_cacheblock((i + 1) * 64 - 1, i * 64)   // 8 Byte ==> 64 bit
+    detect_pipe.io.detect_req.bits.data     := detect_trig_arb.io.out.bits.half_cacheblock((i + 1) * 64 - 1, i * 64)   // 8 Byte ==> 64 bit
     detect_pipe.io.detect_req.bits.pfDepth  := detect_trig_arb.io.out.bits.pfDepth
     detect_pipe.io.detect_req.bits.pfSource := detect_trig_arb.io.out.bits.pfSource
     detect_pipe.io.detect_req.bits.is_hit   := detect_trig_arb.io.out.bits.is_hit
@@ -1414,6 +1436,11 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
 
   val issueDegree =
     if (UseDynamicDegree) {
+      /**
+        * EWMA Accuracy Control
+        * Low accuracy will reduce the degree to avoid useless prefetches
+        */
+
       val cdpPfSent = io.pfStat.pfSentVec(PfSource.CDP.id)
       val cdpPfHit = io.pfStat.pfHitVec(PfSource.CDP.id)
 
@@ -1449,7 +1476,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
       buf.io.enq(j).bits  := req.bits
 
       if (j > 0) {
-        buf.io.enq(j).bits.pfAddr := req.bits.pfAddr + (j * blockBytes).U
+        buf.io.enq(j).bits.pfVAddr := req.bits.pfVAddr + (j * blockBytes).U
       }
     }
 
