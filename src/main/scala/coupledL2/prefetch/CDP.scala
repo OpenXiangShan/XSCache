@@ -1349,6 +1349,24 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
     detect_trig_queue.io.enq(1).bits.is_hit   := detect_trig.bits.is_hit
 
     detect_trig_arb.io.in(i) <> detect_trig_queue_seq(i).io.deq(0)
+
+    XSPerfAccumulate(s"detect_trig_num_bank$i", detect_trig.valid && enable)
+    XSPerfAccumulate(s"detect_trig_drop0_bank$i", detect_trig_queue.io.enq(0).valid && !detect_trig_queue.io.enq(0).ready && enable)
+    XSPerfAccumulate(s"detect_trig_drop1_bank$i", detect_trig_queue.io.enq(1).valid && !detect_trig_queue.io.enq(1).ready && enable)
+
+    XSPerfAccumulate(s"detect_trig_hit_fromCDP_bank$i", detect_trig.valid && detect_trig.bits.is_hit && detect_trig_fromCDP && enable)
+    XSPerfAccumulate(s"detect_trig_hit_fromSMS_bank$i", detect_trig.valid && detect_trig.bits.is_hit && detect_trig_fromSMS && enable)
+    XSPerfAccumulate(s"detect_trig_hit_fromBOP_bank$i", detect_trig.valid && detect_trig.bits.is_hit && detect_trig_fromBOP && enable)
+    XSPerfAccumulate(s"detect_trig_hit_fromStream_bank$i", detect_trig.valid && detect_trig.bits.is_hit && detect_trig_fromStream && enable)
+    XSPerfAccumulate(s"detect_trig_hit_fromStride_bank$i", detect_trig.valid && detect_trig.bits.is_hit && detect_trig_fromStride && enable)
+    XSPerfAccumulate(s"detect_trig_hit_fromCPU_bank$i", detect_trig.valid && detect_trig.bits.is_hit && detect_trig_fromCPU && enable)
+
+    XSPerfAccumulate(s"detect_trig_refill_fromCDP_bank$i", detect_trig.valid && !detect_trig.bits.is_hit && detect_trig_fromCDP && enable)
+    XSPerfAccumulate(s"detect_trig_refill_fromSMS_bank$i", detect_trig.valid && !detect_trig.bits.is_hit && detect_trig_fromSMS && enable)
+    XSPerfAccumulate(s"detect_trig_refill_fromBOP_bank$i", detect_trig.valid && !detect_trig.bits.is_hit && detect_trig_fromBOP && enable)
+    XSPerfAccumulate(s"detect_trig_refill_fromStream_bank$i", detect_trig.valid && !detect_trig.bits.is_hit && detect_trig_fromStream && enable)
+    XSPerfAccumulate(s"detect_trig_refill_fromStride_bank$i", detect_trig.valid && !detect_trig.bits.is_hit && detect_trig_fromStride && enable)
+    XSPerfAccumulate(s"detect_trig_refill_fromCPU_bank$i", detect_trig.valid && !detect_trig.bits.is_hit && detect_trig_fromCPU && enable)
   }
 
   for (i <- 0 until DetectPipeNum) {
