@@ -30,6 +30,23 @@ case object MdpHintKey extends ControlKey[Bool](name = "mdpHint")
 
 case class MdpHintField() extends BundleField[Bool](MdpHintKey, Output(Bool()), _ := false.B)
 
+// The remaining fields describe the exact hinted load. L1 writes them on the
+// TileLink A request and L2 keeps them until refill data is sent to L2 MDP.
+case object MdpImmKey extends ControlKey[UInt](name = "mdpImm")
+case class MdpImmField(width: Int) extends BundleField[UInt](MdpImmKey, Output(UInt(width.W)), _ := 0.U(width.W))
+
+case object MdpVaddrKey extends ControlKey[UInt](name = "mdpVaddr")
+case class MdpVaddrField(width: Int) extends BundleField[UInt](MdpVaddrKey, Output(UInt(width.W)), _ := 0.U(width.W))
+
+case object MdpPCKey extends ControlKey[UInt](name = "mdpPC")
+case class MdpPCField(width: Int) extends BundleField[UInt](MdpPCKey, Output(UInt(width.W)), _ := 0.U(width.W))
+
+case object MdpLoadSizeKey extends ControlKey[UInt](name = "mdpLoadSize")
+case class MdpLoadSizeField() extends BundleField[UInt](MdpLoadSizeKey, Output(UInt(2.W)), _ := 0.U(2.W))
+
+case object MdpLoadUnsignedKey extends ControlKey[Bool](name = "mdpLoadUnsigned")
+case class MdpLoadUnsignedField() extends BundleField[Bool](MdpLoadUnsignedKey, Output(Bool()), _ := false.B)
+
 case object DirtyKey extends ControlKey[Bool](name = "dirty")
 
 case class DirtyField() extends BundleField[Bool](DirtyKey, Output(Bool()), _ := false.B)

@@ -109,6 +109,7 @@ trait HasCoupledL2Parameters {
   def hasReceiver = prefetchers.exists(_.isInstanceOf[PrefetchReceiverParams])
   def hasTPPrefetcher = prefetchers.exists(_.isInstanceOf[TPParameters])
   def hasNLPrefetcher = prefetchers.exists(_.isInstanceOf[NLParameters])
+  def hasL2Mdp = prefetchers.exists(_.isInstanceOf[L2MdpParameters])
   def hasPrefetchBit = prefetchers.exists(_.hasPrefetchBit) // !! TODO.test this
   def hasPrefetchSrc = prefetchers.exists(_.hasPrefetchSrc)
   def chiOpt = Some(true)
@@ -375,6 +376,9 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     //  val l2_hint = Valid(UInt(32.W))
       val l2_hint = ValidIO(new L2ToL1Hint()(l2ECCParams))
       val l2_tlb_req = new L2ToL1TlbIO(nRespDups = 1)(l2TlbParams)
+      // L2 MDP translates data-dependent targets on an independent port so
+      // the existing BOP request/response pipeline remains unchanged.
+      val l2_mdp_tlb_req = if (hasL2Mdp) Some(new L2ToL1TlbIO(nRespDups = 1)(l2TlbParams)) else None
       val debugTopDown = new Bundle {
         val robTrueCommit = Input(UInt(64.W))
         val robHeadPaddr = Flipped(Valid(UInt(36.W)))
@@ -454,6 +458,9 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
         prefetcher.get.pfCtrlFromCore := io.pfCtrlFromCore
         prefetcher.get.io.resp <> prefetchResps.get
         prefetcher.get.io.tlb_req <> io.l2_tlb_req
+        prefetcher.get.io.mdp_tlb_req.zip(io.l2_mdp_tlb_req).foreach { case (prefetchTlb, topTlb) =>
+          prefetchTlb <> topTlb
+        }
     }
     pf_recv_node match {
       case Some(x) =>
@@ -556,6 +563,12 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
             val resp = Pipeline(s.resp)
             prefetchTrains.get(i) <> train
             prefetchResps.get(i) <> resp
+            // Register the per-slice pulse before it enters the multi-bank
+            // L2 MDP refill filter, breaking the MainPipe-to-prefetcher path.
+            p.io.mdpRefill.foreach { mdpRefills =>
+              mdpRefills(i).valid := RegNext(s.mdpRefill.get.valid, false.B)
+              mdpRefills(i).bits := RegEnable(s.mdpRefill.get.bits, s.mdpRefill.get.valid)
+            }
             // restore to full address
             if(bankBits != 0){
               val train_full_addr = Cat(

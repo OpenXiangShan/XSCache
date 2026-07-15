@@ -39,6 +39,9 @@ class OverwriteQueue[T <: Data](
   val io = IO(new Bundle {
     val enq = Flipped(DecoupledIO(gen))
     val deq = DecoupledIO(gen)
+    // Reports the oldest queued request discarded by an overwrite.  Consumers
+    // use this perf-only sideband to attribute dropped prefetches by source.
+    val overwrite = ValidIO(gen)
   })
   def wrapInc(ptr: UInt): UInt = Mux(ptr === (entries - 1).U, 0.U, ptr + 1.U)
   require(entries > 1, "Queue must have positive entries")
@@ -73,6 +76,9 @@ class OverwriteQueue[T <: Data](
   val flowHappens = if (hasFlow) empty && do_enq && io.deq.ready else false.B
 
   val overwriteHappens =  full &&  do_enq && !do_deq 
+
+  io.overwrite.valid := overwriteHappens
+  io.overwrite.bits := queue(headPtr)
   
   when(overwriteHappens) {
     maybe_full := true.B // Overwrite: both pointers advance together, queue stays full

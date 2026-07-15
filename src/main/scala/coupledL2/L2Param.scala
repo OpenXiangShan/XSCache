@@ -25,7 +25,8 @@ import freechips.rocketchip.util._
 import org.chipsalliance.cde.config.Field
 import xscache.coupledL2.prefetch._
 import utility.{Code, MemReqSource, ReqSourceKey}
-import xscache.common.{AliasKey, BankBitsKey, CacheParameters, IsHitKey, MdpHintKey, PrefetchKey}
+import xscache.common.{AliasKey, BankBitsKey, CacheParameters, IsHitKey, MdpHintKey, MdpImmKey,
+  MdpLoadSizeKey, MdpLoadUnsignedKey, MdpPCKey, MdpVaddrKey, PrefetchKey}
 
 case object EnableL2ClockGate extends Field[Boolean](true)
 
@@ -88,8 +89,11 @@ case class L2Param(
   echoField: Seq[BundleFieldBase] = Nil,
   reqField: Seq[BundleFieldBase] = Nil,
   respKey: Seq[BundleKeyBase] = Seq(IsHitKey),
-  // MdpHintKey negotiates the L1 hinted-load marker onto the inner A channel.
-  reqKey: Seq[BundleKeyBase] = Seq(AliasKey, VaddrKey, PrefetchKey, MdpHintKey, ReqSourceKey, PCKey),
+  // MDP keys negotiate the exact hinted-load context onto the inner A channel.
+  reqKey: Seq[BundleKeyBase] = Seq(
+    AliasKey, VaddrKey, PrefetchKey, MdpHintKey, MdpImmKey, MdpVaddrKey,
+    MdpPCKey, MdpLoadSizeKey, MdpLoadUnsignedKey, ReqSourceKey, PCKey
+  ),
   respField: Seq[BundleFieldBase] = Nil,
 
   innerBuf: TLBufferParams = TLBufferParams(),

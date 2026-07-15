@@ -90,8 +90,14 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   val fromL2pft = prefetchOpt.map(_ => Bool()) // Is the prefetch req from L2(BOP) or from L1 prefetch?
                                           // If true, MSHR should send an ack to L2 prefetcher.
   val needHint = prefetchOpt.map(_ => Bool())
-  // Marker received from the L1 DCache TileLink A MdpHintKey field.
+  // Exact hinted-load context received from L1 TileLink A. SinkA writes it,
+  // an allocated/merged MSHR preserves it, and MainPipe consumes it on refill.
   val mdpHint = Bool()
+  val mdpImm = UInt(12.W)
+  val mdpVaddr = UInt(64.W)
+  val mdpPC = UInt(64.W)
+  val mdpLoadSize = UInt(2.W)
+  val mdpLoadUnsigned = Bool()
 
   val dirty = Bool()
 

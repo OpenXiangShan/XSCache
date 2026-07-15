@@ -126,13 +126,15 @@ class PrefetchReq(implicit p: Parameters) extends PrefetchBundle {
   def isSMS:Bool = pfSource === MemReqSource.Prefetch2L2SMS.id.U
   def isTP:Bool = pfSource === MemReqSource.Prefetch2L2TP.id.U
   def isNL:Bool = pfSource === MemReqSource.Prefetch2L2NL.id.U
+  def isMDP:Bool = pfSource === MemReqSource.Prefetch2L2MDP.id.U
   def needAck:Bool = pfSource === MemReqSource.Prefetch2L2BOP.id.U || pfSource === MemReqSource.Prefetch2L2PBOP.id.U
   def fromL2:Bool =
     pfSource === MemReqSource.Prefetch2L2BOP.id.U ||
       pfSource === MemReqSource.Prefetch2L2PBOP.id.U ||
       pfSource === MemReqSource.Prefetch2L2SMS.id.U ||
       pfSource === MemReqSource.Prefetch2L2TP.id.U  ||
-      pfSource === MemReqSource.Prefetch2L2NL.id.U
+      pfSource === MemReqSource.Prefetch2L2NL.id.U ||
+      pfSource === MemReqSource.Prefetch2L2MDP.id.U
 }
 
 class PrefetchResp(implicit p: Parameters) extends PrefetchBundle {
@@ -148,12 +150,14 @@ class PrefetchResp(implicit p: Parameters) extends PrefetchBundle {
   def isSMS: Bool = pfSource === MemReqSource.Prefetch2L2SMS.id.U
   def isTP: Bool = pfSource === MemReqSource.Prefetch2L2TP.id.U
   def isNL: Bool = pfSource === MemReqSource.Prefetch2L2NL.id.U
+  def isMDP: Bool = pfSource === MemReqSource.Prefetch2L2MDP.id.U
   def fromL2: Bool =
     pfSource === MemReqSource.Prefetch2L2BOP.id.U ||
       pfSource === MemReqSource.Prefetch2L2PBOP.id.U ||
       pfSource === MemReqSource.Prefetch2L2SMS.id.U ||
       pfSource === MemReqSource.Prefetch2L2TP.id.U  ||
-      pfSource === MemReqSource.Prefetch2L2NL.id.U
+      pfSource === MemReqSource.Prefetch2L2NL.id.U ||
+      pfSource === MemReqSource.Prefetch2L2MDP.id.U
 }
 
 class PrefetchTrain(implicit p: Parameters) extends PrefetchBundle {
@@ -182,6 +186,17 @@ class PrefetchIO(implicit p: Parameters) extends PrefetchBundle {
   }))
 }
 
+/** Per-slice extension of the ordinary prefetch interface.
+  *
+  * Only Slice/MainPipe produces an L2 MDP refill.  Keeping this port out of
+  * PrefetchIO avoids adding an unconnected input to PrefetchReceiver and other
+  * standalone prefetcher modules that reuse the ordinary interface.
+  */
+class SlicePrefetchIO(implicit p: Parameters) extends PrefetchIO {
+  // From this slice MainPipe to the central L2 MDP refill filter.
+  val mdpRefill = if (hasL2Mdp) Some(Flipped(ValidIO(new L2MdpRefill))) else None
+}
+
 class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
   val banks = 1 << bankBits
   val train = Vec(banks, Flipped(DecoupledIO(new PrefetchTrain)))
@@ -192,6 +207,10 @@ class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
     val addr = UInt(64.W)
     val pfSource = UInt(MemReqSource.reqSourceBits.W)
   }))
+  // One refill lane per slice; L2 MDP preserves simultaneous pulses.
+  val mdpRefill = if (hasL2Mdp) Some(Vec(banks, Flipped(ValidIO(new L2MdpRefill)))) else None
+  // A dedicated TLB/PMP path keeps BOP response timing independent of MDP.
+  val mdp_tlb_req = if (hasL2Mdp) Some(new L2ToL1TlbIO(nRespDups = 1)) else None
 }
 
 class Prefetcher(implicit p: Parameters) extends PrefetchModule {
@@ -255,6 +274,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val tp = if (hasTPPrefetcher) Some(Module(new TemporalPrefetch())) else None
   // define Next-Line Prefetcher
   val nl = if (hasNLPrefetcher) Some(Module(new NextLinePrefetch())) else None
+  val mdp = if (hasL2Mdp) Some(Module(new L2MemoryDependencePrefetcher())) else None
   // prefetch from upper level
   val pfRcv = if (hasReceiver) Some(Module(new PrefetchReceiver())) else None
 
@@ -264,7 +284,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   fastArb(io.resp, resp, Some("prefetch_resp"))
 
   // =================== Connection for each Prefetcher =====================
-  // Rcv > NL >VBOP > PBOP > TP
+  // Rcv > MDP > NL > VBOP > PBOP > TP
   if (hasBOP) {
     vbop.get.io.enable := vbop_en
     vbop.get.io.pfCtrlOfDelayLatency := delay_latency
@@ -305,6 +325,12 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     nl.get.io.resp <> resp
   }
 
+  if (hasL2Mdp) {
+    mdp.get.io.refill := io.mdpRefill.get
+    mdp.get.io.enable := pfCtrlFromCore.l2_pf_master_en
+    mdp.get.io.tlbReq <> io.mdp_tlb_req.get
+  }
+
   if (hasTPPrefetcher) {
     tp.get.io.enable := tp_en
     tp.get.io.train <> train
@@ -317,10 +343,11 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   // =================== Connection of all Prefetchers =====================
   /* prefetchers -> pftQueue -> pipe -> Slices.SinkA */
-  private val SRC_NUM = 5
-  private val Seq(rcv_idx, nl_idx, vbop_idx, pbop_idx, tp_idx) = (0 until SRC_NUM).toSeq
+  private val SRC_NUM = 6
+  private val Seq(rcv_idx, mdp_idx, nl_idx, vbop_idx, pbop_idx, tp_idx) = (0 until SRC_NUM).toSeq
   val reqs = Seq(
     if (hasReceiver) Some(pfRcv.get.io.req) else None,
+    if (hasL2Mdp) Some(mdp.get.io.req) else None,
     if (hasNLPrefetcher) Some(nl.get.io.req) else None,
     if (hasBOP) Some(vbop.get.io.req) else None,
     if (hasBOP) Some(pbop.get.io.req) else None,
@@ -358,12 +385,14 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   }
 
   val reqsFire = reqs.map(_.map(_.fire).getOrElse(false.B))
+  val pftQueueOverwrite = pftQueue.map(_.io.overwrite)
 
   XSPerfAccumulate("prefetch_train_valid", train.valid)
   XSPerfAccumulate("prefetch_train_in_valid", PopCount(io.train.map(_.valid)))
   XSPerfAccumulate("prefetch_resp_valid", resp.valid)
   XSPerfAccumulate("prefetch_resp_in_valid", PopCount(io.resp.map(_.valid)))
   XSPerfAccumulate("prefetch_req_fromL1", reqsValid(rcv_idx))
+  XSPerfAccumulate("prefetch_req_fromMDP", reqsValid(mdp_idx))
   XSPerfAccumulate("prefetch_req_fromVBOP", reqsValid(vbop_idx))
   XSPerfAccumulate("prefetch_req_fromPBOP", reqsValid(pbop_idx))
   XSPerfAccumulate("prefetch_req_fromBOP", reqsValid(vbop_idx) || reqsValid(pbop_idx))
@@ -371,14 +400,20 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   XSPerfAccumulate("prefetch_req_fromNL", reqsValid(nl_idx))
 
   XSPerfAccumulate("prefetch_req_selectL1", reqsFire(rcv_idx))
+  XSPerfAccumulate("prefetch_req_selectMDP", reqsFire(mdp_idx))
   XSPerfAccumulate("prefetch_req_selectVBOP", reqsFire(vbop_idx))
   XSPerfAccumulate("prefetch_req_selectPBOP", reqsFire(pbop_idx))
   XSPerfAccumulate("prefetch_req_selectBOP", reqsFire(vbop_idx) || reqsFire(pbop_idx))
   XSPerfAccumulate("prefetch_req_selectTP", reqsFire(tp_idx))
   XSPerfAccumulate("prefetch_req_selectNL", reqsFire(nl_idx))
+  XSPerfAccumulate("prefetch_req_overwrite", PopCount(pftQueueOverwrite.map(_.valid)))
+  XSPerfAccumulate(
+    "prefetch_req_overwriteMDP",
+    PopCount(pftQueueOverwrite.map(x => x.valid && x.bits.isMDP))
+  )
   XSPerfAccumulate("prefetch_req_SMS_other_overlapped",
     reqsValid(rcv_idx) &&
-      (reqsValid(vbop_idx) || reqsValid(pbop_idx) || reqsValid(tp_idx) || reqsValid(nl_idx))
+      (reqsValid(mdp_idx) || reqsValid(vbop_idx) || reqsValid(pbop_idx) || reqsValid(tp_idx) || reqsValid(nl_idx))
   )
 
   // NOTE: set basicDB false when debug over

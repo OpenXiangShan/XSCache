@@ -155,6 +155,19 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     backoffTimer := 0.U
   }
 
+  // A demand request can merge into an in-flight L2 prefetch MSHR. If that
+  // request carries an MDP hint, promote its exact load context into the MSHR
+  // so the eventual refill task cannot lose it. A non-MDP merge leaves any
+  // previously stored context unchanged.
+  when (io.aMergeTask.valid && io.aMergeTask.bits.mdpHint) {
+    req.mdpHint := true.B
+    req.mdpImm := io.aMergeTask.bits.mdpImm
+    req.mdpVaddr := io.aMergeTask.bits.mdpVaddr
+    req.mdpPC := io.aMergeTask.bits.mdpPC
+    req.mdpLoadSize := io.aMergeTask.bits.mdpLoadSize
+    req.mdpLoadUnsigned := io.aMergeTask.bits.mdpLoadUnsigned
+  }
+
   /* ======== Enchantment ======== */
   val meta_pft = meta.prefetch.getOrElse(false.B)
   val meta_no_client = !meta.clients.orR
@@ -799,6 +812,22 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     mp_grant.dsWen := (gotGrantData || probeDirty && (req_get || req.aliasTask.getOrElse(false.B))) && !denied
     mp_grant.fromL2pft.foreach(_ := req.fromL2pft.get)
     mp_grant.needHint.foreach(_ := false.B)
+    // Copy the stored hinted-load context onto the refill task consumed by
+    // MainPipe. This covers both original allocations and promoted merges.
+    // TODO: The L2 MDP trigger can be moved earlier to the cycle in which this
+    // MSHR receives the final refill data.  That change must send the same
+    // merged metadata and extracted load value without waiting for MainPipe.
+    val mergeMdpNow = io.aMergeTask.valid && io.aMergeTask.bits.mdpHint
+    mp_grant.mdpHint := req.mdpHint || mergeMdpNow
+    mp_grant.mdpImm := Mux(mergeMdpNow, io.aMergeTask.bits.mdpImm, req.mdpImm)
+    mp_grant.mdpVaddr := Mux(mergeMdpNow, io.aMergeTask.bits.mdpVaddr, req.mdpVaddr)
+    mp_grant.mdpPC := Mux(mergeMdpNow, io.aMergeTask.bits.mdpPC, req.mdpPC)
+    mp_grant.mdpLoadSize := Mux(mergeMdpNow, io.aMergeTask.bits.mdpLoadSize, req.mdpLoadSize)
+    mp_grant.mdpLoadUnsigned := Mux(
+      mergeMdpNow,
+      io.aMergeTask.bits.mdpLoadUnsigned,
+      req.mdpLoadUnsigned
+    )
     mp_grant.replTask := !dirResult.hit && !state.w_replResp && !denied
     mp_grant.cmoTask := cmo_cbo
     mp_grant.wayMask := 0.U(cacheParams.ways.W)
@@ -1444,6 +1473,9 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   assert(!RegNext(weFire) || !state.s_cbwrdata.get, "There must be a CopyBackWrData after WriteEvictFull")
 
   /* ======== Performance counters ======== */
+  XSPerfAccumulate("l2_mdp_mshr_alloc", io.alloc.valid && io.alloc.bits.task.mdpHint)
+  XSPerfAccumulate("l2_mdp_mshr_merge", io.aMergeTask.valid && io.aMergeTask.bits.mdpHint)
+
   // time stamp
   val acquire_period = Option.when(cacheParams.enablePerf)(IO(ValidIO(UInt(64.W))))
   val release_period = Option.when(cacheParams.enablePerf)(IO(ValidIO(UInt(64.W))))

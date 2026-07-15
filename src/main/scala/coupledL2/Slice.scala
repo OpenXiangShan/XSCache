@@ -22,7 +22,6 @@ import chisel3.util._
 import utility.mbist.MbistPipeline
 import org.chipsalliance.cde.config.Parameters
 import xscache.coupledL2._
-import xscache.coupledL2.prefetch.PrefetchIO
 import utility.MemReqSource
 import xscache.chi.{DecoupledPortIO, HasCHIMsgParameters}
 
@@ -174,6 +173,9 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
 
   io.prefetch.foreach { p =>
     p.train <> mainPipe.io.prefetchTrain.get
+    // Forward this slice's completed hinted refill to the matching central
+    // L2 MDP input lane; bank-level pipelining is added in CoupledL2.
+    p.mdpRefill.zip(mainPipe.io.mdpRefill).foreach { case (out, in) => out := in }
     sinkA.io.prefetchReq.get <> p.req
     p.resp <> grantBuf.io.prefetchResp.get
     p.tlb_req.req.ready := true.B

@@ -25,7 +25,7 @@ import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLPermissions._
 import org.chipsalliance.cde.config.Parameters
 import xscache.coupledL2._
-import xscache.coupledL2.prefetch.{PrefetchTrain, PfSource}
+import xscache.coupledL2.prefetch.{L2MdpRefill, PrefetchTrain, PfSource}
 import xscache.coupledL2.MetaData._
 import xscache.chi.{CHIREQ, HasCHIOpcodes}
 import xscache.chi.CHICohStates._
@@ -112,6 +112,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
     /* send prefetchTrain to Prefetch to trigger a prefetch req */
     val prefetchTrain = prefetchOpt.map(_ => DecoupledIO(new PrefetchTrain))
+    // Completed MDP-hinted L2 miss data goes to this slice's L2 MDP lane.
+    val mdpRefill = if (hasL2Mdp) Some(ValidIO(new L2MdpRefill)) else None
 
     /* top-down monitor */
     // TODO
@@ -476,6 +478,34 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val hasData_s3_tl = source_req_s3.opcode(0) // whether to respond data to TileLink-side
   val hasData_s3_chi = source_req_s3.toTXDAT // whether to respond data to CHI-side
   val hasData_s3 = hasData_s3_tl || hasData_s3_chi
+
+  // Extract the original hinted load from refill data. Normal Acquire/Get
+  // refills carry data directly; a demand merged into an L2 Hint MSHR carries
+  // GrantData in aMergeTask even though the outer task opcode is HintAck.
+  // TODO: Move this L2 MDP trigger to the MSHR cycle that receives the final
+  // refill data, so dependent-address generation does not wait for MainPipe.
+  io.mdpRefill.foreach { refill =>
+    // An MDP marker on a HintAck can only have been promoted from a merged L1
+    // data request; the refill buffer therefore contains the demanded line even
+    // if mergeA metadata and the grant task become visible in the same cycle.
+    val mergeGrantData = mshr_hintack_s3 && req_s3.mdpHint
+    val mdpRefillHasData = mshr_grantdata_s3 || mshr_accessackdata_s3 || mergeGrantData
+    val rawData = (io.refillBufResp_s3.bits.data >> (req_s3.mdpVaddr(offsetBits - 1, 0) << 3))(63, 0)
+    val loadData = MuxLookup(req_s3.mdpLoadSize, rawData)(Seq(
+      0.U -> Mux(req_s3.mdpLoadUnsigned, ZeroExt(rawData(7, 0), 64), SignExt(rawData(7, 0), 64)),
+      1.U -> Mux(req_s3.mdpLoadUnsigned, ZeroExt(rawData(15, 0), 64), SignExt(rawData(15, 0), 64)),
+      2.U -> Mux(req_s3.mdpLoadUnsigned, ZeroExt(rawData(31, 0), 64), SignExt(rawData(31, 0), 64)),
+      3.U -> rawData
+    ))
+
+    refill.valid := task_s3.valid && mdpRefillHasData && !retry &&
+      io.refillBufResp_s3.valid && req_s3.mdpHint
+    refill.bits.data := loadData
+    refill.bits.imm := req_s3.mdpImm
+    refill.bits.pc := req_s3.mdpPC
+    refill.bits.vaddr := req_s3.mdpVaddr
+    refill.bits.source := req_s3.sourceId
+  }
 
   val need_data_a = dirResult_s3.hit && (req_get_s3 || req_acquireBlock_s3)
   val need_data_b = sinkB_req_s3 && (doRespData || doFwd || nestable_dirResult_s3.hit && nestable_meta_s3.state === TRUNK)
@@ -1005,6 +1035,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   XSPerfAccumulate("mshr_grantdata_req", task_s3.valid && mshr_grantdata_s3 && !retry)
   XSPerfAccumulate("mshr_accessackdata_req", task_s3.valid && mshr_accessackdata_s3 && !retry)
   XSPerfAccumulate("mshr_hintack_req", task_s3.valid && mshr_hintack_s3 && !retry)
+  XSPerfAccumulate("l2_mdp_mainpipe_refill", io.mdpRefill.map(_.valid).getOrElse(false.B))
   // XSPerfAccumulate("mshr_probeack_req", task_s3.valid && mshr_probeack_s3)
   // XSPerfAccumulate("mshr_probeackdata_req", task_s3.valid && mshr_probeackdata_s3)
   // XSPerfAccumulate("mshr_release_req", task_s3.valid && mshr_release_s3)
