@@ -703,6 +703,13 @@ class vtTrainPipeline(implicit p: Parameters) extends CDPModule {
     val query_req = ValidIO(new vtQueryReq)
     val query_rsp = Flipped(ValidIO(new vtQueryRsp))
     val train_req = ValidIO(new vtTrainReq)
+
+    // to DetectPipe
+    val addr_state = new Bundle {
+      val is_sv39 = Output(Bool())
+      val is_sv48 = Output(Bool())
+      val is_sv57 = Output(Bool())
+    }
   })
 
   val (train_trigger, query_req, query_rsp, train_req) =
@@ -715,6 +722,10 @@ class vtTrainPipeline(implicit p: Parameters) extends CDPModule {
 
   val same_addr = same_vec.reduce(_ || _)
 
+  // Record Max Addr Range
+  val s_sv39::s_sv48::s_sv57::Nil = Enum(3)
+  val addr_state = RegInit(s_sv39)
+
   // ----------- s0: accept train trigger -----------
   stage_valid(0) := train_trigger.valid && !same_addr
   train_trigger.ready := reset.asBool || !same_addr
@@ -724,6 +735,44 @@ class vtTrainPipeline(implicit p: Parameters) extends CDPModule {
   val s0_sub_idx  = get_sub_idx(train_vaddr)
   val s0_tag      = get_vpntab_tag(train_vaddr)
   val s0_is_hit_cdp = train_trigger.bits.hit && train_trigger.bits.pfsource === PfSource.CDP.id.U
+
+  // addr_state update
+  val max_addr_width = if (train_trigger.bits.vaddr.isDefined) {
+    train_trigger.bits.vaddr.getOrElse(0.U).getWidth + log2Ceil(blockBytes)
+  } else {
+    39  // default to sv39 if vaddr is not defined
+  }
+
+  val next_state = WireDefault(addr_state)
+  switch (addr_state) {
+    is (s_sv39) {
+      if (39 < max_addr_width && max_addr_width <= 48) {
+        when (train_trigger.fire) {
+          next_state := Mux(train_vaddr(train_vaddr.getWidth - 1, 39) =/= 0.U, s_sv48, s_sv39)
+        }
+      }
+      if (48 < max_addr_width && max_addr_width <= 57) {
+        when (train_trigger.fire) {
+          next_state := Mux(train_vaddr(train_vaddr.getWidth - 1, 48) =/= 0.U, 
+            s_sv57, 
+            Mux(train_vaddr(train_vaddr.getWidth - 1, 39) =/= 0.U, s_sv48, s_sv39)
+          )
+        }
+      }
+    }
+    is (s_sv48) {
+      if (48 < max_addr_width && max_addr_width <= 57) {
+        when (train_trigger.fire) {
+          next_state := Mux(train_vaddr(train_vaddr.getWidth - 1, 48) =/= 0.U, s_sv57, s_sv48)
+        }
+      }
+    }
+  }
+
+  addr_state := next_state
+  io.addr_state.is_sv39 := addr_state === s_sv39
+  io.addr_state.is_sv48 := addr_state === s_sv48
+  io.addr_state.is_sv57 := addr_state === s_sv57
 
   // ----------- s1: query VpnTable -----------
   stage_valid(1) := RegNext(stage_valid(0))
@@ -830,6 +879,13 @@ class DetectPipeline(name:String)(implicit p: Parameters) extends CDPModule {
 
     // Prefetch Req
     val pft_req = ValidIO(new CDPPrefetchReq)
+
+    // addr_state
+    val addr_state = new Bundle {
+      val is_sv39 = Input(Bool())
+      val is_sv48 = Input(Bool())
+      val is_sv57 = Input(Bool())
+    }
   })
 
   val detect_req  = io.detect_req
@@ -893,7 +949,14 @@ class DetectPipeline(name:String)(implicit p: Parameters) extends CDPModule {
   val s2_low_bit  = s2_data(1, 0)
   val s2_low_bit_is_zero  = s2_low_bit === 0.U
 
-  val s2_high_bit = s2_data(63, 48)
+  val s2_high_bit = Mux(
+    io.addr_state.is_sv39, 
+    s2_data(63, 39),
+    Mux(io.addr_state.is_sv48, 
+      s2_data(63, 48),
+      Mux(io.addr_state.is_sv57, s2_data(63, 57), 0.U)
+    )
+  )
   val s2_high_bit_is_zero = s2_high_bit === 0.U
 
   // TODO: maybe we should move depth control totally to the entrance?
@@ -1399,6 +1462,8 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
     detect_pipe.io.detect_req.bits.pfDepth  := detect_trig_arb.io.out.bits.pfDepth
     detect_pipe.io.detect_req.bits.pfSource := detect_trig_arb.io.out.bits.pfSource
     detect_pipe.io.detect_req.bits.is_hit   := detect_trig_arb.io.out.bits.is_hit
+
+    detect_pipe.io.addr_state <> vt_train_pipe.io.addr_state
   }
   detect_trig_arb.io.out.ready := true.B
 
