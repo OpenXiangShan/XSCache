@@ -452,6 +452,12 @@ class Directory(implicit p: Parameters) extends L2Module {
   XSPerfAccumulate("dirRead_cnt", io.read.fire)
   XSPerfAccumulate("choose_busy_way", reqValid_s3 && !Mux1H(chosenOH, req_s3.wayMask))
 
+  val evictBlockEn = io.replResp.valid && !io.replResp.bits.retry
+  val evictBlockMeta = Mux1H(finalReplOH, metaAll_s3)
+  val pfReqEvictEn = evictBlockEn && evictBlockMeta.prefetch.getOrElse(false.B)
+  XSPerfAccumulate("l2prefetchUselessL1Nack", pfReqEvictEn &&
+    io.replResp.bits.meta.prefetchSrc.getOrElse(PfSource.NoWhere.id.U) === PfSource.L1Nack.id.U)
+
   /* ====== ChiselDB logging for  prefetcher lifecycle ====== */
   if (cacheParams.enableMonitor && !cacheParams.FPGAPlatform) {
     val defaultPfSrc = PfSource.NoWhere.id.U
@@ -489,9 +495,6 @@ class Directory(implicit p: Parameters) extends L2Module {
     pfReqReadTable.log(pfReqRead, pfReqReadEn, s"L2${hartId}_${p(SliceIdKey)}", clock, reset)
 
     // Eviction: when Directory issues a replacement for a prefetched block
-    val evictBlockEn = io.replResp.valid && !io.replResp.bits.retry
-    val evictBlockMeta = Mux1H(finalReplOH, metaAll_s3) // meta of the block to be evicted 
-    val pfReqEvictEn = evictBlockEn && evictBlockMeta.prefetch.getOrElse(false.B)
     val pfReqEvict = Wire(new PrefetchDbEntry)
 
     // read request info that causes eviction
