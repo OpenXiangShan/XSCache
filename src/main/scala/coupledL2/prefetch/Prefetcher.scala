@@ -26,7 +26,7 @@ import xscache.coupledL2._
 import xscache.coupledL2.utils._
 
 /* virtual address */
-trait HasPrefetcherHelper extends HasCircularQueuePtrHelper with HasCoupledL2Parameters {
+trait HasPrefetcherHelper extends HasCircularQueuePtrHelper with HasCoupledL2Parameters with HasPrefetchParameters {
   // filter
   val TRAIN_FILTER_SIZE = 4
   val REQ_FILTER_SIZE = 16
@@ -183,7 +183,6 @@ class PrefetchIO(implicit p: Parameters) extends PrefetchBundle {
 }
 
 class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
-  val banks = 1 << bankBits
   val train = Vec(banks, Flipped(DecoupledIO(new PrefetchTrain)))
   val tlb_req = new L2ToL1TlbIO(nRespDups= 1)
   val req = Vec(banks, DecoupledIO(new PrefetchReq))
@@ -201,14 +200,31 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   })
   val hartId = IO(Input(UInt(hartIdLen.W)))
   val pfCtrlFromCore = IO(Input(new PrefetchCtrlFromCore))
+  val l2ToL1PfCtrl = IO(Output(new L2ToL1PfCtrl))
+  val pfFeedbackVec = IO(Input(Vec(banks, new PrefetchFeedbackBundle())))
+
+  val prefetchController = Module(new PrefetchController)
+  prefetchController.io.pfFeedbackVec := pfFeedbackVec
 
   // l2 receive need 2 cycles to transmit from core
+  val streamDegree = prefetchController.io.l2PfFbCtrl.streamDegree
+  val strideDegree = prefetchController.io.l2PfFbCtrl.strideDegree
+  val bertiDegree = prefetchController.io.l2PfFbCtrl.bertiDegree
+  val smsDegree = prefetchController.io.l2PfFbCtrl.smsDegree
+  val vbopDegree = prefetchController.io.l2PfFbCtrl.vbopDegree
+  val pbopDegree = prefetchController.io.l2PfFbCtrl.pbopDegree
+  val tpDegree = prefetchController.io.l2PfFbCtrl.tpDegree
+
+  l2ToL1PfCtrl.streamDegree := streamDegree
+  l2ToL1PfCtrl.strideDegree := strideDegree
+  l2ToL1PfCtrl.bertiDegree := bertiDegree
+  l2ToL1PfCtrl.smsDegree := smsDegree
+
   val pfRcv_en = RegNextN(pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pf_recv_en, 2, Some(true.B))
   val pbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pbop_en
   val vbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_vbop_en
   val tp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_tp_en
   val delay_latency = pfCtrlFromCore.l2_pf_delay_latency
-  val banks = 1 << bankBits
 
   // =================== Prefetchers =====================
   // TODO: consider separate VBOP and PBOP in prefetch param
@@ -263,10 +279,14 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   fastArb(io.train, train, Some("prefetch_train"))
   fastArb(io.resp, resp, Some("prefetch_resp"))
 
+  prefetchController.io.isDemandTrain := train.valid && (
+    MemReqSource.isCPUReq(train.bits.reqsource) || MemReqSource.isL1Prefetch(train.bits.reqsource)
+  )
   // =================== Connection for each Prefetcher =====================
   // Rcv > NL >VBOP > PBOP > TP
   if (hasBOP) {
     vbop.get.io.enable := vbop_en
+    vbop.get.io.fdbkDegree := vbopDegree
     vbop.get.io.pfCtrlOfDelayLatency := delay_latency
     vbop.get.io.train <> train
     vbop.get.io.resp <> resp
@@ -275,22 +295,15 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     vbop.get.io.pbopCrossPage := true.B // pbop.io.pbopCrossPage // let vbop have noting to do with pbop
 
     pbop.get.io.enable := pbop_en
+    pbop.get.io.fdbkDegree := pbopDegree
     pbop.get.io.pfCtrlOfDelayLatency := delay_latency
     pbop.get.io.train <> train
     pbop.get.io.resp <> resp
     pbop.get.io.resp.valid := resp.valid && resp.bits.isPBOP
   }
   if (hasReceiver) {
-    pfRcv.get.io_enable := pfRcv_en
+    pfRcv.get.io.enable := pfRcv_en
     pfRcv.get.io.recv_addr := ValidIODelay(io.recv_addr, 2)
-    pfRcv.get.io.train.valid := false.B
-    pfRcv.get.io.train.bits := 0.U.asTypeOf(new PrefetchTrain)
-    pfRcv.get.io.resp.valid := false.B
-    pfRcv.get.io.resp.bits := 0.U.asTypeOf(new PrefetchResp)
-    pfRcv.get.io.tlb_req.req.ready := true.B
-    pfRcv.get.io.tlb_req.resp.valid := false.B
-    pfRcv.get.io.tlb_req.resp.bits := DontCare
-    pfRcv.get.io.tlb_req.pmp_resp := DontCare
     assert(!pfRcv.get.io.req.valid ||
       pfRcv.get.io.req.bits.pfSource === MemReqSource.Prefetch2L2SMS.id.U ||
       pfRcv.get.io.req.bits.pfSource === MemReqSource.Prefetch2L2Stream.id.U ||
@@ -307,6 +320,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   if (hasTPPrefetcher) {
     tp.get.io.enable := tp_en
+    tp.get.io.fdbkDegree := tpDegree
     tp.get.io.train <> train
     tp.get.io.resp <> resp
     tp.get.io.hartid := hartId
@@ -339,10 +353,17 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val pipe = Seq.tabulate(banks) { _ => Module(new Pipeline(new PrefetchReq, 1)) }
   val select = Wire(Vec(banks, Vec(SRC_NUM, Bool())))
   val selectOH = Wire(Vec(banks, Vec(SRC_NUM, Bool())))
+  val reqsAllowed = Seq(
+    true.B,
+    true.B,
+    vbopDegree.orR,
+    pbopDegree.orR,
+    tpDegree.orR
+  )
 
   for (i <- 0 until banks) {
-    select(i) := VecInit(reqsValid.zip(reqsSetAddr).map {
-      case (valid, addr) => valid && bank_eq(addr, i, bankBits)
+    select(i) := VecInit(reqsValid.zip(reqsSetAddr).zip(reqsAllowed).map {
+      case ((valid, addr), allowed) => valid && allowed && bank_eq(addr, i, bankBits)
     })
     selectOH(i) := VecInit(PriorityEncoderOH(select(i).asUInt).asBools)
     pftQueue(i).io.enq.valid := select(i).asUInt.orR

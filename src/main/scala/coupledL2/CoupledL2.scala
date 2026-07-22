@@ -104,6 +104,7 @@ trait HasCoupledL2Parameters {
   def encDataPadBits = 0 // recaculate if any split changes
 
   // Prefetch
+  def timestampBits = 16
   def prefetchers = cacheParams.prefetch
   def prefetchOpt = if(prefetchers.nonEmpty) Some(true) else None
   def hasBOP = prefetchers.exists(_.isInstanceOf[BOPParameters])
@@ -288,6 +289,32 @@ trait HasCoupledL2Parameters {
   def bank_eq(set: UInt, bankId: Int, bankBits: Int): Bool = {
     if(bankBits == 0) true.B else set(bankBits - 1, 0) === bankId.U
   }
+
+  // I-POP statistic: dram addr mapping
+  def get_roracobabgch(addr: UInt): (UInt, UInt, UInt, UInt, UInt, UInt) = {
+    // Address mapping follows DRAMsim3 XiangShan.ini: roracobabgch
+    // row/0, rank/1, column/2, bankPerGroup/3, bankgroup/4, channel/5
+    val field_widths = Seq(16, 1, 7, 2, 2, 1, 6)
+    val res = Wire(Vec(6, UInt(addr.getWidth.W)))
+    for (i <- 0 until (field_widths.length - 1)) {
+      if (field_widths(i) > 0) {
+        res(i) := addr(field_widths.drop(i).sum-1, field_widths.drop(i+1).sum)
+      } else {
+        res(i) := 0.U
+      }
+    }
+    (res(0), res(1), res(4), res(2), res(3), res(5))
+  }
+  
+  def getDramChannel(addr: UInt) = {
+    val (_, _, _, _, _, ch) = get_roracobabgch(addr)
+    ch
+  }
+
+  def getDramBank(addr: UInt) = {
+    val (_, rk, _, bp, bg, ch) = get_roracobabgch(addr)
+    Cat(ch, rk, bg, bp)
+  }
 }
 
 abstract class CoupledL2Bundle(implicit val p: Parameters) extends Bundle
@@ -418,6 +445,7 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     val io = IO(new Bundle {
       val hartId = Input(UInt(hartIdLen.W))
       val pfCtrlFromCore = Input(new PrefetchCtrlFromCore)
+      val l2_fdbk_pf_ctrl = Output(new L2ToL1PfCtrl)
       val l2_hint = Vec(hintChannelCount, ValidIO(new L2ToL1Hint()(l2ECCParams)))
       val l2_tlb_req = new L2ToL1TlbIO(nRespDups = 1)(l2TlbParams)
       val debugTopDown = new Bundle {
@@ -499,6 +527,11 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
         prefetcher.get.pfCtrlFromCore := io.pfCtrlFromCore
         prefetcher.get.io.resp <> prefetchResps.get
         prefetcher.get.io.tlb_req <> io.l2_tlb_req
+    }
+    if (prefetchOpt.isEmpty) {
+      io.l2_fdbk_pf_ctrl := L2ToL1PfCtrl.default()
+    } else {
+      io.l2_fdbk_pf_ctrl := prefetcher.get.l2ToL1PfCtrl
     }
     pf_recv_node match {
       case Some(x) =>
@@ -815,6 +848,16 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       for (ch <- 0 until hintChannelCount) {
         hintChosen(ch) := hintChosenVec(ch)
         hintFire(ch) := hintFireVec(ch)
+      }
+    }
+    // ==================== Prefetch replenish (after slice initilize)===================
+    prefetcher.foreach{ p =>
+      for ((f, s) <- p.pfFeedbackVec zip slices) {
+        f.replaceRecord := s.io.replaceRecord.get
+        f.dataRefill := s.io.dataRefill.get
+        f.dirResult := s.io.dirResult.get
+        f.pfStatInMSHR := s.io.pfStatInMSHR.get
+        f.busContention := s.io.busContention.get
       }
     }
 

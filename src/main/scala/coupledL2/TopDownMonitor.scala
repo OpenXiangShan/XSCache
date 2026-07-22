@@ -31,6 +31,12 @@ class PfStatInMSHRBundle()(implicit p: Parameters) extends L2Bundle {
 
   val hitPf = Bool()
   val hitPfReqSrc = UInt(MemReqSource.reqSourceBits.W)
+  val hitPfLatency = UInt(timestampBits.W)
+
+  // prefetch request leaves RequestBuffer (issued/released or merged by demand)
+  val pfReleaseFromReqBuffer = Bool()
+  val reqBufferPfReqSrc = UInt(MemReqSource.reqSourceBits.W)
+  val reqBufferHoldLatency = UInt(timestampBits.W)
 }
 
 // TODO: Accommodate CHI
@@ -122,7 +128,7 @@ class TopDownMonitor()(implicit p: Parameters) extends L2Module {
    * Some performance counters need to be aggregated among slices. For convenience, they are defined here
    */
   val pfTypes: Seq[(String, UInt => Bool, UInt => Bool)] = Seq(
-    ("BOP", (x: UInt) => x === MemReqSource.Prefetch2L2BOP.id.U, (y: UInt) => y === PfSource.BOP.id.U),
+    ("VBOP", (x: UInt) => x === MemReqSource.Prefetch2L2BOP.id.U, (y: UInt) => y === PfSource.BOP.id.U),
     ("PBOP", (x: UInt) => x === MemReqSource.Prefetch2L2PBOP.id.U, (y: UInt) => y === PfSource.PBOP.id.U),
     ("SMS", (x: UInt) => x === MemReqSource.Prefetch2L2SMS.id.U, (y: UInt) => y === PfSource.SMS.id.U),
     ("Stride", (x: UInt) => x === MemReqSource.Prefetch2L2Stride.id.U, (y: UInt) => y === PfSource.Stride.id.U),
