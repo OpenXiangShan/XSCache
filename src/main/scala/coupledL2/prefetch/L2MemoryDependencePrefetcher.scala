@@ -132,6 +132,8 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
     val candidate = Flipped(DecoupledIO(new L2MdpCandidate))
     val tlbReq = new L2ToL1TlbIO(nRespDups = 1)
     val req = DecoupledIO(new PrefetchReq)
+    // Retain the source PC alongside the translated request for ChiselDB.
+    val triggerPC = Output(UInt(64.W))
   })
 
   val entries = RegInit(VecInit(Seq.fill(entriesNum)(0.U.asTypeOf(new Entry))))
@@ -239,6 +241,7 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
   io.req.bits.needT := false.B
   io.req.bits.source := entries(pfIdx).source
   io.req.bits.pfSource := MemReqSource.Prefetch2L2MDP.id.U
+  io.triggerPC := entries(pfIdx).triggerPC
 
   when(io.req.fire) {
     valids(pfIdx) := false.B
@@ -298,6 +301,8 @@ class L2MemoryDependencePrefetcher(implicit p: Parameters)
 
   class L2MdpPrefetchDBEntry extends Bundle {
     val timeCnt = UInt(64.W)
+    // PC carried from the hinted L2 refill through translation to this fire.
+    val triggerPC = UInt(64.W)
     val vaddr = UInt(fullVAddrBits.W)
     val paddr = UInt(fullAddressBits.W)
   }
@@ -362,6 +367,7 @@ class L2MemoryDependencePrefetcher(implicit p: Parameters)
 
   val prefetchLog = Wire(new L2MdpPrefetchDBEntry)
   prefetchLog.timeCnt := GTimer()
+  prefetchLog.triggerPC := pfBuffer.io.triggerPC
   prefetchLog.vaddr := pfBuffer.io.req.bits.vaddr.getOrElse(0.U) << offsetBits
   prefetchLog.paddr := pfBuffer.io.req.bits.addr
   prefetchTable.log(prefetchLog, pfBuffer.io.req.fire, "l2mdp", clock, reset)

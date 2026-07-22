@@ -207,6 +207,10 @@ class SinkA(implicit p: Parameters) extends L2Module {
   XSPerfAccumulate("sinkA_acquireblock_req", io.a.fire && io.a.bits.opcode === AcquireBlock)
   XSPerfAccumulate("sinkA_acquireperm_req", io.a.fire && io.a.bits.opcode === AcquirePerm)
   XSPerfAccumulate("sinkA_get_req", io.a.fire && io.a.bits.opcode === Get)
+  // Count the exact A-channel fire carrying the L1 MDP metadata.  This is
+  // the first L2-side observation point after the TileLink user fields leave
+  // the DCache and is intentionally independent of directory/MSHR outcome.
+  XSPerfAccumulate("l2_mdp_sink_a_hint", io.a.fire && io.a.bits.user.lift(MdpHintKey).getOrElse(false.B))
   prefetchOpt.foreach {
     _ =>
       XSPerfAccumulate("sinkA_prefetch_req", io.prefetchReq.get.fire)

@@ -1052,6 +1052,17 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // directory access result
   val hit_s3 = task_s3.valid && !mshr_req_s3 && dirResult_s3.hit
   val miss_s3 = task_s3.valid && !mshr_req_s3 && !dirResult_s3.hit
+  // V0.4 L2 path accounting for hinted A requests.  S2 counts entry into
+  // MainPipe; S3 splits the same request by directory result and whether the
+  // A-side policy requires an MSHR (including hit-with-upgrade/alias cases).
+  val mdpHintA_s2 = task_s2.valid && task_s2.bits.fromA && task_s2.bits.mdpHint
+  val mdpHintA_s3 = task_s3.valid && sinkA_req_s3 && req_s3.mdpHint
+  XSPerfAccumulate("l2_mdp_mainpipe_hint_a_s2", mdpHintA_s2)
+  XSPerfAccumulate("l2_mdp_mainpipe_hint_a_s3", mdpHintA_s3)
+  XSPerfAccumulate("l2_mdp_mainpipe_hint_a_dir_hit", mdpHintA_s3 && dirResult_s3.hit)
+  XSPerfAccumulate("l2_mdp_mainpipe_hint_a_dir_miss", mdpHintA_s3 && !dirResult_s3.hit)
+  XSPerfAccumulate("l2_mdp_mainpipe_hint_a_need_mshr", mdpHintA_s3 && need_mshr_s3_a)
+  XSPerfAccumulate("l2_mdp_mainpipe_hint_a_no_mshr", mdpHintA_s3 && !need_mshr_s3_a)
   XSPerfAccumulate("a_req_hit", hit_s3 && req_s3.fromA)
   XSPerfAccumulate("acquire_hit", hit_s3 && req_s3.fromA &&
     (req_s3.opcode === AcquireBlock || req_s3.opcode === AcquirePerm))
