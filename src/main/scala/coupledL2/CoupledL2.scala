@@ -608,20 +608,23 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
                 train.bits.tag, train.bits.set, i.U(bankBits.W), 0.U(offsetBits.W)
               )
               val (train_tag, train_set, _) = s.parseFullAddress(train_full_addr)
-              val evict_full_addr = Cat(
-                train.bits.evict_tag, train.bits.evict_set, i.U(bankBits.W), 0.U(offsetBits.W)
-              )
-              val (evict_tag, evict_set, _) = s.parseFullAddress(evict_full_addr)
               val resp_full_addr = Cat(
                 resp.bits.tag, resp.bits.set, i.U(bankBits.W), 0.U(offsetBits.W)
               )
               val (resp_tag, resp_set, _) = s.parseFullAddress(resp_full_addr)
               prefetchTrains.get(i).bits.tag := train_tag
               prefetchTrains.get(i).bits.set := train_set
-              prefetchTrains.get(i).bits.evict_tag := evict_tag
-              prefetchTrains.get(i).bits.evict_set := evict_set
               prefetchResps.get(i).bits.tag := resp_tag
               prefetchResps.get(i).bits.set := resp_set
+
+              if (hasCDP) {
+                val evict_full_addr = Cat(
+                  train.bits.evict_tag.get, train.bits.evict_set.get, i.U(bankBits.W), 0.U(offsetBits.W)
+                )
+                val (evict_tag, evict_set, _) = s.parseFullAddress(evict_full_addr)
+                prefetchTrains.get(i).bits.evict_tag.get := evict_tag
+                prefetchTrains.get(i).bits.evict_set.get := evict_set
+              }
             }
             s.tlb_req.req.valid := false.B
             s.tlb_req.req.bits := DontCare

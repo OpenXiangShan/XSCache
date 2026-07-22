@@ -41,7 +41,7 @@ class MetaEntry(implicit p: Parameters) extends L2Bundle {
   val dataErr = Bool()
 
   // for CDP
-  val pfDepth = UInt(pfDepthBits.W)
+  val pfDepth = if (hasCDP) Some(UInt(pfDepthBits.W)) else None
 
   def =/=(entry: MetaEntry): Bool = {
     this.asUInt =/= entry.asUInt
@@ -67,7 +67,7 @@ object MetaEntry {
     entry.accessed := accessed
     entry.tagErr := tagErr
     entry.dataErr := dataErr
-    entry.pfDepth := pfDepth
+    entry.pfDepth.foreach(_ := pfDepth)
     entry
   }
 }

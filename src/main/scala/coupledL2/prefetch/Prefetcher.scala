@@ -174,20 +174,21 @@ class PrefetchTrain(implicit p: Parameters) extends PrefetchBundle {
   val pfsource = UInt(PfSource.pfSourceBits.W)
   val reqsource = UInt(MemReqSource.reqSourceBits.W)
 
-  val evict_tag = UInt(fullTagBits.W)
-  val evict_set = UInt(setBits.W)
+  val evict_tag = Option.when(hasCDP) (UInt(fullTagBits.W))
+  val evict_set = Option.when(hasCDP) (UInt(setBits.W))
 
   // this is for CDP: train CDP when valid address req comes to MainPipe
-  val cdp_vpn_train_valid     = Bool()
+  val cdp_vpn_train_valid     = Option.when(hasCDP) (Bool())
 
-  val cdp_filter_train_hit    = Bool()
-  val cdp_filter_train_evict  = Bool()
+  val cdp_filter_train_hit    = Option.when(hasCDP) (Bool())
+  val cdp_filter_train_evict  = Option.when(hasCDP) (Bool())
 
-  val is_cdp_train    = Bool()    // for CDP
-  val is_other_train  = Bool()    // for BOP or TP
+  // clarify whether the train is for CDP or other prefetcher
+  val is_cdp_train    = Option.when(hasCDP) (Bool())
+  val is_other_train  = Option.when(hasCDP) (Bool())
   
   def addr: UInt = Cat(tag, set, 0.U(offsetBits.W))
-  def evict_addr: UInt = Cat(evict_tag, evict_set, 0.U(offsetBits.W))
+  def evict_addr: UInt = Cat(evict_tag.getOrElse(0.U(fullTagBits.W)), evict_set.getOrElse(0.U(setBits.W)), 0.U(offsetBits.W))
 }
 
 class PrefetchIO(implicit p: Parameters) extends PrefetchBundle {
@@ -259,41 +260,47 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   // TODO: consider separate VBOP and PBOP in prefetch param
   val pbop = if (hasBOP) Some(
     Module(new PBestOffsetPrefetch()(p.alterPartial({
-      case L2ParamKey => p(L2ParamKey).copy(prefetch = Seq(BOPParameters(
-        virtualTrain = false,
-        badScore = 1,
-        offsetList = Seq(
-          -32, -30, -27, -25, -24, -20, -18, -16, -15,
-          -12, -10, -9, -8, -6, -5, -4, -3, -2, -1,
-          1, 2, 3, 4, 5, 6, 8, 9, 10,
-          12, 15, 16, 18, 20, 24, 25, 27, 30
+      case L2ParamKey =>
+        val l2Params = p(L2ParamKey)
+        l2Params.copy(prefetch = Seq(BOPParameters(
+            virtualTrain = false,
+            badScore = 1,
+            offsetList = Seq(
+              -32, -30, -27, -25, -24, -20, -18, -16, -15,
+              -12, -10, -9, -8, -6, -5, -4, -3, -2, -1,
+              1, 2, 3, 4, 5, 6, 8, 9, 10,
+              12, 15, 16, 18, 20, 24, 25, 27, 30
+            )
+          )) ++ l2Params.prefetch.filterNot(_.isInstanceOf[BOPParameters])
         )
-      )))
     })))
   ) else None
 
   val vbop = if (hasBOP) Some(
     Module(new VBestOffsetPrefetch()(p.alterPartial({
-      case L2ParamKey => p(L2ParamKey).copy(prefetch = Seq(BOPParameters(
-        badScore = 2,
-        offsetList = Seq(
-          -117, -147, -91, 117, 147, 91,
-          -256, -250, -243, -240, -225, -216, -200,
-          -192, -180, -162, -160, -150, -144, -135, -128,
-          -125, -120, -108, -100, -96, -90, -81, -80,
-          -75, -72, -64, -60, -54, -50, -48, -45,
-          -40, -36, -32, -30, -27, -25, -24, -20,
-          -18, -16, -15, -12, -10, -9, -8, -6,
-          -5, -4, -3, -2, -1,
-          1, 2, 3, 4, 5, 6, 8,
-          9, 10, 12, 15, 16, 18, 20, 24,
-          25, 27, 30, 32, 36, 40, 45, 48,
-          50, 54, 60, 64, 72, 75, 80, 81,
-          90, 96, 100, 108, 120, 125, 128, 135,
-          144, 150, 160, 162, 180, 192, 200, 216,
-          225, 240, 243, 250 /*, 256*/
+      case L2ParamKey =>
+        val l2Params = p(L2ParamKey)
+        l2Params.copy(prefetch = Seq(BOPParameters(
+            badScore = 2,
+            offsetList = Seq(
+              -117, -147, -91, 117, 147, 91,
+              -256, -250, -243, -240, -225, -216, -200,
+              -192, -180, -162, -160, -150, -144, -135, -128,
+              -125, -120, -108, -100, -96, -90, -81, -80,
+              -75, -72, -64, -60, -54, -50, -48, -45,
+              -40, -36, -32, -30, -27, -25, -24, -20,
+              -18, -16, -15, -12, -10, -9, -8, -6,
+              -5, -4, -3, -2, -1,
+              1, 2, 3, 4, 5, 6, 8,
+              9, 10, 12, 15, 16, 18, 20, 24,
+              25, 27, 30, 32, 36, 40, 45, 48,
+              50, 54, 60, 64, 72, 75, 80, 81,
+              90, 96, 100, 108, 120, 125, 128, 135,
+              144, 150, 160, 162, 180, 192, 200, 216,
+              225, 240, 243, 250 /*, 256*/
+            )
+          )) ++ l2Params.prefetch.filterNot(_.isInstanceOf[BOPParameters])
         )
-      )))
     })))
   ) else None
 
@@ -316,7 +323,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   train.ready := true.B
   if (hasBOP) {
     val vbop_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
-    vbop_train_buf.io.enq.valid := train.valid && train.bits.is_other_train
+    vbop_train_buf.io.enq.valid := train.valid && train.bits.is_other_train.getOrElse(true.B)
     vbop_train_buf.io.enq.bits  := train.bits
     XSPerfAccumulate("vbop_train_drop", vbop_train_buf.io.enq.valid && !vbop_train_buf.io.enq.ready)
     XSPerfAccumulate("vbop_train_accept", vbop_train_buf.io.enq.fire)
@@ -330,7 +337,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     vbop.get.io.pbopCrossPage := true.B // pbop.io.pbopCrossPage // let vbop have noting to do with pbop
 
     val pbop_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
-    pbop_train_buf.io.enq.valid := train.valid && train.bits.is_other_train
+    pbop_train_buf.io.enq.valid := train.valid && train.bits.is_other_train.getOrElse(true.B)
     pbop_train_buf.io.enq.bits  := train.bits
     XSPerfAccumulate("pbop_train_drop", pbop_train_buf.io.enq.valid && !pbop_train_buf.io.enq.ready)
     XSPerfAccumulate("pbop_train_accept", pbop_train_buf.io.enq.fire)
@@ -362,7 +369,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   if (hasNLPrefetcher) {
     val nl_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
-    nl_train_buf.io.enq.valid := train.valid && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U) && train.bits.is_other_train
+    nl_train_buf.io.enq.valid := train.valid && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U) && train.bits.is_other_train.getOrElse(true.B)
     nl_train_buf.io.enq.bits  := train.bits
     XSPerfAccumulate("nl_train_drop", nl_train_buf.io.enq.valid && !nl_train_buf.io.enq.ready)
     XSPerfAccumulate("nl_train_accept", nl_train_buf.io.enq.fire)
@@ -374,7 +381,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   if (hasTPPrefetcher) {
     val tp_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
-    tp_train_buf.io.enq.valid := train.valid && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U) && train.bits.is_other_train
+    tp_train_buf.io.enq.valid := train.valid && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U) && train.bits.is_other_train.getOrElse(true.B)
     tp_train_buf.io.enq.bits  := train.bits
     XSPerfAccumulate("tp_train_drop", tp_train_buf.io.enq.valid && !tp_train_buf.io.enq.ready)
     XSPerfAccumulate("tp_train_accept", tp_train_buf.io.enq.fire)
@@ -390,10 +397,10 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     cdp.get.io.enable := true.B
 
     // Train
-    cdp.get.io.vpn_train.valid  := train.valid && train.bits.cdp_vpn_train_valid && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U)
+    cdp.get.io.vpn_train.valid  := train.valid && train.bits.cdp_vpn_train_valid.get && train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U
     cdp.get.io.vpn_train.bits   := train.bits
 
-    cdp.get.io.filter_train.valid := train.valid && (train.bits.cdp_filter_train_hit || train.bits.cdp_filter_train_evict) && (train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U)
+    cdp.get.io.filter_train.valid := train.valid && (train.bits.cdp_filter_train_hit.get || train.bits.cdp_filter_train_evict.get) && train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U
     cdp.get.io.filter_train.bits  := train.bits
 
     // Trigger

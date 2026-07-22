@@ -124,7 +124,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val cmoLineDone = Option.when(cacheParams.enableL2Flush) (Output(Bool()))
 
     /* to CDP for detection */
-    val cdp_trigger = Option.when(prefetchers.exists(_.isInstanceOf[CDPParameters])) (ValidIO(new CDPDetectTrigger))
+    val cdp_trigger = Option.when(hasCDP) (ValidIO(new CDPDetectTrigger))
   })
 
   require(chiOpt.isDefined)
@@ -574,7 +574,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       tagErr = metaOnHit_s3.tagErr,
       dataErr = metaOnHit_s3.dataErr,
       pfsrc = metaOnHit_s3.prefetchSrc.getOrElse(0.U),
-      pfDepth = metaOnHit_s3.pfDepth
+      pfDepth = metaOnHit_s3.pfDepth.getOrElse(0.U)
     )
   )
   val metaW_s3_c = MetaEntry(
@@ -586,7 +586,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     tagErr = Mux(wen_c, req_s3.denied, metaOnHit_s3.tagErr),
     dataErr = Mux(wen_c, req_s3.corrupt, metaOnHit_s3.dataErr), // update error when write DS
     pfsrc = metaOnHit_s3.prefetchSrc.getOrElse(0.U),
-    pfDepth = metaOnHit_s3.pfDepth
+    pfDepth = metaOnHit_s3.pfDepth.getOrElse(0.U)
   )
 
   // use merge_meta if mergeA
@@ -734,9 +734,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       val cdp_filter_train_evict = task_s3.valid && mshr_refill_s3 && req_s3.replTask &&
         !io.replResp.bits.meta.accessed && io.replResp.bits.meta.prefetch.getOrElse(false.B) && io.replResp.bits.meta.prefetchSrc.getOrElse(false.B) === PfSource.CDP.id.U
 
-      train.bits.cdp_vpn_train_valid    := cdp_vpn_train_valid
-      train.bits.cdp_filter_train_hit   := cdp_filter_train_hit
-      train.bits.cdp_filter_train_evict := cdp_filter_train_evict
+      if (hasCDP) {
+        train.bits.cdp_vpn_train_valid.get  := cdp_vpn_train_valid
+        train.bits.cdp_filter_train_hit.get := cdp_filter_train_hit
+        train.bits.cdp_filter_train_evict.get := cdp_filter_train_evict
+      }
 
       val is_cdp_train  = cdp_vpn_train_valid || cdp_filter_train_hit || cdp_filter_train_evict
 
@@ -750,7 +752,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
         )
       
       // --------------------- Train Detail ---------------------
-      train.valid := is_cdp_train || is_other_train
+      train.valid := is_other_train || (if (hasCDP) is_cdp_train else false.B)
       train.bits.tag := req_s3.tag
       train.bits.set := req_s3.set
       train.bits.needT := Mux(
@@ -767,11 +769,15 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       train.bits.prefetched := Mux(req_s3.mergeA, true.B, metaOnHit_s3.prefetch.getOrElse(false.B))
       train.bits.pfsource := Mux(req_s3.mergeA, req_s3.meta.prefetchSrc.getOrElse(PfSource.NoWhere.id.U), metaOnHit_s3.prefetchSrc.getOrElse(PfSource.NoWhere.id.U)) // TODO
       train.bits.reqsource := req_s3.reqSource
-      train.bits.is_cdp_train := is_cdp_train
-      train.bits.is_other_train := is_other_train
+      if (hasCDP){
+        train.bits.is_cdp_train.get := is_cdp_train
+        train.bits.is_other_train.get := is_other_train
+      }
 
-      train.bits.evict_tag := io.replResp.bits.tag
-      train.bits.evict_set := io.replResp.bits.set
+      if (hasCDP) {
+        train.bits.evict_tag.get := io.replResp.bits.tag
+        train.bits.evict_set.get := io.replResp.bits.set
+      }
   }
 
   /* ======== Stage 4 ======== */
@@ -896,31 +902,31 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   txdat_s5.bits.data.data := out_data_s5
 
   /* ======== s5 CDP Detect Trigger ======== */
-  val dirResult_s5_hit      = RegNext(RegNext(dirResult_s3.hit))
-  val dirResult_s5_fromCDP  = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.getOrElse(0.U) === PfSource.CDP.id.U))
-  val dirResult_s5_fromSMS  = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.getOrElse(0.U) === PfSource.SMS.id.U))
-  val dirResult_s5_fromBOP  = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.getOrElse(0.U) === PfSource.BOP.id.U))
-  val dirResult_s5_fromPBOP = RegNext(RegNext(dirResult_s3.meta.prefetchSrc.getOrElse(0.U) === PfSource.PBOP.id.U))
-  
-  val req_s5_sinkA = !task_s5.bits.mshrTask && task_s5.bits.fromA
-  val req_s5_acquire_block = req_s5_sinkA && task_s5.bits.opcode === GrantData
+  if (hasCDP){
+    val dirResult_s5_hit      = RegNextN(dirResult_s3.hit, 2)
+    val dirResult_s5_fromCDP  = RegNextN(dirResult_s3.meta.prefetchSrc.getOrElse(0.U) === PfSource.CDP.id.U, 2)
+    val dirResult_s5_fromSMS  = RegNextN(dirResult_s3.meta.prefetchSrc.getOrElse(0.U) === PfSource.SMS.id.U, 2)
+    val dirResult_s5_fromBOP  = RegNextN(dirResult_s3.meta.prefetchSrc.getOrElse(0.U) === PfSource.BOP.id.U, 2)
+    val dirResult_s5_fromPBOP = RegNextN(dirResult_s3.meta.prefetchSrc.getOrElse(0.U) === PfSource.PBOP.id.U, 2)
 
-  val is_hit_trigger_s5     = task_s5.valid && dirResult_s5_hit && req_s5_acquire_block &&
-    (dirResult_s5_fromCDP || dirResult_s5_fromSMS || dirResult_s5_fromBOP || dirResult_s5_fromPBOP)
-  val hit_trigger_data_s5   = out_data_s5
-  val hit_trigger_depth_s3  = dirResult_s3.meta.pfDepth
-  val hit_trigger_pfSrc_s3  = Mux(dirResult_s3.meta.accessed, PfSource.NoWhere.id.U, dirResult_s3.meta.prefetchSrc.getOrElse(0.U))
-  val hit_trigger_depth_s5  = RegNext(RegNext(hit_trigger_depth_s3))
-  val hit_trigger_pfsrc_s5  = RegNext(RegNext(hit_trigger_pfSrc_s3))
+    val req_s5_sinkA = !task_s5.bits.mshrTask && task_s5.bits.fromA
+    val req_s5_acquire_block = req_s5_sinkA && task_s5.bits.opcode === GrantData
 
-  val is_refill_trigger_s3 = task_s3.valid && (mshr_grantdata_s3 || mshr_hintack_s3)
-  val is_refill_trigger_s5 = RegNext(RegNext(is_refill_trigger_s3))
-  val refill_trigger_data_s3  = Mux(req_s3.useProbeData, io.releaseBufResp_s3.bits.data, io.refillBufResp_s3.bits.data)
-  val refill_trigger_data_s5  = RegNext(RegNext(refill_trigger_data_s3))
-  val refill_trigger_depth_s5 = RegNext(RegNext(metaW_s3_mshr.pfDepth))
-  val refill_trigger_pfsrc_s5 = RegNext(RegNext(metaW_s3_mshr.prefetchSrc.getOrElse(0.U)))
+    val is_hit_trigger_s5     = task_s5.valid && dirResult_s5_hit && req_s5_acquire_block &&
+      (dirResult_s5_fromCDP || dirResult_s5_fromSMS || dirResult_s5_fromBOP || dirResult_s5_fromPBOP)
+    val hit_trigger_data_s5   = out_data_s5
+    val hit_trigger_depth_s3  = dirResult_s3.meta.pfDepth.getOrElse(0.U)
+    val hit_trigger_pfSrc_s3  = Mux(dirResult_s3.meta.accessed, PfSource.NoWhere.id.U, dirResult_s3.meta.prefetchSrc.getOrElse(0.U))
+    val hit_trigger_depth_s5  = RegNextN(hit_trigger_depth_s3, 2)
+    val hit_trigger_pfsrc_s5  = RegNextN(hit_trigger_pfSrc_s3, 2)
 
-  if (hasCDP) {
+    val is_refill_trigger_s3 = task_s3.valid && (mshr_grantdata_s3 || mshr_hintack_s3)
+    val is_refill_trigger_s5 = RegNextN(is_refill_trigger_s3, 2)
+    val refill_trigger_data_s3  = Mux(req_s3.useProbeData, io.releaseBufResp_s3.bits.data, io.refillBufResp_s3.bits.data)
+    val refill_trigger_data_s5  = RegNextN(refill_trigger_data_s3, 2)
+    val refill_trigger_depth_s5 = RegNextN(metaW_s3_mshr.pfDepth.getOrElse(0.U), 2)
+    val refill_trigger_pfsrc_s5 = RegNextN(metaW_s3_mshr.prefetchSrc.getOrElse(0.U), 2)
+
     val cdp_trigger = io.cdp_trigger.get
     cdp_trigger.valid := is_hit_trigger_s5 || is_refill_trigger_s5
     cdp_trigger.bits.cacheblock  := Mux(is_hit_trigger_s5, hit_trigger_data_s5, refill_trigger_data_s5)

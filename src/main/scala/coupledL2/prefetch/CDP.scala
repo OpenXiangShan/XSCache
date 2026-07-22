@@ -598,7 +598,7 @@ class ftTrainPipeline(implicit p: Parameters) extends CDPModule {
   train_trigger.ready := !reset.asBool && s1_ready && !same_addr
 
   val train_paddr = Mux(
-    train_trigger.bits.cdp_filter_train_evict,
+    train_trigger.bits.cdp_filter_train_evict.get,
     train_trigger.bits.evict_addr,
     train_trigger.bits.addr
   )
@@ -606,8 +606,8 @@ class ftTrainPipeline(implicit p: Parameters) extends CDPModule {
   val s0_set_idx = get_filter_set(train_paddr)
   val s0_offset  = get_filter_offset(train_paddr)
   val s0_tag     = get_filter_tag(train_paddr)
-  val s0_is_used = train_trigger.bits.cdp_filter_train_hit
-  val s0_is_evict = train_trigger.bits.cdp_filter_train_evict
+  val s0_is_used = train_trigger.bits.cdp_filter_train_hit.get
+  val s0_is_evict = train_trigger.bits.cdp_filter_train_evict.get
 
   // ----------- s1: query FilterTable -----------
   when (s1_ready) {
