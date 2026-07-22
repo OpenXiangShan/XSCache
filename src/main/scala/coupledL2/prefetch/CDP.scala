@@ -9,40 +9,40 @@ import utility.sram.SRAMTemplate
 import xscache.coupledL2._
 
 case class CDPParameters(
-  UseFilteredDetect:  Boolean = false,
+  useFilteredDetect:  Boolean = false,
 
-  HotThreshold:   Int = 2,
-  DepthThreshold: Int = 1,
+  hotThreshold:   Int = 2,
+  depthThreshold: Int = 1,
 
-  DetectPipeNum: Int = 4,
+  detectPipeNum: Int = 4,
 
-  ReqFilterEntryNum: Int = 16,   // how many entries in the prefetch req filter?
+  reqFilterEntryNum: Int = 16,   // how many entries in the prefetch req filter?
 
   // Replacement
   replacer: Option[String] = Some("setplru"),
 
   // VPN Table Params
-  VpnTableSetNum:       Int = 4,
-  VpnTableWayNum:       Int = 4,
-  VpnTableSubEntryNum:  Int = 4,
-  VpnTableTagBits:      Int = 10,     // should be a val within (0, 18 - log2(VpnTableSubEntryNum)]
-  UseVpnTableHashIndex: Boolean = true,
-  CounterBits:          Int = 10,
-  VpnResetPeriod:       Int = 128,    // Every $VpnResetPeriod visits, VPN entries will be reset
-  EntryBits:            Int = 21,     // Every SubEntry maintain for 2^$(EntryBits) Bits
+  vpnTableSetNum:       Int = 4,
+  vpnTableWayNum:       Int = 4,
+  vpnTableSubEntryNum:  Int = 4,
+  vpnTableTagBits:      Int = 10,     // should be a val within (0, 18 - log2(vpnTableSubEntryNum)]
+  useVpnTableHashIndex: Boolean = true,
+  counterBits:          Int = 10,
+  vpnResetPeriod:       Int = 128,    // Every $vpnResetPeriod visits, VPN entries will be reset
+  entryBits:            Int = 21,     // Every SubEntry maintain for 2^$(entryBits) Bits
 
   // FilterTable Params
-  FilterTableSetNum:  Int = 64,
-  FilterTableWayNum:  Int = 4,
-  FilterEntryBlks:  Int = 64,         // 64 slots per entry
-  FilterEntryGranularity: Int = 4096, // 4KB per slot
+  filterTableSetNum:  Int = 64,
+  filterTableWayNum:  Int = 4,
+  filterEntryBlks:  Int = 64,         // 64 slots per entry
+  filterEntryGranularity: Int = 4096, // 4KB per slot
 
-  Degree:   Int = 3,      // issue how many prefetch req?
-  UseDynamicDegree: Boolean = false,
+  degree:   Int = 3,      // issue how many prefetch req?
+  useDynamicDegree: Boolean = false,
 
   debug: Boolean = false,
 
-  UseFilterTable: Boolean = true
+  useFilterTable: Boolean = true
 
 ) extends PrefetchParameters {
   override val hasPrefetchBit: Boolean = true
@@ -60,18 +60,18 @@ trait HasCDPParams extends HasPrefetcherHelper with HasCoupledL2Parameters {
 
   val debug = cdpParams.debug
 
-  val UseFilteredDetect = cdpParams.UseFilteredDetect
-  val UseFilterTable    = cdpParams.UseFilterTable
+  val useFilteredDetect = cdpParams.useFilteredDetect
+  val useFilterTable    = cdpParams.useFilterTable
 
-  val hot_threshold   = cdpParams.HotThreshold
-  val depth_threshold = cdpParams.DepthThreshold
-  require(depth_threshold <= pfDepthMax, s"depth_threshold(${depth_threshold}) should be less than pfDepthMax(${pfDepthMax})")
+  val hotThreshold   = cdpParams.hotThreshold
+  val depthThreshold = cdpParams.depthThreshold
+  require(depthThreshold <= pfDepthMax, s"depthThreshold(${depthThreshold}) should be less than pfDepthMax(${pfDepthMax})")
 
   // helper function
-  def get_folded_hash(origin_val: UInt, resultBitWidth: Int): UInt = {    // fold $origin_val length value into $resultBitWidth
-    val totalBits = origin_val.getWidth
+  def get_folded_hash(originVal: UInt, resultBitWidth: Int): UInt = {    // fold $originVal length value into $resultBitWidth
+    val totalBits = originVal.getWidth
 
-    // Handle zero-width origin_val to avoid reduce on an empty sequence
+    // Handle zero-width originVal to avoid reduce on an empty sequence
     if (totalBits == 0) {
       0.U(resultBitWidth.W)
     } else {
@@ -79,92 +79,92 @@ trait HasCDPParams extends HasPrefetcherHelper with HasCoupledL2Parameters {
 
       val paddedBits = groupNum * resultBitWidth
       val padWidth = paddedBits - totalBits
-      val padded_val =
-        if (padWidth == 0) origin_val
-        else Cat(0.U(padWidth.W), origin_val)
+      val paddedVal =
+        if (padWidth == 0) originVal
+        else Cat(0.U(padWidth.W), originVal)
 
       val groups = Seq.tabulate(groupNum) { i =>
         val startBit = i * resultBitWidth
         val endBit = (i + 1) * resultBitWidth - 1
-        padded_val(endBit, startBit)
+        paddedVal(endBit, startBit)
       }
 
       groups.reduce(_ ^ _)
     }
   }
 
-  val DetectPipeNum = cdpParams.DetectPipeNum
+  val detectPipeNum = cdpParams.detectPipeNum
 
-  val Degree            = cdpParams.Degree
-  val UseDynamicDegree  = cdpParams.UseDynamicDegree
+  val degree            = cdpParams.degree
+  val useDynamicDegree  = cdpParams.useDynamicDegree
 
   val replType  = cdpParams.replacer
 
   // VpnTable Params
-  val CounterBits   = cdpParams.CounterBits
+  val counterBits   = cdpParams.counterBits
 
   def get_vpn2(addr: UInt): UInt = addr(38, 30)
   def get_vpn1(addr: UInt): UInt = addr(29, 21)
   def get_vpn0(addr: UInt): UInt = addr(20, 12)
   def get_offset(addr: UInt): UInt = addr(11, 0)
 
-  val VpnTableSetNum      = cdpParams.VpnTableSetNum
-  val VpnTableWayNum      = cdpParams.VpnTableWayNum
-  val VpnTableSubEntryNum = cdpParams.VpnTableSubEntryNum
+  val vpnTableSetNum      = cdpParams.vpnTableSetNum
+  val vpnTableWayNum      = cdpParams.vpnTableWayNum
+  val vpnTableSubEntryNum = cdpParams.vpnTableSubEntryNum
 
-  val VpnResetPeriod      = cdpParams.VpnResetPeriod
+  val vpnResetPeriod      = cdpParams.vpnResetPeriod
 
-  val EntryBits     = cdpParams.EntryBits
-  val mainEntryBits = log2Ceil(VpnTableSetNum)
-  val subEntryBits  = log2Ceil(VpnTableSubEntryNum)
-  val vpnTabTagBits = cdpParams.VpnTableTagBits
-  val useVpnTableHashIndex = cdpParams.UseVpnTableHashIndex
-  val vpnWayBits    = log2Ceil(VpnTableWayNum)
+  val entryBits     = cdpParams.entryBits
+  val mainEntryBits = log2Ceil(vpnTableSetNum)
+  val subEntryBits  = log2Ceil(vpnTableSubEntryNum)
+  val vpnTabTagBits = cdpParams.vpnTableTagBits
+  val useVpnTableHashIndex = cdpParams.useVpnTableHashIndex
+  val vpnWayBits    = log2Ceil(vpnTableWayNum)
 
-  // vaddr => [ Tag | MainEntryIdx | SubEntryIdx | EntryBits(1M Space) ]
+  // vaddr => [ Tag | MainEntryIdx | SubEntryIdx | entryBits(1M Space) ]
   // vpn_addr => [ Tag | MainEntryIdx | SubEntryIdx ]
   //
   // Hash the narrow index fields with upper VPN bits to avoid skewed set/sub-entry access.
   // Keep the main-entry hash independent of sub_idx so the four sub entries belonging to
   // the same main entry still share one tag/way and can use alloc_sub normally.
 
-  def get_vpn_addr(addr: UInt) = addr(addr.getWidth - 1, EntryBits)  // TODO: parameterize
+  def get_vpn_addr(addr: UInt) = addr(addr.getWidth - 1, entryBits)  // TODO: parameterize
 
   def get_vpntab_origin_tag(addr: UInt) = {
-    val vpn_addr = get_vpn_addr(addr)
-    vpn_addr(vpn_addr.getWidth - 1, subEntryBits + mainEntryBits) // TODO: parameterize
+    val vpnAddr = get_vpn_addr(addr)
+    vpnAddr(vpnAddr.getWidth - 1, subEntryBits + mainEntryBits) // TODO: parameterize
   }
 
   def get_vpntab_origin_main_idx(addr: UInt) = {
-    val vpn_addr = get_vpn_addr(addr)
-    vpn_addr(subEntryBits + mainEntryBits - 1, subEntryBits)
+    val vpnAddr = get_vpn_addr(addr)
+    vpnAddr(subEntryBits + mainEntryBits - 1, subEntryBits)
   }
 
   def get_vpntab_origin_sub_idx(addr: UInt) = {
-    val vpn_addr = get_vpn_addr(addr)
-    vpn_addr(subEntryBits - 1, 0)
+    val vpnAddr = get_vpn_addr(addr)
+    vpnAddr(subEntryBits - 1, 0)
   }
 
   def get_main_idx(addr: UInt) = {
-    val origin_tag      = get_vpntab_origin_tag(addr)
-    val origin_main_idx = get_vpntab_origin_main_idx(addr)
+    val originTag     = get_vpntab_origin_tag(addr)
+    val originMainIdx = get_vpntab_origin_main_idx(addr)
 
     if (useVpnTableHashIndex) {
-      origin_main_idx ^ get_folded_hash(origin_tag, mainEntryBits)
+      originMainIdx ^ get_folded_hash(originTag, mainEntryBits)
     } else {
-      origin_main_idx
+      originMainIdx
     }
   }
 
   def get_sub_idx(addr: UInt) = {
-    val origin_tag      = get_vpntab_origin_tag(addr)
-    val origin_main_idx = get_vpntab_origin_main_idx(addr)
-    val origin_sub_idx  = get_vpntab_origin_sub_idx(addr)
+    val originTag     = get_vpntab_origin_tag(addr)
+    val originMainIdx = get_vpntab_origin_main_idx(addr)
+    val originSubIdx  = get_vpntab_origin_sub_idx(addr)
 
     if (useVpnTableHashIndex) {
-      origin_sub_idx ^ get_folded_hash(Cat(origin_tag, origin_main_idx), subEntryBits)
+      originSubIdx ^ get_folded_hash(Cat(originTag, originMainIdx), subEntryBits)
     } else {
-      origin_sub_idx
+      originSubIdx
     }
   }
 
@@ -173,38 +173,38 @@ trait HasCDPParams extends HasPrefetcherHelper with HasCoupledL2Parameters {
   }
 
   // Filter Table Params
-  val FilterTableSetNum = cdpParams.FilterTableSetNum
-  val FilterTableWayNum = cdpParams.FilterTableWayNum
-  val FilterEntryBlks = cdpParams.FilterEntryBlks
-  val FilterEntryGranularity = cdpParams.FilterEntryGranularity
+  val filterTableSetNum = cdpParams.filterTableSetNum
+  val filterTableWayNum = cdpParams.filterTableWayNum
+  val filterEntryBlks = cdpParams.filterEntryBlks
+  val filterEntryGranularity = cdpParams.filterEntryGranularity
 
-  val FilterTableOffsetBits = log2Ceil(FilterEntryBlks)
-  val FilterTableSetBits    = log2Ceil(FilterTableSetNum)
-  val FilterTableTagBits    = fullAddressBits - log2Ceil(FilterEntryGranularity) - FilterTableSetBits - FilterTableOffsetBits
+  val filterTableOffsetBits = log2Ceil(filterEntryBlks)
+  val filterTableSetBits    = log2Ceil(filterTableSetNum)
+  val filterTableTagBits    = fullAddressBits - log2Ceil(filterEntryGranularity) - filterTableSetBits - filterTableOffsetBits
 
   def get_filter_addr(addr: UInt) = {
-    addr(addr.getWidth - 1, log2Ceil(FilterEntryGranularity))
+    addr(addr.getWidth - 1, log2Ceil(filterEntryGranularity))
   }
 
   def get_filter_offset(addr: UInt) = {
-    val filter_addr = get_filter_addr(addr)
-    filter_addr(FilterTableOffsetBits - 1, 0)
+    val filterAddr = get_filter_addr(addr)
+    filterAddr(filterTableOffsetBits - 1, 0)
   }
 
   def get_filter_set(addr: UInt) = {
-    val filter_addr = get_filter_addr(addr)
-    filter_addr(FilterTableSetBits + FilterTableOffsetBits - 1, FilterTableOffsetBits)
+    val filterAddr = get_filter_addr(addr)
+    filterAddr(filterTableSetBits + filterTableOffsetBits - 1, filterTableOffsetBits)
   }
 
   def get_filter_tag(addr: UInt) = {
-    val filter_addr = get_filter_addr(addr)
-    filter_addr(filter_addr.getWidth - 1, FilterTableSetBits + FilterTableOffsetBits)
+    val filterAddr = get_filter_addr(addr)
+    filterAddr(filterAddr.getWidth - 1, filterTableSetBits + filterTableOffsetBits)
   }
 
   // SentUnit Params
-  val ReqFilterEntryNum = cdpParams.ReqFilterEntryNum
-  val ReqFilterVTagBits = fullVAddrBits - log2Ceil(blockBytes)
-  val ReqFilterPTagBits = fullAddressBits - log2Ceil(blockBytes)
+  val reqFilterEntryNum = cdpParams.reqFilterEntryNum
+  val reqFilterVTagBits = fullVAddrBits - log2Ceil(blockBytes)
+  val reqFilterPTagBits = fullAddressBits - log2Ceil(blockBytes)
 }
 
 abstract class CDPBundle(implicit val p: Parameters) extends Bundle with HasCDPParams
@@ -237,8 +237,8 @@ class VpnTableMetaInfo(implicit p: Parameters) extends CDPBundle {
   val valid = Bool()
   val hot   = Bool()    // indicate whether this 1MB page is frequently visited in the past period
 
-  val prevRefCnt  = UInt(CounterBits.W)
-  val refCnt      = UInt(CounterBits.W)
+  val prevRefCnt  = UInt(counterBits.W)
+  val refCnt      = UInt(counterBits.W)
 }
 
 class vtQueryReq(implicit p: Parameters) extends CDPBundle {
@@ -247,15 +247,15 @@ class vtQueryReq(implicit p: Parameters) extends CDPBundle {
 }
 
 class vtQueryRsp(implicit p: Parameters) extends CDPBundle {
-  val tag_vec   = Vec(VpnTableWayNum, UInt(vpnTabTagBits.W))
-  val meta_vec  = Vec(VpnTableWayNum, new VpnTableMetaInfo)
-  val valid_vec = Vec(VpnTableWayNum, Bool())
+  val tag_vec   = Vec(vpnTableWayNum, UInt(vpnTabTagBits.W))
+  val meta_vec  = Vec(vpnTableWayNum, new VpnTableMetaInfo)
+  val valid_vec = Vec(vpnTableWayNum, Bool())
 }
 
 class vtTrainReq(implicit p: Parameters) extends CDPBundle {
   val alloc_main  = Bool()    // allocate a new MainEntry (clear all the SubEntries)
   val alloc_sub   = Bool()    // allocate a new SubEntry (refCnt = 1)
-  val target_way  = UInt(log2Ceil(VpnTableWayNum).W)
+  val target_way  = UInt(log2Ceil(vpnTableWayNum).W)
 
   val main_idx    = UInt(mainEntryBits.W)
   val sub_idx     = UInt(subEntryBits.W)
@@ -267,8 +267,8 @@ class vtTrainReq(implicit p: Parameters) extends CDPBundle {
 
 class VpnTable(implicit p: Parameters) extends CDPModule {
   val io = IO(new Bundle {
-    val query_req = Flipped(Vec(DetectPipeNum + 1, ValidIO(new vtQueryReq)))   // +1 for train pipe
-    val query_rsp = Vec(DetectPipeNum + 1, ValidIO(new vtQueryRsp))
+    val query_req = Flipped(Vec(detectPipeNum + 1, ValidIO(new vtQueryReq)))   // +1 for train pipe
+    val query_rsp = Vec(detectPipeNum + 1, ValidIO(new vtQueryRsp))
     val train_req = Flipped(ValidIO(new vtTrainReq))
   })
 
@@ -280,31 +280,31 @@ class VpnTable(implicit p: Parameters) extends CDPModule {
 
   // TODO: use SRAM ?
   // Tag Array
-  val tag_array = RegInit(VecInit(Seq.fill(VpnTableSetNum)(
-    VecInit(Seq.fill(VpnTableWayNum)(0.U(vpnTabTagBits.W)))
+  val tag_array = RegInit(VecInit(Seq.fill(vpnTableSetNum)(
+    VecInit(Seq.fill(vpnTableWayNum)(0.U(vpnTabTagBits.W)))
   )))
 
   // Valid Array
-  val valid_array = RegInit(VecInit(Seq.fill(VpnTableSetNum)(
-    VecInit(Seq.fill(VpnTableWayNum)(false.B))
+  val valid_array = RegInit(VecInit(Seq.fill(vpnTableSetNum)(
+    VecInit(Seq.fill(vpnTableWayNum)(false.B))
   )))
 
   // Meta Info Array
-  val meta_array = RegInit(VecInit(Seq.fill(VpnTableSetNum)(
-    VecInit(Seq.fill(VpnTableWayNum)(
-      VecInit(Seq.fill(VpnTableSubEntryNum)(0.U.asTypeOf(new VpnTableMetaInfo)))
+  val meta_array = RegInit(VecInit(Seq.fill(vpnTableSetNum)(
+    VecInit(Seq.fill(vpnTableWayNum)(
+      VecInit(Seq.fill(vpnTableSubEntryNum)(0.U.asTypeOf(new VpnTableMetaInfo)))
     ))
   )))
 
   // Query Logic
-  for (i <- 0 until DetectPipeNum + 1) {
+  for (i <- 0 until detectPipeNum + 1) {
     val (req, rsp) = (query_req(i), query_rsp(i))
 
     rsp.valid := !reset.asBool
 
     val (main_idx, sub_idx) = (req.bits.main_idx, req.bits.sub_idx)
 
-    for (j <- 0 until VpnTableWayNum) {
+    for (j <- 0 until vpnTableWayNum) {
       rsp.bits.tag_vec(j)   := tag_array(main_idx)(j)
       rsp.bits.meta_vec(j)  := meta_array(main_idx)(j)(sub_idx)
       rsp.bits.valid_vec(j) := valid_array(main_idx)(j)
@@ -333,7 +333,7 @@ class VpnTable(implicit p: Parameters) extends CDPModule {
       valid_array(main_idx)(replace_way) := true.B
 
       // Update Meta
-      for (i <- 0 until VpnTableSubEntryNum) {
+      for (i <- 0 until vpnTableSubEntryNum) {
         when (i.U === sub_idx) {
           meta_array(main_idx)(replace_way)(i)  := 0.U.asTypeOf(new VpnTableMetaInfo)
           meta_array(main_idx)(replace_way)(i).valid  := true.B
@@ -357,32 +357,32 @@ class VpnTable(implicit p: Parameters) extends CDPModule {
   }
 
   // Refresh Logic
-  when (refreshCnt < VpnResetPeriod.U && train_req.valid){
+  when (refreshCnt < vpnResetPeriod.U && train_req.valid){
     refreshCnt := refreshCnt + 1.U
   }
 
-  is_refresh := refreshCnt >= VpnResetPeriod.U && !reset.asBool
+  is_refresh := refreshCnt >= vpnResetPeriod.U && !reset.asBool
   when (is_refresh) {
     refreshCnt := 0.U
 
     // go through every sub entry
-    for (i <- 0 until VpnTableSetNum) {
-      for (j <- 0 until VpnTableWayNum) {
-        for (k <- 0 until VpnTableSubEntryNum) {
+    for (i <- 0 until vpnTableSetNum) {
+      for (j <- 0 until vpnTableWayNum) {
+        for (k <- 0 until vpnTableSubEntryNum) {
           val entry = meta_array(i)(j)(k)
 
           /**
            * Update Entry:
            *  prevRefCnt -> 0.8 * refCnt + 0.2 * prevRefCnt
            *  refCnt  -> 0
-           *  hot -> prevRefCnt > hot_threshold ? 1 : 0
+           *  hot -> prevRefCnt > hotThreshold ? 1 : 0
            * */
           // TODO: For better timing, maybe we should pipeline this.
           val nxt_prevRefCnt = ((entry.refCnt * 13.U) + (entry.prevRefCnt * 3.U)) >> 4.U
 
           entry.refCnt      := 0.U
           entry.prevRefCnt  := nxt_prevRefCnt
-          entry.hot         := Mux(nxt_prevRefCnt > hot_threshold.U, true.B, false.B)
+          entry.hot         := Mux(nxt_prevRefCnt > hotThreshold.U, true.B, false.B)
         }
       }
     }
@@ -395,7 +395,7 @@ class VpnTable(implicit p: Parameters) extends CDPModule {
   XSPerfAccumulate("vt_no_alloc", train_req.valid && !train_req.bits.alloc_main && !train_req.bits.alloc_sub)
 
   // VpnTable train index distribution.
-  for (i <- 0 until VpnTableSetNum) {
+  for (i <- 0 until vpnTableSetNum) {
     XSPerfAccumulate(s"vt_train_main_idx_$i", train_req.valid && !is_refresh && train_req.bits.main_idx === i.U)
     XSPerfAccumulate(s"vt_alloc_main_idx_$i", train_req.valid && !is_refresh && train_req.bits.alloc_main && train_req.bits.main_idx === i.U)
     XSPerfAccumulate(s"vt_alloc_sub_main_idx_$i", train_req.valid && !is_refresh && train_req.bits.alloc_sub && train_req.bits.main_idx === i.U)
@@ -404,7 +404,7 @@ class VpnTable(implicit p: Parameters) extends CDPModule {
       train_req.valid && !is_refresh && !train_req.bits.alloc_main && !train_req.bits.alloc_sub && train_req.bits.main_idx === i.U
     )
   }
-  for (i <- 0 until VpnTableSubEntryNum) {
+  for (i <- 0 until vpnTableSubEntryNum) {
     XSPerfAccumulate(s"vt_train_sub_idx_$i", train_req.valid && !is_refresh && train_req.bits.sub_idx === i.U)
     XSPerfAccumulate(s"vt_alloc_sub_sub_idx_$i", train_req.valid && !is_refresh && train_req.bits.alloc_sub && train_req.bits.sub_idx === i.U)
     XSPerfAccumulate(
@@ -412,8 +412,8 @@ class VpnTable(implicit p: Parameters) extends CDPModule {
       train_req.valid && !is_refresh && !train_req.bits.alloc_main && !train_req.bits.alloc_sub && train_req.bits.sub_idx === i.U
     )
   }
-  for (i <- 0 until VpnTableSetNum) {
-    for (j <- 0 until VpnTableSubEntryNum) {
+  for (i <- 0 until vpnTableSetNum) {
+    for (j <- 0 until vpnTableSubEntryNum) {
       XSPerfAccumulate(
         s"vt_train_idx_${i}_$j",
         train_req.valid && !is_refresh && train_req.bits.main_idx === i.U && train_req.bits.sub_idx === j.U
@@ -427,20 +427,20 @@ class VpnTable(implicit p: Parameters) extends CDPModule {
 }
 
 class ftQueryReq(implicit p: Parameters) extends CDPBundle {
-  val set_idx = UInt(FilterTableSetBits.W)
+  val set_idx = UInt(filterTableSetBits.W)
 }
 
 class ftQueryRsp(implicit p: Parameters) extends CDPBundle {
-  val valid_vec = Vec(FilterTableWayNum, Bool())
-  val tag_vec   = Vec(FilterTableWayNum, UInt(FilterTableTagBits.W))
-  val sat_vec   = Vec(FilterTableWayNum, Vec(FilterEntryBlks, UInt(2.W)))
+  val valid_vec = Vec(filterTableWayNum, Bool())
+  val tag_vec   = Vec(filterTableWayNum, UInt(filterTableTagBits.W))
+  val sat_vec   = Vec(filterTableWayNum, Vec(filterEntryBlks, UInt(2.W)))
 }
 
 class ftTrainReq(implicit p: Parameters) extends CDPBundle {
-  val set     = UInt(FilterTableSetBits.W)
-  val way     = UInt(log2Ceil(FilterTableWayNum).W)
-  val tag     = UInt(FilterTableTagBits.W)
-  val sat     = Vec(FilterEntryBlks, UInt(2.W))
+  val set     = UInt(filterTableSetBits.W)
+  val way     = UInt(log2Ceil(filterTableWayNum).W)
+  val tag     = UInt(filterTableTagBits.W)
+  val sat     = Vec(filterEntryBlks, UInt(2.W))
 }
 
 class FilterTable(implicit p: Parameters) extends CDPModule {
@@ -454,19 +454,19 @@ class FilterTable(implicit p: Parameters) extends CDPModule {
   val train_req = io.train_req
 
   val SatBankNum = 2
-  val SatBankBlks = FilterEntryBlks / SatBankNum
-  require(FilterEntryBlks % SatBankNum == 0, "FilterEntryBlks must be divisible by SatBankNum")
+  val SatBankBlks = filterEntryBlks / SatBankNum
+  require(filterEntryBlks % SatBankNum == 0, "filterEntryBlks must be divisible by SatBankNum")
 
   def ftMetaEntry() = new Bundle {
     val valid = Bool()
-    val tag   = UInt(FilterTableTagBits.W)
+    val tag   = UInt(filterTableTagBits.W)
   }
 
   val metaArray = Module(
     new SRAMTemplate(
       ftMetaEntry(),
-      set = FilterTableSetNum,
-      way = FilterTableWayNum,
+      set = filterTableSetNum,
+      way = filterTableWayNum,
       shouldReset = true,
       singlePort = true,
       hasMbist = cacheParams.hasMbist,
@@ -477,8 +477,8 @@ class FilterTable(implicit p: Parameters) extends CDPModule {
     Module(
       new SRAMTemplate(
         Vec(SatBankBlks, UInt(2.W)),
-        set = FilterTableSetNum,
-        way = FilterTableWayNum,
+        set = filterTableSetNum,
+        way = filterTableWayNum,
         singlePort = true,
         hasMbist = cacheParams.hasMbist,
         hasSramCtl = cacheParams.hasSramCtl
@@ -499,10 +499,10 @@ class FilterTable(implicit p: Parameters) extends CDPModule {
   }
 
   query_rsp.valid := RegNext(queryFire, false.B)
-  for (i <- 0 until FilterTableWayNum) {
+  for (i <- 0 until filterTableWayNum) {
     query_rsp.bits.valid_vec(i) := metaArray.io.r.resp.data(i).valid
     query_rsp.bits.tag_vec(i)   := metaArray.io.r.resp.data(i).tag
-    for (j <- 0 until FilterEntryBlks) {
+    for (j <- 0 until filterEntryBlks) {
       query_rsp.bits.sat_vec(i)(j) := satBanks(j / SatBankBlks).io.r.resp.data(i)(j % SatBankBlks)
     }
   }
@@ -511,7 +511,7 @@ class FilterTable(implicit p: Parameters) extends CDPModule {
   val trainReady = metaArray.io.w.req.ready && satBanks.map(_.io.w.req.ready).reduce(_ && _)
   train_req.ready := trainReady
   val trainFire = train_req.valid && trainReady
-  val trainWayOH = UIntToOH(train_req.bits.way, FilterTableWayNum)
+  val trainWayOH = UIntToOH(train_req.bits.way, filterTableWayNum)
 
   val metaWData = WireInit(0.U.asTypeOf(ftMetaEntry()))
   metaWData.valid := true.B
@@ -566,26 +566,26 @@ class ftTrainPipeline(implicit p: Parameters) extends CDPModule {
   val (train_trigger, query_req, query_rsp, train_req) =
     (io.train_trigger, io.query_req, io.query_rsp, io.train_req)
 
-  val replacer = ReplacementPolicy.fromString(replType, FilterTableWayNum, FilterTableSetNum)
+  val replacer = ReplacementPolicy.fromString(replType, filterTableWayNum, filterTableSetNum)
 
   val s1_valid = RegInit(false.B)
-  val s1_set_idx = Reg(UInt(FilterTableSetBits.W))
-  val s1_offset  = Reg(UInt(FilterTableOffsetBits.W))
-  val s1_tag     = Reg(UInt(FilterTableTagBits.W))
+  val s1_set_idx = Reg(UInt(filterTableSetBits.W))
+  val s1_offset  = Reg(UInt(filterTableOffsetBits.W))
+  val s1_tag     = Reg(UInt(filterTableTagBits.W))
   val s1_is_used = Reg(Bool())
   val s1_is_evict = Reg(Bool())
 
   val s2_valid = RegInit(false.B)
-  val s2_set_idx = Reg(UInt(FilterTableSetBits.W))
-  val s2_offset  = Reg(UInt(FilterTableOffsetBits.W))
-  val s2_tag     = Reg(UInt(FilterTableTagBits.W))
+  val s2_set_idx = Reg(UInt(filterTableSetBits.W))
+  val s2_offset  = Reg(UInt(filterTableOffsetBits.W))
+  val s2_tag     = Reg(UInt(filterTableTagBits.W))
   val s2_is_used = Reg(Bool())
   val s2_is_evict = Reg(Bool())
 
   val s3_valid = Wire(Bool())
-  val s3_set_idx = Wire(UInt(FilterTableSetBits.W))
-  val s3_offset  = Wire(UInt(FilterTableOffsetBits.W))
-  val s3_tag     = Wire(UInt(FilterTableTagBits.W))
+  val s3_set_idx = Wire(UInt(filterTableSetBits.W))
+  val s3_offset  = Wire(UInt(filterTableOffsetBits.W))
+  val s3_tag     = Wire(UInt(filterTableTagBits.W))
   val s3_is_used = Wire(Bool())
   val s3_is_evict = Wire(Bool())
 
@@ -663,8 +663,8 @@ class ftTrainPipeline(implicit p: Parameters) extends CDPModule {
   val s3_old_sat_vec = ft_s3_rsp.sat_vec(s3_target_way)
   val s3_need_update = s3_hit || s3_is_evict
 
-  val s3_next_sat_vec = Wire(Vec(FilterEntryBlks, UInt(2.W)))
-  for (i <- 0 until FilterEntryBlks) {
+  val s3_next_sat_vec = Wire(Vec(filterEntryBlks, UInt(2.W)))
+  for (i <- 0 until filterEntryBlks) {
     val old_sat = s3_old_sat_vec(i)
     when (!s3_hit) {
       s3_next_sat_vec(i) := Mux(i.U === s3_offset, Mux(s3_is_used, 1.U, 3.U), 2.U)  // if not hit, set the accessed block to 1 or 3, others to 2
@@ -715,7 +715,7 @@ class vtTrainPipeline(implicit p: Parameters) extends CDPModule {
   val (train_trigger, query_req, query_rsp, train_req) =
     (io.train_trigger, io.query_req, io.query_rsp, io.train_req)
 
-  val replacer = ReplacementPolicy.fromString(replType, VpnTableWayNum, VpnTableSetNum)
+  val replacer = ReplacementPolicy.fromString(replType, vpnTableWayNum, vpnTableSetNum)
 
   val stage_valid = Wire(Vec(5, Bool()))
   val same_vec = Wire(Vec(4, Bool()))
@@ -1019,8 +1019,8 @@ class DetectPipeline(name:String)(implicit p: Parameters) extends CDPModule {
 
 class PrefetchFilterEntry(implicit p: Parameters) extends CDPBundle {
   val paddr_valid = Bool()
-  val pTag  = UInt(ReqFilterPTagBits.W)   // paddr = [ pTag | blockOffset ]
-  val vTag  = UInt(ReqFilterVTagBits.W)   // vaddr = [ vTag | blockOffset ]
+  val pTag  = UInt(reqFilterPTagBits.W)   // paddr = [ pTag | blockOffset ]
+  val vTag  = UInt(reqFilterVTagBits.W)   // vaddr = [ vTag | blockOffset ]
   val pfDepth = UInt(pfDepthBits.W)
 
   // for TLB retry
@@ -1078,13 +1078,13 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   }
 
   // buffer
-  val valids    = RegInit(VecInit(Seq.fill(ReqFilterEntryNum)(false.B)))
-  val entries   = RegInit(VecInit(Seq.fill(ReqFilterEntryNum)(0.U.asTypeOf(new PrefetchFilterEntry))))
+  val valids    = RegInit(VecInit(Seq.fill(reqFilterEntryNum)(false.B)))
+  val entries   = RegInit(VecInit(Seq.fill(reqFilterEntryNum)(0.U.asTypeOf(new PrefetchFilterEntry))))
   
-  val req_inflight  = RegInit(VecInit(Seq.fill(ReqFilterEntryNum)(false.B)))
+  val req_inflight  = RegInit(VecInit(Seq.fill(reqFilterEntryNum)(false.B)))
 
-  val tlb_arb = Module(new TwoLevelRRArbiter(new L2TlbReq, ReqFilterEntryNum))
-  val pft_arb = Module(new TwoLevelRRArbiter(new PrefetchReq, ReqFilterEntryNum))
+  val tlb_arb = Module(new TwoLevelRRArbiter(new L2TlbReq, reqFilterEntryNum))
+  val pft_arb = Module(new TwoLevelRRArbiter(new PrefetchReq, reqFilterEntryNum))
   ArbPerf(tlb_arb, "cdp_tlb_arb")
   ArbPerf(pft_arb, "cdp_pft_arb")
 
@@ -1115,7 +1115,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   }
 
   // timer
-  for (i <- 0 until ReqFilterEntryNum) {
+  for (i <- 0 until reqFilterEntryNum) {
     when (entries(i).retry_en && entries(i).retry_timer < 10.U) {   // TODO: parameterize the interval value
       entries(i).retry_timer := entries(i).retry_timer + 1.U
     }
@@ -1132,7 +1132,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   val tlb_s3_addr = RegEnable(tlb_s2_addr, tlb_s2_valid)
 
   // -------- tlb s0: arb tlb req from buffer --------
-  for (i <- 0 until ReqFilterEntryNum) {
+  for (i <- 0 until reqFilterEntryNum) {
     val entry = entries(i)
     val entry_tlb_req = tlb_arb.io.in(i)
 
@@ -1187,7 +1187,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
     tlb_s3_pmp.ld
   
   // gather info from s2 and s3
-  for (i <- 0 until ReqFilterEntryNum) {
+  for (i <- 0 until reqFilterEntryNum) {
     val entry = entries(i)
     val entry_addr = Cat(entries(i).vTag, 0.U(log2Ceil(blockBytes).W))
     
@@ -1232,7 +1232,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   val pft_s1_valid = RegNext(ft_query_req.fire, false.B)
   val pft_s2_valid = RegNext(pft_s1_valid, false.B)
 
-  val pft_s0_chosen_idx = Wire(UInt(log2Ceil(ReqFilterEntryNum).W))
+  val pft_s0_chosen_idx = Wire(UInt(log2Ceil(reqFilterEntryNum).W))
   val pft_s1_chosen_idx = RegEnable(pft_s0_chosen_idx, ft_query_req.fire)
   val pft_s2_chosen_idx = RegEnable(pft_s1_chosen_idx, pft_s1_valid)
 
@@ -1241,7 +1241,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   val pft_s2_req = RegEnable(pft_s1_req, pft_s1_valid)
 
   // --------- req s0: arb prefetch req & query filter table ---------
-  for (i <- 0 until ReqFilterEntryNum) {
+  for (i <- 0 until reqFilterEntryNum) {
     val entry = entries(i)
     val entry_pft_req = pft_arb.io.in(i)
 
@@ -1272,7 +1272,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
   val hit = Wire(Bool())
   val can_pft = Wire(Bool())
 
-  if (UseFilterTable) {
+  if (useFilterTable) {
     val valid_vec = ft_s2_rsp.valid_vec
     val tag_vec   = ft_s2_rsp.tag_vec
     val hit_vec   = valid_vec.zip(tag_vec).map{
@@ -1341,31 +1341,31 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   })
 
   println(s"====== CDP Prefetcher Config (hart ${cacheParams.hartId}) ======")
-  println(s"UseFilteredDetect:  $UseFilteredDetect")
-  println(s"UseFilterTable:     $UseFilterTable")
-  println(s"Degree:             $Degree")
-  println(s"UseDynamicDegree:   $UseDynamicDegree")
-  println(s"VpnTableTagBits:    $vpnTabTagBits")
-  println(s"VpnSubEntryBits:    $EntryBits")
-  println(s"VpnResetPeriod:     $VpnResetPeriod")
-  println(s"HotThreshold:       $hot_threshold")
+  println(s"useFilteredDetect:  $useFilteredDetect")
+  println(s"useFilterTable:     $useFilterTable")
+  println(s"degree:             $degree")
+  println(s"useDynamicDegree:   $useDynamicDegree")
+  println(s"vpnTableTagBits:    $vpnTabTagBits")
+  println(s"VpnSubEntryBits:    $entryBits")
+  println(s"vpnResetPeriod:     $vpnResetPeriod")
+  println(s"hotThreshold:       $hotThreshold")
   println(s"debug mode:         $debug")
   println(s"============================================")
 
 
   private val cstEnable = Constantin.createRecord("cdp_enable"+cacheParams.hartId.toString, initValue = 1)
-  require(Degree > 0, "CDP degree must be positive")
+  require(degree > 0, "CDP degree must be positive")
 
   val enable = io.enable & cstEnable.orR
   val (vpn_train, filter_train) = (io.vpn_train, io.filter_train)
 
   val l2_triggers = io.l2_detect_triggers
 
-  val filter_table      = if (UseFilterTable) Some(Module(new FilterTable)) else None
+  val filter_table      = if (useFilterTable) Some(Module(new FilterTable)) else None
   val vpn_table         = Module(new VpnTable)
   val vt_train_pipe     = Module(new vtTrainPipeline)
-  val ft_train_pipe     = if (UseFilterTable) Some(Module(new ftTrainPipeline)) else None
-  val detect_pipe_seq   = Seq.tabulate(DetectPipeNum)(i => Module(new DetectPipeline(s"dp$i")))
+  val ft_train_pipe     = if (useFilterTable) Some(Module(new ftTrainPipeline)) else None
+  val detect_pipe_seq   = Seq.tabulate(detectPipeNum)(i => Module(new DetectPipeline(s"dp$i")))
 
   // TODO: ugly...
   // Detect Req
@@ -1399,7 +1399,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
     // TODO: move depth check to MainPipe?
     val hit_trigger       = detect_trig.bits.is_hit  &&
       (
-        if (UseFilteredDetect) {
+        if (useFilteredDetect) {
           detect_trig_fromCDP &&
             (detect_trig.bits.pfDepth === 1.U || detect_trig.bits.pfDepth === pfDepthMax.U) ||
             detect_trig_fromSMS || detect_trig_fromBOP
@@ -1409,9 +1409,9 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
             (detect_trig.bits.pfDepth === 1.U || detect_trig.bits.pfDepth === pfDepthMax.U)
         }
       )
-    val refill_trigger    = !detect_trig.bits.is_hit && detect_trig.bits.pfDepth < depth_threshold.U &&
+    val refill_trigger    = !detect_trig.bits.is_hit && detect_trig.bits.pfDepth < depthThreshold.U &&
       (
-        if (UseFilteredDetect) {
+        if (useFilteredDetect) {
           detect_trig_fromCPU || detect_trig_fromCDP || detect_trig_fromStride || detect_trig_fromStream
         }
         else {
@@ -1454,7 +1454,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
     XSPerfAccumulate(s"detect_trig_refill_fromCPU_bank$i", detect_trig.valid && !detect_trig.bits.is_hit && detect_trig_fromCPU && enable)
   }
 
-  for (i <- 0 until DetectPipeNum) {
+  for (i <- 0 until detectPipeNum) {
     val detect_pipe = detect_pipe_seq(i)
 
     detect_pipe.io.detect_req.valid := detect_trig_arb.io.out.valid
@@ -1475,7 +1475,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   XSPerfAccumulate("vpn_train_drop", vpn_train_reqBuf.io.enq.valid && !vpn_train_reqBuf.io.enq.ready)
   XSPerfAccumulate("vpn_train_accept", vpn_train_reqBuf.io.enq.fire)
 
-  if (UseFilterTable) {
+  if (useFilterTable) {
     val filter_train_reqBuf = Module(new Queue(new PrefetchTrain, 8))
     filter_train_reqBuf.io.enq.valid := filter_train.valid && enable
     filter_train_reqBuf.io.enq.bits  := filter_train.bits
@@ -1500,7 +1500,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   vpn_table.io.train_req  <> vt_train_pipe.io.train_req
 
   val issueDegree =
-    if (UseDynamicDegree) {
+    if (useDynamicDegree) {
       /**
         * EWMA Accuracy Control
         * Low accuracy will reduce the degree to avoid useless prefetches
@@ -1524,19 +1524,19 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
 
       val sentLt100 = cdpPfSent < 100.U(cdpPfSent.getWidth.W)
       val accuracyGt5Pct = hitEwma * 100.U(7.W) > sentEwma * 5.U(3.W)
-      Mux(sentLt100 || accuracyGt5Pct, Degree.U, 1.U)
+      Mux(sentLt100 || accuracyGt5Pct, degree.U, 1.U)
     } else {
-      Degree.U
+      degree.U
     }
 
   // Degreed Buffer
-  val degree_buf_seq = Seq.fill(DetectPipeNum)(Module(new MIMOQueue(new CDPPrefetchReq, 8, Degree, 1)))
-  val degree_buf_arb = Module(new RRArbiterInit(new CDPPrefetchReq, DetectPipeNum))
-  for (i <- 0 until DetectPipeNum) {
+  val degree_buf_seq = Seq.fill(detectPipeNum)(Module(new MIMOQueue(new CDPPrefetchReq, 8, degree, 1)))
+  val degree_buf_arb = Module(new RRArbiterInit(new CDPPrefetchReq, detectPipeNum))
+  for (i <- 0 until detectPipeNum) {
     val buf = degree_buf_seq(i)
     val req = detect_pipe_seq(i).io.pft_req
     buf.io.flush := reset.asBool
-    for (j <- 0 until Degree) {
+    for (j <- 0 until degree) {
       buf.io.enq(j).valid := req.valid && j.U < issueDegree
       buf.io.enq(j).bits  := req.bits
 
@@ -1547,13 +1547,13 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
 
     degree_buf_arb.io.in(i) <> buf.io.deq(0)
 
-    XSPerfAccumulate(s"drop_by_acc_pipe$i", Mux(req.valid, Degree.U - issueDegree, 0.U))
+    XSPerfAccumulate(s"drop_by_acc_pipe$i", Mux(req.valid, degree.U - issueDegree, 0.U))
   }
 
   // SendUnit
   val send_unit = Module(new SentUnit)
   send_unit.io.tlb_req <> io.tlb_req
-  if (UseFilterTable) {
+  if (useFilterTable) {
     val ft_query_arb = Module(new RRArbiter(new ftQueryReq, 2))
     ft_query_arb.io.in(0) <> ft_train_pipe.get.io.query_req
     ft_query_arb.io.in(1) <> send_unit.io.ft_query_req
