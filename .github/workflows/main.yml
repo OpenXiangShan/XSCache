@@ -125,15 +125,16 @@ jobs:
           sudo make install
           verilator --version
 
-      - name: Setup Scala
-        uses: olafurpg/setup-scala@v11
+      - name: Setup Java
+        uses: actions/setup-java@v5
         with:
-          java-version: openjdk@1.17
+          distribution: temurin
+          java-version: '17'
 
       - name: Setup Mill
-        uses: jodersky/setup-mill@v0.2.3
+        uses: zhutmost/setup-mill@main
         with:
-          mill-version: 0.12.3
+          mill-version: 0.12.17
 
       # - name: Check scalafmt
       #   run: make checkformat
