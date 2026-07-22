@@ -1356,7 +1356,12 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   private val cstEnable = Constantin.createRecord("cdp_enable"+cacheParams.hartId.toString, initValue = 1)
   require(degree > 0, "CDP degree must be positive")
 
-  val enable = io.enable & cstEnable.orR
+  /**
+   * When disabled, no new detect or train triggers are accepted.
+   * Requests already in the pipeline continue until they drain naturally.
+   */
+  val enable = io.enable & cstEnable.orR  
+
   val (vpn_train, filter_train) = (io.vpn_train, io.filter_train)
 
   val l2_triggers = io.l2_detect_triggers

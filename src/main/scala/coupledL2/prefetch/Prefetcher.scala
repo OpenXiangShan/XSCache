@@ -233,10 +233,10 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val pbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pbop_en
   val vbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_vbop_en
   val tp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_tp_en
+  val cdp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_cdp_en
   val delay_latency = pfCtrlFromCore.l2_pf_delay_latency
 
   // tlb req wires
-  // TODO: ugly. Any better solution?
   val bop_tlb_req = WireInit(0.U.asTypeOf(io.tlb_req))
   val cdp_tlb_req = WireInit(0.U.asTypeOf(io.tlb_req))
 
@@ -394,7 +394,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     tp.get.io.tpmeta_port <> tpio.tpmeta_port.get
   }
   if (hasCDP) {
-    cdp.get.io.enable := true.B
+    cdp.get.io.enable := cdp_en
 
     // Train
     cdp.get.io.vpn_train.valid  := train.valid && train.bits.cdp_vpn_train_valid.get && train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U
@@ -406,11 +406,6 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     // Trigger
     cdp.get.io.l2_detect_triggers <> cdpio.cdp_trigger.get
     cdp.get.io.pfStat <> cdpio.pfStat.get
-
-    // pft req
-    cdp.get.io.pft_req.ready  := (if (hasReceiver) !pfRcv.get.io.req.valid else true.B) &&
-      (if (hasBOP) !vbop.get.io.req.valid && !pbop.get.io.req.valid else true.B) &&
-      (if (hasTPPrefetcher) !tp.get.io.req.valid else true.B)
 
     // tlb req
     cdp.get.io.tlb_req <> cdp_tlb_req
