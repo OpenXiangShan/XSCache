@@ -552,11 +552,14 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     require(stashPrefetchIdBits > 0)
     require(mshrsAll <= (1 << stashPrefetchIdBits))
     def setStashPrefetchID(txnID: UInt): UInt = {
+      val mmioFlag = 0.U(1.W)
+      val stashFlag = 1.U(1.W)
       val entryID = txnID(stashPrefetchIdBits - 1, 0)
       if (banks <= 1) {
-        Cat(0.U(1.W), 1.U(1.W), entryID)
+        Cat(mmioFlag, stashFlag, entryID)
       } else {
-        Cat(0.U(1.W), 0.U(bankBits.W), 1.U(1.W), entryID)
+        val sliceId = 0.U(bankBits.W)
+        Cat(mmioFlag, sliceId, stashFlag, entryID)
       }
     }
     def isStashPrefetchID(txnID: UInt): Bool = {
@@ -659,10 +662,10 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
 
     val stashTxReqOpt = prefetcher.map { pf =>
       val req = Wire(DecoupledIO(new CHIREQ))
-      req.valid := pf.io.slc_txreq.valid
-      req.bits := pf.io.slc_txreq.bits
-      req.bits.txnID := setStashPrefetchID(pf.io.slc_txreq.bits.txnID)
-      pf.io.slc_txreq.ready := req.ready
+      req.valid := pf.io.stash_txreq.valid
+      req.bits := pf.io.stash_txreq.bits
+      req.bits.txnID := setStashPrefetchID(pf.io.stash_txreq.bits.txnID)
+      pf.io.stash_txreq.ready := req.ready
       req
     }
     val txreqArbInputs = slices.map(_.io.out.tx.req) ++ Seq(mmio.io.tx.req) ++ stashTxReqOpt.toSeq
@@ -752,10 +755,10 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     val rxrspSliceID = getSliceID(rxrsp.bits.txnID)
     val stashRxRspReady = WireInit(false.B)
     prefetcher.foreach { p =>
-      p.io.slc_rxrsp.valid := rxrsp.valid && rxrspIsStashPrefetch && !isPCrdGrant
-      p.io.slc_rxrsp.bits := rxrsp.bits
-      p.io.slc_rxrsp.bits.txnID := restoreStashPrefetchID(rxrsp.bits.txnID)
-      stashRxRspReady := p.io.slc_rxrsp.ready
+      p.io.stash_rxrsp.valid := rxrsp.valid && rxrspIsStashPrefetch && !isPCrdGrant
+      p.io.stash_rxrsp.bits := rxrsp.bits
+      p.io.stash_rxrsp.bits.txnID := restoreStashPrefetchID(rxrsp.bits.txnID)
+      stashRxRspReady := p.io.stash_rxrsp.ready
     }
     slices.zipWithIndex.foreach { case (s, i) =>
       s.io.out.rx.rsp.valid := rxrsp.valid && rxrspSliceID === i.U && !rxrspIsMMIO && !rxrspIsStashPrefetch && !isPCrdGrant
