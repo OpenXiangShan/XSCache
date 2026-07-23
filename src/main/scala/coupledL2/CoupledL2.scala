@@ -541,16 +541,25 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     val hintChosen = Wire(Vec(hintChannelCount, UInt(banks.W)))
     val hintFire = Wire(Vec(hintChannelCount, Bool()))
 
+    val stashPrefetchIdBits = TXNID_WIDTH - bankBits - 2
+    require(stashPrefetchIdBits > 0)
+    require(
+      idsAll <= (1 << stashPrefetchIdBits),
+      s"normal TxnID space idsAll=$idsAll overlaps stash prefetch ID space"
+    )
+
     def setSliceID(txnID: UInt, sliceID: UInt, mmioReq: Bool): UInt = {
+      val entryID = txnID(stashPrefetchIdBits - 1, 0)
       Mux(
         mmioReq,
         Cat(1.U(1.W), txnID.tail(1)),
-        Cat(0.U(1.W), if (banks <= 1) txnID.tail(1) else Cat(sliceID(bankBits - 1, 0), txnID.tail(bankBits + 1)))
+        if (banks <= 1) {
+          Cat(0.U(1.W), 0.U(1.W), entryID)
+        } else {
+          Cat(0.U(1.W), sliceID(bankBits - 1, 0), 0.U(1.W), entryID)
+        }
       )
     }
-    val stashPrefetchIdBits = TXNID_WIDTH - bankBits - 2
-    require(stashPrefetchIdBits > 0)
-    require(mshrsAll <= (1 << stashPrefetchIdBits))
     def setStashPrefetchID(txnID: UInt): UInt = {
       val mmioFlag = 0.U(1.W)
       val stashFlag = 1.U(1.W)
@@ -683,6 +692,13 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       txreq_arb.io.out.bits.txnID,
       setSliceID(txreq_arb.io.out.bits.txnID, txreq_arb.io.chosen, txreqFromMMIO)
     )
+    when(txreq.valid) {
+      when(txreqFromStashPrefetch) {
+        assert(isStashPrefetchID(txreq.bits.txnID), "stash prefetch TxnID is not marked")
+      }.otherwise {
+        assert(!isStashPrefetchID(txreq.bits.txnID), "normal TxnID overlaps stash prefetch ID")
+      }
+    }
 
     val txrsp = Wire(DecoupledIO(new CHIRSP))
     fastArb(slices.map(_.io.out.tx.rsp), txrsp, Some("txrsp"))

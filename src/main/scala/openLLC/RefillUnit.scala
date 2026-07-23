@@ -63,6 +63,7 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
 
     /* response from downstream RXDAT channel */
     val snRespData = Flipped(ValidIO(new RespWithData()))
+    val bypassData = Flipped(Vec(beatSize, ValidIO(new RespWithData())))
 
     /* refill data read */
     val read = Flipped(ValidIO(new RefillBufRead()))
@@ -74,6 +75,7 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
 
   val rnRespData = io.respData
   val snRespData = io.snRespData
+  val bypassRespData = io.bypassData
   val rsp = io.resp
 
   /* Data Structure */
@@ -126,20 +128,55 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     }
   }
 
+  def updateBypassRespDataEntry(entry: RefillEntry): Unit = {
+    val bypassBeatValids = VecInit(bypassRespData.map(_.valid))
+    val newBeatValids = entry.beatValids.asUInt | bypassBeatValids.asUInt
+    entry.beatValids := VecInit(newBeatValids.asBools)
+    entry.state.w_datRsp := newBeatValids.andR
+    entry.task.resp := PriorityMux(bypassRespData.map(d => d.valid -> d.bits.resp))
+
+    bypassRespData.zipWithIndex.foreach { case (data, i) =>
+      val beatId = data.bits.dataID >> log2Ceil(beatBytes / 16)
+      assert(!data.valid || beatId === i.U, "Refill bypass data beat mismatch")
+      when(data.valid) {
+        entry.data.data(i) := data.bits.data
+      }
+    }
+  }
+
   val rnRespDataUpdateVec = VecInit(buffer.map(e => e.task.reqID === rnRespData.bits.txnID && e.valid))
   val snRespDataUpdateVec = VecInit(buffer.map(e =>
     e.task.reqID === snRespData.bits.txnID && e.valid && e.task.chiOpcode === StashOnceShared
   ))
+  val bypassRespDataValid = bypassRespData.map(_.valid).reduce(_ || _)
+  val bypassRespDataTxnID = PriorityMux(bypassRespData.map(d => d.valid -> d.bits.txnID))
+  val bypassRespDataUpdateVec = VecInit(buffer.map(e =>
+    e.task.reqID === bypassRespDataTxnID && e.valid && e.task.chiOpcode === StashOnceShared
+  ))
   assert(!rnRespData.valid || PopCount(rnRespDataUpdateVec) < 2.U, "Refill task repeated")
   assert(!snRespData.valid || PopCount(snRespDataUpdateVec) < 2.U, "Refill task repeated")
+  assert(!bypassRespDataValid || PopCount(bypassRespDataUpdateVec) < 2.U, "Refill task repeated")
+  bypassRespData.foreach { data =>
+    assert(!bypassRespDataValid || !data.valid || data.bits.txnID === bypassRespDataTxnID,
+      "Refill bypass data has multiple TxnIDs"
+    )
+  }
   buffer.zipWithIndex.foreach { case (entry, i) =>
     val rnRespDataHit = rnRespData.valid && rnRespDataUpdateVec(i)
     val snRespDataHit = snRespData.valid && snRespDataUpdateVec(i)
-    assert(!(rnRespDataHit && snRespDataHit), "Refill task receives data from multiple sources")
+    val bypassRespDataHit = bypassRespDataValid && bypassRespDataUpdateVec(i)
+    assert(
+      !(rnRespDataHit && snRespDataHit) &&
+        !(rnRespDataHit && bypassRespDataHit) &&
+        !(snRespDataHit && bypassRespDataHit),
+      "Refill task receives data from multiple sources"
+    )
     when(rnRespDataHit) {
       updateRespDataEntry(entry, rnRespData.bits)
     }.elsewhen(snRespDataHit) {
       updateRespDataEntry(entry, snRespData.bits)
+    }.elsewhen(bypassRespDataHit) {
+      updateBypassRespDataEntry(entry)
     }
   }
 
@@ -180,7 +217,8 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
 
   /* Issue */
   issueArb.io.in.zip(buffer).foreach { case (in, e) =>
-    in.valid := e.valid && e.state.w_datRsp && !e.state.s_refill && (!e.task.replSnp || e.task.replSnp && e.state.w_snpRsp)
+    val waitSnpRsp = !e.task.replSnp || e.task.replSnp && e.state.w_snpRsp
+    in.valid := e.valid && e.state.w_datRsp && !e.state.s_refill && waitSnpRsp
     in.bits := e.task
   }
   issueArb.io.out.ready := true.B
