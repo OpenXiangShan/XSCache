@@ -24,6 +24,7 @@ import org.chipsalliance.cde.config.Parameters
 import utility.mbist.MbistPipeline
 import xscache.coupledL2._
 import xscache.coupledL2.utils._
+import xscache.chi.{CHIREQ, CHIRSP, HasCHIOpcodes, MPAM, MemAttr, OrderEncodings, SAM}
 
 /* virtual address */
 trait HasPrefetcherHelper extends HasCircularQueuePtrHelper with HasCoupledL2Parameters {
@@ -187,11 +188,14 @@ class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
   val train = Vec(banks, Flipped(DecoupledIO(new PrefetchTrain)))
   val tlb_req = new L2ToL1TlbIO(nRespDups= 1)
   val req = Vec(banks, DecoupledIO(new PrefetchReq))
+  val stash_txreq = DecoupledIO(new CHIREQ)
+  val stash_rxrsp = Flipped(DecoupledIO(new CHIRSP))
   val resp = Vec(banks, Flipped(DecoupledIO(new PrefetchResp)))
   val recv_addr = Flipped(ValidIO(new Bundle() {
     val addr = UInt(64.W)
     val pfSource = UInt(MemReqSource.reqSourceBits.W)
   }))
+  val l3_recv = Input(new PrefetchRecv)
 }
 
 class Prefetcher(implicit p: Parameters) extends PrefetchModule {
@@ -209,6 +213,10 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val tp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_tp_en
   val delay_latency = pfCtrlFromCore.l2_pf_delay_latency
   val banks = 1 << bankBits
+  val stashPrefetcher = Module(new StashPrefetcher)
+  stashPrefetcher.io.recv := io.l3_recv
+  io.stash_txreq <> stashPrefetcher.io.txreq
+  stashPrefetcher.io.rxrsp <> io.stash_rxrsp
 
   // =================== Prefetchers =====================
   // TODO: consider separate VBOP and PBOP in prefetch param

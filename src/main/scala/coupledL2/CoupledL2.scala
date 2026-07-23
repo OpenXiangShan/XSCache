@@ -306,6 +306,8 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
 
   val pf_recv_node: Option[BundleBridgeSink[PrefetchRecv]] =
     if(hasReceiver) Some(BundleBridgeSink(Some(() => new PrefetchRecv))) else None
+  val l3_pf_recv_node: Option[BundleBridgeSink[PrefetchRecv]] =
+    if(prefetchOpt.nonEmpty) Some(BundleBridgeSink(Some(() => new PrefetchRecv))) else None
 
   val addressRange = Seq(AddressSet(0x00000000L, 0xffffffffffffL)) // TODO: parameterize this
   val managerParameters = TLSlavePortParameters.v1(
@@ -511,6 +513,15 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
             p.io.recv_addr := 0.U.asTypeOf(p.io.recv_addr)
         }
     }
+    l3_pf_recv_node match {
+      case Some(x) =>
+        prefetcher.get.io.l3_recv := x.in.head._1
+      case None =>
+        prefetcher.foreach {
+          p =>
+            p.io.l3_recv := 0.U.asTypeOf(p.io.l3_recv)
+        }
+    }
     tpmeta_source_node match {
       case Some(x) =>
         x.out.head._1 <> prefetcher.get.tpio.tpmeta_port.get.req
@@ -530,12 +541,47 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     val hintChosen = Wire(Vec(hintChannelCount, UInt(banks.W)))
     val hintFire = Wire(Vec(hintChannelCount, Bool()))
 
+    val stashPrefetchIdBits = TXNID_WIDTH - bankBits - 2
+    require(stashPrefetchIdBits > 0)
+    require(
+      idsAll <= (1 << stashPrefetchIdBits),
+      s"normal TxnID space idsAll=$idsAll overlaps stash prefetch ID space"
+    )
+
     def setSliceID(txnID: UInt, sliceID: UInt, mmioReq: Bool): UInt = {
+      val entryID = txnID(stashPrefetchIdBits - 1, 0)
       Mux(
         mmioReq,
         Cat(1.U(1.W), txnID.tail(1)),
-        Cat(0.U(1.W), if (banks <= 1) txnID.tail(1) else Cat(sliceID(bankBits - 1, 0), txnID.tail(bankBits + 1)))
+        if (banks <= 1) {
+          Cat(0.U(1.W), 0.U(1.W), entryID)
+        } else {
+          Cat(0.U(1.W), sliceID(bankBits - 1, 0), 0.U(1.W), entryID)
+        }
       )
+    }
+    def setStashPrefetchID(txnID: UInt): UInt = {
+      val mmioFlag = 0.U(1.W)
+      val stashFlag = 1.U(1.W)
+      val entryID = txnID(stashPrefetchIdBits - 1, 0)
+      if (banks <= 1) {
+        Cat(mmioFlag, stashFlag, entryID)
+      } else {
+        val sliceId = 0.U(bankBits.W)
+        Cat(mmioFlag, sliceId, stashFlag, entryID)
+      }
+    }
+    def isStashPrefetchID(txnID: UInt): Bool = {
+      val stashID = if (banks <= 1) txnID(TXNID_WIDTH - 2) else txnID(TXNID_WIDTH - bankBits - 2)
+      !txnID.head(1).asBool && stashID
+    }
+    def restoreStashPrefetchID(txnID: UInt): UInt = {
+      val entryID = txnID(stashPrefetchIdBits - 1, 0)
+      if (banks <= 1) {
+        Cat(0.U(2.W), entryID)
+      } else {
+        Cat(0.U((bankBits + 2).W), entryID)
+      }
     }
     def getSliceID(txnID: UInt): UInt = if (banks <= 1) 0.U else txnID.tail(1).head(bankBits)
     def restoreTXNID(txnID: UInt): UInt = {
@@ -623,13 +669,36 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
         slice
     }
 
-    val txreq_arb = Module(new TwoLevelRRArbiter(new CHIREQ, slices.size + 1))
+    val stashTxReqOpt = prefetcher.map { pf =>
+      val req = Wire(DecoupledIO(new CHIREQ))
+      req.valid := pf.io.stash_txreq.valid
+      req.bits := pf.io.stash_txreq.bits
+      req.bits.txnID := setStashPrefetchID(pf.io.stash_txreq.bits.txnID)
+      pf.io.stash_txreq.ready := req.ready
+      req
+    }
+    val txreqArbInputs = slices.map(_.io.out.tx.req) ++ Seq(mmio.io.tx.req) ++ stashTxReqOpt.toSeq
+    val mmioTxReqIndex = slices.size
+    val stashTxReqIndex = slices.size + 1
+    val txreq_arb = Module(new TwoLevelRRArbiter(new CHIREQ, txreqArbInputs.size))
     ArbPerf(txreq_arb, "txreq_arb")
     val txreq = Wire(DecoupledIO(new CHIREQ))
-    slices.zip(txreq_arb.io.in.init).foreach { case (s, in) => in <> s.io.out.tx.req }
-    txreq_arb.io.in.last <> mmio.io.tx.req
+    txreqArbInputs.zip(txreq_arb.io.in).foreach { case (req, in) => in <> req }
     txreq <> txreq_arb.io.out
-    txreq.bits.txnID := setSliceID(txreq_arb.io.out.bits.txnID, txreq_arb.io.chosen, mmio.io.tx.req.fire)
+    val txreqFromMMIO = txreq_arb.io.chosen === mmioTxReqIndex.U
+    val txreqFromStashPrefetch = prefetchOpt.map(_ => txreq_arb.io.chosen === stashTxReqIndex.U).getOrElse(false.B)
+    txreq.bits.txnID := Mux(
+      txreqFromStashPrefetch,
+      txreq_arb.io.out.bits.txnID,
+      setSliceID(txreq_arb.io.out.bits.txnID, txreq_arb.io.chosen, txreqFromMMIO)
+    )
+    when(txreq.valid) {
+      when(txreqFromStashPrefetch) {
+        assert(isStashPrefetchID(txreq.bits.txnID), "stash prefetch TxnID is not marked")
+      }.otherwise {
+        assert(!isStashPrefetchID(txreq.bits.txnID), "normal TxnID overlaps stash prefetch ID")
+      }
+    }
 
     val txrsp = Wire(DecoupledIO(new CHIRSP))
     fastArb(slices.map(_.io.out.tx.rsp), txrsp, Some("txrsp"))
@@ -646,7 +715,8 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     rxsnp.ready := Cat(slices.zipWithIndex.map { case (s, i) => s.io.out.rx.snp.ready && rxsnpSliceID === i.U }).orR
 
     val rxrsp = Wire(DecoupledIO(new CHIRSP))
-    val rxrspIsMMIO = rxrsp.bits.txnID.head(1).asBool
+    val rxrspIsStashPrefetch = isStashPrefetchID(rxrsp.bits.txnID)
+    val rxrspIsMMIO = rxrsp.bits.txnID.head(1).asBool && !rxrspIsStashPrefetch
     val isPCrdGrant = rxrsp.valid && rxrsp.bits.opcode === PCrdGrant
 
     class EmptyBundle extends Bundle
@@ -699,36 +769,59 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     dontTouch(grantCnt)
 
     val rxrspSliceID = getSliceID(rxrsp.bits.txnID)
+    val stashRxRspReady = WireInit(false.B)
+    prefetcher.foreach { p =>
+      p.io.stash_rxrsp.valid := rxrsp.valid && rxrspIsStashPrefetch && !isPCrdGrant
+      p.io.stash_rxrsp.bits := rxrsp.bits
+      p.io.stash_rxrsp.bits.txnID := restoreStashPrefetchID(rxrsp.bits.txnID)
+      stashRxRspReady := p.io.stash_rxrsp.ready
+    }
     slices.zipWithIndex.foreach { case (s, i) =>
-      s.io.out.rx.rsp.valid := rxrsp.valid && rxrspSliceID === i.U && !rxrspIsMMIO && !isPCrdGrant
+      s.io.out.rx.rsp.valid := rxrsp.valid && rxrspSliceID === i.U && !rxrspIsMMIO && !rxrspIsStashPrefetch && !isPCrdGrant
       s.io.out.rx.rsp.bits := rxrsp.bits
       s.io.out.rx.rsp.bits.txnID := restoreTXNID(rxrsp.bits.txnID)
     }
     mmio.io.rx.rsp.valid := rxrsp.valid && rxrspIsMMIO && !isPCrdGrant
     mmio.io.rx.rsp.bits := rxrsp.bits
     mmio.io.rx.rsp.bits.txnID := restoreTXNID(rxrsp.bits.txnID)
+    val rxrspSliceReady = Cat(slices.zipWithIndex.map {
+      case (s, i) => s.io.out.rx.rsp.ready && rxrspSliceID === i.U
+    }).orR
     rxrsp.ready := rxrsp.bits.opcode === PCrdGrant || Mux(
-      rxrspIsMMIO,
-      mmio.io.rx.rsp.ready,
-      Cat(slices.zipWithIndex.map { case (s, i) => s.io.out.rx.rsp.ready && rxrspSliceID === i.U }).orR
+      rxrspIsStashPrefetch,
+      stashRxRspReady,
+      Mux(rxrspIsMMIO, mmio.io.rx.rsp.ready, rxrspSliceReady)
     )
 
     val rxdat = Wire(DecoupledIO(new CHIDAT))
-    val rxdatIsMMIO = rxdat.bits.txnID.head(1).asBool
+    val rxdatIsStashPrefetch = isStashPrefetchID(rxdat.bits.txnID)
+    val rxdatIsMMIO = rxdat.bits.txnID.head(1).asBool && !rxdatIsStashPrefetch
     val rxdatSliceID = getSliceID(rxdat.bits.txnID)
+    assert(!rxdat.valid || !rxdatIsStashPrefetch, "Stash prefetch should not receive RXDAT")
     slices.zipWithIndex.foreach { case (s, i) =>
-      s.io.out.rx.dat.valid := rxdat.valid && rxdatSliceID === i.U && !rxdatIsMMIO
+      s.io.out.rx.dat.valid := rxdat.valid && rxdatSliceID === i.U && !rxdatIsMMIO && !rxdatIsStashPrefetch
       s.io.out.rx.dat.bits := rxdat.bits
       s.io.out.rx.dat.bits.txnID := restoreTXNID(rxdat.bits.txnID)
     }
     mmio.io.rx.dat.valid := rxdat.valid && rxdatIsMMIO
     mmio.io.rx.dat.bits := rxdat.bits
     mmio.io.rx.dat.bits.txnID := restoreTXNID(rxdat.bits.txnID)
+    val rxdatSliceReady = Cat(slices.zipWithIndex.map {
+      case (s, i) => s.io.out.rx.dat.ready && rxdatSliceID === i.U
+    }).orR
     rxdat.ready := Mux(
-      rxdatIsMMIO,
-      mmio.io.rx.dat.ready,
-      Cat(slices.zipWithIndex.map { case (s, i) => s.io.out.rx.dat.ready && rxdatSliceID === i.U }).orR
+      rxdatIsStashPrefetch,
+      true.B,
+      Mux(rxdatIsMMIO, mmio.io.rx.dat.ready, rxdatSliceReady)
     )
+
+    val txreqStash = txreq.bits.opcode === StashOnceShared ||
+      txreq.bits.opcode === StashOnceUnique ||
+      txreq.bits.opcode === WriteUniqueFullStash ||
+      txreq.bits.opcode === WriteUniquePtlStash
+
+    XSPerfAccumulate("l2_l3_txreq_fire", txreq.fire)
+    XSPerfAccumulate("l2_l3_txreq_stash", txreq.fire && txreqStash)
 
     val linkMonitor = Module(new LinkMonitor)
     val rxdatPipe = Pipeline(linkMonitor.io.in.rx.dat)

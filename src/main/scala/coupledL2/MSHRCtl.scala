@@ -239,8 +239,12 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       }
       val enable = m.io.status.valid && m.io.status.bits.will_free
       XSPerfHistogram("mshr_latency_" + Integer.toString(i, 10),
-        timer, enable, 0, 300, 10)
-      XSPerfMax("mshr_latency", timer, enable)
+        timer, enable, 0, 300, 10, true, true)
+      XSPerfHistogram("mshr_latency_" + Integer.toString(i, 10),
+        timer, enable, 300, 1000, 50, true, true)
+      XSPerfHistogram("mshr_latency_" + Integer.toString(i, 10),
+        timer, enable, 1000, 5000, 200, true, false)
+      XSPerfMax("mshr_latency_" + Integer.toString(i, 10), timer, enable)
     }
   }
 
