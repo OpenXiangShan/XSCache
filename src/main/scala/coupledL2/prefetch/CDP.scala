@@ -16,7 +16,8 @@ case class CDPParameters(
 
   detectPipeNum: Int = 4,
 
-  reqFilterEntryNum: Int = 16,   // how many entries in the prefetch req filter?
+  reqFilterEntryNum: Int = 16,   // how many entries in the SentUnit?
+  retryInterval: Int = 10,
 
   // Replacement
   replacer: Option[String] = Some("setplru"),
@@ -203,6 +204,8 @@ trait HasCDPParams extends HasPrefetcherHelper with HasCoupledL2Parameters {
   val reqFilterEntryNum = cdpParams.reqFilterEntryNum
   val reqFilterVTagBits = fullVAddrBits - log2Ceil(blockBytes)
   val reqFilterPTagBits = fullAddressBits - log2Ceil(blockBytes)
+  val retryInterval = cdpParams.retryInterval
+  require(retryInterval <= 15, "retryInterval should be less than 15, otherwise the retryTimer will overflow")
 }
 
 abstract class CDPBundle(implicit val p: Parameters) extends Bundle with HasCDPParams
@@ -1081,7 +1084,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
 
   // timer
   for (i <- 0 until reqFilterEntryNum) {
-    when (entries(i).retryEn && entries(i).retryTimer < 10.U) {   // TODO: parameterize the interval value
+    when (entries(i).retryEn && entries(i).retryTimer < retryInterval.U) {
       entries(i).retryTimer := entries(i).retryTimer + 1.U
     }
   }
@@ -1101,7 +1104,7 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
     val entry = entries(i)
     val entryTlbReq = tlbArb.io.in(i)
 
-    val entryTimerOk = !entry.retryEn || entry.retryTimer >= 10.U
+    val entryTimerOk = !entry.retryEn || entry.retryTimer >= retryInterval.U
 
     val reqVaddr = Cat(entry.vTag, 0.U(log2Ceil(blockBytes).W))
     val s1_same_page = samePage(reqVaddr, tlb_s1_addr) && tlb_s1_valid
