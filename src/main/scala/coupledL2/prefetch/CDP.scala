@@ -1117,7 +1117,6 @@ class SentUnit(implicit p: Parameters) extends CDPModule {
     )
 
     entryTlbReq.valid := valids(i) && !entry.paddrValid && entryTimerOk && !pageConflict
-    entryTlbReq.bits  := DontCare
     entryTlbReq.bits.vaddr  := reqVaddr
     entryTlbReq.bits.cmd    := TlbCmd.read
     entryTlbReq.bits.isPrefetch := true.B

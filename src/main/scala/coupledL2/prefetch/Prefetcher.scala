@@ -236,25 +236,32 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val cdp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_cdp_en
   val delay_latency = pfCtrlFromCore.l2_pf_delay_latency
 
-  // tlb req wires
-  val bop_tlb_req = WireInit(0.U.asTypeOf(io.tlb_req))
-  val cdp_tlb_req = WireInit(0.U.asTypeOf(io.tlb_req))
+  /**
+   * TLB request arbitration logic.
+   *
+   * WARNING:
+   * 1. `req_kill` is always low in both BOP and CDP, so it is not considered here.
+   * 2. The request → response → PMP response pipeline takes three cycles.
+   *    Request-response pairing is guaranteed by the prefetchers.
+   */
+  val bop_tlb_req = WireInit(0.U.asTypeOf(new L2ToL1TlbIO(nRespDups= 1)))
+  val cdp_tlb_req = WireInit(0.U.asTypeOf(new L2ToL1TlbIO(nRespDups= 1)))
 
-  io.tlb_req.req.valid := bop_tlb_req.req.valid || cdp_tlb_req.req.valid
-  io.tlb_req.req.bits := Mux(bop_tlb_req.req.valid, bop_tlb_req.req.bits, cdp_tlb_req.req.bits)
-  io.tlb_req.req_kill := bop_tlb_req.req_kill || cdp_tlb_req.req_kill // TODO: check this
+  val tlbReqArb = Module(new Arbiter(new L2TlbReq, 2))
+  tlbReqArb.io.in(0) <> bop_tlb_req.req
+  tlbReqArb.io.in(1) <> cdp_tlb_req.req
+  tlbReqArb.io.out <> io.tlb_req.req
+  io.tlb_req.req_kill := false.B
 
-  bop_tlb_req.req.ready := io.tlb_req.req.ready
   bop_tlb_req.resp.valid := io.tlb_req.resp.valid
   bop_tlb_req.resp.bits := io.tlb_req.resp.bits
   bop_tlb_req.pmp_resp := io.tlb_req.pmp_resp
   
-  cdp_tlb_req.req.ready := io.tlb_req.req.ready && !bop_tlb_req.req.valid
   cdp_tlb_req.resp.valid := io.tlb_req.resp.valid
   cdp_tlb_req.resp.bits := io.tlb_req.resp.bits
   cdp_tlb_req.pmp_resp := io.tlb_req.pmp_resp
 
-  io.tlb_req.resp.ready := true.B   // TODO: check whether this is correct
+  io.tlb_req.resp.ready := true.B
 
   // =================== Prefetchers =====================
   // TODO: consider separate VBOP and PBOP in prefetch param
