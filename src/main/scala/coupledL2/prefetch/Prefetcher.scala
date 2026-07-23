@@ -397,18 +397,18 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     cdp.get.io.enable := cdp_en
 
     // Train
-    cdp.get.io.vpn_train.valid  := train.valid && train.bits.cdp_vpn_train_valid.get && train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U
-    cdp.get.io.vpn_train.bits   := train.bits
+    cdp.get.io.vpnTrain.valid  := train.valid && train.bits.cdp_vpn_train_valid.get && train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U
+    cdp.get.io.vpnTrain.bits   := train.bits
 
-    cdp.get.io.filter_train.valid := train.valid && (train.bits.cdp_filter_train_hit.get || train.bits.cdp_filter_train_evict.get) && train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U
-    cdp.get.io.filter_train.bits  := train.bits
+    cdp.get.io.filterTrain.valid := train.valid && (train.bits.cdp_filter_train_hit.get || train.bits.cdp_filter_train_evict.get) && train.bits.reqsource =/= MemReqSource.L1DataPrefetch.id.U
+    cdp.get.io.filterTrain.bits  := train.bits
 
     // Trigger
-    cdp.get.io.l2_detect_triggers <> cdpio.cdp_trigger.get
+    cdp.get.io.l2DetectTriggers <> cdpio.cdp_trigger.get
     cdp.get.io.pfStat <> cdpio.pfStat.get
 
     // tlb req
-    cdp.get.io.tlb_req <> cdp_tlb_req
+    cdp.get.io.tlbReq <> cdp_tlb_req
 
   }
   private val mbistPl = MbistPipeline.PlaceMbistPipeline(2, "MbistPipeL2Prefetcher", cacheParams.hasMbist && (hasBOP || hasTPPrefetcher || hasCDP))
@@ -423,7 +423,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     if (hasBOP) Some(vbop.get.io.req) else None,
     if (hasBOP) Some(pbop.get.io.req) else None,
     if (hasTPPrefetcher) Some(tp.get.io.req) else None,
-    if (hasCDP) Some(cdp.get.io.pft_req) else None
+    if (hasCDP) Some(cdp.get.io.pftReq) else None
   )
   val reqsValid = reqs.map(_.map(_.valid).getOrElse(false.B))
   val reqsBits = reqs.map(_.map(_.bits).getOrElse(0.U.asTypeOf(new PrefetchReq)))
