@@ -30,8 +30,6 @@ class PrefetcherMonitor(implicit p: Parameters) extends PrefetchModule {
     val stat = Output(new PrefetchStat)
   })
 
-  io.stat := 0.U.asTypeOf(new PrefetchStat)
-
   for (pfSrcId <- 0 until PfSource.PfSourceCount.id) {
     val sentAcc = RegInit(0.U(64.W))
     val hitAcc  = RegInit(0.U(64.W))
