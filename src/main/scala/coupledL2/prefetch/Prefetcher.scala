@@ -222,7 +222,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     val tpmeta_port = if (hasTPPrefetcher) Some(new tpmetaPortIO(hartIdLen, fullAddressBits, offsetBits)) else None
   })
   val cdpio = IO(new Bundle {
-    val cdp_trigger = if (hasCDP) Some(Vec(banks, Flipped(ValidIO(new CDPDetectTrigger)))) else None
+    val cdp_trigger = if (hasCDP) Some(Vec(banks, Flipped(ValidIO(new CDPDetectTask(dataBits=blockBits))))) else None
     val pfStat = if (hasCDP) Some(Input(new PrefetchStat)) else None
   })
   val hartId = IO(Input(UInt(hartIdLen.W)))

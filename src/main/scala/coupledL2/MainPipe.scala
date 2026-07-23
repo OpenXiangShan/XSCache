@@ -25,7 +25,7 @@ import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLPermissions._
 import org.chipsalliance.cde.config.Parameters
 import xscache.coupledL2._
-import xscache.coupledL2.prefetch.{PrefetchTrain, PfSource, CDPDetectTrigger, CDPParameters}
+import xscache.coupledL2.prefetch.{PrefetchTrain, PfSource, CDPDetectTask, CDPParameters}
 import xscache.coupledL2.MetaData._
 import xscache.chi.{CHIREQ, HasCHIOpcodes}
 import xscache.chi.CHICohStates._
@@ -124,7 +124,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val cmoLineDone = Option.when(cacheParams.enableL2Flush) (Output(Bool()))
 
     /* to CDP for detection */
-    val cdp_trigger = Option.when(hasCDP) (ValidIO(new CDPDetectTrigger))
+    val cdp_trigger = Option.when(hasCDP) (ValidIO(new CDPDetectTask(dataBits=blockBits)))
   })
 
   require(chiOpt.isDefined)
@@ -929,10 +929,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
     val cdp_trigger = io.cdp_trigger.get
     cdp_trigger.valid := is_hit_trigger_s5 || is_refill_trigger_s5
-    cdp_trigger.bits.cacheblock  := Mux(is_hit_trigger_s5, hit_trigger_data_s5, refill_trigger_data_s5)
+    cdp_trigger.bits.data        := Mux(is_hit_trigger_s5, hit_trigger_data_s5, refill_trigger_data_s5)
     cdp_trigger.bits.pfDepth     := Mux(is_hit_trigger_s5, hit_trigger_depth_s5, refill_trigger_depth_s5)
     cdp_trigger.bits.pfSource    := Mux(is_hit_trigger_s5, hit_trigger_pfsrc_s5, refill_trigger_pfsrc_s5)
-    cdp_trigger.bits.is_hit      := is_hit_trigger_s5
+    cdp_trigger.bits.isHit       := is_hit_trigger_s5
   }
 
   /* ======== BlockInfo ======== */

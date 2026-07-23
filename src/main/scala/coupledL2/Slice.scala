@@ -22,7 +22,7 @@ import chisel3.util._
 import utility.mbist.MbistPipeline
 import org.chipsalliance.cde.config.Parameters
 import xscache.coupledL2._
-import xscache.coupledL2.prefetch.{PrefetchIO, CDPDetectTrigger, CDPParameters, PfSource}
+import xscache.coupledL2.prefetch.{PrefetchIO, CDPDetectTask, CDPParameters, PfSource}
 import utility.MemReqSource
 import xscache.chi.{DecoupledPortIO, HasCHIMsgParameters}
 
@@ -37,7 +37,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   })
   val io_pCrd = IO(Vec(mshrsAll, new PCrdQueryBundle))
 
-  val io_cdp_triggers = Option.when(prefetchers.exists(_.isInstanceOf[CDPParameters])) (IO(ValidIO(new CDPDetectTrigger)))
+  val io_cdp_triggers = Option.when(hasCDP) (IO(ValidIO(new CDPDetectTask(dataBits=blockBits))))
 
   /* Upwards TileLink-related modules */
   val sinkA = Module(new SinkA)
