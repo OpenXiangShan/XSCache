@@ -25,8 +25,9 @@ import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLHints._
 import xscache.coupledL2.prefetch.PrefetchReq
 import utility.{MemReqSource, XSPerfAccumulate}
-import xscache.common.{AliasKey, MdpHintKey, MdpImmKey, MdpLoadSizeKey, MdpLoadUnsignedKey,
-  MdpPCKey, MdpVaddrKey, PrefetchKey}
+import xscache.common.{AliasKey, MdpChainImmKey, MdpChainLoadSizeKey, MdpChainLoadUnsignedKey,
+  MdpChainValidKey, MdpHintKey, MdpImmKey, MdpLoadSizeKey, MdpLoadUnsignedKey, MdpOriginKey, MdpPCKey,
+  MdpVaddrKey, PrefetchKey}
 
 class SinkA(implicit p: Parameters) extends L2Module {
   val io = IO(new Bundle() {
@@ -76,13 +77,23 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task.fromL2pft.foreach(_ := false.B)
     task.needHint.foreach(_ := a.user.lift(PrefetchKey).getOrElse(false.B))
     // Consume the context produced by L1 DCache. Defaults preserve clients
-    // that do not negotiate the optional MDP TileLink fields.
-    task.mdpHint := a.user.lift(MdpHintKey).getOrElse(false.B)
-    task.mdpImm := a.user.lift(MdpImmKey).getOrElse(0.U)
-    task.mdpVaddr := a.user.lift(MdpVaddrKey).getOrElse(0.U)
-    task.mdpPC := a.user.lift(MdpPCKey).getOrElse(0.U)
-    task.mdpLoadSize := a.user.lift(MdpLoadSizeKey).getOrElse(0.U)
-    task.mdpLoadUnsigned := a.user.lift(MdpLoadUnsignedKey).getOrElse(false.B)
+    // that do not negotiate the optional MDP TileLink fields.  Normalize all
+    // payload fields against mdpHint so a malformed/legacy A user bundle cannot
+    // create a chain event without the marker.
+    val mdpHint = a.user.lift(MdpHintKey).getOrElse(false.B)
+    val rawChainValid = a.user.lift(MdpChainValidKey).getOrElse(false.B)
+    val mdpChainValid = mdpHint && rawChainValid
+    task.mdpHint := mdpHint
+    task.mdpImm := Mux(mdpHint, a.user.lift(MdpImmKey).getOrElse(0.U), 0.U)
+    task.mdpChainImm := Mux(mdpChainValid, a.user.lift(MdpChainImmKey).getOrElse(0.U), 0.U)
+    task.mdpChainValid := mdpChainValid
+    task.mdpChainLoadSize := Mux(mdpChainValid, a.user.lift(MdpChainLoadSizeKey).getOrElse(0.U), 0.U)
+    task.mdpChainLoadUnsigned := mdpChainValid && a.user.lift(MdpChainLoadUnsignedKey).getOrElse(false.B)
+    task.mdpOrigin := Mux(mdpHint, a.user.lift(MdpOriginKey).getOrElse(0.U), 0.U)
+    task.mdpVaddr := Mux(mdpHint, a.user.lift(MdpVaddrKey).getOrElse(0.U), 0.U)
+    task.mdpPC := Mux(mdpHint, a.user.lift(MdpPCKey).getOrElse(0.U), 0.U)
+    task.mdpLoadSize := Mux(mdpHint, a.user.lift(MdpLoadSizeKey).getOrElse(0.U), 0.U)
+    task.mdpLoadUnsigned := mdpHint && a.user.lift(MdpLoadUnsignedKey).getOrElse(false.B)
     task.dirty := false.B
     task.way := Mux(cmoAllValid, wayVal, 0.U(wayBits.W))
     task.meta := 0.U.asTypeOf(new MetaEntry)
@@ -124,6 +135,18 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task.fromL2pft.foreach(_ := req.needAck)
     task.mshrRetry := false.B
     task.needHint.foreach(_ := false.B)
+    val mdpChainValid = req.mdpHint && req.mdpChainValid
+    task.mdpHint := req.mdpHint
+    task.mdpImm := Mux(req.mdpHint, req.mdpImm, 0.U)
+    task.mdpChainImm := Mux(mdpChainValid, req.mdpChainImm, 0.U)
+    task.mdpChainValid := mdpChainValid
+    task.mdpChainLoadSize := Mux(mdpChainValid, req.mdpChainLoadSize, 0.U)
+    task.mdpChainLoadUnsigned := mdpChainValid && req.mdpChainLoadUnsigned
+    task.mdpOrigin := Mux(req.mdpHint, req.mdpOrigin, 0.U)
+    task.mdpVaddr := Mux(req.mdpHint, req.mdpVaddr, 0.U)
+    task.mdpPC := Mux(req.mdpHint, req.mdpPC, 0.U)
+    task.mdpLoadSize := Mux(req.mdpHint, req.mdpLoadSize, 0.U)
+    task.mdpLoadUnsigned := req.mdpHint && req.mdpLoadUnsigned
     task.dirty := false.B
     task.way := 0.U(wayBits.W)
     task.meta := 0.U.asTypeOf(new MetaEntry)
@@ -211,11 +234,21 @@ class SinkA(implicit p: Parameters) extends L2Module {
   // the first L2-side observation point after the TileLink user fields leave
   // the DCache and is intentionally independent of directory/MSHR outcome.
   XSPerfAccumulate("l2_mdp_sink_a_hint", io.a.fire && io.a.bits.user.lift(MdpHintKey).getOrElse(false.B))
+  XSPerfAccumulate(
+    "l2_mdp_sink_a_chain_hint",
+    io.a.fire && io.a.bits.user.lift(MdpHintKey).getOrElse(false.B) &&
+      io.a.bits.user.lift(MdpChainValidKey).getOrElse(false.B)
+  )
   prefetchOpt.foreach {
     _ =>
       XSPerfAccumulate("sinkA_prefetch_req", io.prefetchReq.get.fire)
       XSPerfAccumulate("sinkA_prefetch_from_l2", io.prefetchReq.get.bits.fromL2 && io.prefetchReq.get.fire)
       XSPerfAccumulate("sinkA_prefetch_from_l1", !io.prefetchReq.get.bits.fromL2 && io.prefetchReq.get.fire)
+      XSPerfAccumulate(
+        "l2_mdp_sink_a_recursive_prefetch",
+        io.prefetchReq.get.fire && io.prefetchReq.get.bits.mdpHint &&
+          io.prefetchReq.get.bits.mdpOrigin === 2.U
+      )
   }
 
   // cycels stalled by mainpipe

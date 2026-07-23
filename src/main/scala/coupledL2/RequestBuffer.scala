@@ -191,6 +191,19 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     io.mshrInfo.map(_.bits.reqSource) ++ buffer.map(_.task.reqSource)
   )
 
+  // A duplicate internal PrefetchReq/TL-Hint that only matches a buffered task
+  // may still flow directly to MainPipe when the normal flow conditions hold.
+  // Otherwise it is consumed without allocating a second transaction (the MDP
+  // PrefetchReq has needAck=false). It keeps the context owned by the first
+  // same-line request. Do not reuse aMergeTask here: that path means an Acquire
+  // merged into an MSHR and causes Grant/GrantData bookkeeping. Preserving a
+  // higher-ranked MDP context (chain > plain hint) therefore needs a separate
+  // context-only interface in a future change.
+  val mdpHintDuplicateDrop = io.in.fire && dup && !doFlow && in.mdpHint
+  val mdpChainDuplicateDrop = mdpHintDuplicateDrop && in.mdpChainValid
+  val mdpHintDuplicateFlow = io.in.fire && dup && doFlow && in.mdpHint
+  val mdpChainDuplicateFlow = mdpHintDuplicateFlow && in.mdpChainValid
+
   // statistics io
   val latePrefetchRes = latePrefetch(in) // demand request hit entry of pf
   io.pfStatInMSHR.hitPf := latePrefetchRes._1 && io.in.valid && !sameAddr(in, RegNext(in))
@@ -312,6 +325,10 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   // add XSPerf to see how many cycles the req is held in Buffer
   if(cacheParams.enablePerf) {
     XSPerfAccumulate("drop_prefetch", io.in.valid && dup)
+    XSPerfAccumulate("l2_mdp_hint_duplicate_drop", mdpHintDuplicateDrop)
+    XSPerfAccumulate("l2_mdp_chain_duplicate_drop", mdpChainDuplicateDrop)
+    XSPerfAccumulate("l2_mdp_hint_duplicate_flow", mdpHintDuplicateFlow)
+    XSPerfAccumulate("l2_mdp_chain_duplicate_flow", mdpChainDuplicateFlow)
     if(flow){
       XSPerfAccumulate("req_buffer_flow", io.in.valid && doFlow)
     }

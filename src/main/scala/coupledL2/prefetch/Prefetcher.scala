@@ -119,6 +119,20 @@ class PrefetchReq(implicit p: Parameters) extends PrefetchBundle {
   val source = UInt(sourceIdBits.W)
   val pfSource = UInt(MemReqSource.reqSourceBits.W)
 
+  // L2 MDP recursively consumes these fields when this prefetch misses. Other
+  // prefetchers explicitly drive the marker low and the context to zero.
+  val mdpHint = Bool()
+  val mdpImm = UInt(12.W)
+  val mdpChainImm = UInt(12.W)
+  val mdpChainValid = Bool()
+  val mdpChainLoadSize = UInt(2.W)
+  val mdpChainLoadUnsigned = Bool()
+  val mdpOrigin = UInt(3.W)
+  val mdpVaddr = UInt(64.W)
+  val mdpPC = UInt(64.W)
+  val mdpLoadSize = UInt(2.W)
+  val mdpLoadUnsigned = Bool()
+
   def addr: UInt = Cat(tag, set, 0.U(offsetBits.W))
   def setaddr: UInt = Cat(tag, set)
   def isBOP:Bool = pfSource === MemReqSource.Prefetch2L2BOP.id.U

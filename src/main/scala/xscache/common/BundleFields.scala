@@ -35,6 +35,26 @@ case class MdpHintField() extends BundleField[Bool](MdpHintKey, Output(Bool()), 
 case object MdpImmKey extends ControlKey[UInt](name = "mdpImm")
 case class MdpImmField(width: Int) extends BundleField[UInt](MdpImmKey, Output(UInt(width.W)), _ := 0.U(width.W))
 
+case object MdpChainImmKey extends ControlKey[UInt](name = "mdpChainImm")
+case class MdpChainImmField(width: Int)
+  extends BundleField[UInt](MdpChainImmKey, Output(UInt(width.W)), _ := 0.U(width.W))
+
+case object MdpChainValidKey extends ControlKey[Bool](name = "mdpChainValid")
+case class MdpChainValidField()
+  extends BundleField[Bool](MdpChainValidKey, Output(Bool()), _ := false.B)
+
+case object MdpChainLoadSizeKey extends ControlKey[UInt](name = "mdpChainLoadSize")
+case class MdpChainLoadSizeField()
+  extends BundleField[UInt](MdpChainLoadSizeKey, Output(UInt(2.W)), _ := 0.U(2.W))
+
+case object MdpChainLoadUnsignedKey extends ControlKey[Bool](name = "mdpChainLoadUnsigned")
+case class MdpChainLoadUnsignedField()
+  extends BundleField[Bool](MdpChainLoadUnsignedKey, Output(Bool()), _ := false.B)
+
+case object MdpOriginKey extends ControlKey[UInt](name = "mdpOrigin")
+case class MdpOriginField(width: Int)
+  extends BundleField[UInt](MdpOriginKey, Output(UInt(width.W)), _ := 0.U(width.W))
+
 case object MdpVaddrKey extends ControlKey[UInt](name = "mdpVaddr")
 case class MdpVaddrField(width: Int) extends BundleField[UInt](MdpVaddrKey, Output(UInt(width.W)), _ := 0.U(width.W))
 

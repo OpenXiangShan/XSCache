@@ -395,6 +395,17 @@ class TemporalPrefetch(implicit p: Parameters) extends TPModule {
   io.req.bits.needT := true.B
   io.req.bits.source := 0.U // TODO: ensure source 0 is dcache
   io.req.bits.pfSource := MemReqSource.Prefetch2L2TP.id.U
+  io.req.bits.mdpHint := false.B
+  io.req.bits.mdpImm := 0.U
+  io.req.bits.mdpChainImm := 0.U
+  io.req.bits.mdpChainValid := false.B
+  io.req.bits.mdpChainLoadSize := 0.U
+  io.req.bits.mdpChainLoadUnsigned := false.B
+  io.req.bits.mdpOrigin := 0.U
+  io.req.bits.mdpVaddr := 0.U
+  io.req.bits.mdpPC := 0.U
+  io.req.bits.mdpLoadSize := 0.U
+  io.req.bits.mdpLoadUnsigned := false.B
 
   io.resp.ready := true.B
   io.train.ready := resetFinish

@@ -387,6 +387,17 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
     req.needT := needT
     req.source := source
     req.pfSource := MemReqSource.Prefetch2L2BOP.id.U
+    req.mdpHint := false.B
+    req.mdpImm := 0.U
+    req.mdpChainImm := 0.U
+    req.mdpChainValid := false.B
+    req.mdpChainLoadSize := 0.U
+    req.mdpChainLoadUnsigned := false.B
+    req.mdpOrigin := 0.U
+    req.mdpVaddr := 0.U
+    req.mdpPC := 0.U
+    req.mdpLoadSize := 0.U
+    req.mdpLoadUnsigned := false.B
     req
   }
 
@@ -786,6 +797,17 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     io.req.bits.needT := s1_needT
     io.req.bits.source := s1_source
     io.req.bits.pfSource := MemReqSource.Prefetch2L2BOP.id.U
+    io.req.bits.mdpHint := false.B
+    io.req.bits.mdpImm := 0.U
+    io.req.bits.mdpChainImm := 0.U
+    io.req.bits.mdpChainValid := false.B
+    io.req.bits.mdpChainLoadSize := 0.U
+    io.req.bits.mdpChainLoadUnsigned := false.B
+    io.req.bits.mdpOrigin := 0.U
+    io.req.bits.mdpVaddr := 0.U
+    io.req.bits.mdpPC := 0.U
+    io.req.bits.mdpLoadSize := 0.U
+    io.req.bits.mdpLoadUnsigned := false.B
     io.req.bits.isBOP := true.B
   }
 
@@ -859,6 +881,17 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   io.req.valid := enable && req_valid
   io.req.bits := req
   io.req.bits.pfSource := MemReqSource.Prefetch2L2PBOP.id.U
+  io.req.bits.mdpHint := false.B
+  io.req.bits.mdpImm := 0.U
+  io.req.bits.mdpChainImm := 0.U
+  io.req.bits.mdpChainValid := false.B
+  io.req.bits.mdpChainLoadSize := 0.U
+  io.req.bits.mdpChainLoadUnsigned := false.B
+  io.req.bits.mdpOrigin := 0.U
+  io.req.bits.mdpVaddr := 0.U
+  io.req.bits.mdpPC := 0.U
+  io.req.bits.mdpLoadSize := 0.U
+  io.req.bits.mdpLoadUnsigned := false.B
   io.train.ready := delayQueue.io.in.ready && scoreTable.io.req.ready && (!req_valid || io.req.ready)
   io.resp.ready := rrTable.io.w.ready
 

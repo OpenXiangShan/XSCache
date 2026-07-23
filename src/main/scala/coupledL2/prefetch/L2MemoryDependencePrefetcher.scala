@@ -58,8 +58,15 @@ trait HasL2MdpParameters extends HasPrefetchParameters {
 class L2MdpRefill(implicit p: Parameters) extends PrefetchBundle {
   val data = UInt(64.W)
   val imm = UInt(12.W)
+  val chainImm = UInt(12.W)
+  val chainValid = Bool()
+  val chainLoadSize = UInt(2.W)
+  val chainLoadUnsigned = Bool()
+  val origin = UInt(3.W)
   val pc = UInt(64.W)
   val vaddr = UInt(64.W)
+  val loadSize = UInt(2.W)
+  val loadUnsigned = Bool()
   val source = UInt(sourceIdBits.W)
 }
 
@@ -67,6 +74,13 @@ class L2MdpCandidate(implicit p: Parameters) extends PrefetchBundle {
   val triggerPC = UInt(64.W)
   val triggerVaddr = UInt(64.W)
   val targetVaddr = UInt(fullVAddrBits.W)
+  val chainImm = UInt(12.W)
+  val chainValid = Bool()
+  val chainLoadSize = UInt(2.W)
+  val chainLoadUnsigned = Bool()
+  val origin = UInt(3.W)
+  val loadSize = UInt(2.W)
+  val loadUnsigned = Bool()
   val source = UInt(sourceIdBits.W)
 }
 
@@ -120,6 +134,14 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
     val tlbMiss = Bool()
     val triggerPC = UInt(64.W)
     val triggerVaddr = UInt(64.W)
+    val targetVaddr = UInt(fullVAddrBits.W)
+    val chainImm = UInt(12.W)
+    val chainValid = Bool()
+    val chainLoadSize = UInt(2.W)
+    val chainLoadUnsigned = Bool()
+    val origin = UInt(3.W)
+    val loadSize = UInt(2.W)
+    val loadUnsigned = Bool()
     val source = UInt(sourceIdBits.W)
 
     def vaddr: UInt = Cat(vline, 0.U(offsetBits.W))
@@ -134,6 +156,7 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
     val req = DecoupledIO(new PrefetchReq)
     // Retain the source PC alongside the translated request for ChiselDB.
     val triggerPC = Output(UInt(64.W))
+    val triggerOrigin = Output(UInt(3.W))
   })
 
   val entries = RegInit(VecInit(Seq.fill(entriesNum)(0.U.asTypeOf(new Entry))))
@@ -147,6 +170,7 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
   val invalidVec = VecInit(valids.map(! _))
   val hasMatch = matchVec.asUInt.orR
   val hasInvalid = invalidVec.asUInt.orR
+  val matchIdx = PriorityEncoder(matchVec)
   val allocIdx = PriorityEncoder(invalidVec)
   io.candidate.ready := hasMatch || hasInvalid
 
@@ -157,8 +181,32 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
     entries(allocIdx).tlbMiss := false.B
     entries(allocIdx).triggerPC := io.candidate.bits.triggerPC
     entries(allocIdx).triggerVaddr := io.candidate.bits.triggerVaddr
+    entries(allocIdx).targetVaddr := io.candidate.bits.targetVaddr
+    entries(allocIdx).chainImm := io.candidate.bits.chainImm
+    entries(allocIdx).chainValid := io.candidate.bits.chainValid
+    entries(allocIdx).chainLoadSize := io.candidate.bits.chainLoadSize
+    entries(allocIdx).chainLoadUnsigned := io.candidate.bits.chainLoadUnsigned
+    entries(allocIdx).origin := io.candidate.bits.origin
+    entries(allocIdx).loadSize := io.candidate.bits.loadSize
+    entries(allocIdx).loadUnsigned := io.candidate.bits.loadUnsigned
     entries(allocIdx).source := io.candidate.bits.source
     valids(allocIdx) := true.B
+  }
+
+  // A chain-bearing candidate must atomically promote an existing same-line
+  // translation entry. A non-chain duplicate never clears recursive context.
+  when(io.candidate.fire && hasMatch && io.candidate.bits.chainValid) {
+    entries(matchIdx).triggerPC := io.candidate.bits.triggerPC
+    entries(matchIdx).triggerVaddr := io.candidate.bits.triggerVaddr
+    entries(matchIdx).targetVaddr := io.candidate.bits.targetVaddr
+    entries(matchIdx).chainImm := io.candidate.bits.chainImm
+    entries(matchIdx).chainValid := true.B
+    entries(matchIdx).chainLoadSize := io.candidate.bits.chainLoadSize
+    entries(matchIdx).chainLoadUnsigned := io.candidate.bits.chainLoadUnsigned
+    entries(matchIdx).origin := io.candidate.bits.origin
+    entries(matchIdx).loadSize := io.candidate.bits.loadSize
+    entries(matchIdx).loadUnsigned := io.candidate.bits.loadUnsigned
+    entries(matchIdx).source := io.candidate.bits.source
   }
 
   /* TLB s0: arbitrate one untranslated entry. */
@@ -233,15 +281,49 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
     pfArb.io.in(i).bits := i.U
   }
   val pfIdx = pfArb.io.out.bits
+  // If a chain-bearing duplicate arrives while its matching entry is emitted,
+  // use the incoming metadata combinationally so the promotion cannot be lost
+  // when the entry is cleared by the same-cycle request fire.
+  val promotePfEntry = io.candidate.fire && hasMatch && io.candidate.bits.chainValid && matchIdx === pfIdx
+  val pfTriggerPC = Mux(promotePfEntry, io.candidate.bits.triggerPC, entries(pfIdx).triggerPC)
+  val pfTargetVaddr = Mux(promotePfEntry, io.candidate.bits.targetVaddr, entries(pfIdx).targetVaddr)
+  val pfChainImm = Mux(promotePfEntry, io.candidate.bits.chainImm, entries(pfIdx).chainImm)
+  val pfChainValid = Mux(promotePfEntry, io.candidate.bits.chainValid, entries(pfIdx).chainValid)
+  val pfChainLoadSize = Mux(
+    promotePfEntry,
+    io.candidate.bits.chainLoadSize,
+    entries(pfIdx).chainLoadSize
+  )
+  val pfChainLoadUnsigned = Mux(
+    promotePfEntry,
+    io.candidate.bits.chainLoadUnsigned,
+    entries(pfIdx).chainLoadUnsigned
+  )
+  val pfTriggerOrigin = Mux(promotePfEntry, io.candidate.bits.origin, entries(pfIdx).origin)
+  val pfSource = Mux(promotePfEntry, io.candidate.bits.source, entries(pfIdx).source)
   pfArb.io.out.ready := io.req.ready
   io.req.valid := pfArb.io.out.valid
   io.req.bits.tag := parseFullAddress(entries(pfIdx).paddr)._1
   io.req.bits.set := parseFullAddress(entries(pfIdx).paddr)._2
   io.req.bits.vaddr.foreach(_ := entries(pfIdx).vline)
   io.req.bits.needT := false.B
-  io.req.bits.source := entries(pfIdx).source
+  io.req.bits.source := pfSource
   io.req.bits.pfSource := MemReqSource.Prefetch2L2MDP.id.U
-  io.triggerPC := entries(pfIdx).triggerPC
+  io.req.bits.mdpHint := pfChainValid
+  io.req.bits.mdpImm := Mux(pfChainValid, pfChainImm, 0.U)
+  // Consume one chain descriptor: this request is the next carrier, so it is
+  // hinted, but it must not reuse the same chain metadata indefinitely.
+  io.req.bits.mdpChainImm := 0.U
+  io.req.bits.mdpChainValid := false.B
+  io.req.bits.mdpChainLoadSize := 0.U
+  io.req.bits.mdpChainLoadUnsigned := false.B
+  io.req.bits.mdpOrigin := Mux(pfChainValid, 2.U, 0.U)
+  io.req.bits.mdpVaddr := Mux(pfChainValid, pfTargetVaddr, 0.U)
+  io.req.bits.mdpPC := Mux(pfChainValid, pfTriggerPC, 0.U)
+  io.req.bits.mdpLoadSize := Mux(pfChainValid, pfChainLoadSize, 0.U)
+  io.req.bits.mdpLoadUnsigned := pfChainValid && pfChainLoadUnsigned
+  io.triggerPC := pfTriggerPC
+  io.triggerOrigin := pfTriggerOrigin
 
   when(io.req.fire) {
     valids(pfIdx) := false.B
@@ -270,6 +352,10 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
   // Performance counters are grouped at the end of this helper class.
   XSPerfAccumulate("l2_mdp_tlb_candidate", io.candidate.fire)
   XSPerfAccumulate("l2_mdp_tlb_candidate_merge", io.candidate.fire && hasMatch)
+  XSPerfAccumulate(
+    "l2_mdp_tlb_candidate_chain_promote",
+    io.candidate.fire && hasMatch && io.candidate.bits.chainValid
+  )
   XSPerfAccumulate("l2_mdp_tlb_req", io.tlbReq.req.fire)
   XSPerfAccumulate("l2_mdp_tlb_req_blocked", io.tlbReq.req.valid && !io.tlbReq.req.ready)
   XSPerfAccumulate("l2_mdp_tlb_resp", io.tlbReq.resp.fire)
@@ -283,6 +369,7 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
   XSPerfAccumulate("l2_mdp_tlb_miss_retry", io.tlbReq.req.fire && s1_tlbRetry)
   XSPerfAccumulate("l2_mdp_tlb_fault", s3_fault)
   XSPerfAccumulate("l2_mdp_prefetch_fire", io.req.fire)
+  XSPerfAccumulate("l2_mdp_recursive_prefetch_fire", io.req.fire && io.req.bits.mdpHint)
 }
 
 class L2MemoryDependencePrefetcher(implicit p: Parameters)
@@ -296,6 +383,13 @@ class L2MemoryDependencePrefetcher(implicit p: Parameters)
     val vaddr = UInt(64.W)
     val data = UInt(64.W)
     val imm = UInt(12.W)
+    val chainImm = UInt(12.W)
+    val chainValid = Bool()
+    val chainLoadSize = UInt(2.W)
+    val chainLoadUnsigned = Bool()
+    val origin = UInt(3.W)
+    val loadSize = UInt(2.W)
+    val loadUnsigned = Bool()
     val prefetchVaddr = UInt(fullVAddrBits.W)
   }
 
@@ -303,8 +397,17 @@ class L2MemoryDependencePrefetcher(implicit p: Parameters)
     val timeCnt = UInt(64.W)
     // PC carried from the hinted L2 refill through translation to this fire.
     val triggerPC = UInt(64.W)
+    val triggerOrigin = UInt(3.W)
     val vaddr = UInt(fullVAddrBits.W)
     val paddr = UInt(fullAddressBits.W)
+    val mdpHint = Bool()
+    val chainImm = UInt(12.W)
+    val chainValid = Bool()
+    val chainLoadSize = UInt(2.W)
+    val chainLoadUnsigned = Bool()
+    val origin = UInt(3.W)
+    val loadSize = UInt(2.W)
+    val loadUnsigned = Bool()
   }
 
   val io = IO(new Bundle {
@@ -339,6 +442,13 @@ class L2MemoryDependencePrefetcher(implicit p: Parameters)
   candidateQueue.io.enq.bits.triggerPC := refillFilter.io.out.bits.pc
   candidateQueue.io.enq.bits.triggerVaddr := refillFilter.io.out.bits.vaddr
   candidateQueue.io.enq.bits.targetVaddr := refillTarget
+  candidateQueue.io.enq.bits.chainImm := refillFilter.io.out.bits.chainImm
+  candidateQueue.io.enq.bits.chainValid := refillFilter.io.out.bits.chainValid
+  candidateQueue.io.enq.bits.chainLoadSize := refillFilter.io.out.bits.chainLoadSize
+  candidateQueue.io.enq.bits.chainLoadUnsigned := refillFilter.io.out.bits.chainLoadUnsigned
+  candidateQueue.io.enq.bits.origin := refillFilter.io.out.bits.origin
+  candidateQueue.io.enq.bits.loadSize := refillFilter.io.out.bits.loadSize
+  candidateQueue.io.enq.bits.loadUnsigned := refillFilter.io.out.bits.loadUnsigned
   candidateQueue.io.enq.bits.source := refillFilter.io.out.bits.source
   refillFilter.io.out.ready := candidateQueue.io.enq.ready
 
@@ -362,23 +472,54 @@ class L2MemoryDependencePrefetcher(implicit p: Parameters)
   refillLog.vaddr := refillFilter.io.out.bits.vaddr
   refillLog.data := refillFilter.io.out.bits.data
   refillLog.imm := refillFilter.io.out.bits.imm
+  refillLog.chainImm := refillFilter.io.out.bits.chainImm
+  refillLog.chainValid := refillFilter.io.out.bits.chainValid
+  refillLog.chainLoadSize := refillFilter.io.out.bits.chainLoadSize
+  refillLog.chainLoadUnsigned := refillFilter.io.out.bits.chainLoadUnsigned
+  refillLog.origin := refillFilter.io.out.bits.origin
+  refillLog.loadSize := refillFilter.io.out.bits.loadSize
+  refillLog.loadUnsigned := refillFilter.io.out.bits.loadUnsigned
   refillLog.prefetchVaddr := refillTarget
   refillTable.log(refillLog, refillFilter.io.out.fire, "l2mdp", clock, reset)
 
   val prefetchLog = Wire(new L2MdpPrefetchDBEntry)
   prefetchLog.timeCnt := GTimer()
   prefetchLog.triggerPC := pfBuffer.io.triggerPC
+  prefetchLog.triggerOrigin := pfBuffer.io.triggerOrigin
   prefetchLog.vaddr := pfBuffer.io.req.bits.vaddr.getOrElse(0.U) << offsetBits
   prefetchLog.paddr := pfBuffer.io.req.bits.addr
+  prefetchLog.mdpHint := pfBuffer.io.req.bits.mdpHint
+  prefetchLog.chainImm := pfBuffer.io.req.bits.mdpChainImm
+  prefetchLog.chainValid := pfBuffer.io.req.bits.mdpChainValid
+  prefetchLog.chainLoadSize := pfBuffer.io.req.bits.mdpChainLoadSize
+  prefetchLog.chainLoadUnsigned := pfBuffer.io.req.bits.mdpChainLoadUnsigned
+  prefetchLog.origin := pfBuffer.io.req.bits.mdpOrigin
+  prefetchLog.loadSize := pfBuffer.io.req.bits.mdpLoadSize
+  prefetchLog.loadUnsigned := pfBuffer.io.req.bits.mdpLoadUnsigned
   prefetchTable.log(prefetchLog, pfBuffer.io.req.fire, "l2mdp", clock, reset)
 
   // Performance counters are grouped after the DB writers.
   XSPerfAccumulate("l2_mdp_refill", refillFilter.io.out.fire)
+  XSPerfAccumulate(
+    "l2_mdp_chain_refill",
+    refillFilter.io.out.fire && refillFilter.io.out.bits.chainValid
+  )
   XSPerfAccumulate("l2_mdp_candidate", candidateQueue.io.enq.fire)
+  XSPerfAccumulate(
+    "l2_mdp_chain_candidate",
+    candidateQueue.io.enq.fire && candidateQueue.io.enq.bits.chainValid
+  )
   XSPerfAccumulate(
     "l2_mdp_candidate_queue_block",
     refillFilter.io.out.valid && !candidateQueue.io.enq.ready
   )
   XSPerfAccumulate("l2_mdp_req_fire", io.req.fire)
+  // A consumed descriptor produces a one-shot carrier (mdpHint=1,
+  // mdpChainValid=0); count the carrier itself rather than the already-cleared
+  // descriptor payload.
+  XSPerfAccumulate(
+    "l2_mdp_chain_req_fire",
+    io.req.fire && io.req.bits.mdpHint && io.req.bits.mdpOrigin === 2.U
+  )
   XSPerfAccumulate("l2_mdp_req_block", io.req.valid && !io.req.ready)
 }

@@ -155,13 +155,24 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     backoffTimer := 0.U
   }
 
-  // A demand request can merge into an in-flight L2 prefetch MSHR. If that
-  // request carries an MDP hint, promote its exact load context into the MSHR
-  // so the eventual refill task cannot lose it. A non-MDP merge leaves any
-  // previously stored context unchanged.
-  when (io.aMergeTask.valid && io.aMergeTask.bits.mdpHint) {
+  val existingMdpChain = req.mdpHint && req.mdpChainValid
+  val incomingMdpHint = io.aMergeTask.valid && io.aMergeTask.bits.mdpHint
+  val incomingMdpChain = incomingMdpHint && io.aMergeTask.bits.mdpChainValid
+  val takeIncomingMdp = incomingMdpHint && (!existingMdpChain || incomingMdpChain)
+  // A demand request can merge into an in-flight L2 prefetch MSHR. Resolve the
+  // complete context atomically with chain > plain hint priority.
+  when (takeIncomingMdp) {
     req.mdpHint := true.B
     req.mdpImm := io.aMergeTask.bits.mdpImm
+    req.mdpChainImm := Mux(incomingMdpChain, io.aMergeTask.bits.mdpChainImm, 0.U)
+    req.mdpChainValid := incomingMdpChain
+    req.mdpChainLoadSize := Mux(
+      incomingMdpChain,
+      io.aMergeTask.bits.mdpChainLoadSize,
+      0.U
+    )
+    req.mdpChainLoadUnsigned := incomingMdpChain && io.aMergeTask.bits.mdpChainLoadUnsigned
+    req.mdpOrigin := io.aMergeTask.bits.mdpOrigin
     req.mdpVaddr := io.aMergeTask.bits.mdpVaddr
     req.mdpPC := io.aMergeTask.bits.mdpPC
     req.mdpLoadSize := io.aMergeTask.bits.mdpLoadSize
@@ -817,16 +828,56 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     // TODO: The L2 MDP trigger can be moved earlier to the cycle in which this
     // MSHR receives the final refill data.  That change must send the same
     // merged metadata and extracted load value without waiting for MainPipe.
-    val mergeMdpNow = io.aMergeTask.valid && io.aMergeTask.bits.mdpHint
-    mp_grant.mdpHint := req.mdpHint || mergeMdpNow
-    mp_grant.mdpImm := Mux(mergeMdpNow, io.aMergeTask.bits.mdpImm, req.mdpImm)
-    mp_grant.mdpVaddr := Mux(mergeMdpNow, io.aMergeTask.bits.mdpVaddr, req.mdpVaddr)
-    mp_grant.mdpPC := Mux(mergeMdpNow, io.aMergeTask.bits.mdpPC, req.mdpPC)
-    mp_grant.mdpLoadSize := Mux(mergeMdpNow, io.aMergeTask.bits.mdpLoadSize, req.mdpLoadSize)
+    val mergeMdpNow = io.aMergeTask.valid && io.aMergeTask.bits.mdpHint &&
+      (!existingMdpChain || incomingMdpChain)
+    val grantMdpHint = req.mdpHint || mergeMdpNow
+    val grantMdpChain = Mux(mergeMdpNow, incomingMdpChain, existingMdpChain)
+    mp_grant.mdpHint := grantMdpHint
+    mp_grant.mdpImm := Mux(
+      grantMdpHint,
+      Mux(mergeMdpNow, io.aMergeTask.bits.mdpImm, req.mdpImm),
+      0.U
+    )
+    mp_grant.mdpChainImm := Mux(
+      grantMdpChain,
+      Mux(mergeMdpNow, io.aMergeTask.bits.mdpChainImm, req.mdpChainImm),
+      0.U
+    )
+    mp_grant.mdpChainValid := grantMdpChain
+    mp_grant.mdpChainLoadSize := Mux(
+      grantMdpChain,
+      Mux(mergeMdpNow, io.aMergeTask.bits.mdpChainLoadSize, req.mdpChainLoadSize),
+      0.U
+    )
+    mp_grant.mdpChainLoadUnsigned := Mux(
+      grantMdpChain,
+      Mux(mergeMdpNow, io.aMergeTask.bits.mdpChainLoadUnsigned, req.mdpChainLoadUnsigned),
+      false.B
+    )
+    mp_grant.mdpOrigin := Mux(
+      grantMdpHint,
+      Mux(mergeMdpNow, io.aMergeTask.bits.mdpOrigin, req.mdpOrigin),
+      0.U
+    )
+    mp_grant.mdpVaddr := Mux(
+      grantMdpHint,
+      Mux(mergeMdpNow, io.aMergeTask.bits.mdpVaddr, req.mdpVaddr),
+      0.U
+    )
+    mp_grant.mdpPC := Mux(
+      grantMdpHint,
+      Mux(mergeMdpNow, io.aMergeTask.bits.mdpPC, req.mdpPC),
+      0.U
+    )
+    mp_grant.mdpLoadSize := Mux(
+      grantMdpHint,
+      Mux(mergeMdpNow, io.aMergeTask.bits.mdpLoadSize, req.mdpLoadSize),
+      0.U
+    )
     mp_grant.mdpLoadUnsigned := Mux(
-      mergeMdpNow,
-      io.aMergeTask.bits.mdpLoadUnsigned,
-      req.mdpLoadUnsigned
+      grantMdpHint,
+      Mux(mergeMdpNow, io.aMergeTask.bits.mdpLoadUnsigned, req.mdpLoadUnsigned),
+      false.B
     )
     mp_grant.replTask := !dirResult.hit && !state.w_replResp && !denied
     mp_grant.cmoTask := cmo_cbo
@@ -1475,6 +1526,18 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   /* ======== Performance counters ======== */
   XSPerfAccumulate("l2_mdp_mshr_alloc", io.alloc.valid && io.alloc.bits.task.mdpHint)
   XSPerfAccumulate("l2_mdp_mshr_merge", io.aMergeTask.valid && io.aMergeTask.bits.mdpHint)
+  XSPerfAccumulate(
+    "l2_mdp_mshr_preserve_chain",
+    incomingMdpHint && existingMdpChain && !incomingMdpChain
+  )
+  XSPerfAccumulate(
+    "l2_mdp_chain_mshr_alloc",
+    io.alloc.valid && io.alloc.bits.task.mdpHint && io.alloc.bits.task.mdpChainValid
+  )
+  XSPerfAccumulate(
+    "l2_mdp_chain_mshr_merge",
+    io.aMergeTask.valid && io.aMergeTask.bits.mdpHint && io.aMergeTask.bits.mdpChainValid
+  )
 
   // time stamp
   val acquire_period = Option.when(cacheParams.enablePerf)(IO(ValidIO(UInt(64.W))))

@@ -499,11 +499,18 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     ))
 
     refill.valid := task_s3.valid && mdpRefillHasData && !retry &&
-      io.refillBufResp_s3.valid && req_s3.mdpHint
+      io.refillBufResp_s3.valid && req_s3.mdpHint && !req_s3.denied && !req_s3.corrupt
     refill.bits.data := loadData
     refill.bits.imm := req_s3.mdpImm
+    refill.bits.chainImm := req_s3.mdpChainImm
+    refill.bits.chainValid := req_s3.mdpChainValid
+    refill.bits.chainLoadSize := req_s3.mdpChainLoadSize
+    refill.bits.chainLoadUnsigned := req_s3.mdpChainLoadUnsigned
+    refill.bits.origin := req_s3.mdpOrigin
     refill.bits.pc := req_s3.mdpPC
     refill.bits.vaddr := req_s3.mdpVaddr
+    refill.bits.loadSize := req_s3.mdpLoadSize
+    refill.bits.loadUnsigned := req_s3.mdpLoadUnsigned
     refill.bits.source := req_s3.sourceId
   }
 
@@ -1036,6 +1043,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   XSPerfAccumulate("mshr_accessackdata_req", task_s3.valid && mshr_accessackdata_s3 && !retry)
   XSPerfAccumulate("mshr_hintack_req", task_s3.valid && mshr_hintack_s3 && !retry)
   XSPerfAccumulate("l2_mdp_mainpipe_refill", io.mdpRefill.map(_.valid).getOrElse(false.B))
+  XSPerfAccumulate(
+    "l2_mdp_mainpipe_chain_refill",
+    io.mdpRefill.map(refill => refill.valid && refill.bits.chainValid).getOrElse(false.B)
+  )
   // XSPerfAccumulate("mshr_probeack_req", task_s3.valid && mshr_probeack_s3)
   // XSPerfAccumulate("mshr_probeackdata_req", task_s3.valid && mshr_probeackdata_s3)
   // XSPerfAccumulate("mshr_release_req", task_s3.valid && mshr_release_s3)

@@ -25,8 +25,9 @@ import freechips.rocketchip.util._
 import org.chipsalliance.cde.config.Field
 import xscache.coupledL2.prefetch._
 import utility.{Code, MemReqSource, ReqSourceKey}
-import xscache.common.{AliasKey, BankBitsKey, CacheParameters, IsHitKey, MdpHintKey, MdpImmKey,
-  MdpLoadSizeKey, MdpLoadUnsignedKey, MdpPCKey, MdpVaddrKey, PrefetchKey}
+import xscache.common.{AliasKey, BankBitsKey, CacheParameters, IsHitKey, MdpChainImmKey,
+  MdpChainLoadSizeKey, MdpChainLoadUnsignedKey, MdpChainValidKey, MdpHintKey, MdpImmKey, MdpLoadSizeKey,
+  MdpLoadUnsignedKey, MdpOriginKey, MdpPCKey, MdpVaddrKey, PrefetchKey}
 
 case object EnableL2ClockGate extends Field[Boolean](true)
 
@@ -91,8 +92,9 @@ case class L2Param(
   respKey: Seq[BundleKeyBase] = Seq(IsHitKey),
   // MDP keys negotiate the exact hinted-load context onto the inner A channel.
   reqKey: Seq[BundleKeyBase] = Seq(
-    AliasKey, VaddrKey, PrefetchKey, MdpHintKey, MdpImmKey, MdpVaddrKey,
-    MdpPCKey, MdpLoadSizeKey, MdpLoadUnsignedKey, ReqSourceKey, PCKey
+    AliasKey, VaddrKey, PrefetchKey, MdpHintKey, MdpImmKey, MdpChainImmKey,
+    MdpChainValidKey, MdpChainLoadSizeKey, MdpChainLoadUnsignedKey, MdpOriginKey,
+    MdpVaddrKey, MdpPCKey, MdpLoadSizeKey, MdpLoadUnsignedKey, ReqSourceKey, PCKey
   ),
   respField: Seq[BundleFieldBase] = Nil,
 

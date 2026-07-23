@@ -94,6 +94,11 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   // an allocated/merged MSHR preserves it, and MainPipe consumes it on refill.
   val mdpHint = Bool()
   val mdpImm = UInt(12.W)
+  val mdpChainImm = UInt(12.W)
+  val mdpChainValid = Bool()
+  val mdpChainLoadSize = UInt(2.W)
+  val mdpChainLoadUnsigned = Bool()
+  val mdpOrigin = UInt(3.W)
   val mdpVaddr = UInt(64.W)
   val mdpPC = UInt(64.W)
   val mdpLoadSize = UInt(2.W)

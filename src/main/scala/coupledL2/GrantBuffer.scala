@@ -145,6 +145,21 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   mergeAtask.mshrRetry := false.B
   mergeAtask.fromL2pft.foreach(_ := false.B)
   mergeAtask.needHint.foreach(_ := false.B)
+  // Preserve the hinted-load context when a demand is merged into an MSHR
+  // and the reconstructed task is sent through GrantBuffer.  This path does
+  // not use the outer task directly, so leaving these fields at their
+  // WireInit defaults would silently drop the L2 MDP trigger at MainPipe.
+  mergeAtask.mdpHint := io.d_task.bits.task.mdpHint
+  mergeAtask.mdpImm := io.d_task.bits.task.mdpImm
+  mergeAtask.mdpChainImm := io.d_task.bits.task.mdpChainImm
+  mergeAtask.mdpChainValid := io.d_task.bits.task.mdpChainValid
+  mergeAtask.mdpChainLoadSize := io.d_task.bits.task.mdpChainLoadSize
+  mergeAtask.mdpChainLoadUnsigned := io.d_task.bits.task.mdpChainLoadUnsigned
+  mergeAtask.mdpOrigin := io.d_task.bits.task.mdpOrigin
+  mergeAtask.mdpVaddr := io.d_task.bits.task.mdpVaddr
+  mergeAtask.mdpPC := io.d_task.bits.task.mdpPC
+  mergeAtask.mdpLoadSize := io.d_task.bits.task.mdpLoadSize
+  mergeAtask.mdpLoadUnsigned := io.d_task.bits.task.mdpLoadUnsigned
   mergeAtask.dirty := io.d_task.bits.task.dirty
   mergeAtask.way := io.d_task.bits.task.way
   mergeAtask.metaWen := io.d_task.bits.task.metaWen

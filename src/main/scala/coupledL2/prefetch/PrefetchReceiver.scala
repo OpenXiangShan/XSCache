@@ -51,6 +51,17 @@ class PrefetchReceiver()(implicit p: Parameters) extends PrefetchModule {
   io.req.bits.needT := false.B
   io.req.bits.source := 0.U // TODO: ensure source 0 is dcache
   io.req.bits.pfSource := io.recv_addr.bits.pfSource
+  io.req.bits.mdpHint := false.B
+  io.req.bits.mdpImm := 0.U
+  io.req.bits.mdpChainImm := 0.U
+  io.req.bits.mdpChainValid := false.B
+  io.req.bits.mdpChainLoadSize := 0.U
+  io.req.bits.mdpChainLoadUnsigned := false.B
+  io.req.bits.mdpOrigin := 0.U
+  io.req.bits.mdpVaddr := 0.U
+  io.req.bits.mdpPC := 0.U
+  io.req.bits.mdpLoadSize := 0.U
+  io.req.bits.mdpLoadUnsigned := false.B
   io.req.valid := enable && io.recv_addr.valid
 
   io.tlb_req.req.valid := false.B

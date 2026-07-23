@@ -650,6 +650,17 @@ class NextLinePrefetch(implicit p: Parameters) extends NLModule {
   io.req.bits.needT := true.B  
   io.req.bits.source := 0.U  
   io.req.bits.pfSource := MemReqSource.Prefetch2L2NL.id.U  
+  io.req.bits.mdpHint := false.B
+  io.req.bits.mdpImm := 0.U
+  io.req.bits.mdpChainImm := 0.U
+  io.req.bits.mdpChainValid := false.B
+  io.req.bits.mdpChainLoadSize := 0.U
+  io.req.bits.mdpChainLoadUnsigned := false.B
+  io.req.bits.mdpOrigin := 0.U
+  io.req.bits.mdpVaddr := 0.U
+  io.req.bits.mdpPC := 0.U
+  io.req.bits.mdpLoadSize := 0.U
+  io.req.bits.mdpLoadUnsigned := false.B
 
   // ========== performance counter==========
   XSPerfAccumulate("nlTotalTrainTimes", io.enable && io.train.fire)//nl accept req times
@@ -662,4 +673,3 @@ class NextLinePrefetch(implicit p: Parameters) extends NLModule {
   XSPerfAccumulate("nlTransmitPrefetchReqTimes",io.req.fire && io.enable)
   XSPerfAccumulate("nlTimeSampleCountResetTimes",(!timeSampleCounter.orR) & shouldTrain)
 }
-
