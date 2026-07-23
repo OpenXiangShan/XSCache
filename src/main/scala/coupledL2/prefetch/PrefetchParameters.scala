@@ -46,6 +46,7 @@ object PfSource extends Enumeration {
   val TP      = Value("TP")
   val Berti   = Value("Berti")
   val NL      = Value("NL")  // Next-Line Prefetcher
+  val CDP     = Value("CDP")
 
   val PfSourceCount = Value("PfSourceCount")
   val pfSourceBits = log2Ceil(PfSourceCount.id)
@@ -61,7 +62,18 @@ object PfSource extends Enumeration {
       is (MemReqSource.Prefetch2L2Stride.id.U) { pfsrc := Stride.id.U }
       is (MemReqSource.Prefetch2L2Berti.id.U) { pfsrc := Berti.id.U }
       is (MemReqSource.Prefetch2L2NL.id.U) { pfsrc := NL.id.U } // The global ID of memReqSource is converted to the internal ID of the prefetcher
+      is (MemReqSource.Prefetch2L2CDP.id.U) { pfsrc := CDP.id.U }
     }
     pfsrc
   }
+}
+
+class PrefetchStat(implicit p: Parameters) extends PrefetchBundle {
+  val pfSentVec = Vec(PfSource.PfSourceCount.id, UInt(64.W))
+  val pfHitVec  = Vec(PfSource.PfSourceCount.id, UInt(64.W))
+}
+
+class PrefetchStatDelta(implicit p: Parameters) extends PrefetchBundle {
+  val pfSentVec = Vec(PfSource.PfSourceCount.id, UInt(2.W))
+  val pfHitVec  = Vec(PfSource.PfSourceCount.id, UInt(3.W))
 }

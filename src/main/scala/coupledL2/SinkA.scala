@@ -113,6 +113,7 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task.aliasTask.foreach(_ := false.B)
     task.useProbeData := false.B
     task.fromL2pft.foreach(_ := req.needAck)
+    task.pftDepth.foreach(_ := req.pfDepth)
     task.mshrRetry := false.B
     task.needHint.foreach(_ := false.B)
     task.dirty := false.B

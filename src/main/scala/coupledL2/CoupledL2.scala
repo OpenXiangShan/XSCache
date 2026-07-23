@@ -107,11 +107,14 @@ trait HasCoupledL2Parameters {
   def prefetchers = cacheParams.prefetch
   def prefetchOpt = if(prefetchers.nonEmpty) Some(true) else None
   def hasBOP = prefetchers.exists(_.isInstanceOf[BOPParameters])
+  def hasCDP = prefetchers.exists(_.isInstanceOf[CDPParameters])
   def hasReceiver = prefetchers.exists(_.isInstanceOf[PrefetchReceiverParams])
   def hasTPPrefetcher = prefetchers.exists(_.isInstanceOf[TPParameters])
   def hasNLPrefetcher = prefetchers.exists(_.isInstanceOf[NLParameters])
   def hasPrefetchBit = prefetchers.exists(_.hasPrefetchBit) // !! TODO.test this
   def hasPrefetchSrc = prefetchers.exists(_.hasPrefetchSrc)
+  def pfDepthMax = 3
+  def pfDepthBits = log2Ceil(pfDepthMax + 1)
   def chiOpt = Some(true)
   def topDownOpt = if(cacheParams.elaboratedTopDown) Some(true) else None
 
@@ -613,11 +616,24 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
               prefetchTrains.get(i).bits.set := train_set
               prefetchResps.get(i).bits.tag := resp_tag
               prefetchResps.get(i).bits.set := resp_set
+
+              if (hasCDP) {
+                val evict_full_addr = Cat(
+                  train.bits.evict_tag.get, train.bits.evict_set.get, i.U(bankBits.W), 0.U(offsetBits.W)
+                )
+                val (evict_tag, evict_set, _) = s.parseFullAddress(evict_full_addr)
+                prefetchTrains.get(i).bits.evict_tag.get := evict_tag
+                prefetchTrains.get(i).bits.evict_set.get := evict_set
+              }
             }
             s.tlb_req.req.valid := false.B
             s.tlb_req.req.bits := DontCare
             s.tlb_req.req_kill := DontCare
             s.tlb_req.resp.ready := true.B
+        }
+
+        if (hasCDP) {
+          prefetcher.get.cdpio.cdp_trigger.get(i) <> slice.io_cdp_triggers.get
         }
 
         slice
@@ -824,6 +840,19 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       case EdgeOutKey => node.out.head._2
       case BankBitsKey => bankBits
     })))
+    val pfMonitor = prefetchOpt.map(_ => Module(new prefetch.PrefetcherMonitor()(p.alterPartial {
+      case EdgeInKey => node.in.head._2
+      case EdgeOutKey => node.out.head._2
+      case BankBitsKey => bankBits
+    })))
+    pfMonitor.foreach { m =>
+      for ((s, i) <- slices.zipWithIndex) {
+        m.io.sliceStat(i) := s.io.pfMonitorStat.get
+      }
+      if (hasCDP) {
+        prefetcher.foreach(_.cdpio.pfStat.get := m.io.stat)
+      }
+    }
     topDown match {
       case Some(t) =>
         for ((s, i) <- slices.zipWithIndex) {

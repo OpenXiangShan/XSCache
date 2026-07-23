@@ -32,6 +32,7 @@ abstract class BaseSliceIO[T_OUT <: BaseOuterBundle](implicit p: Parameters) ext
   val sliceId = Input(UInt(bankBits.W))
   val l1Hint = DecoupledIO(new L2ToL1HintInsideL2())
   val prefetch = prefetchOpt.map(_ => Flipped(new PrefetchIO))
+  val pfMonitorStat = prefetchOpt.map(_ => Output(new PrefetchStatDelta))
   val dirResult = topDownOpt.map(_ => ValidIO(new DirResult))
   val pfSent = topDownOpt.map(_ => ValidIO(UInt(MemReqSource.reqSourceBits.W)))
   val pfStatInMSHR = topDownOpt.map(_ => Output(new PfStatInMSHRBundle()))
