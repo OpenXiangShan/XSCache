@@ -732,7 +732,9 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
       // Evict a unused CDP prefetched block
       val cdp_filter_train_evict = task_s3.valid && mshr_refill_s3 && req_s3.replTask &&
-        !io.replResp.bits.meta.accessed && io.replResp.bits.meta.prefetch.getOrElse(false.B) && io.replResp.bits.meta.prefetchSrc.getOrElse(false.B) === PfSource.CDP.id.U
+        !io.replResp.bits.retry && !io.replResp.bits.meta.accessed && 
+        io.replResp.bits.meta.prefetch.getOrElse(false.B) && 
+        io.replResp.bits.meta.prefetchSrc.getOrElse(false.B) === PfSource.CDP.id.U
 
       if (hasCDP) {
         train.bits.cdp_vpn_train_valid.get  := cdp_vpn_train_valid
