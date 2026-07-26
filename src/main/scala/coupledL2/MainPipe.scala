@@ -562,7 +562,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     accessed = true.B,
     tagErr = metaOnHit_s3.tagErr,
     dataErr = metaOnHit_s3.dataErr,
-    pfDepth = 0.U,
+    cdpPfDepth = 0.U,
   )
   val metaW_s3_b = Mux(isSnpToN(req_s3.chiOpcode.get), MetaEntry(),
     MetaEntry(
@@ -574,7 +574,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       tagErr = metaOnHit_s3.tagErr,
       dataErr = metaOnHit_s3.dataErr,
       pfsrc = metaOnHit_s3.prefetchSrc.getOrElse(0.U),
-      pfDepth = metaOnHit_s3.pfDepth.getOrElse(0.U)
+      cdpPfDepth = metaOnHit_s3.cdpPfDepth.getOrElse(0.U)
     )
   )
   val metaW_s3_c = MetaEntry(
@@ -586,7 +586,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     tagErr = Mux(wen_c, req_s3.denied, metaOnHit_s3.tagErr),
     dataErr = Mux(wen_c, req_s3.corrupt, metaOnHit_s3.dataErr), // update error when write DS
     pfsrc = metaOnHit_s3.prefetchSrc.getOrElse(0.U),
-    pfDepth = metaOnHit_s3.pfDepth.getOrElse(0.U)
+    cdpPfDepth = metaOnHit_s3.cdpPfDepth.getOrElse(0.U)
   )
 
   // use merge_meta if mergeA
@@ -915,7 +915,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val is_hit_trigger_s5     = task_s5.valid && dirResult_s5_hit && req_s5_acquire_block &&
       (dirResult_s5_fromCDP || dirResult_s5_fromSMS || dirResult_s5_fromBOP || dirResult_s5_fromPBOP)
     val hit_trigger_data_s5   = out_data_s5
-    val hit_trigger_depth_s3  = dirResult_s3.meta.pfDepth.getOrElse(0.U)
+    val hit_trigger_depth_s3  = dirResult_s3.meta.cdpPfDepth.getOrElse(0.U)
     val hit_trigger_pfSrc_s3  = Mux(dirResult_s3.meta.accessed, PfSource.NoWhere.id.U, dirResult_s3.meta.prefetchSrc.getOrElse(0.U))
     val hit_trigger_depth_s5  = RegNextN(hit_trigger_depth_s3, 2)
     val hit_trigger_pfsrc_s5  = RegNextN(hit_trigger_pfSrc_s3, 2)
@@ -924,7 +924,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val is_refill_trigger_s5 = RegNextN(is_refill_trigger_s3, 2)
     val refill_trigger_data_s3  = Mux(req_s3.useProbeData, io.releaseBufResp_s3.bits.data, io.refillBufResp_s3.bits.data)
     val refill_trigger_data_s5  = RegNextN(refill_trigger_data_s3, 2)
-    val refill_trigger_depth_s5 = RegNextN(metaW_s3_mshr.pfDepth.getOrElse(0.U), 2)
+    val refill_trigger_depth_s5 = RegNextN(metaW_s3_mshr.cdpPfDepth.getOrElse(0.U), 2)
     val refill_trigger_pfsrc_s5 = RegNextN(metaW_s3_mshr.prefetchSrc.getOrElse(0.U), 2)
 
     val cdp_trigger = io.cdp_trigger.get

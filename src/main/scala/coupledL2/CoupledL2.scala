@@ -113,8 +113,9 @@ trait HasCoupledL2Parameters {
   def hasNLPrefetcher = prefetchers.exists(_.isInstanceOf[NLParameters])
   def hasPrefetchBit = prefetchers.exists(_.hasPrefetchBit) // !! TODO.test this
   def hasPrefetchSrc = prefetchers.exists(_.hasPrefetchSrc)
-  def pfDepthMax = 3
-  def pfDepthBits = log2Ceil(pfDepthMax + 1)
+  def cdpPfDepthMax: Option[Int] = prefetchers.collectFirst { case cdp: CDPParameters => cdp.pfDepthMax }
+  def cdpPfDepthBits: Option[Int] = prefetchers.collectFirst { case cdp: CDPParameters => cdp.pfDepthBits }
+
   def chiOpt = Some(true)
   def topDownOpt = if(cacheParams.elaboratedTopDown) Some(true) else None
 

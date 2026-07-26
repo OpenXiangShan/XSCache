@@ -9,6 +9,9 @@ import utility.sram.SRAMTemplate
 import xscache.coupledL2._
 
 case class CDPParameters(
+  pfDepthMax: Int = 3,
+  pfDepthBits: Int = 2,
+
   useFilteredDetect:  Boolean = false,
 
   hotThreshold:   Int = 2,
@@ -56,6 +59,7 @@ trait HasCDPParams extends HasPrefetcherHelper with HasCoupledL2Parameters {
     case p: CDPParameters => true
     case _ => false
   }.get.asInstanceOf[CDPParameters]
+  require(cdpParams.pfDepthMax < (1 << cdpParams.pfDepthBits), s"pfDepthMax(${cdpParams.pfDepthMax}) should be less than 2^pfDepthBits(${cdpParams.pfDepthBits})")
 
   val banks = 1 << bankBits
 
@@ -66,7 +70,7 @@ trait HasCDPParams extends HasPrefetcherHelper with HasCoupledL2Parameters {
 
   val hotThreshold   = cdpParams.hotThreshold
   val depthThreshold = cdpParams.depthThreshold
-  require(depthThreshold <= pfDepthMax, s"depthThreshold(${depthThreshold}) should be less than pfDepthMax(${pfDepthMax})")
+  require(depthThreshold <= cdpPfDepthMax.get, s"depthThreshold(${depthThreshold}) should be less than pfDepthMax(${cdpPfDepthMax.get})")
 
   // helper function
   def getFoldedHash(originVal: UInt, resultBitWidth: Int): UInt = {    // fold $originVal length value into $resultBitWidth
@@ -222,7 +226,7 @@ class CDPDetectTask(val dataBits: Int)(implicit p: Parameters) extends CDPBundle
   require(dataBits == blockBits || dataBits == blockBits / 2 || dataBits == 64)
 
   val data = UInt(dataBits.W)
-  val pfDepth = UInt(pfDepthBits.W)
+  val pfDepth = UInt(cdpPfDepthBits.get.W)
   val pfSource = UInt(PfSource.pfSourceBits.W)
   val isHit = Bool() // is this trigger from req hitting l2?
 }
@@ -528,7 +532,7 @@ class CDPPrefetchReq(implicit p: Parameters) extends CDPBundle {
     * Used in DetectPipe <> degreeBuf <> SentUnit
     */
   val pfVAddr = UInt(fullVAddrBits.W)
-  val pfDepth = UInt(pfDepthBits.W)
+  val pfDepth = UInt(cdpPfDepthBits.get.W)
 
   // Only for monitor
   val pfSource = UInt(PfSource.pfSourceBits.W)
@@ -941,7 +945,7 @@ class DetectPipeline(name: String)(implicit p: Parameters) extends CDPModule {
   val s3_depth = RegNext(Mux(
     s2_is_hit,
     1.U,      // hit a CDP prefetched block, reinforce
-    Mux(s2_depth === 0.U, pfDepthMax.U, s2_depth + 1.U)
+    Mux(s2_depth === 0.U, cdpPfDepthMax.get.U, s2_depth + 1.U)
   ))
 
   val s3_data = s3_req.bits.data
@@ -960,7 +964,7 @@ class DetectPipeline(name: String)(implicit p: Parameters) extends CDPModule {
   // ----------- ChiselDB -----------
   class DetectTriggerEntry extends CDPBundle {
     val vaddr = UInt(64.W)
-    val pfDepth = UInt(pfDepthBits.W)
+    val pfDepth = UInt(cdpPfDepthBits.get.W)
     val pfSource = UInt(PfSource.pfSourceBits.W)
     val mainIdx = UInt(mainEntryBits.W)
     val subIdx = UInt(subEntryBits.W)
@@ -989,7 +993,7 @@ class PrefetchFilterEntry(implicit p: Parameters) extends CDPBundle {
   val paddrValid = Bool()
   val pTag = UInt(reqFilterPTagBits.W)   // paddr = [ pTag | blockOffset ]
   val vTag = UInt(reqFilterVTagBits.W)   // vaddr = [ vTag | blockOffset ]
-  val pfDepth = UInt(pfDepthBits.W)
+  val pfDepth = UInt(cdpPfDepthBits.get.W)
 
   // for TLB retry
   val retryEn = Bool()
@@ -1007,7 +1011,7 @@ class PrefetchFilterEntry(implicit p: Parameters) extends CDPBundle {
     req.tag := parseFullAddress(fullAddr)._1
     req.set := parseFullAddress(fullAddr)._2
     req.pfSource := MemReqSource.Prefetch2L2CDP.id.U
-    req.pfDepth := pfDepth
+    req.cdpPfDepth.foreach(_ := pfDepth)
 
     req
   }
@@ -1373,12 +1377,12 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
       (
         if (useFilteredDetect) {
           detectTrigFromCDP &&
-            (detectTrig.bits.pfDepth === 1.U || detectTrig.bits.pfDepth === pfDepthMax.U) ||
+            (detectTrig.bits.pfDepth === 1.U || detectTrig.bits.pfDepth === cdpPfDepthMax.get.U) ||
             detectTrigFromSMS || detectTrigFromBOP
         }
         else {
           detectTrigFromCDP &&
-            (detectTrig.bits.pfDepth === 1.U || detectTrig.bits.pfDepth === pfDepthMax.U)
+            (detectTrig.bits.pfDepth === 1.U || detectTrig.bits.pfDepth === cdpPfDepthMax.get.U)
         }
       )
     val refillTrigger = !detectTrig.bits.isHit && detectTrig.bits.pfDepth < depthThreshold.U &&
