@@ -55,6 +55,16 @@ class StashPrefetchEntry(implicit p: Parameters) extends PrefetchModule with Has
 
   assert(!io.rxrsp.valid || io.rxrsp.bits.opcode =/= RetryAck, "Stash prefetch does not support CHI retry")
 
+  if(cacheParams.enablePerf) {
+    val timer = RegInit(0.U(16.W))
+    when(state === s_invalid) {
+      timer := 0.U
+    }.otherwise {
+      timer := timer + 1.U
+    }
+    assert(state === s_invalid || timer < 20000.U, "StashPrefetchEntry Leak(id: %d)", io.id)
+  }
+
   io.waitResp := state === s_waitResp
   io.txreq.valid := state === s_sendReq
   io.txreq.bits := 0.U.asTypeOf(new CHIREQ)
