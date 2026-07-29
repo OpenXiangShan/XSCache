@@ -20,7 +20,7 @@ package xscache.coupledL2.prefetch
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
-import utility.{MemReqSource, XSPerfAccumulate}
+import utility.{MemReqSource, TwoLevelRRArbiter, XSPerfAccumulate}
 import xscache.chi.{CHIREQ, CHIRSP, HasCHIOpcodes, MPAM, MemAttr, OrderEncodings, SAM}
 import xscache.coupledL2.PrefetchRecv
 import xscache.coupledL2.utils.OverwriteQueue
@@ -139,7 +139,10 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
   io.rxrsp.ready := rxrspHit
   assert(!io.rxrsp.valid || rxrspHit, "Stash prefetch received a response with no matching entry")
 
-  fastArb(stashPrefetchEntries.map(_.io.txreq), io.txreq, Some("stash_prefetch_txreq"))
+  val txreqArb = Module(new TwoLevelRRArbiter(chiselTypeOf(io.txreq.bits), stashPrefetchEntries.size))
+  txreqArb.suggestName("stash_prefetch_txreq_arb")
+  stashPrefetchEntries.map(_.io.txreq).zip(txreqArb.io.in).foreach { case (req, in) => in <> req }
+  io.txreq <> txreqArb.io.out
 
   XSPerfAccumulate("l3_prefetch_recv", io.recv.addr_valid && io.recv.pf_en)
   XSPerfAccumulate("l3_prefetch_queue_fire", l3PftQueue.io.deq.fire)
