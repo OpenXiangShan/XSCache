@@ -575,6 +575,7 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   XSPerfAccumulate("stashOnceSharedDirHit", stashOnceSharedDirHit_s3)
   XSPerfAccumulate("stashOnceSharedSelfDirHit", stashOnceSharedSelfDirHit_s3)
   XSPerfAccumulate("stashOnceSharedClientDirHit", stashOnceSharedClientDirHit_s3)
+  // Used to analyze how many L3 PFs are redundantly transmitted
   XSPerfAccumulate("stashOnceSharedOriginalRNHit", stashOnceSharedOriginalRNHit_s3)
   XSPerfAccumulate("stashOnceSharedPeerRNHit", stashOnceSharedPeerRNHit_s3)
   XSPerfAccumulate("stashOnceSharedDirMiss", stashOnceSharedDirMiss_s3)
