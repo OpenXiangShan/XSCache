@@ -38,6 +38,7 @@ trait HasClientInfo { this: HasOpenLLCParameters =>
 class SelfMetaEntry(implicit p: Parameters) extends Bundle {
   val valid = Bool()
   val dirty = Bool()
+  val stash = Bool()
 }
 
 object SelfMetaEntry {
@@ -45,10 +46,11 @@ object SelfMetaEntry {
     val init = WireInit(0.U.asTypeOf(new SelfMetaEntry))
     init
   }
-  def apply(valid: Bool, dirty: Bool)(implicit p: Parameters) = {
+  def apply(valid: Bool, dirty: Bool, stash: Bool = false.B)(implicit p: Parameters) = {
     val entry = Wire(new SelfMetaEntry)
     entry.valid := valid
     entry.dirty := dirty
+    entry.stash := stash
     entry
   }
 }

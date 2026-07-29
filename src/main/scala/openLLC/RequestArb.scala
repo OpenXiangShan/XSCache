@@ -21,6 +21,7 @@ import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import scala.math.min
+import utility.XSPerfAccumulate
 import xscache.chi.HasCHIOpcodes
 
 class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo with HasCHIOpcodes {
@@ -64,11 +65,12 @@ class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo wi
 
   val isReadNotSharedDirty_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === ReadNotSharedDirty
   val isReadUnique_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === ReadUnique
+  val isStashOnceShared_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === StashOnceShared
   val isCleanInvalid_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === CleanInvalid
   val isCleanShared_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === CleanShared
   val isWriteCleanFull_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === WriteCleanFull
 
-  val isRead_s1  = isReadNotSharedDirty_s1 || isReadUnique_s1
+  val isRead_s1  = isReadNotSharedDirty_s1 || isReadUnique_s1 || isStashOnceShared_s1
   val isClean_s1 = isCleanInvalid_s1 || isCleanShared_s1 || isWriteCleanFull_s1
 
   // To prevent data hazards caused by read-after-write conflicts in the directory,
@@ -113,10 +115,67 @@ class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo wi
     Cat(snpInfo.map(e => e.valid && e.bits.reqID === reqID_s1)).orR ||
     (inflight_snoop +& potential_snoop) >= mshrs.snoop.U
   )
-  val blockByMem = Cat(memInfo.map(e => e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag_s1, set_s1) &&
-    e.bits.opcode === WriteNoSnpFull && (task_s1.bits.refillTask || isClean_s1 || !e.bits.w_datRsp && isRead_s1))).orR ||
+  val blockByMem = Cat(memInfo.map(e =>
+    e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag_s1, set_s1) &&
+      e.bits.opcode === WriteNoSnpFull &&
+      (task_s1.bits.refillTask || isClean_s1 || !e.bits.w_datRsp && isRead_s1)
+  )).orR ||
     Cat(memInfo.map(e => e.valid && e.bits.reqID === reqID_s1 && !task_s1.bits.refillTask)).orR ||
     (inflight_memAccess +& potential_memAccess) >= mshrs.memory.U
+
+  def isDemandReadOpcode(opcode: UInt): Bool = opcode === ReadNotSharedDirty || opcode === ReadUnique
+
+  val busDemandRead_s1 = io.busTask_s1.valid && !io.busTask_s1.bits.refillTask &&
+    isDemandReadOpcode(io.busTask_s1.bits.chiOpcode)
+  val busDemandBlockAddr_s1 = Cat(io.busTask_s1.bits.tag, io.busTask_s1.bits.set)
+  val sameStashRefill_s1 = Cat(refillInfo.map(e =>
+    e.valid && e.bits.opcode === StashOnceShared && Cat(e.bits.tag, e.bits.set) === busDemandBlockAddr_s1
+  )).orR
+  val sameStashRefillPipe_s1 = Cat((0 until 5).map(i =>
+    pipeInfo.valids(i) && pipeInfo.refillTasks(i) && pipeInfo.opcodes(i) === StashOnceShared &&
+      Cat(pipeInfo.tags(i), pipeInfo.sets(i)) === busDemandBlockAddr_s1
+  )).orR
+
+  val l3PrefetchHitInRefillCycle = busDemandRead_s1 && sameStashRefill_s1
+  val l3PrefetchHitInPipeCycle = busDemandRead_s1 && !sameStashRefill_s1 && sameStashRefillPipe_s1
+  val l3PrefetchHitInFlightCycle = l3PrefetchHitInRefillCycle || l3PrefetchHitInPipeCycle
+  val prevBusDemandRead = RegNext(busDemandRead_s1, false.B)
+  val prevBusDemandBlockAddr = RegEnable(busDemandBlockAddr_s1, busDemandRead_s1)
+  val sameBusDemandAsPrev = prevBusDemandRead && prevBusDemandBlockAddr === busDemandBlockAddr_s1
+  val duplicateBusDemandHit = RegNext(l3PrefetchHitInFlightCycle, false.B) && sameBusDemandAsPrev
+  val l3PrefetchHitInRefill = l3PrefetchHitInRefillCycle && !duplicateBusDemandHit
+  val l3PrefetchHitInPipe = l3PrefetchHitInPipeCycle && !duplicateBusDemandHit
+  val l3PrefetchHitInFlight = l3PrefetchHitInRefill || l3PrefetchHitInPipe
+
+  val busStashOnceShared_s1 = io.busTask_s1.valid && !io.busTask_s1.bits.refillTask &&
+    io.busTask_s1.bits.chiOpcode === StashOnceShared
+  val busStashBlockAddr_s1 = Cat(io.busTask_s1.bits.tag, io.busTask_s1.bits.set)
+  val sameDemandReadRefill_s1 = Cat(refillInfo.map(e =>
+    e.valid && isDemandReadOpcode(e.bits.opcode) && Cat(e.bits.tag, e.bits.set) === busStashBlockAddr_s1
+  )).orR
+  val sameDemandReadResponse_s1 = Cat(respInfo.map(e =>
+    e.valid && isDemandReadOpcode(e.bits.opcode) && Cat(e.bits.tag, e.bits.set) === busStashBlockAddr_s1
+  )).orR
+  val sameDemandReadPipe_s1 = Cat((0 until 5).map(i =>
+    pipeInfo.valids(i) && isDemandReadOpcode(pipeInfo.opcodes(i)) &&
+      Cat(pipeInfo.tags(i), pipeInfo.sets(i)) === busStashBlockAddr_s1
+  )).orR
+
+  val l3PrefetchLateInRefillCycle = busStashOnceShared_s1 && sameDemandReadRefill_s1
+  val l3PrefetchLateInResponseCycle = busStashOnceShared_s1 && !sameDemandReadRefill_s1 &&
+    sameDemandReadResponse_s1
+  val l3PrefetchLateInPipeCycle = busStashOnceShared_s1 && !sameDemandReadRefill_s1 &&
+    !sameDemandReadResponse_s1 && sameDemandReadPipe_s1
+  val l3PrefetchLateCycle = l3PrefetchLateInRefillCycle || l3PrefetchLateInResponseCycle ||
+    l3PrefetchLateInPipeCycle
+  val prevBusStashOnceShared = RegNext(busStashOnceShared_s1, false.B)
+  val prevBusStashBlockAddr = RegEnable(busStashBlockAddr_s1, busStashOnceShared_s1)
+  val sameBusStashAsPrev = prevBusStashOnceShared && prevBusStashBlockAddr === busStashBlockAddr_s1
+  val duplicateBusStashLate = RegNext(l3PrefetchLateCycle, false.B) && sameBusStashAsPrev
+  val l3PrefetchLateInRefill = l3PrefetchLateInRefillCycle && !duplicateBusStashLate
+  val l3PrefetchLateInResponse = l3PrefetchLateInResponseCycle && !duplicateBusStashLate
+  val l3PrefetchLateInPipe = l3PrefetchLateInPipeCycle && !duplicateBusStashLate
+  val l3PrefetchLate = l3PrefetchLateInRefill || l3PrefetchLateInResponse || l3PrefetchLateInPipe
 
   val blockEntrance = blockByMainPipe || blockByRefill || blockByResp || blockByMem
 
@@ -151,4 +210,19 @@ class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo wi
   io.refillBufRead_s2.valid := task_s2.valid && task_s2.bits.refillTask
   io.refillBufRead_s2.bits.id := task_s2.bits.bufID
 
+  XSPerfAccumulate("l3prefetchHitInRefill", l3PrefetchHitInRefill)
+  XSPerfAccumulate("l3prefetchHitInRefillCycles", l3PrefetchHitInRefillCycle)
+  XSPerfAccumulate("l3prefetchHitInPipe", l3PrefetchHitInPipe)
+  XSPerfAccumulate("l3prefetchHitInPipeCycles", l3PrefetchHitInPipeCycle)
+  XSPerfAccumulate("l3prefetchHitInFlight", l3PrefetchHitInFlight)
+  XSPerfAccumulate("l3prefetchHitInFlightCycles", l3PrefetchHitInFlightCycle)
+
+  XSPerfAccumulate("l3prefetchLateInRefill", l3PrefetchLateInRefill)
+  XSPerfAccumulate("l3prefetchLateInRefillCycles", l3PrefetchLateInRefillCycle)
+  XSPerfAccumulate("l3prefetchLateInResponse", l3PrefetchLateInResponse)
+  XSPerfAccumulate("l3prefetchLateInResponseCycles", l3PrefetchLateInResponseCycle)
+  XSPerfAccumulate("l3prefetchLateInPipe", l3PrefetchLateInPipe)
+  XSPerfAccumulate("l3prefetchLateInPipeCycles", l3PrefetchLateInPipeCycle)
+  XSPerfAccumulate("l3prefetchLate", l3PrefetchLate)
+  XSPerfAccumulate("l3prefetchLateCycles", l3PrefetchLateCycle)
 }

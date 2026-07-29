@@ -61,6 +61,9 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     val respData = Flipped(ValidIO(new RespWithData()))
     val resp = Flipped(ValidIO(new Resp()))
 
+    /* response from downstream RXDAT channel */
+    val snRespData = Flipped(ValidIO(new RespWithData()))
+
     /* refill data read */
     val read = Flipped(ValidIO(new RefillBufRead()))
     val data = Output(new DSBlock())
@@ -69,8 +72,9 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     val refillInfo = Vec(mshrs.refill, ValidIO(new BlockInfo()))
   })
 
-  val rsp     = io.resp
-  val rspData = io.respData
+  val rnRespData = io.respData
+  val snRespData = io.snRespData
+  val rsp = io.resp
 
   /* Data Structure */
   val buffer   = RegInit(VecInit(Seq.fill(mshrs.refill)(0.U.asTypeOf(new RefillEntry()))))
@@ -94,38 +98,48 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   assert(!full || !io.alloc.valid, "RefillBuf overflow")
 
   /* Update state */
-  when(rspData.valid) {
-    val update_vec = buffer.map(e => (e.task.reqID === rspData.bits.txnID) && e.valid)
-    assert(PopCount(update_vec) < 2.U, "Refill task repeated")
-    val canUpdate = Cat(update_vec).orR
-    val update_id = PriorityEncoder(update_vec)
-    when(canUpdate) {
-      val entry = buffer(update_id)
-      val isWrite = entry.isWrite
-      val inv_CBWrData = rspData.bits.resp === I
-      val cancel = isWrite && inv_CBWrData
-      val clients_hit = entry.dirResult.clients.hit
-      val clients_meta = entry.dirResult.clients.meta
+  def updateRespDataEntry(entry: RefillEntry, responseData: RespWithData): Unit = {
+    val isWrite = entry.isWrite
+    val inv_CBWrData = responseData.resp === I
+    val cancel = isWrite && inv_CBWrData
+    val clients_hit = entry.dirResult.clients.hit
+    val clients_meta = entry.dirResult.clients.meta
 
-      assert(
-        !isWrite || inv_CBWrData || clients_hit && clients_meta(rspData.bits.srcID).valid,
-        "Non-exist block release?(addr: 0x%x)",
-        Cat(entry.task.tag, entry.task.set, entry.task.bank, entry.task.off)
-      )
+    assert(
+      !isWrite || inv_CBWrData || clients_hit && clients_meta(responseData.srcID).valid,
+      "Non-exist block release?(addr: 0x%x)",
+      Cat(entry.task.tag, entry.task.set, entry.task.bank, entry.task.off)
+    )
 
-      val beatId = rspData.bits.dataID >> log2Ceil(beatBytes / 16)
-      val newBeatValids = entry.beatValids.asUInt | UIntToOH(beatId)
-      entry.valid := !cancel
-      entry.beatValids := VecInit(newBeatValids.asBools)
-      entry.state.w_datRsp := newBeatValids.andR
-      entry.data.data(beatId) := rspData.bits.data
-      entry.task.resp := rspData.bits.resp
-      when(rspData.bits.opcode === SnpRespData) {
-        val src_idOH  = UIntToOH(rspData.bits.srcID)(numRNs - 1, 0)
-        val newSnpVec = VecInit((entry.task.snpVec.asUInt & ~src_idOH).asBools)
-        entry.task.snpVec := newSnpVec
-        entry.state.w_snpRsp := !Cat(newSnpVec).orR
-      }
+    val beatId = responseData.dataID >> log2Ceil(beatBytes / 16)
+    val newBeatValids = entry.beatValids.asUInt | UIntToOH(beatId)
+    entry.valid := !cancel
+    entry.beatValids := VecInit(newBeatValids.asBools)
+    entry.state.w_datRsp := newBeatValids.andR
+    entry.data.data(beatId) := responseData.data
+    entry.task.resp := responseData.resp
+    when(responseData.opcode === SnpRespData) {
+      val src_idOH  = UIntToOH(responseData.srcID)(numRNs - 1, 0)
+      val newSnpVec = VecInit((entry.task.snpVec.asUInt & ~src_idOH).asBools)
+      entry.task.snpVec := newSnpVec
+      entry.state.w_snpRsp := !Cat(newSnpVec).orR
+    }
+  }
+
+  val rnRespDataUpdateVec = VecInit(buffer.map(e => e.task.reqID === rnRespData.bits.txnID && e.valid))
+  val snRespDataUpdateVec = VecInit(buffer.map(e =>
+    e.task.reqID === snRespData.bits.txnID && e.valid && e.task.chiOpcode === StashOnceShared
+  ))
+  assert(!rnRespData.valid || PopCount(rnRespDataUpdateVec) < 2.U, "Refill task repeated")
+  assert(!snRespData.valid || PopCount(snRespDataUpdateVec) < 2.U, "Refill task repeated")
+  buffer.zipWithIndex.foreach { case (entry, i) =>
+    val rnRespDataHit = rnRespData.valid && rnRespDataUpdateVec(i)
+    val snRespDataHit = snRespData.valid && snRespDataUpdateVec(i)
+    assert(!(rnRespDataHit && snRespDataHit), "Refill task receives data from multiple sources")
+    when(rnRespDataHit) {
+      updateRespDataEntry(entry, rnRespData.bits)
+    }.elsewhen(snRespDataHit) {
+      updateRespDataEntry(entry, snRespData.bits)
     }
   }
 
@@ -145,16 +159,16 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     }
   }
 
-  when(rspData.valid && rsp.valid) {
-    when(rspData.bits.opcode === SnpRespData && rsp.bits.opcode === SnpResp) {
-      when(rspData.bits.txnID === rsp.bits.txnID) {
+  when(rnRespData.valid && rsp.valid) {
+    when(rnRespData.bits.opcode === SnpRespData && rsp.bits.opcode === SnpResp) {
+      when(rnRespData.bits.txnID === rsp.bits.txnID) {
         val update_vec = buffer.map(e => e.task.reqID === rsp.bits.txnID && e.valid && !e.state.w_snpRsp)
         assert(PopCount(update_vec) < 2.U, "Refill task repeated")
         val update_id = PriorityEncoder(update_vec)
         val entry = buffer(update_id)
         val canUpdate = Cat(update_vec).orR
         when(canUpdate) {
-          val src_idOH_dat = UIntToOH(rspData.bits.srcID)(numRNs - 1, 0)
+          val src_idOH_dat = UIntToOH(rnRespData.bits.srcID)(numRNs - 1, 0)
           val src_idOH_rsp = UIntToOH(rsp.bits.srcID)(numRNs - 1, 0)
           val newSnpVec = VecInit((entry.task.snpVec.asUInt & ~src_idOH_dat & ~src_idOH_rsp).asBools)
           entry.task.snpVec := newSnpVec
@@ -184,7 +198,9 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
 
   /* Dealloc */
   buffer.foreach {e =>
-    val cancel = e.valid && !e.state.w_datRsp && !e.isWrite && e.state.w_snpRsp && !e.beatValids.asUInt.orR
+    val isStashRefill = e.task.chiOpcode === StashOnceShared
+    val cancel = e.valid && !isStashRefill && !e.state.w_datRsp && !e.isWrite &&
+      e.state.w_snpRsp && !e.beatValids.asUInt.orR
     when(cancel) {
       e.valid := false.B
     }
