@@ -157,11 +157,6 @@ class PrefetchResp(implicit p: Parameters) extends PrefetchBundle {
       pfSource === MemReqSource.Prefetch2L2NL.id.U
 }
 
-class StashPrefetchReq(implicit p: Parameters) extends PrefetchBundle {
-  val addr = UInt(fullAddressBits.W)
-  val pfSource = UInt(MemReqSource.reqSourceBits.W)
-}
-
 class PrefetchTrain(implicit p: Parameters) extends PrefetchBundle {
   val tag = UInt(fullTagBits.W)
   val set = UInt(setBits.W)
@@ -201,114 +196,6 @@ class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
     val pfSource = UInt(MemReqSource.reqSourceBits.W)
   }))
   val l3_recv = Input(new PrefetchRecv)
-}
-
-class StashPrefetchEntry(implicit p: Parameters) extends PrefetchModule with HasCHIOpcodes {
-  val io = IO(new Bundle {
-    val alloc = Flipped(DecoupledIO(new StashPrefetchReq))
-    val txreq = DecoupledIO(new CHIREQ)
-    val rxrsp = Flipped(ValidIO(new CHIRSP))
-    val id = Input(UInt(TXNID_WIDTH.W))
-    val waitResp = Output(Bool())
-  })
-
-  val s_invalid :: s_send_req :: s_wait_resp :: Nil = Enum(3)
-  val state = RegInit(s_invalid)
-  val req = Reg(new StashPrefetchReq)
-
-  io.alloc.ready := state === s_invalid
-  when (io.alloc.fire) {
-    req := io.alloc.bits
-    state := s_send_req
-  }.elsewhen (io.txreq.fire) {
-    state := s_wait_resp
-  }.elsewhen (io.rxrsp.valid) {
-    state := s_invalid
-  }
-
-  assert(!io.rxrsp.valid || io.rxrsp.bits.opcode =/= RetryAck, "Stash prefetch does not support CHI retry")
-
-  io.waitResp := state === s_wait_resp
-  io.txreq.valid := state === s_send_req
-  io.txreq.bits := 0.U.asTypeOf(new CHIREQ)
-  io.txreq.bits.qos := Fill(QOS_WIDTH, 1.U(1.W)) - 1.U
-  io.txreq.bits.tgtID := SAM(sam).lookup(req.addr)
-  io.txreq.bits.srcID := 0.U
-  io.txreq.bits.txnID := io.id
-  io.txreq.bits.opcode := StashOnceShared
-  io.txreq.bits.size := log2Ceil(blockBytes).U(SIZE_WIDTH.W)
-  io.txreq.bits.addr := req.addr
-  io.txreq.bits.ns := enableNS.B
-  io.txreq.bits.allowRetry := false.B
-  io.txreq.bits.pCrdType := 0.U
-  io.txreq.bits.expCompAck := false.B
-  io.txreq.bits.likelyshared := false.B
-  io.txreq.bits.snpAttr := true.B
-  io.txreq.bits.order := OrderEncodings.None
-  io.txreq.bits.memAttr := MemAttr(
-    cacheable = true.B,
-    allocate = true.B,
-    device = false.B,
-    ewa = true.B
-  )
-  io.txreq.bits.stashNIDValid := false.B
-  io.txreq.bits.stashNID := 0.U
-  io.txreq.bits.returnTxnID := 0.U
-  io.txreq.bits.snoopMe := false.B
-  io.txreq.bits.mpam.foreach(_ := MPAM(io.txreq.bits.ns))
-}
-
-class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHIOpcodes {
-  private val stashPrefetchIdBits = TXNID_WIDTH - bankBits - 2
-
-  require(inflightEntries > 0)
-  require(stashPrefetchIdBits > 0)
-  require(inflightEntries <= (1 << stashPrefetchIdBits))
-
-  val io = IO(new Bundle {
-    val recv = Input(new PrefetchRecv)
-    val txreq = DecoupledIO(new CHIREQ)
-    val rxrsp = Flipped(DecoupledIO(new CHIRSP))
-  })
-
-  val l3PftQueue = Module(new OverwriteQueue(
-    gen = new StashPrefetchReq,
-    entries = inflightEntries,
-    hasFlow = true
-  ))
-  l3PftQueue.io.enq.valid := io.recv.addr_valid && io.recv.pf_en
-  l3PftQueue.io.enq.bits.addr := io.recv.addr(fullAddressBits - 1, 0)
-  l3PftQueue.io.enq.bits.pfSource := io.recv.pf_source
-
-  val stashPrefetchEntries = Seq.tabulate(inflightEntries) { i =>
-    val entry = Module(new StashPrefetchEntry)
-    entry.io.id := i.U
-    entry
-  }
-
-  val allocReadys = VecInit(stashPrefetchEntries.map(_.io.alloc.ready))
-  val allocOH = PriorityEncoderOH(allocReadys)
-  l3PftQueue.io.deq.ready := allocReadys.asUInt.orR
-  stashPrefetchEntries.zipWithIndex.foreach { case (entry, i) =>
-    entry.io.alloc.valid := l3PftQueue.io.deq.valid && allocOH(i)
-    entry.io.alloc.bits := l3PftQueue.io.deq.bits
-    entry.io.rxrsp.valid := io.rxrsp.valid && entry.io.waitResp && io.rxrsp.bits.txnID === i.U
-    entry.io.rxrsp.bits := io.rxrsp.bits
-  }
-  val rxrspHit = VecInit(stashPrefetchEntries.zipWithIndex.map {
-    case (entry, i) => entry.io.waitResp && io.rxrsp.bits.txnID === i.U
-  }).asUInt.orR
-  io.rxrsp.ready := rxrspHit
-  assert(!io.rxrsp.valid || rxrspHit, "Stash prefetch received a response with no matching entry")
-
-  fastArb(stashPrefetchEntries.map(_.io.txreq), io.txreq, Some("stash_prefetch_txreq"))
-
-  XSPerfAccumulate("l3_prefetch_recv", io.recv.addr_valid && io.recv.pf_en)
-  XSPerfAccumulate("l3_prefetch_queue_fire", l3PftQueue.io.deq.fire)
-  XSPerfAccumulate("slc_prefetch_txreq_valid", io.txreq.valid)
-  XSPerfAccumulate("slc_prefetch_txreq_blocked", io.txreq.valid && !io.txreq.ready)
-  XSPerfAccumulate("slc_prefetch_txreq_fire", io.txreq.fire)
-  XSPerfAccumulate("slc_prefetch_rxrsp_fire", io.rxrsp.fire)
 }
 
 class Prefetcher(implicit p: Parameters) extends PrefetchModule {
