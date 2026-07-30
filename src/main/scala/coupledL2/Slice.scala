@@ -226,16 +226,19 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
       io.replaceRecord.get := mainPipe.io.replaceRecord.get
       io.dataRefill.get := mshrCtl.io.dataRefill.get
       io.busContention.get := mshrCtl.io.busContention.get
+  }
+  prefetchOrTopDownOpt.foreach {
+    _ =>
       io.dirResult.get.valid := directory.io.resp.valid && !directory.io.replResp.valid // exclude MSHR-Grant read-dir
       io.dirResult.get.bits := directory.io.resp.bits
       io.pfStatInMSHR.get := reqBuf.io.pfStatInMSHR
+      io.pfSent.get.valid := io.prefetch.fold(false.B)(_.req.fire)
+      io.pfSent.get.bits := io.prefetch.fold(MemReqSource.NoWhere.id.U)(p => p.req.bits.pfSource)
   }
   topDownOpt.foreach (
     _ => {
       io.msStatus.get := mshrCtl.io.msStatus.get
       io.msAlloc.get := mshrCtl.io.msAlloc.get
-      io.pfSent.get.valid := io.prefetch.fold(false.B)(_.req.fire)
-      io.pfSent.get.bits := io.prefetch.fold(MemReqSource.NoWhere.id.U)(p => p.req.bits.pfSource)
     }
   )
   io.l2Miss := mshrCtl.io.l2Miss

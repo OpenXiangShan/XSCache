@@ -119,6 +119,7 @@ trait HasCoupledL2Parameters {
 
   def chiOpt = Some(true)
   def topDownOpt = if(cacheParams.elaboratedTopDown) Some(true) else None
+  def prefetchOrTopDownOpt = if(prefetchOpt.nonEmpty || cacheParams.elaboratedTopDown) Some(true) else None
 
   def enableHintGuidedGrant = true
 
