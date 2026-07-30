@@ -738,7 +738,7 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
 
   // out value
   io.train.ready := s0_ready
-  io.resp.ready := rrTable.io.w.ready
+  io.resp.ready := true.B
   io.tlb_req.resp.ready := true.B
 
   // different situation
@@ -847,7 +847,7 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   io.req.bits := req
   io.req.bits.pfSource := MemReqSource.Prefetch2L2PBOP.id.U
   io.train.ready := delayQueue.io.in.ready && scoreTable.io.req.ready && (!req_valid || io.req.ready)
-  io.resp.ready := rrTable.io.w.ready
+  io.resp.ready := true.B
 
   for (off <- offsetList) {
     if (off < 0) {
