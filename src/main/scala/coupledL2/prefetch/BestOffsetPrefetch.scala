@@ -350,7 +350,6 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
 
 class BopReqBundle(implicit p: Parameters) extends BOPBundle{
   val full_vaddr = UInt(fullVAddrBits.W)
-  val base_vaddr = UInt(vaddrBitsOpt.getOrElse(0).W)
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
   val isBOP = Bool()
@@ -360,8 +359,7 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
   // for tlb req
   val paddrValid = Bool()
   val vaddrNoOffset = UInt((fullVAddrBits-offsetBits).W)
-  val baseVaddr = UInt((fullVAddrBits-offsetBits).W)
-  val paddrNoOffset = UInt(fullVAddrBits.W)
+  val paddrNoOffset = UInt((fullAddressBits-offsetBits).W)
   val replayEn = Bool()
   val replayCnt = UInt(4.W)
   // for pf req
@@ -370,8 +368,7 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
 
   def fromBopReqBundle(req: BopReqBundle) = {
     paddrValid := false.B
-    vaddrNoOffset := get_block_vaddr(req.full_vaddr)
-    baseVaddr := req.base_vaddr
+    vaddrNoOffset := get_block_addr(req.full_vaddr)
     replayEn := false.B
     replayCnt := 0.U
     paddrNoOffset := 0.U
@@ -383,7 +380,7 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
     val req = Wire(new PrefetchReq)
     req.tag := parseFullAddress(get_pf_paddr())._1
     req.set := parseFullAddress(get_pf_paddr())._2
-    req.vaddr.foreach(_ := baseVaddr)
+    req.vaddr.foreach(_ := vaddrNoOffset)
     req.needT := needT
     req.source := source
     req.pfSource := MemReqSource.Prefetch2L2BOP.id.U
@@ -409,7 +406,7 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
 
 class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends BOPModule{
   val io = IO(new Bundle() {
-    val in_req = Flipped(ValidIO(new BopReqBundle))
+    val in_req = Flipped(DecoupledIO(new BopReqBundle))
     val tlb_req = new L2ToL1TlbIO(nRespDups = 1)
     val out_req = DecoupledIO(new PrefetchReq)
   })
@@ -425,8 +422,6 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
   ArbPerf(pf_req_arb, "bop_pf_req_arb")
 
   def wayMap[T <: Data](f: Int => T) = VecInit((0 until REQ_FILTER_SIZE).map(f))
-
-  def get_flag(vaddr: UInt) = get_block_vaddr(vaddr)
 
   def alloc_entry(i: Int, e: BopReqBufferEntry): Unit = {
     valids(i) := true.B
@@ -446,8 +441,7 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
     val v = valids(i)
     val e = entries(i)
     v &&
-      e.vaddrNoOffset === get_block_vaddr(req.full_vaddr) &&
-      e.baseVaddr === req.base_vaddr &&
+      e.vaddrNoOffset === get_block_addr(req.full_vaddr) &&
       e.needT === req.needT &&
       e.source === req.source
   }
@@ -459,6 +453,7 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
    */
 
   // add a cycle for timing
+  io.in_req.ready := true.B
   tlb_req_arb.io.out.ready := true.B
   io.tlb_req.req.valid := RegNext(tlb_req_arb.io.out.valid)
   io.tlb_req.req.bits := RegEnable(tlb_req_arb.io.out.bits, tlb_req_arb.io.out.valid)
@@ -475,19 +470,14 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
   /* s0: entries look up */
   val prev_in_valid = RegNext(io.in_req.valid, false.B)
   val prev_in_req = RegNext(io.in_req.bits)
-  val prev_in_flag = get_flag(prev_in_req.full_vaddr)
+  val prev_in_flag = get_block_addr(prev_in_req.full_vaddr)
   // s1 entry update
   val alloc = Wire(Vec(REQ_FILTER_SIZE, Bool()))
 
   val s0_in_req = io.in_req.bits
-  val s0_in_flag = get_flag(s0_in_req.full_vaddr)
+  val s0_in_flag = get_block_addr(s0_in_req.full_vaddr)
   val s0_conflict_prev = prev_in_valid && s0_in_flag === prev_in_flag
-  // FIXME lyq: the comparision logic is very complicated, is there a way to simplify
-  val s0_match_oh = VecInit(entries.indices.map(i =>
-    valids(i) && entries(i).vaddrNoOffset === s0_in_flag &&
-    entries(i).needT === s0_in_req.needT && entries(i).source === s0_in_req.source &&
-    entries(i).baseVaddr === s0_in_req.base_vaddr
-  )).asUInt
+  val s0_match_oh = VecInit(entries.indices.map(i => isEqualBopReq(i, s0_in_req))).asUInt
   val s0_match = Cat(s0_match_oh).orR
 
   val s0_invalid_vec = wayMap(w => !valids(w) && !alloc(w))
@@ -696,10 +686,12 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val delayQueue = Module(new DelayQueue("vbop"))
   val rrTable = Module(new RecentRequestTable("vbop"))
   val scoreTable = Module(new OffsetScoreTable("vbop"))
+  val reqFilter = Module(new PrefetchReqBuffer)
 
-  val s0_fire = scoreTable.io.req.fire && io.pbopCrossPage
-  val s1_fire = WireInit(false.B)
+  val s1_req_valid = RegInit(false.B)
   val s0_ready, s1_ready = WireInit(false.B)
+  val s0_fire = s0_ready && io.train.valid
+  val s1_fire = s1_ready && s1_req_valid
 
   /* s0 train */
   val prefetchOffset = scoreTable.io.prefetchOffset
@@ -710,8 +702,6 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val s0_oldFullAddrNoOff = s0_oldFullAddr(s0_oldFullAddr.getWidth-1, offsetBits)
   val s0_newFullAddr = s0_oldFullAddr + signedExtend((prefetchOffset << offsetBits), fullAddrBits)
   val s0_crossPage = getPPN(s0_newFullAddr) =/= getPPN(s0_oldFullAddr) // unequal tags
-  val respFullAddr = if(virtualTrain) Cat(io.resp.bits.vaddr.getOrElse(0.U), 0.U(offsetBits.W))
-                 else io.resp.bits.addr - signedExtend((prefetchOffset << offsetBits), fullAddrBits)
 
   rrTable.io.r <> scoreTable.io.test
   rrTable.io.w <> delayQueue.io.out
@@ -722,48 +712,40 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   scoreTable.io.req.bits := s0_oldFullAddr
 
   /* s1 get or send req */
-  val s1_req_valid = RegInit(false.B)
   val s1_needT = RegEnable(io.train.bits.needT, s0_fire)
   val s1_source = RegEnable(io.train.bits.source, s0_fire)
   val s1_newFullAddr = RegEnable(s0_newFullAddr, s0_fire)
-  val s1_reqVaddr = RegEnable(s0_reqVaddr, s0_fire)
   // val out_req = Wire(new PrefetchReq)
   // val out_req_valid = Wire(Bool())
   // val out_drop_req = WireInit(false.B)
 
   // pipeline control signal
+  if (virtualTrain) {
+    s0_ready := delayQueue.io.in.ready && scoreTable.io.req.ready && s1_ready
+    s1_ready := reqFilter.io.in_req.ready || !s1_req_valid
+  } else {
+    s0_ready := s1_ready
+    s1_ready := io.req.ready || !s1_req_valid
+  }
   when(s0_fire) {
-    if(virtualTrain) s1_req_valid := true.B
-    else s1_req_valid := !s0_crossPage // stop prefetch when prefetch req crosses pages
+    if(virtualTrain) s1_req_valid := enable && !prefetchDisable && io.pbopCrossPage // now pbopCrossPage is true.B by default
+    else s1_req_valid := enable && !prefetchDisable && !s0_crossPage // stop prefetch when prefetch req crosses pages
   }.elsewhen(s1_fire){
     s1_req_valid := false.B
   }
 
-  if (virtualTrain) {
-    // FIXME lyq: it it not correct
-    s0_ready := io.tlb_req.req.ready && s1_ready || !s1_req_valid
-    s1_ready := io.req.ready || !io.req.valid
-    s1_fire := s1_ready && s1_req_valid
-  } else {
-    s0_ready := io.req.ready || !io.req.valid
-    s1_ready := io.req.ready
-    s1_fire := io.req.fire
-  }
-
   // out value
-  io.train.ready := delayQueue.io.in.ready && scoreTable.io.req.ready && s0_ready
+  io.train.ready := s0_ready
   io.resp.ready := rrTable.io.w.ready
   io.tlb_req.resp.ready := true.B
 
   // different situation
-  val reqFilter = Module(new PrefetchReqBuffer)
-  when(prefetchDisable || !virtualTrain.B){
+  when(!virtualTrain.B){
     reqFilter.io.in_req.valid := false.B
     reqFilter.io.in_req.bits := DontCare
   }.otherwise{
     reqFilter.io.in_req.valid := s1_req_valid
     reqFilter.io.in_req.bits.full_vaddr := s1_newFullAddr
-    reqFilter.io.in_req.bits.base_vaddr := s1_reqVaddr
     reqFilter.io.in_req.bits.needT := s1_needT
     reqFilter.io.in_req.bits.source := s1_source
     reqFilter.io.in_req.bits.isBOP := true.B
@@ -772,14 +754,14 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   if(virtualTrain){
     io.tlb_req <> reqFilter.io.tlb_req
     io.req <> reqFilter.io.out_req
-    io.req.valid := enable && reqFilter.io.out_req.valid
+    io.req.valid := reqFilter.io.out_req.valid
   } else {
     io.tlb_req.req.valid := false.B
     io.tlb_req.req.bits := DontCare
     io.tlb_req.req_kill := false.B
 
     /* s1 send prefetch req */
-    io.req.valid := enable && s1_req_valid
+    io.req.valid := s1_req_valid
     io.req.bits.tag := parseFullAddress(s1_newFullAddr)._1
     io.req.bits.set := parseFullAddress(s1_newFullAddr)._2
     io.req.bits.vaddr.foreach(_ := 0.U)
@@ -806,7 +788,8 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   }else{
     XSPerfAccumulate("bop_cross_page", scoreTable.io.req.fire && s0_crossPage)
   }
-  XSPerfAccumulate("bop_drop_for_disable", scoreTable.io.req.fire && prefetchDisable)
+  XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
+  XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && prefetchDisable)
 }
 
 class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
@@ -852,11 +835,11 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     req.set := parseFullAddress(newAddr)._2
     req.needT := io.train.bits.needT
     req.source := io.train.bits.source
-    req_valid := !crossPage && !prefetchDisable // stop prefetch when prefetch req crosses pages
+    req_valid := enable && !crossPage && !prefetchDisable // stop prefetch when prefetch req crosses pages
   }
 
   io.pbopCrossPage := crossPage
-  io.req.valid := enable && req_valid
+  io.req.valid := req_valid
   io.req.bits := req
   io.req.bits.pfSource := MemReqSource.Prefetch2L2PBOP.id.U
   io.train.ready := delayQueue.io.in.ready && scoreTable.io.req.ready && (!req_valid || io.req.ready)
@@ -874,5 +857,6 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   XSPerfAccumulate("bop_resp", io.resp.fire)
   XSPerfAccumulate("bop_train_stall_for_st_not_ready", io.train.valid && !scoreTable.io.req.ready)
   XSPerfAccumulate("bop_drop_for_cross_page", scoreTable.io.req.fire && crossPage)
-  XSPerfAccumulate("bop_drop_for_disable", scoreTable.io.req.fire && prefetchDisable)
+  XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
+  XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && prefetchDisable)
 }

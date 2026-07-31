@@ -72,8 +72,8 @@ trait HasPrefetcherHelper extends HasCircularQueuePtrHelper with HasCoupledL2Par
     UIntToOH(get_index(vaddr))
   }
 
-  def get_block_vaddr(vaddr: UInt): UInt = {
-    vaddr(vaddr.getWidth - 1, BLOCK_OFFSET)
+  def get_block_addr(addr: UInt): UInt = {
+    addr(addr.getWidth - 1, BLOCK_OFFSET)
   }
 
   def _vaddr_hash(x: UInt): UInt = {
@@ -85,7 +85,7 @@ trait HasPrefetcherHelper extends HasCircularQueuePtrHelper with HasCoupledL2Par
   }
 
   def block_hash_tag(vaddr: UInt): UInt = {
-    val blk_addr = get_block_vaddr(vaddr)
+    val blk_addr = get_block_addr(vaddr)
     val low = blk_addr(BLK_ADDR_RAW_WIDTH - 1, 0)
     val high = blk_addr(BLK_ADDR_RAW_WIDTH - 1 + 3 * VADDR_HASH_WIDTH, BLK_ADDR_RAW_WIDTH)
     val high_hash = _vaddr_hash(high)
@@ -113,7 +113,7 @@ trait HasPrefetcherHelper extends HasCircularQueuePtrHelper with HasCoupledL2Par
 class PrefetchReq(implicit p: Parameters) extends PrefetchBundle {
   val tag = UInt(fullTagBits.W)
   val set = UInt(setBits.W)
-  // NOTE: the vaddr is the train address for response update, not virtual address of prefetch paddr.
+  // NOTE: the vaddr is the virtual address of prefetch paddr without offset bits.
   val vaddr = vaddrBitsOpt.map(_ => UInt(vaddrBitsOpt.get.W))
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
