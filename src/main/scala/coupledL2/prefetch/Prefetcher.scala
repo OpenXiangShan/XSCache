@@ -298,6 +298,18 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
         l2Params.copy(prefetch = Seq(BOPParameters(
             virtualTrain = false,
             badScore = 1,
+            crossPage = false,
+            enableStudentCover = true,
+            studentTeacherTopN = 1,
+            studentPoolSize = 8,
+            studentConfAlphaPct = 0,
+            studentCovThresholdPct = 5,
+            studentLowCostArithEnable = false,
+            studentLargeOffsetPriorityEnable = false,
+            studentLargeOffsetPriorityCoeffPct = 99,
+            studentFilterEntries = 2048,
+            studentHashMode = "splitmix",
+            studentHashCount = 1,
             offsetList = Seq(
               -32, -30, -27, -25, -24, -20, -18, -16, -15,
               -12, -10, -9, -8, -6, -5, -4, -3, -2, -1,
@@ -315,18 +327,25 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
         val l2Params = p(L2ParamKey)
         l2Params.copy(prefetch = Seq(BOPParameters(
             badScore = 2,
+            crossPage = true,
+            enableStudentCover = true,
+            studentTeacherTopN = 1,
+            studentPoolSize = 4,
+            studentConfAlphaPct = 0,
+            studentCovThresholdPct = 2,
+            studentLowCostArithEnable = false,
+            studentLargeOffsetPriorityEnable = true,
+            studentLargeOffsetPriorityCoeffPct = 99,
+            studentFilterEntries = 4096,
+            studentHashMode = "bop_rr",
+            studentHashCount = 1,
             offsetList = Seq(
               -117, -147, -91, 117, 147, 91,
               -256, -250, -243, -240, -225, -216, -200,
               -192, -180, -162, -160, -150, -144, -135, -128,
               -125, -120, -108, -100, -96, -90, -81, -80,
               -75, -72, -64, -60, -54, -50, -48, -45,
-              -40, -36, -32, -30, -27, -25, -24, -20,
-              -18, -16, -15, -12, -10, -9, -8, -6,
-              -5, -4, -3, -2, -1,
-              1, 2, 3, 4, 5, 6, 8,
-              9, 10, 12, 15, 16, 18, 20, 24,
-              25, 27, 30, 32, 36, 40, 45, 48,
+              -40, -36, 32, 36, 40, 45, 48,
               50, 54, 60, 64, 72, 75, 80, 81,
               90, 96, 100, 108, 120, 125, 128, 135,
               144, 150, 160, 162, 180, 192, 200, 216,
@@ -371,7 +390,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     vbop.get.io.resp <> resp
     vbop.get.io.resp.valid := resp.valid && resp.bits.isBOP
     vbop.get.io.tlb_req <> bop_tlb_req
-    vbop.get.io.pbopCrossPage := true.B // pbop.io.pbopCrossPage // let vbop have noting to do with pbop
+    vbop.get.io.pbopIssueActive := pbop.get.io.issueActive
+    vbop.get.io.pbopIssueOffset := pbop.get.io.issueOffset.pad(vbop.get.offsetWidth)
 
     val pbop_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
     pbop_train_buf.io.enq.valid := train.valid && train.bits.is_other_train.getOrElse(true.B)
