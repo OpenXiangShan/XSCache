@@ -26,7 +26,7 @@
 
 package xscache.coupledL2.prefetch
 
-import utility.{ChiselDB, Constantin, MemReqSource, ParallelPriorityMux, XSPerfAccumulate, TwoLevelRRArbiter, ArbPerf}
+import utility.{ChiselDB, Constantin, MemReqSource, ParallelPriorityMux, RRArbiterInit, XSPerfAccumulate, XSPerfHistogram, TwoLevelRRArbiter, ArbPerf}
 import utility.sram.SRAMTemplate
 import org.chipsalliance.cde.config.Parameters
 import chisel3.DontCare.:=
@@ -49,6 +49,18 @@ case class BOPParameters(
   dQEntries: Int = 16,
   dQLatency: Int = 300,
   dQMaxLatency: Int = 1024,
+  crossPage: Boolean = true,
+  enableStudentCover: Boolean = false,
+  studentTeacherTopN: Int = 1,
+  studentPoolSize: Int = 4,
+  studentConfAlphaPct: Int = 0,
+  studentCovThresholdPct: Int = 0,
+  studentLowCostArithEnable: Boolean = false,
+  studentLargeOffsetPriorityEnable: Boolean = false,
+  studentLargeOffsetPriorityCoeffPct: Int = 99,
+  studentFilterEntries: Int = 1024,
+  studentHashMode: String = "bop_rr",
+  studentHashCount: Int = 1,
   offsetList: Seq[Int] = Seq(
     -256, -250, -243, -240, -225, -216, -200,
     -192, -180, -162, -160, -150, -144, -135, -128,
@@ -99,12 +111,29 @@ trait HasBOPParams extends HasPrefetcherHelper {
   def dQEntries = bopParams.dQEntries
   def dQLatency = bopParams.dQLatency
   def dQMaxLatency = bopParams.dQMaxLatency
+  def crossPage = bopParams.crossPage
+  def enableStudentCover = bopParams.enableStudentCover
+  def studentTeacherTopN = bopParams.studentTeacherTopN
+  def studentPoolSize = bopParams.studentPoolSize
+  def studentConfAlphaPct = bopParams.studentConfAlphaPct
+  def studentCovThresholdPct = bopParams.studentCovThresholdPct
+  def studentLowCostArithEnable = bopParams.studentLowCostArithEnable
+  def studentLargeOffsetPriorityEnable = bopParams.studentLargeOffsetPriorityEnable
+  def studentLargeOffsetPriorityCoeffPct = bopParams.studentLargeOffsetPriorityCoeffPct
+  def studentFilterEntries = bopParams.studentFilterEntries
+  def studentHashMode = bopParams.studentHashMode
+  def studentHashCount = bopParams.studentHashCount
 
   def scores = offsetList.length
   def offsetWidth = log2Up(offsetList.max) + 2 // -32 <= offset <= 31
   def roundBits = log2Up(roundMax)
   def scoreMax = (1 << scoreBits) - 1
   def scoreTableIdxBits = log2Up(scores)
+  def studentPoolIdxBits = log2Up(math.max(studentPoolSize, 2))
+  def studentFilterIdxBits = log2Up(math.max(studentFilterEntries, 2))
+  def studentConfBits = 2
+  def studentPhaseTrainBits = log2Up(scores * (roundMax + 2) + 1)
+  def studentPhaseTrainMax = scores * (roundMax + 2)
   // val prefetchIdWidth = log2Up(inflightEntries)
 
   def signedExtend(x: UInt, width: Int): UInt = {
@@ -117,7 +146,54 @@ trait HasBOPParams extends HasPrefetcherHelper {
 }
 
 abstract class BOPBundle(implicit val p: Parameters) extends Bundle with HasBOPParams
-abstract class BOPModule(implicit val p: Parameters) extends Module with HasBOPParams
+abstract class BOPModule(implicit val p: Parameters) extends Module with HasBOPParams {
+  protected def alignUp(value: Int, step: Int): Int = ((value + step - 1) / step) * step
+
+  private def emitHistogramRange(
+    perfName: String,
+    perfCnt: UInt,
+    enable: Bool,
+    start: Int,
+    stop: Int,
+    step: Int,
+    leftStrict: Boolean = false,
+    rightStrict: Boolean = false
+  ): Unit = {
+    if (stop > start) {
+      XSPerfHistogram(
+        perfName,
+        perfCnt,
+        enable,
+        start,
+        stop,
+        step,
+        left_strict = leftStrict,
+        right_strict = rightStrict
+      )
+    }
+  }
+
+  protected def emitOffsetDistCounters(prefix: String, offset: SInt, enable: Bool): Unit = {
+    for (off <- offsetList) {
+      val counterName =
+        if (off < 0) prefix + "_neg_" + (-off).toString
+        else prefix + "_pos_" + off.toString
+      XSPerfAccumulate(counterName, enable && offset === off.S(offsetWidth.W))
+    }
+  }
+
+  protected def emitCoverageHistogram(prefix: String, coverage: UInt, enable: Bool): Unit = {
+    val rawUpper = studentPhaseTrainMax + 1
+    emitHistogramRange(prefix, coverage, enable, 0, math.min(32, rawUpper), 1, rightStrict = true)
+    emitHistogramRange(prefix, coverage, enable, 32, math.min(128, rawUpper), 8,
+      leftStrict = true, rightStrict = true)
+    emitHistogramRange(prefix, coverage, enable, 128, math.min(512, rawUpper), 32,
+      leftStrict = true, rightStrict = true)
+    emitHistogramRange(prefix, coverage, enable, 512, math.min(2048, rawUpper), 128,
+      leftStrict = true, rightStrict = true)
+    emitHistogramRange(prefix, coverage, enable, 2048, alignUp(rawUpper, 512), 512, leftStrict = true)
+  }
+}
 
 class ScoreTableEntry(implicit p: Parameters) extends BOPBundle {
   // val offset = UInt(offsetWidth.W)
@@ -228,6 +304,9 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
     val req = Flipped(DecoupledIO(UInt(fullAddrBits.W)))
     val prefetchOffset = Output(UInt(offsetWidth.W))
     val prefetchDisable = Output(Bool())
+    val phaseEndPulse = Output(Bool())
+    val phaseBestOffsetCommitted = Output(UInt(offsetWidth.W))
+    val phaseIssueEnable = Output(Bool())
     val test = new TestOffsetBundle
   })
 
@@ -244,8 +323,20 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
   val round = RegInit(0.U(roundBits.W))
 
   val bestOffset = RegInit(2.U(offsetWidth.W)) // the entry with the highest score while traversing
-  val bestScore = RegInit(0.U)
+  val bestScore = RegInit(0.U(scoreBits.W))
   val testOffset = offList(ptr)
+  val phaseEndCommit = WireDefault(false.B)
+  val phaseBestOffset = RegInit(2.U(offsetWidth.W))
+  val phaseIssueEnable = RegInit(false.B)
+  val respHit = io.test.resp.valid && io.test.resp.bits.hit
+  val respPtr = io.test.resp.bits.ptr
+  val oldScore = st(respPtr).score
+  val newScore = Mux(oldScore === scoreMax.U, oldScore, oldScore + 1.U)
+  val respOffset = offList(respPtr)
+  val renewOffset = respHit && newScore > bestScore
+  val committedBestOffset = Mux(renewOffset, respOffset, bestOffset)
+  val committedBestScore = Mux(renewOffset, newScore, bestScore)
+  val committedIsBad = committedBestScore < badscoreConstant
   // def winner(e1: ScoreTableEntry, e2: ScoreTableEntry): ScoreTableEntry = {
   //   val w = Wire(new ScoreTableEntry)
   //   w := Mux(e1.score > e2.score, e1, e2)
@@ -287,27 +378,33 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
     // (2) the number of rounds equals ROUNDMAX.
     when(round >= roundMaxConstant) {
       state := s_idle
+      phaseEndCommit := true.B
     }
 
-    when(io.test.resp.valid && io.test.resp.bits.hit) {
-      val oldScore = st(io.test.resp.bits.ptr).score
-      val newScore = oldScore + 1.U
-      val offset = offList(io.test.resp.bits.ptr)
-      st(io.test.resp.bits.ptr).score := newScore
+    when(respHit) {
+      st(respPtr).score := newScore
       // bestOffset := winner((new ScoreTableEntry).apply(offset, newScore), bestOffset)
-      val renewOffset = newScore > bestScore
-      bestOffset := Mux(renewOffset, offset, bestOffset)
+      bestOffset := committedBestOffset
       bestScore := Mux(renewOffset, newScore, bestScore)
       // (1) one of the score equals SCOREMAX
       when(newScore >= scoreMax.U) {
         state := s_idle
+        phaseEndCommit := true.B
       }
     }
+  }
+
+  when(phaseEndCommit) {
+    phaseBestOffset := committedBestOffset
+    phaseIssueEnable := !committedIsBad
   }
 
   io.req.ready := state === s_learn
   io.prefetchOffset := prefetchOffset
   io.prefetchDisable := prefetchDisable
+  io.phaseEndPulse := RegNext(phaseEndCommit, false.B)
+  io.phaseBestOffsetCommitted := phaseBestOffset
+  io.phaseIssueEnable := phaseIssueEnable
   io.test.req.valid := state === s_learn && io.req.valid
   io.test.req.bits.addr := io.req.bits
   io.test.req.bits.testOffset := testOffset
@@ -348,11 +445,438 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
 
 }
 
+class StudentPoolEntry(implicit p: Parameters) extends BOPBundle {
+  val valid = Bool()
+  val offset = SInt(offsetWidth.W)
+  val conf = SInt(studentConfBits.W)
+  val lastPhaseCov = UInt(studentPhaseTrainBits.W)
+  val curPhaseCov = UInt(studentPhaseTrainBits.W)
+}
+
+class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends BOPModule {
+  require(enableStudentCover, s"$name student coverage learner should only be instantiated when enabled")
+  require(studentPoolSize > 0, s"$name studentPoolSize must be positive")
+  require(studentPoolSize <= 64, s"$name studentPoolSize=$studentPoolSize exceeds 64-bit filter mask capacity")
+  require(studentHashCount == 1, s"$name only single-hash student filter is supported in RTL")
+  require(studentTeacherTopN <= 1, s"$name only top-1 teacher injection is supported in RTL")
+  require(studentConfAlphaPct == 0, s"$name only studentConfAlphaPct=0 is supported in RTL")
+  require(studentCovThresholdPct >= 0 && studentCovThresholdPct <= 100,
+    s"$name studentCovThresholdPct must be in [0, 100]")
+  require(studentLargeOffsetPriorityCoeffPct > 0 && studentLargeOffsetPriorityCoeffPct <= 100,
+    s"$name studentLargeOffsetPriorityCoeffPct must be in (0, 100]")
+  require(isPow2(studentFilterEntries), s"$name studentFilterEntries must be a power of two")
+  require(studentHashMode == "bop_rr" || studentHashMode == "splitmix",
+    s"$name unsupported studentHashMode=$studentHashMode")
+
+  val io = IO(new Bundle {
+    val train = Flipped(ValidIO(UInt(fullAddrBits.W)))
+    val trainReady = Output(Bool())
+    val teacherPhaseEnd = Input(Bool())
+    val teacherBestOffset = Input(UInt(offsetWidth.W))
+    val teacherIssueEnable = Input(Bool())
+    val selectedOffset = Output(UInt(offsetWidth.W))
+    val selectedValid = Output(Bool())
+    val selectedEnable = Output(Bool())
+  })
+
+  private val splitmixConst1 = BigInt("9E3779B97F4A7C15", 16).U(64.W)
+  private val splitmixConst2 = BigInt("BF58476D1CE4E5B9", 16).U(64.W)
+  private val splitmixConst3 = BigInt("94D049BB133111EB", 16).U(64.W)
+
+  private def absOffset(offset: SInt): UInt = Mux(offset < 0.S, (-offset).asUInt, offset.asUInt)
+
+  private def betterBest(lhs: StudentPoolEntry, rhs: StudentPoolEntry): Bool = {
+    val lhsAbs = absOffset(lhs.offset)
+    val rhsAbs = absOffset(rhs.offset)
+    (lhs.curPhaseCov > rhs.curPhaseCov) ||
+      (lhs.curPhaseCov === rhs.curPhaseCov && (
+        (lhs.conf > rhs.conf) ||
+          (lhs.conf === rhs.conf && (
+            (lhsAbs < rhsAbs) ||
+              (lhsAbs === rhsAbs && lhs.offset < rhs.offset)
+          ))
+      ))
+  }
+
+  private def worseWorst(lhs: StudentPoolEntry, rhs: StudentPoolEntry): Bool = {
+    val lhsAbs = absOffset(lhs.offset)
+    val rhsAbs = absOffset(rhs.offset)
+    (lhs.curPhaseCov < rhs.curPhaseCov) ||
+      (lhs.curPhaseCov === rhs.curPhaseCov && (
+        (lhs.conf < rhs.conf) ||
+          (lhs.conf === rhs.conf && (
+            (lhsAbs < rhsAbs) ||
+              (lhsAbs === rhsAbs && lhs.offset < rhs.offset)
+          ))
+      ))
+  }
+
+  private def worseVictim(lhs: StudentPoolEntry, rhs: StudentPoolEntry): Bool = {
+    val lhsAbs = absOffset(lhs.offset)
+    val rhsAbs = absOffset(rhs.offset)
+    (lhs.conf < rhs.conf) ||
+      (lhs.conf === rhs.conf && (
+        (lhs.lastPhaseCov < rhs.lastPhaseCov) ||
+          (lhs.lastPhaseCov === rhs.lastPhaseCov && (
+            (lhsAbs > rhsAbs) ||
+              (lhsAbs === rhsAbs && lhs.offset < rhs.offset)
+          ))
+      ))
+  }
+
+  private def absLess(lhs: StudentPoolEntry, rhs: StudentPoolEntry): Bool = {
+    val lhsAbs = absOffset(lhs.offset)
+    val rhsAbs = absOffset(rhs.offset)
+    (lhsAbs < rhsAbs) || (lhsAbs === rhsAbs && lhs.offset < rhs.offset)
+  }
+
+  private def splitmix64(x: UInt): UInt = {
+    val x64 = if (x.getWidth >= 64) {
+      x(63, 0)
+    } else {
+      Cat(0.U((64 - x.getWidth).W), x)
+    }
+    val z1 = x64 + splitmixConst1
+    val z2Mul = (z1 ^ (z1 >> 30)) * splitmixConst2
+    val z2 = z2Mul(63, 0)
+    val z3Mul = (z2 ^ (z2 >> 27)) * splitmixConst3
+    val z3 = z3Mul(63, 0)
+    z3 ^ (z3 >> 31)
+  }
+
+  private def filterIndex(lineAddr: UInt): UInt = {
+    studentHashMode match {
+      case "bop_rr" => (lineAddr ^ (lineAddr >> studentFilterIdxBits))(studentFilterIdxBits - 1, 0)
+      case "splitmix" => splitmix64(lineAddr)(studentFilterIdxBits - 1, 0)
+    }
+  }
+
+  // Low-cost mode is elaboration-time selected, so only one arithmetic implementation
+  // exists in the final hardware.
+  private def scaleByConst(x: UInt, factor: Int): UInt = {
+    require(factor >= 0, s"$name scaleByConst factor must be non-negative")
+    if (factor == 0) {
+      0.U(1.W)
+    } else {
+      var acc = 0.U(1.W)
+      for (shift <- 0 to log2Up(factor + 1)) {
+        if (((factor >> shift) & 1) != 0) {
+          acc = acc +& (x << shift)
+        }
+      }
+      acc
+    }
+  }
+
+  private def coverageThresholdMet(selectedCov: UInt, phaseLen: UInt, requiredCov: UInt): Bool = {
+    if (studentCovThresholdPct == 0) {
+      true.B
+    } else if (studentLowCostArithEnable) {
+      phaseLen.orR && (selectedCov >= requiredCov)
+    } else {
+      phaseLen.orR &&
+        (selectedCov * 100.U) >= (phaseLen * studentCovThresholdPct.U)
+    }
+  }
+
+  private def withinCoeffRange(lhs: UInt, rhs: UInt): Bool = {
+    if (studentLowCostArithEnable) {
+      val lhs100 = scaleByConst(lhs, 100)
+      val rhs100 = scaleByConst(rhs, 100)
+      val lhsCoeff = scaleByConst(lhs, studentLargeOffsetPriorityCoeffPct)
+      val rhsCoeff = scaleByConst(rhs, studentLargeOffsetPriorityCoeffPct)
+      (lhs100 >= rhsCoeff) && (lhsCoeff <= rhs100)
+    } else {
+      (lhs * 100.U) >= (rhs * studentLargeOffsetPriorityCoeffPct.U) &&
+        (lhs * studentLargeOffsetPriorityCoeffPct.U) <= (rhs * 100.U)
+    }
+  }
+
+  val studentPool = RegInit(VecInit(Seq.fill(studentPoolSize)(0.U.asTypeOf(new StudentPoolEntry))))
+  val studentFilterBits = RegInit(VecInit(Seq.fill(studentFilterEntries)(0.U(studentPoolSize.W))))
+  val studentPhaseTrainCount = RegInit(0.U(studentPhaseTrainBits.W))
+  val studentPhaseRequiredCov = RegInit(0.U(studentPhaseTrainBits.W))
+  val studentPhaseCovPctAcc = RegInit((if (studentCovThresholdPct == 0) 0 else 99).U(8.W))
+  val studentSelectedOffset = RegInit(1.S(offsetWidth.W))
+  val studentSelectedValid = RegInit(false.B)
+  val studentSelectedEnable = RegInit(false.B)
+
+  val s_training :: s_phaseEnd :: Nil = Enum(2)
+  val state = RegInit(s_training)
+
+  val phaseValidCount = RegInit(0.U(log2Up(studentPoolSize + 1).W))
+  val phaseTrainCount = RegInit(0.U(studentPhaseTrainBits.W))
+  val phaseHasValidPool = RegInit(false.B)
+  val phaseAllSameSign = RegInit(false.B)
+  val phaseHasFreeSlot = RegInit(false.B)
+  val phaseDuplicateTeacherBest = RegInit(false.B)
+  val phaseTeacherBestOffset = RegInit(0.S(offsetWidth.W))
+  val phaseTeacherIssueEnable = RegInit(false.B)
+  val phaseRequiredCov = RegInit(0.U(studentPhaseTrainBits.W))
+  val phaseBestIdx = RegInit(0.U(studentPoolIdxBits.W))
+  val phaseWorstIdx = RegInit(0.U(studentPoolIdxBits.W))
+  val phaseMinAbsIdx = RegInit(0.U(studentPoolIdxBits.W))
+  val phaseMaxAbsIdx = RegInit(0.U(studentPoolIdxBits.W))
+  val phaseVictimIdx = RegInit(0.U(studentPoolIdxBits.W))
+  val phaseFirstInvalidIdx = RegInit(0.U(studentPoolIdxBits.W))
+  val phasePerfBestOffset = RegInit(0.S(offsetWidth.W))
+  val phasePerfBestCov = RegInit(0.U(studentPhaseTrainBits.W))
+  val phasePerfWorstCov = RegInit(0.U(studentPhaseTrainBits.W))
+
+  // Training state keeps the hot path small: filter query and filter insert only.
+  // All phase-end comparisons are snapshotted here and consumed one cycle later.
+  val liveValidVec = VecInit(studentPool.map(_.valid))
+  val liveHasValidPool = liveValidVec.asUInt.orR
+  val liveValidCount = PopCount(liveValidVec)
+  val liveFirstValidIdx = PriorityEncoder(liveValidVec)
+  val liveHasFreeSlot = !liveValidVec.asUInt.andR
+  val liveFirstInvalidIdx = PriorityEncoder(VecInit(studentPool.map(entry => !entry.valid)))
+
+  // Build the winner/victim scans as explicit stage chains.
+  // This keeps the logic purely feed-forward and avoids self-referential wires.
+  val bestIdxChain = Wire(Vec(studentPoolSize + 1, UInt(studentPoolIdxBits.W)))
+  val worstIdxChain = Wire(Vec(studentPoolSize + 1, UInt(studentPoolIdxBits.W)))
+  val minAbsIdxChain = Wire(Vec(studentPoolSize + 1, UInt(studentPoolIdxBits.W)))
+  val maxAbsIdxChain = Wire(Vec(studentPoolSize + 1, UInt(studentPoolIdxBits.W)))
+  val victimIdxChain = Wire(Vec(studentPoolSize + 1, UInt(studentPoolIdxBits.W)))
+  bestIdxChain(0) := liveFirstValidIdx
+  worstIdxChain(0) := liveFirstValidIdx
+  minAbsIdxChain(0) := liveFirstValidIdx
+  maxAbsIdxChain(0) := liveFirstValidIdx
+  victimIdxChain(0) := liveFirstValidIdx
+
+  for (i <- 0 until studentPoolSize) {
+    val bestPrevIdx = bestIdxChain(i)
+    val worstPrevIdx = worstIdxChain(i)
+    val minAbsPrevIdx = minAbsIdxChain(i)
+    val maxAbsPrevIdx = maxAbsIdxChain(i)
+    val victimPrevIdx = victimIdxChain(i)
+
+    bestIdxChain(i + 1) := Mux(
+      studentPool(i).valid && betterBest(studentPool(i), studentPool(bestPrevIdx)),
+      i.U,
+      bestPrevIdx
+    )
+    worstIdxChain(i + 1) := Mux(
+      studentPool(i).valid && worseWorst(studentPool(i), studentPool(worstPrevIdx)),
+      i.U,
+      worstPrevIdx
+    )
+    minAbsIdxChain(i + 1) := Mux(
+      studentPool(i).valid && absLess(studentPool(i), studentPool(minAbsPrevIdx)),
+      i.U,
+      minAbsPrevIdx
+    )
+    maxAbsIdxChain(i + 1) := Mux(
+      studentPool(i).valid && absLess(studentPool(maxAbsPrevIdx), studentPool(i)),
+      i.U,
+      maxAbsPrevIdx
+    )
+    victimIdxChain(i + 1) := Mux(
+      studentPool(i).valid && worseVictim(studentPool(i), studentPool(victimPrevIdx)),
+      i.U,
+      victimPrevIdx
+    )
+  }
+
+  val liveBestIdx = bestIdxChain(studentPoolSize)
+  val liveWorstIdx = worstIdxChain(studentPoolSize)
+  val liveMinAbsIdx = minAbsIdxChain(studentPoolSize)
+  val liveMaxAbsIdx = maxAbsIdxChain(studentPoolSize)
+  val liveVictimIdx = victimIdxChain(studentPoolSize)
+
+  val livePositiveSign = liveHasValidPool && studentPool(liveFirstValidIdx).offset > 0.S
+  val liveSignMismatch = (0 until studentPoolSize).map { i =>
+    studentPool(i).valid && ((studentPool(i).offset > 0.S) =/= livePositiveSign)
+  }.reduce(_ || _)
+  val liveAllSameSign = liveHasValidPool && !liveSignMismatch
+  val liveDuplicateTeacherBest = liveHasValidPool && (0 until studentPoolSize).map { i =>
+    studentPool(i).valid && studentPool(i).offset === io.teacherBestOffset.asSInt
+  }.reduce(_ || _)
+
+  // Phase-end state is a one-cycle slow path used to finish takeover and replacement.
+  val phaseBestEntry = studentPool(phaseBestIdx)
+  val phaseWorstEntry = studentPool(phaseWorstIdx)
+  val phaseBestCov = phaseBestEntry.curPhaseCov
+  val phaseWorstCov = phaseWorstEntry.curPhaseCov
+  val phaseBestAbs = absOffset(phaseBestEntry.offset)
+  val phaseWorstAbs = absOffset(phaseWorstEntry.offset)
+  val phaseEndpointAligned = phaseBestAbs === absOffset(studentPool(phaseMinAbsIdx).offset) &&
+    phaseWorstAbs === absOffset(studentPool(phaseMaxAbsIdx).offset)
+  val phaseAbsDelta = Mux(phaseWorstAbs >= phaseBestAbs, phaseWorstAbs - phaseBestAbs, 0.U)
+  val phaseCovGapSigned = phaseWorstCov.zext - phaseBestCov.zext
+  val phasePriorityGapOk =
+    (phaseCovGapSigned * studentLargeOffsetPriorityCoeffPct.S * phaseTrainCount.zext) <=
+      (phaseAbsDelta.zext * 100.S)
+  val phaseRefDist = phaseAbsDelta
+  val phaseRefCovGap = Mux(phaseBestCov >= phaseWorstCov, phaseBestCov - phaseWorstCov, 0.U)
+  val phaseIntermediateSlopeOk = (0 until studentPoolSize).map { i =>
+    val entry = studentPool(i)
+    val isIntermediate = entry.valid && i.U =/= phaseBestIdx && i.U =/= phaseWorstIdx
+    val curAbs = absOffset(entry.offset)
+    val curCov = entry.curPhaseCov
+    val curDist = Mux(curAbs >= phaseBestAbs, curAbs - phaseBestAbs, 0.U)
+    val curCovGap = Mux(phaseBestCov >= curCov, phaseBestCov - curCov, 0.U)
+    val offsetInRange = curAbs > phaseBestAbs && curAbs < phaseWorstAbs
+    val covInRange = curCov <= phaseBestCov && curCov >= phaseWorstCov
+    val slopeAligned = Mux(phaseRefCovGap === 0.U,
+      curCovGap === 0.U,
+      withinCoeffRange(curCovGap * phaseRefDist, phaseRefCovGap * curDist))
+    !isIntermediate || (offsetInRange && covInRange && slopeAligned)
+  }.reduce(_ && _)
+  val phasePreferLargeOffset = studentLargeOffsetPriorityEnable.B &&
+    (phaseValidCount >= 2.U) &&
+    phaseTrainCount.orR &&
+    phaseAllSameSign &&
+    phaseEndpointAligned &&
+    phasePriorityGapOk &&
+    phaseIntermediateSlopeOk
+  val phaseSelectedIdx = Mux(phasePreferLargeOffset, phaseWorstIdx, phaseBestIdx)
+  val phaseRewardIdx = Mux(phasePreferLargeOffset, phaseWorstIdx, phaseBestIdx)
+  val phasePunishIdx = Mux(phasePreferLargeOffset, phaseBestIdx, phaseWorstIdx)
+  val phaseSelectedCov = Mux(phasePreferLargeOffset, phaseWorstCov, phaseBestCov)
+  val phaseSelectedEnable = phaseHasValidPool &&
+    coverageThresholdMet(phaseSelectedCov, phaseTrainCount, phaseRequiredCov)
+  val phaseInjectTeacherBest = (studentTeacherTopN > 0).B &&
+    (phaseTeacherBestOffset =/= 0.S) &&
+    !phaseDuplicateTeacherBest
+  val phaseInjectIdx = Mux(phaseHasFreeSlot, phaseFirstInvalidIdx, phaseVictimIdx)
+  val phaseEndPool = WireInit(studentPool)
+
+  for (i <- 0 until studentPoolSize) {
+    when(studentPool(i).valid) {
+      val confUpdate = WireDefault(0.S(studentConfBits.W))
+      when(phaseRewardIdx === i.U) {
+        confUpdate := 1.S
+      }
+      when(phasePunishIdx === i.U) {
+        confUpdate := (-1).S
+      }
+      phaseEndPool(i).conf := confUpdate
+      phaseEndPool(i).lastPhaseCov := studentPool(i).curPhaseCov
+      phaseEndPool(i).curPhaseCov := 0.U
+    }
+  }
+
+  when(state === s_training) {
+    when(io.teacherPhaseEnd) {
+      phaseValidCount := liveValidCount
+      phaseTrainCount := studentPhaseTrainCount
+      phaseHasValidPool := liveHasValidPool
+      phaseAllSameSign := liveAllSameSign
+      phaseHasFreeSlot := liveHasFreeSlot
+      phaseDuplicateTeacherBest := liveDuplicateTeacherBest
+      phaseTeacherBestOffset := io.teacherBestOffset.asSInt
+      phaseTeacherIssueEnable := io.teacherIssueEnable
+      phaseRequiredCov := studentPhaseRequiredCov
+      phaseBestIdx := liveBestIdx
+      phaseWorstIdx := liveWorstIdx
+      phaseMinAbsIdx := liveMinAbsIdx
+      phaseMaxAbsIdx := liveMaxAbsIdx
+      phaseVictimIdx := liveVictimIdx
+      phaseFirstInvalidIdx := liveFirstInvalidIdx
+      phasePerfBestOffset := Mux(liveHasValidPool, studentPool(liveBestIdx).offset, 0.S)
+      phasePerfBestCov := Mux(liveHasValidPool, studentPool(liveBestIdx).curPhaseCov, 0.U)
+      phasePerfWorstCov := Mux(liveHasValidPool, studentPool(liveWorstIdx).curPhaseCov, 0.U)
+      state := s_phaseEnd
+    }.elsewhen(io.train.valid) {
+      studentPhaseTrainCount := studentPhaseTrainCount + 1.U
+      if (studentLowCostArithEnable && studentCovThresholdPct > 0) {
+        val nextCovPctAcc = studentPhaseCovPctAcc + studentCovThresholdPct.U
+        when(nextCovPctAcc >= 100.U) {
+          studentPhaseCovPctAcc := nextCovPctAcc - 100.U
+          studentPhaseRequiredCov := studentPhaseRequiredCov + 1.U
+        }.otherwise {
+          studentPhaseCovPctAcc := nextCovPctAcc
+        }
+      }
+
+      when(liveHasValidPool) {
+        val queryIdx = filterIndex(io.train.bits(fullAddrBits - 1, offsetBits))
+        val hitMask = studentFilterBits(queryIdx)
+        for (i <- 0 until studentPoolSize) {
+          when(studentPool(i).valid && hitMask(i)) {
+            studentPool(i).curPhaseCov := studentPool(i).curPhaseCov + 1.U
+          }
+        }
+
+        val writeValids = Wire(Vec(studentPoolSize, Bool()))
+        val writeIdxs = Wire(Vec(studentPoolSize, UInt(studentFilterIdxBits.W)))
+        for (i <- 0 until studentPoolSize) {
+          val predictedAddrS = io.train.bits.asSInt + signedExtend(
+            (studentPool(i).offset.asUInt << offsetBits), fullAddrBits).asSInt
+          val predictedAddrBits = predictedAddrS.asUInt
+          val predictedAddr = predictedAddrBits(fullAddrBits - 1, 0)
+          val predictedSamePage = getPPN(predictedAddr) === getPPN(io.train.bits)
+          writeValids(i) := studentPool(i).valid &&
+            (predictedAddrS >= 0.S) &&
+            (crossPage.B || predictedSamePage)
+          writeIdxs(i) := filterIndex(predictedAddr(fullAddrBits - 1, offsetBits))
+        }
+
+        for (i <- 0 until studentPoolSize) {
+          val mergedMask = (0 to i).foldLeft(0.U(studentPoolSize.W)) { (mask, j) =>
+            mask | Mux(writeValids(j) && writeIdxs(j) === writeIdxs(i), (1.U(studentPoolSize.W) << j), 0.U)
+          }
+          when(writeValids(i)) {
+            studentFilterBits(writeIdxs(i)) := studentFilterBits(writeIdxs(i)) | mergedMask
+          }
+        }
+      }
+    }
+  }.otherwise {
+    when(phaseHasValidPool) {
+      studentSelectedOffset := studentPool(phaseSelectedIdx).offset
+      studentSelectedValid := true.B
+      studentSelectedEnable := phaseSelectedEnable
+    }.otherwise {
+      studentSelectedValid := false.B
+      studentSelectedEnable := false.B
+    }
+
+    when(phaseInjectTeacherBest) {
+      phaseEndPool(phaseInjectIdx).valid := true.B
+      phaseEndPool(phaseInjectIdx).offset := phaseTeacherBestOffset
+      phaseEndPool(phaseInjectIdx).conf := 0.S
+      phaseEndPool(phaseInjectIdx).lastPhaseCov := 0.U
+      phaseEndPool(phaseInjectIdx).curPhaseCov := 0.U
+    }
+
+    for (i <- 0 until studentPoolSize) {
+      studentPool(i) := phaseEndPool(i)
+    }
+    studentFilterBits.foreach(_ := 0.U)
+    studentPhaseTrainCount := 0.U
+    studentPhaseRequiredCov := 0.U
+    studentPhaseCovPctAcc := (if (studentCovThresholdPct == 0) 0 else 99).U
+    state := s_training
+  }
+
+  io.trainReady := state === s_training
+  io.selectedOffset := studentSelectedOffset.asUInt
+  io.selectedValid := studentSelectedValid
+  io.selectedEnable := studentSelectedEnable
+
+  XSPerfAccumulate("student_phase_end", state === s_phaseEnd)
+  XSPerfAccumulate("student_takeover", state === s_phaseEnd && phaseHasValidPool && phaseSelectedEnable)
+  XSPerfAccumulate("student_fallback", state === s_phaseEnd && !phaseSelectedEnable)
+  XSPerfAccumulate("student_large_offset_priority", state === s_phaseEnd && phasePreferLargeOffset)
+  XSPerfAccumulate("student_override_teacher_disable",
+    state === s_phaseEnd && phaseHasValidPool && phaseSelectedEnable && !phaseTeacherIssueEnable)
+  XSPerfAccumulate("teacher_best_injected", state === s_phaseEnd && phaseInjectTeacherBest)
+  emitOffsetDistCounters("student_best_offset", phasePerfBestOffset, state === s_phaseEnd && phaseHasValidPool)
+  emitCoverageHistogram("student_best_cov", phasePerfBestCov, state === s_phaseEnd && phaseHasValidPool)
+  emitCoverageHistogram("student_worst_cov", phasePerfWorstCov, state === s_phaseEnd && phaseHasValidPool)
+}
+
 class BopReqBundle(implicit p: Parameters) extends BOPBundle{
   val full_vaddr = UInt(fullVAddrBits.W)
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
   val isBOP = Bool()
+  val issueOffset = SInt(offsetWidth.W)
+  val samePagePaddrValid = Bool()
+  val samePagePaddr = UInt(fullAddressBits.W)
 }
 
 class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
@@ -365,15 +889,20 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
   // for pf req
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
+  val issueOffset = SInt(offsetWidth.W)
 
   def fromBopReqBundle(req: BopReqBundle) = {
-    paddrValid := false.B
     vaddrNoOffset := get_block_addr(req.full_vaddr)
     replayEn := false.B
     replayCnt := 0.U
-    paddrNoOffset := 0.U
+    paddrValid := req.samePagePaddrValid
+    paddrNoOffset := Mux(req.samePagePaddrValid,
+      req.samePagePaddr(req.samePagePaddr.getWidth - 1, offsetBits),
+      0.U
+    )
     needT := req.needT
     source := req.source
+    issueOffset := req.issueOffset
   }
 
   def toPrefetchReq(): PrefetchReq = {
@@ -410,6 +939,7 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
     val in_req = Flipped(DecoupledIO(new BopReqBundle))
     val tlb_req = new L2ToL1TlbIO(nRespDups = 1)
     val out_req = DecoupledIO(new PrefetchReq)
+    val out_issueOffset = Output(SInt(offsetWidth.W))
   })
 
   val firstTlbReplayCnt = Constantin.createRecord(name+"_firstTlbReplayCnt", bopParams.tlbReplayCnt)
@@ -467,6 +997,9 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
   io.tlb_req.resp.ready := true.B
   io.out_req <> pf_req_arb.io.out
   io.out_req.bits.pfSource := MemReqSource.Prefetch2L2BOP.id.U
+  io.out_issueOffset := Mux1H(entries.indices.map(i =>
+    pf_req_arb.io.in(i).fire -> entries(i).issueOffset.asUInt
+  )).asSInt
 
   /* s0: entries look up */
   val prev_in_valid = RegNext(io.in_req.valid, false.B)
@@ -675,19 +1208,25 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     val enable = Input(Bool())
     val pfCtrlOfDelayLatency = Input(UInt(10.W))
     val train = Flipped(DecoupledIO(new PrefetchTrain))
-    val pbopCrossPage = Input(Bool())
+    val pbopIssueActive = Input(Bool())
+    val pbopIssueOffset = Input(SInt(offsetWidth.W))
     val tlb_req = new L2ToL1TlbIO(nRespDups= 1)
     val req = DecoupledIO(new PrefetchReq)
     val resp = Flipped(DecoupledIO(new PrefetchResp))
   })
   // 0 / 1: whether to enable
   private val cstEnable = Constantin.createRecord("vbop_enable"+cacheParams.hartId.toString, initValue = 1)
+  private val cstAvoidPbopOverlap =
+    Constantin.createRecord("vbop_avoid_pbop_overlap"+cacheParams.hartId.toString, initValue = 1)
   val enable = io.enable && cstEnable.orR
+  val avoidPbopOverlap = cstAvoidPbopOverlap.orR
 
   val delayQueue = Module(new DelayQueue("vbop"))
   val rrTable = Module(new RecentRequestTable("vbop"))
   val scoreTable = Module(new OffsetScoreTable("vbop"))
   val reqFilter = Module(new PrefetchReqBuffer)
+  val student = if (enableStudentCover) Some(Module(new StudentCoverageLearner("vbop"))) else None
+  val studentTrainReady = student.map(_.io.trainReady).getOrElse(true.B)
 
   val s1_req_valid = RegInit(false.B)
   val s0_ready, s1_ready = WireInit(false.B)
@@ -697,40 +1236,63 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   /* s0 train */
   val prefetchOffset = scoreTable.io.prefetchOffset
   val prefetchDisable = scoreTable.io.prefetchDisable
+  val studentSelectedOffset = student.map(_.io.selectedOffset).getOrElse(prefetchOffset)
+  val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
+  val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, prefetchOffset)
+  val issueEnable = studentSelectedEnable || !prefetchDisable
   // NOTE: vaddr from l1 to l2 has no offset bits
   val s0_reqVaddr = io.train.bits.vaddr.getOrElse(0.U)
   val s0_oldFullAddr = if(virtualTrain) Cat(io.train.bits.vaddr.getOrElse(0.U), 0.U(offsetBits.W)) else io.train.bits.addr
   val s0_oldFullAddrNoOff = s0_oldFullAddr(s0_oldFullAddr.getWidth-1, offsetBits)
-  val s0_newFullAddr = s0_oldFullAddr + signedExtend((prefetchOffset << offsetBits), fullAddrBits)
+  val s0_newFullAddr = s0_oldFullAddr + signedExtend((issueOffset << offsetBits), fullAddrBits)
+  val s0_newPaddr = io.train.bits.addr + signedExtend((issueOffset << offsetBits), fullAddressBits)
   val s0_crossPage = getPPN(s0_newFullAddr) =/= getPPN(s0_oldFullAddr) // unequal tags
+  val vbopAvoidedByPbop =
+    avoidPbopOverlap &&
+    enable &&
+    issueEnable &&
+    !s0_crossPage &&
+    io.pbopIssueActive &&
+    io.pbopIssueOffset === issueOffset.asSInt
 
   rrTable.io.r <> scoreTable.io.test
   rrTable.io.w <> delayQueue.io.out
   delayQueue.io.pfCtrlOfDelayLatency := io.pfCtrlOfDelayLatency
-  delayQueue.io.in.valid := io.train.valid
+  // Student phase-end is a deliberate one-cycle bubble, so both teacher and RR updates stop here.
+  delayQueue.io.in.valid := io.train.valid && studentTrainReady
   delayQueue.io.in.bits := s0_oldFullAddrNoOff
-  scoreTable.io.req.valid := io.train.valid
+  scoreTable.io.req.valid := io.train.valid && studentTrainReady
   scoreTable.io.req.bits := s0_oldFullAddr
+  student.foreach { learner =>
+    learner.io.train.valid := scoreTable.io.req.fire
+    learner.io.train.bits := s0_oldFullAddr
+    learner.io.teacherPhaseEnd := scoreTable.io.phaseEndPulse
+    learner.io.teacherBestOffset := scoreTable.io.phaseBestOffsetCommitted
+    learner.io.teacherIssueEnable := scoreTable.io.phaseIssueEnable
+  }
 
   /* s1 get or send req */
   val s1_needT = RegEnable(io.train.bits.needT, s0_fire)
   val s1_source = RegEnable(io.train.bits.source, s0_fire)
   val s1_newFullAddr = RegEnable(s0_newFullAddr, s0_fire)
+  val s1_newPaddr = RegEnable(s0_newPaddr, s0_fire)
+  val s1_issueOffset = RegEnable(issueOffset.asSInt, s0_fire)
+  val s1_samePagePaddrValid = RegEnable(!s0_crossPage, s0_fire)
   // val out_req = Wire(new PrefetchReq)
   // val out_req_valid = Wire(Bool())
   // val out_drop_req = WireInit(false.B)
 
   // pipeline control signal
   if (virtualTrain) {
-    s0_ready := delayQueue.io.in.ready && scoreTable.io.req.ready && s1_ready
+    s0_ready := delayQueue.io.in.ready && scoreTable.io.req.ready && s1_ready && studentTrainReady
     s1_ready := reqFilter.io.in_req.ready || !s1_req_valid
   } else {
-    s0_ready := s1_ready
+    s0_ready := s1_ready && studentTrainReady
     s1_ready := io.req.ready || !s1_req_valid
   }
   when(s0_fire) {
-    if(virtualTrain) s1_req_valid := enable && !prefetchDisable && io.pbopCrossPage // now pbopCrossPage is true.B by default
-    else s1_req_valid := enable && !prefetchDisable && !s0_crossPage // stop prefetch when prefetch req crosses pages
+    if(virtualTrain) s1_req_valid := enable && issueEnable && !vbopAvoidedByPbop
+    else s1_req_valid := enable && issueEnable && !s0_crossPage // stop prefetch when prefetch req crosses pages
   }.elsewhen(s1_fire){
     s1_req_valid := false.B
   }
@@ -750,6 +1312,9 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     reqFilter.io.in_req.bits.needT := s1_needT
     reqFilter.io.in_req.bits.source := s1_source
     reqFilter.io.in_req.bits.isBOP := true.B
+    reqFilter.io.in_req.bits.issueOffset := s1_issueOffset
+    reqFilter.io.in_req.bits.samePagePaddrValid := s1_samePagePaddrValid
+    reqFilter.io.in_req.bits.samePagePaddr := s1_newPaddr
   }
 
   if(virtualTrain){
@@ -772,6 +1337,8 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     io.req.bits.isBOP := true.B
   }
 
+  val prefetchSentIssueOffset = if (virtualTrain) reqFilter.io.out_issueOffset else s1_issueOffset
+
   for (off <- offsetList) {
     if (off < 0) {
       XSPerfAccumulate("best_offset_neg_" + (-off).toString, prefetchOffset === off.S(offsetWidth.W).asUInt)
@@ -780,6 +1347,7 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     }
   }
   XSPerfAccumulate("bop_req", io.req.fire)
+  emitOffsetDistCounters("prefetch_sent_issue_offset", prefetchSentIssueOffset, io.req.fire)
   XSPerfAccumulate("bop_train", io.train.fire)
   XSPerfAccumulate("bop_resp", io.resp.fire)
   XSPerfAccumulate("bop_train_stall_for_st_not_ready", io.train.valid && !scoreTable.io.req.ready)
@@ -789,8 +1357,10 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   }else{
     XSPerfAccumulate("bop_cross_page", scoreTable.io.req.fire && s0_crossPage)
   }
+  XSPerfAccumulate("bop_drop_for_pbop_overlap", scoreTable.io.req.fire && vbopAvoidedByPbop)
   XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
   XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && prefetchDisable)
+  XSPerfAccumulate("bop_student_takeover", scoreTable.io.req.fire && studentSelectedEnable)
 }
 
 class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
@@ -798,7 +1368,8 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     val enable = Input(Bool())
     val pfCtrlOfDelayLatency = Input(UInt(10.W))
     val train = Flipped(DecoupledIO(new PrefetchTrain))
-    val pbopCrossPage = Output(Bool())
+    val issueActive = Output(Bool())
+    val issueOffset = Output(SInt(offsetWidth.W))
     val req = DecoupledIO(new PrefetchReq)
     val resp = Flipped(DecoupledIO(new PrefetchResp))
   })
@@ -810,24 +1381,39 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val delayQueue = Module(new DelayQueue("pbop"))
   val rrTable = Module(new RecentRequestTable("pbop"))
   val scoreTable = Module(new OffsetScoreTable("pbop"))
+  val student = if (enableStudentCover) Some(Module(new StudentCoverageLearner("pbop"))) else None
+  val studentTrainReady = student.map(_.io.trainReady).getOrElse(true.B)
 
   val prefetchOffset = scoreTable.io.prefetchOffset
   val prefetchDisable = scoreTable.io.prefetchDisable
+  val studentSelectedOffset = student.map(_.io.selectedOffset).getOrElse(prefetchOffset)
+  val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
+  val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, prefetchOffset)
+  val issueEnable = studentSelectedEnable || !prefetchDisable
   val oldAddr = io.train.bits.addr
   val oldAddrNoOff = oldAddr(oldAddr.getWidth-1, offsetBits)
-  val newAddr = oldAddr + signedExtend((prefetchOffset << offsetBits), fullAddressBits)
+  val newAddr = oldAddr + signedExtend((issueOffset << offsetBits), fullAddressBits)
 
   rrTable.io.r <> scoreTable.io.test
   rrTable.io.w <> delayQueue.io.out
   delayQueue.io.pfCtrlOfDelayLatency := io.pfCtrlOfDelayLatency
-  delayQueue.io.in.valid := io.train.valid
+  // Student phase-end is a deliberate one-cycle bubble, so both teacher and RR updates stop here.
+  delayQueue.io.in.valid := io.train.valid && studentTrainReady
   delayQueue.io.in.bits := oldAddrNoOff
-  scoreTable.io.req.valid := io.train.valid
+  scoreTable.io.req.valid := io.train.valid && studentTrainReady
   scoreTable.io.req.bits := oldAddr
+  student.foreach { learner =>
+    learner.io.train.valid := scoreTable.io.req.fire
+    learner.io.train.bits := oldAddr
+    learner.io.teacherPhaseEnd := scoreTable.io.phaseEndPulse
+    learner.io.teacherBestOffset := scoreTable.io.phaseBestOffsetCommitted
+    learner.io.teacherIssueEnable := scoreTable.io.phaseIssueEnable
+  }
 
   val req = Reg(new PrefetchReq)
   val req_valid = RegInit(false.B)
-  val crossPage = getPPN(newAddr) =/= getPPN(oldAddr) // unequal tags
+  val reqIssueOffset = RegInit(0.S(offsetWidth.W))
+  val crossPageReq = getPPN(newAddr) =/= getPPN(oldAddr) // unequal tags
   when(io.req.fire) {
     req_valid := false.B
   }
@@ -836,14 +1422,16 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     req.set := parseFullAddress(newAddr)._2
     req.needT := io.train.bits.needT
     req.source := io.train.bits.source
-    req_valid := enable && !crossPage && !prefetchDisable // stop prefetch when prefetch req crosses pages
+    reqIssueOffset := issueOffset.asSInt
+    req_valid := enable && !crossPageReq && issueEnable // stop prefetch when prefetch req crosses pages
   }
 
-  io.pbopCrossPage := crossPage
+  io.issueActive := enable && issueEnable
+  io.issueOffset := issueOffset.asSInt
   io.req.valid := req_valid
   io.req.bits := req
   io.req.bits.pfSource := MemReqSource.Prefetch2L2PBOP.id.U
-  io.train.ready := delayQueue.io.in.ready && scoreTable.io.req.ready && (!req_valid || io.req.ready)
+  io.train.ready := delayQueue.io.in.ready && scoreTable.io.req.ready && (!req_valid || io.req.ready) && studentTrainReady
   io.resp.ready := rrTable.io.w.ready
 
   for (off <- offsetList) {
@@ -854,10 +1442,12 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     }
   }
   XSPerfAccumulate("bop_req", io.req.fire)
+  emitOffsetDistCounters("prefetch_sent_issue_offset", reqIssueOffset, io.req.fire)
   XSPerfAccumulate("bop_train", io.train.fire)
   XSPerfAccumulate("bop_resp", io.resp.fire)
   XSPerfAccumulate("bop_train_stall_for_st_not_ready", io.train.valid && !scoreTable.io.req.ready)
-  XSPerfAccumulate("bop_drop_for_cross_page", scoreTable.io.req.fire && crossPage)
+  XSPerfAccumulate("bop_drop_for_cross_page", scoreTable.io.req.fire && crossPageReq)
   XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
   XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && prefetchDisable)
+  XSPerfAccumulate("bop_student_takeover", scoreTable.io.req.fire && studentSelectedEnable)
 }
