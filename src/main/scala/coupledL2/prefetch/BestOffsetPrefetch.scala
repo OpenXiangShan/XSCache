@@ -620,10 +620,16 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   val injectIdx = Mux(hasFree, freeIdx, victimIdx)
 
   val endSelectedValid = pool(endBestIdx).valid
-  val endSelectedCov = pool(endBestIdx).curPhaseCov
+  // Select the coverage through an explicit mux so XSLog's tapAndRead does not
+  // create a probe on a dynamically indexed aggregate field.
+  val endSelectedCov = MuxLookup(endBestIdx, 0.U(studentPhaseTrainBits.W))(
+    pool.indices.map(i => i.U -> pool(i).curPhaseCov)
+  )
   val endSelectedEnable = endSelectedValid && covThresholdMet(endSelectedCov, endTrainCount)
   val endSelectedOffset = pool(endBestIdx).offset
-  val endWorstCov = pool(endWorstIdx).curPhaseCov
+  val endWorstCov = MuxLookup(endWorstIdx, 0.U(studentPhaseTrainBits.W))(
+    pool.indices.map(i => i.U -> pool(i).curPhaseCov)
+  )
 
   when(state === s_training) {
     when(io.teacherPhaseEnd) {
