@@ -484,12 +484,23 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // GrantData in aMergeTask even though the outer task opcode is HintAck.
   // TODO: Move this L2 MDP trigger to the MSHR cycle that receives the final
   // refill data, so dependent-address generation does not wait for MainPipe.
+  val mdpCrosslineDrop = WireDefault(false.B)
   io.mdpRefill.foreach { refill =>
     // An MDP marker on a HintAck can only have been promoted from a merged L1
     // data request; the refill buffer therefore contains the demanded line even
     // if mergeA metadata and the grant task become visible in the same cycle.
     val mergeGrantData = mshr_hintack_s3 && req_s3.mdpHint
     val mdpRefillHasData = mshr_grantdata_s3 || mshr_accessackdata_s3 || mergeGrantData
+    val mdpLoadBytesMinusOne = MuxLookup(req_s3.mdpLoadSize, 0.U(offsetBits.W))(Seq(
+      0.U -> 0.U(offsetBits.W),
+      1.U -> 1.U(offsetBits.W),
+      2.U -> 3.U(offsetBits.W),
+      3.U -> 7.U(offsetBits.W)
+    ))
+    // A single refill buffer line cannot reconstruct a cross-line load. Drop
+    // it rather than feed a truncated pointer value into the L2 MDP pipeline.
+    val mdpLoadLastByte = req_s3.mdpVaddr(offsetBits - 1, 0) +& mdpLoadBytesMinusOne
+    val mdpLoadFitsRefillLine = !mdpLoadLastByte(offsetBits)
     val rawData = (io.refillBufResp_s3.bits.data >> (req_s3.mdpVaddr(offsetBits - 1, 0) << 3))(63, 0)
     val loadData = MuxLookup(req_s3.mdpLoadSize, rawData)(Seq(
       0.U -> Mux(req_s3.mdpLoadUnsigned, ZeroExt(rawData(7, 0), 64), SignExt(rawData(7, 0), 64)),
@@ -498,8 +509,13 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       3.U -> rawData
     ))
 
-    refill.valid := task_s3.valid && mdpRefillHasData && !retry &&
+    val mdpRefillEligible = task_s3.valid && mdpRefillHasData && !retry &&
       io.refillBufResp_s3.valid && req_s3.mdpHint && !req_s3.denied && !req_s3.corrupt
+    refill.valid := mdpRefillEligible && mdpLoadFitsRefillLine
+    mdpCrosslineDrop := mdpRefillEligible && !mdpLoadFitsRefillLine
+    when(refill.valid) {
+      assert(mdpLoadFitsRefillLine, "L2 MDP refill must not use cross-line load data")
+    }
     refill.bits.data := loadData
     refill.bits.imm := req_s3.mdpImm
     refill.bits.chainImm := req_s3.mdpChainImm
@@ -1043,6 +1059,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   XSPerfAccumulate("mshr_accessackdata_req", task_s3.valid && mshr_accessackdata_s3 && !retry)
   XSPerfAccumulate("mshr_hintack_req", task_s3.valid && mshr_hintack_s3 && !retry)
   XSPerfAccumulate("l2_mdp_mainpipe_refill", io.mdpRefill.map(_.valid).getOrElse(false.B))
+  XSPerfAccumulate("l2_mdp_mainpipe_crossline_drop", mdpCrosslineDrop)
   XSPerfAccumulate(
     "l2_mdp_mainpipe_chain_refill",
     io.mdpRefill.map(refill => refill.valid && refill.bits.chainValid).getOrElse(false.B)

@@ -125,6 +125,15 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
   private val idxBits = log2Ceil(entriesNum)
   private val vlineBits = fullVAddrBits - offsetBits
   private val plineBits = fullAddressBits - offsetBits
+  // Keep the same first-replay cooldown as L2 BOP. Only the legacy/chain MDP
+  // origins are controlled: stride/stream and their follow-on paths retain
+  // the V0.5 immediate retry behavior required by the V0.6 scope.
+  private val tlbRetryWaitCycles = 10
+  private val tlbRetryWaitWidth = log2Ceil(tlbRetryWaitCycles + 1)
+  private val mdpOriginChain = 2.U(3.W)
+  private val mdpOriginLegacy = 4.U(3.W)
+  private def isRetryControlledOrigin(origin: UInt): Bool =
+    origin === mdpOriginLegacy || origin === mdpOriginChain
 
   class Entry extends PrefetchBundle {
     val vline = UInt(vlineBits.W)
@@ -132,6 +141,13 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
     val paddrValid = Bool()
     // A miss keeps the entry valid; this bit marks subsequent TLB attempts.
     val tlbMiss = Bool()
+    // Retry policy follows the latest same-line candidate until its first TLB
+    // issue, then retains this origin for the rest of that translation life.
+    val tlbInFlight = Bool()
+    val tlbRetryOrigin = UInt(3.W)
+    val tlbRetryControlled = Bool()
+    val tlbRetryArmed = Bool()
+    val tlbRetryWait = UInt(tlbRetryWaitWidth.W)
     val triggerPC = UInt(64.W)
     val triggerVaddr = UInt(64.W)
     val targetVaddr = UInt(fullVAddrBits.W)
@@ -161,6 +177,11 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
 
   val entries = RegInit(VecInit(Seq.fill(entriesNum)(0.U.asTypeOf(new Entry))))
   val valids = RegInit(VecInit(Seq.fill(entriesNum)(false.B)))
+  val tlbArb = Module(new RRArbiter(new L2TlbReq, entriesNum))
+  val pfArb = Module(new Arbiter(UInt(idxBits.W), entriesNum))
+  // The arbiter reads registered entry state, so this pulse can safely guard
+  // same-cycle metadata promotion without creating a candidate-ready loop.
+  val tlbIssueOH = VecInit(tlbArb.io.in.map(_.fire))
 
   // Deduplicate exact virtual cache lines. New lines only consume invalid
   // entries, so temporary fullness backpressures the candidate queue instead
@@ -172,13 +193,17 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
   val hasInvalid = invalidVec.asUInt.orR
   val matchIdx = PriorityEncoder(matchVec)
   val allocIdx = PriorityEncoder(invalidVec)
-  io.candidate.ready := hasMatch || hasInvalid
 
   when(io.candidate.fire && !hasMatch) {
     entries(allocIdx).vline := candidateLine
     entries(allocIdx).pline := 0.U
     entries(allocIdx).paddrValid := false.B
     entries(allocIdx).tlbMiss := false.B
+    entries(allocIdx).tlbInFlight := false.B
+    entries(allocIdx).tlbRetryOrigin := io.candidate.bits.origin
+    entries(allocIdx).tlbRetryControlled := isRetryControlledOrigin(io.candidate.bits.origin)
+    entries(allocIdx).tlbRetryArmed := false.B
+    entries(allocIdx).tlbRetryWait := 0.U
     entries(allocIdx).triggerPC := io.candidate.bits.triggerPC
     entries(allocIdx).triggerVaddr := io.candidate.bits.triggerVaddr
     entries(allocIdx).targetVaddr := io.candidate.bits.targetVaddr
@@ -195,6 +220,10 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
 
   // A chain-bearing candidate must atomically promote an existing same-line
   // translation entry. A non-chain duplicate never clears recursive context.
+  // Before the first TLB issue it also defines the retry class; once a probe
+  // starts, retry metadata freezes even if the outgoing chain payload improves.
+  val promotionCanSetRetryPolicy = !entries(matchIdx).tlbInFlight &&
+    !entries(matchIdx).tlbMiss && !entries(matchIdx).tlbRetryArmed && !tlbIssueOH(matchIdx)
   when(io.candidate.fire && hasMatch && io.candidate.bits.chainValid) {
     entries(matchIdx).triggerPC := io.candidate.bits.triggerPC
     entries(matchIdx).triggerVaddr := io.candidate.bits.triggerVaddr
@@ -207,22 +236,43 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
     entries(matchIdx).loadSize := io.candidate.bits.loadSize
     entries(matchIdx).loadUnsigned := io.candidate.bits.loadUnsigned
     entries(matchIdx).source := io.candidate.bits.source
+    when(promotionCanSetRetryPolicy) {
+      entries(matchIdx).tlbRetryOrigin := io.candidate.bits.origin
+      entries(matchIdx).tlbRetryControlled := isRetryControlledOrigin(io.candidate.bits.origin)
+    }
   }
 
   /* TLB s0: arbitrate one untranslated entry. */
-  val tlbArb = Module(new RRArbiter(new L2TlbReq, entriesNum))
-  val pfArb = Module(new Arbiter(UInt(idxBits.W), entriesNum))
-  val s0_tlbFireOH = VecInit(tlbArb.io.in.map(_.fire))
+  val s0_tlbFireOH = tlbIssueOH
   val s0_tlbRetry = VecInit((0 until entriesNum).map(i => s0_tlbFireOH(i) && entries(i).tlbMiss)).asUInt.orR
+  val s0_tlbRetryControlled = VecInit((0 until entriesNum).map(i =>
+    s0_tlbFireOH(i) && entries(i).tlbRetryControlled
+  )).asUInt.orR
+  val s0_tlbRetryArmed = VecInit((0 until entriesNum).map(i =>
+    s0_tlbFireOH(i) && entries(i).tlbRetryArmed
+  )).asUInt.orR
+  val s0_tlbRetryLegacy = VecInit((0 until entriesNum).map(i =>
+    s0_tlbFireOH(i) && entries(i).tlbRetryOrigin === mdpOriginLegacy
+  )).asUInt.orR
+  val s0_tlbRetryChain = VecInit((0 until entriesNum).map(i =>
+    s0_tlbFireOH(i) && entries(i).tlbRetryOrigin === mdpOriginChain
+  )).asUInt.orR
   val s1_tlbFireOH = RegNext(s0_tlbFireOH, 0.U.asTypeOf(s0_tlbFireOH))
   val s2_tlbFireOH = RegNext(s1_tlbFireOH, 0.U.asTypeOf(s0_tlbFireOH))
   val s3_tlbFireOH = RegNext(s2_tlbFireOH, 0.U.asTypeOf(s0_tlbFireOH))
   val notInFlight = VecInit((0 until entriesNum).map(i =>
     !s1_tlbFireOH(i) && !s2_tlbFireOH(i) && !s3_tlbFireOH(i)
   ))
+  val tlbRetryWaiting = VecInit((0 until entriesNum).map(i =>
+    valids(i) && entries(i).tlbRetryArmed && entries(i).tlbRetryWait.orR
+  ))
 
   for (i <- 0 until entriesNum) {
-    tlbArb.io.in(i).valid := valids(i) && !entries(i).paddrValid && notInFlight(i)
+    when(tlbRetryWaiting(i)) {
+      entries(i).tlbRetryWait := entries(i).tlbRetryWait - 1.U
+    }
+    tlbArb.io.in(i).valid := valids(i) && !entries(i).paddrValid &&
+      notInFlight(i) && !tlbRetryWaiting(i)
     tlbArb.io.in(i).bits := 0.U.asTypeOf(new L2TlbReq)
     tlbArb.io.in(i).bits.vaddr := entries(i).vaddr
     tlbArb.io.in(i).bits.cmd := TlbCmd.read
@@ -231,6 +281,11 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
     tlbArb.io.in(i).bits.kill := false.B
     tlbArb.io.in(i).bits.no_translate := false.B
   }
+  for (i <- 0 until entriesNum) {
+    when(tlbArb.io.in(i).fire) {
+      entries(i).tlbInFlight := true.B
+    }
+  }
   tlbArb.io.out.ready := true.B
 
   /* TLB s0 -> s1: register and send the selected request. */
@@ -238,6 +293,18 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
   val s1_tlbReqBits = RegEnable(tlbArb.io.out.bits, tlbArb.io.out.valid)
   val s1_vaddr = RegEnable(tlbArb.io.out.bits.vaddr, tlbArb.io.out.valid)
   val s1_tlbRetry = RegNext(s0_tlbRetry, false.B)
+  val s1_tlbRetryControlled = RegNext(s0_tlbRetryControlled, false.B)
+  val s1_tlbRetryArmed = RegNext(s0_tlbRetryArmed, false.B)
+  val s1_tlbRetryLegacy = RegNext(s0_tlbRetryLegacy, false.B)
+  val s1_tlbRetryChain = RegNext(s0_tlbRetryChain, false.B)
+  val s2_tlbRetryControlled = RegNext(s1_tlbRetryControlled, false.B)
+  val s2_tlbRetryArmed = RegNext(s1_tlbRetryArmed, false.B)
+  val s2_tlbRetryLegacy = RegNext(s1_tlbRetryLegacy, false.B)
+  val s2_tlbRetryChain = RegNext(s1_tlbRetryChain, false.B)
+  val s3_tlbRetryControlled = RegNext(s2_tlbRetryControlled, false.B)
+  val s3_tlbRetryArmed = RegNext(s2_tlbRetryArmed, false.B)
+  val s3_tlbRetryLegacy = RegNext(s2_tlbRetryLegacy, false.B)
+  val s3_tlbRetryChain = RegNext(s2_tlbRetryChain, false.B)
   io.tlbReq.req.valid := s1_tlbReqValid
   io.tlbReq.req.bits := s1_tlbReqBits
   io.tlbReq.req_kill := false.B
@@ -257,22 +324,53 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
   val s3_responseMatches = s3_tlbRespValid && s3_tlbFireOH.asUInt.orR && !s3_vaddrMismatch
   val s3_miss = s3_responseMatches && s3_tlbRespBits.miss
   val s3_hit = s3_responseMatches && !s3_tlbRespBits.miss
+  val s3_tlbRetryFirstMiss = s3_miss && s3_tlbRetryControlled && !s3_tlbRetryArmed
+  val s3_tlbRetrySecondMiss = s3_miss && s3_tlbRetryControlled && s3_tlbRetryArmed
   val s3_fault = s3_hit && (
     s3_tlbRespBits.excp.head.pf.ld || s3_tlbRespBits.excp.head.gpf.ld || s3_tlbRespBits.excp.head.af.ld ||
     io.tlbReq.pmp_resp.ld || io.tlbReq.pmp_resp.mmio || Pbmt.isUncache(s3_tlbRespBits.pbmt)
   )
+  when(s3_tlbFireOH.asUInt.orR) {
+    // The old request's classification remains available through the pipelined
+    // s3 signals; this only releases future same-line candidate promotion.
+    entries(s3_idx).tlbInFlight := false.B
+  }
+  // Do not accept a same-line candidate in the cycle this entry is dropped.
+  // It must retry next cycle through the newly freed invalid slot instead of
+  // being acknowledged by deduplication and then erased by the terminal path.
+  val s3_terminalDrop = s3_tlbRetrySecondMiss || s3_fault
+  val candidateMatchesTerminalDrop = s3_terminalDrop && hasMatch && matchIdx === s3_idx
+  io.candidate.ready := (hasMatch || hasInvalid) && !candidateMatchesTerminalDrop
 
-  // Match MutiLevelPrefetchFilter semantics: retain a TLB miss and retry it
-  // after the in-flight mask clears; only a real translation/access fault drops.
+  // Keep V0.5 immediate retries for stride/stream origins. Legacy/chain MDP
+  // candidates wait ten cycles after their first miss and drop on the second.
   when(s3_miss) {
-    entries(s3_idx).tlbMiss := true.B
+    when(s3_tlbRetrySecondMiss) {
+      valids(s3_idx) := false.B
+      entries(s3_idx).tlbMiss := false.B
+      entries(s3_idx).tlbRetryControlled := false.B
+      entries(s3_idx).tlbRetryArmed := false.B
+      entries(s3_idx).tlbRetryWait := 0.U
+    }.otherwise {
+      entries(s3_idx).tlbMiss := true.B
+      when(s3_tlbRetryFirstMiss) {
+        entries(s3_idx).tlbRetryArmed := true.B
+        entries(s3_idx).tlbRetryWait := tlbRetryWaitCycles.U
+      }
+    }
   }.elsewhen(s3_fault) {
     valids(s3_idx) := false.B
     entries(s3_idx).tlbMiss := false.B
+    entries(s3_idx).tlbRetryControlled := false.B
+    entries(s3_idx).tlbRetryArmed := false.B
+    entries(s3_idx).tlbRetryWait := 0.U
   }.elsewhen(s3_hit) {
     entries(s3_idx).pline := s3_tlbRespBits.paddr.head(fullAddressBits - 1, offsetBits)
     entries(s3_idx).paddrValid := true.B
     entries(s3_idx).tlbMiss := false.B
+    entries(s3_idx).tlbRetryControlled := false.B
+    entries(s3_idx).tlbRetryArmed := false.B
+    entries(s3_idx).tlbRetryWait := 0.U
   }
 
   // All translated entries compete for the ordinary L2 PrefetchReq interface.
@@ -336,10 +434,16 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
   assert(!io.tlbReq.resp.valid || s2_tlbFireOH.asUInt.orR, "L2 MDP TLB response has no matching request")
   assert(!s3_tlbRespValid || !s3_tlbFireOH.asUInt.orR || !s3_vaddrMismatch,
     "L2 MDP TLB response is associated with the wrong virtual address")
-  val s4_tlbMiss = RegNext(s3_miss, false.B)
-  val s4_tlbMissIdx = RegEnable(s3_idx, s3_miss)
+  val s4_tlbMiss = RegNext(s3_miss && !s3_tlbRetrySecondMiss, false.B)
+  val s4_tlbMissIdx = RegEnable(s3_idx, s3_miss && !s3_tlbRetrySecondMiss)
   when(s4_tlbMiss) {
     assert(valids(s4_tlbMissIdx), "L2 MDP TLB miss must retain its prefetch entry for retry")
+  }
+  for (i <- 0 until entriesNum) {
+    assert(!valids(i) || !entries(i).tlbRetryArmed || entries(i).tlbRetryControlled,
+      "L2 MDP only legacy/chain origins may arm a delayed TLB retry")
+    assert(!tlbArb.io.in(i).fire || !tlbRetryWaiting(i),
+      "L2 MDP must not issue a TLB retry during its cooldown")
   }
   when(io.tlbReq.req.fire) {
     assert(io.tlbReq.req.bits.vaddr(offsetBits - 1, 0) === 0.U, "L2 MDP TLB request must be line-aligned")
@@ -351,6 +455,8 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
 
   // Performance counters are grouped at the end of this helper class.
   XSPerfAccumulate("l2_mdp_tlb_candidate", io.candidate.fire)
+  XSPerfAccumulate("l2_mdp_tlb_terminal_candidate_backpressure",
+    io.candidate.valid && candidateMatchesTerminalDrop)
   XSPerfAccumulate("l2_mdp_tlb_candidate_merge", io.candidate.fire && hasMatch)
   XSPerfAccumulate(
     "l2_mdp_tlb_candidate_chain_promote",
@@ -367,6 +473,19 @@ class L2MdpPrefetchBuffer(entriesNum: Int)(implicit p: Parameters)
   )
   XSPerfAccumulate("l2_mdp_tlb_miss", s3_miss)
   XSPerfAccumulate("l2_mdp_tlb_miss_retry", io.tlbReq.req.fire && s1_tlbRetry)
+  XSPerfAccumulate("l2_mdp_tlb_retry_wait_cycles", PopCount(tlbRetryWaiting))
+  XSPerfAccumulate("l2_mdp_tlb_first_miss", s3_tlbRetryFirstMiss)
+  XSPerfAccumulate("l2_mdp_tlb_retry_after_10",
+    io.tlbReq.req.fire && s1_tlbRetryControlled && s1_tlbRetryArmed)
+  XSPerfAccumulate("l2_mdp_tlb_second_miss_drop", s3_tlbRetrySecondMiss)
+  XSPerfAccumulate("l2_mdp_tlb_first_miss_legacy", s3_tlbRetryFirstMiss && s3_tlbRetryLegacy)
+  XSPerfAccumulate("l2_mdp_tlb_first_miss_chain", s3_tlbRetryFirstMiss && s3_tlbRetryChain)
+  XSPerfAccumulate("l2_mdp_tlb_retry_after_10_legacy",
+    io.tlbReq.req.fire && s1_tlbRetryControlled && s1_tlbRetryArmed && s1_tlbRetryLegacy)
+  XSPerfAccumulate("l2_mdp_tlb_retry_after_10_chain",
+    io.tlbReq.req.fire && s1_tlbRetryControlled && s1_tlbRetryArmed && s1_tlbRetryChain)
+  XSPerfAccumulate("l2_mdp_tlb_second_miss_drop_legacy", s3_tlbRetrySecondMiss && s3_tlbRetryLegacy)
+  XSPerfAccumulate("l2_mdp_tlb_second_miss_drop_chain", s3_tlbRetrySecondMiss && s3_tlbRetryChain)
   XSPerfAccumulate("l2_mdp_tlb_fault", s3_fault)
   XSPerfAccumulate("l2_mdp_prefetch_fire", io.req.fire)
   XSPerfAccumulate("l2_mdp_recursive_prefetch_fire", io.req.fire && io.req.bits.mdpHint)
