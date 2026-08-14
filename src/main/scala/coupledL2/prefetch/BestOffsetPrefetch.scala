@@ -440,6 +440,7 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
 class StudentPoolEntry(implicit p: Parameters) extends BOPBundle {
   val valid = Bool()
   val offset = SInt(offsetWidth.W)
+  val absOffset = UInt(offsetWidth.W)
   val conf = SInt(studentConfBits.W)
   val lastPhaseCov = UInt(studentPhaseTrainBits.W)
   val curPhaseCov = UInt(studentPhaseTrainBits.W)
@@ -496,43 +497,59 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   }
   
   private def isBetter(lhs: StudentPoolEntry, rhs: StudentPoolEntry): Bool = {
-    val lhsAbs = absOffset(lhs.offset)
-    val rhsAbs = absOffset(rhs.offset)
     (lhs.curPhaseCov > rhs.curPhaseCov) ||
       (lhs.curPhaseCov === rhs.curPhaseCov && (
         (lhs.conf > rhs.conf) ||
           (lhs.conf === rhs.conf && (
-            (lhsAbs < rhsAbs) ||
-              (lhsAbs === rhsAbs && lhs.offset < rhs.offset)
+            (lhs.absOffset < rhs.absOffset) ||
+              (lhs.absOffset === rhs.absOffset && lhs.offset < rhs.offset)
           ))
       ))
   }
 
   private def isWorse(lhs: StudentPoolEntry, rhs: StudentPoolEntry): Bool = {
-    val lhsAbs = absOffset(lhs.offset)
-    val rhsAbs = absOffset(rhs.offset)
     (lhs.curPhaseCov < rhs.curPhaseCov) ||
       (lhs.curPhaseCov === rhs.curPhaseCov && (
         (lhs.conf < rhs.conf) ||
           (lhs.conf === rhs.conf && (
-            (lhsAbs < rhsAbs) ||
-              (lhsAbs === rhsAbs && lhs.offset < rhs.offset)
+            (lhs.absOffset < rhs.absOffset) ||
+              (lhs.absOffset === rhs.absOffset && lhs.offset < rhs.offset)
           ))
       ))
   }
 
   // Replacement is confidence-first; it is independent of phase winner/loser ranking.
   private def isVictim(lhs: StudentPoolEntry, rhs: StudentPoolEntry): Bool = {
-    val lhsAbs = absOffset(lhs.offset)
-    val rhsAbs = absOffset(rhs.offset)
     (lhs.conf < rhs.conf) ||
       (lhs.conf === rhs.conf && (
         (lhs.lastPhaseCov < rhs.lastPhaseCov) ||
           (lhs.lastPhaseCov === rhs.lastPhaseCov && (
-            (lhsAbs > rhsAbs) ||
-              (lhsAbs === rhsAbs && lhs.offset < rhs.offset)
+            (lhs.absOffset > rhs.absOffset) ||
+              (lhs.absOffset === rhs.absOffset && lhs.offset < rhs.offset)
           ))
       ))
+  }
+
+  private type SelectNode = (StudentPoolEntry, UInt)
+
+  private def selectTree(
+    nodes: Seq[SelectNode],
+    prefer: (StudentPoolEntry, StudentPoolEntry) => Bool
+  ): SelectNode = {
+    require(nodes.nonEmpty)
+    if (nodes.length == 1) {
+      nodes.head
+    } else {
+      val nextLevel = nodes.grouped(2).map {
+        case Seq(lhs, rhs) =>
+          val takeRhs = rhs._1.valid && (!lhs._1.valid || prefer(rhs._1, lhs._1))
+          val selectedEntry = Wire(new StudentPoolEntry)
+          selectedEntry := Mux(takeRhs, rhs._1, lhs._1)
+          (selectedEntry, Mux(takeRhs, rhs._2, lhs._2))
+        case Seq(single) => single
+      }.toSeq
+      selectTree(nextLevel, prefer)
+    }
   }
 
   private def covThresholdMet(selectedCov: UInt, trainCount: UInt): Bool = {
@@ -593,23 +610,12 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   }
   
   // Select best and worst offset entries
-  val bestIdx = (1 until studentPoolSize).foldLeft(0.U(studentPoolIdxBits.W)) { (best, i) =>
-    val better = pool(i).valid &&
-      (!pool(best).valid || isBetter(pool(i), pool(best)))
-    Mux(better, i.U(studentPoolIdxBits.W), best)
-  }
-  val worstIdx = (1 until studentPoolSize).foldLeft(0.U(studentPoolIdxBits.W)) { (worst, i) =>
-    val worse = pool(i).valid &&
-      (!pool(worst).valid || isWorse(pool(i), pool(worst)))
-    Mux(worse, i.U(studentPoolIdxBits.W), worst)
-  }
+  val selectSeq = (0 until studentPoolSize).map { i =>(pool(i), i.U(studentPoolIdxBits.W)) }
+  val bestIdx = selectTree(selectSeq, isBetter)._2
+  val worstIdx = selectTree(selectSeq, isWorse)._2
 
   // Compute teacher match and injection index
-  val victimIdx = (1 until studentPoolSize).foldLeft(0.U(studentPoolIdxBits.W)) { (victim, i) =>
-    val worse = pool(i).valid &&
-      (!pool(victim).valid || isVictim(pool(i), pool(victim)))
-    Mux(worse, i.U(studentPoolIdxBits.W), victim)
-  }
+  val victimIdx = selectTree(selectSeq, isVictim)._2
   val matchVec = VecInit(pool.map { t =>
     t.valid && io.teacherIssueEnable && (io.teacherBestOffset.asSInt === t.offset)
   }).asUInt
@@ -688,6 +694,7 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
     when (endIssueEn && !endHasMatch) {
       pool(endInjectIdx).valid := true.B
       pool(endInjectIdx).offset := endTeacherOffset.asSInt
+      pool(endInjectIdx).absOffset := absOffset(endTeacherOffset.asSInt)
       pool(endInjectIdx).conf := 0.S
       pool(endInjectIdx).curPhaseCov := 0.U
       pool(endInjectIdx).lastPhaseCov := 0.U
