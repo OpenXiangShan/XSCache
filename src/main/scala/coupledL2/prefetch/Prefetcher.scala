@@ -302,7 +302,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
             enableStudentCover = true,
             studentPoolSize = 8,
             studentFilterEntries = 2048,
-            studentHashMode = "splitmix",
+            studentHashMode = "bop_rr",
             studentCovThreshold = 5,
             studentConfUseEMA = false,
             offsetList = Seq(
