@@ -5,7 +5,7 @@ import chisel3.util._
 import utility._
 import oceanus.l2._
 import oceanus.compactchi._
-import coupledL2.utils.GatedSplittedSRAM
+import xscache.coupledL2.utils.GatedSplittedSRAM
 import org.chipsalliance.cde.config.Parameters
 import utility.mbist.MbistPipeline
 
