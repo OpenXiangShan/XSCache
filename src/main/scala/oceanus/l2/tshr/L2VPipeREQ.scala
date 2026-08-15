@@ -14,7 +14,6 @@ import oceanus.chi.field.CHIFieldSize._
 import oceanus.chi.field.CHIFieldOrder._
 import oceanus.chi.field.CHIFieldMemAttr._
 import oceanus.chi.field.CHIFieldResp
-import coupledL2.tl2chi.MemAttr
 
 object L2VPipeREQ {
 
