@@ -49,7 +49,7 @@ object rocketchip extends `rocket-chip`.common.RocketChipModule with HasChisel {
 
     def scalaVersion: T[String] = T(defaultScalaVersion)
 
-    def scalaReflectIvy = mvn"org.scala-lang:scala-reflect:${scalaVersion}"
+    def scalaReflectIvy = mvn"org.scala-lang:scala-reflect:${defaultScalaVersion}"
   }
 
   object cde extends `rocket-chip`.cde.common.CDEModule with ScalaModule {
