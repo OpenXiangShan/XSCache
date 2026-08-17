@@ -23,7 +23,7 @@ import org.chipsalliance.cde.config.Parameters
 import utility._
 
 class PrefetcherMonitor(implicit p: Parameters) extends PrefetchModule {
-  val banks = 1 << bankBits
+  override val banks = 1 << bankBits
 
   val io = IO(new Bundle {
     val sliceStat = Input(Vec(banks, new PrefetchStatDelta))

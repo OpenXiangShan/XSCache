@@ -31,7 +31,7 @@ package xscache.coupledL2.prefetch
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
-import utility.{ChiselDB, Constantin, MemReqSource}
+import utility.{ChiselDB, Constantin, MemReqSource, XSPerfAccumulate}
 import utility.sram.SRAMTemplate
 import xscache.coupledL2.HasCoupledL2Parameters
 import xscache.coupledL2.utils.ReplacementPolicy
@@ -54,7 +54,7 @@ case class TPParameters(
   override val inflightEntries: Int = 16 // changed in sv48
 }
 
-trait HasTPParams extends HasCoupledL2Parameters {
+trait HasTPParams extends HasCoupledL2Parameters with HasPrefetchParameters {
   def tpParams = prefetchers.find {
     case p: TPParameters => true
     case _ => false
@@ -132,6 +132,7 @@ class tpmetaPortIO(hartIdLen: Int, fullAddressBits: Int, offsetBits: Int)(implic
 class TemporalPrefetch(implicit p: Parameters) extends TPModule {
   val io = IO(new Bundle() {
     val enable = Input(Bool())
+    val fdbkDegree = Input(UInt(degreeBits.W))
     val train = Flipped(DecoupledIO(new PrefetchTrain))
     val req = DecoupledIO(new PrefetchReq)
     val resp = Flipped(DecoupledIO(new PrefetchResp))
@@ -388,7 +389,7 @@ class TemporalPrefetch(implicit p: Parameters) extends TPModule {
     }
   }
 
-  io.req.valid := Mux(enable, sending_valid, false.B)
+  io.req.valid := Mux(enable, sending_valid && io.fdbkDegree > 0.U , false.B)
   io.req.bits.tag := sendingTag
   io.req.bits.set := sendingSet
   io.req.bits.vaddr.foreach(_ := 0.U)
@@ -401,6 +402,8 @@ class TemporalPrefetch(implicit p: Parameters) extends TPModule {
 
 
   /* Performance collection */
+  XSPerfAccumulate("tp_l2_feedback_control_drop", enable && sending_valid && io.fdbkDegree === 0.U)
+
   val triggerDB = ChiselDB.createTable("tptrigger", new triggerBundle(), basicDB = debug)
   val triggerPt = Wire(new triggerBundle())
   triggerPt.paddr := write_record_trigger.paddr

@@ -85,7 +85,7 @@ trait HasCDPParams extends HasPrefetcherHelper with HasCoupledL2Parameters {
   }.get.asInstanceOf[CDPParameters]
   require(cdpParams.pfDepthMax < (1 << cdpParams.pfDepthBits), s"pfDepthMax(${cdpParams.pfDepthMax}) should be less than 2^pfDepthBits(${cdpParams.pfDepthBits})")
 
-  val banks = 1 << bankBits
+  override val banks = 1 << bankBits
 
   val debug = cdpParams.debug
 

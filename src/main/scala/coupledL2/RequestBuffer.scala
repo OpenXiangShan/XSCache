@@ -31,6 +31,7 @@ class ReqEntry(entries: Int = 4)(implicit p: Parameters) extends L2Bundle() {
   val valid    = Bool()
   val rdy      = Bool()
   val task     = new TaskBundle()
+  val timer    = UInt(timestampBits.W) // for prefetch controller analysis
 
   /* blocked by MainPipe
   * [3] by stage1, a same-set entry just fired
@@ -122,7 +123,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   def conflictMaskFromA(a: TaskBundle): UInt =
     conflictMask(a) & VecInit(io.mshrInfo.map(_.bits.fromA)).asUInt
 
-  def latePrefetch(a: TaskBundle): (Bool, UInt) = {
+  def latePrefetch(a: TaskBundle): (Bool, UInt, UInt) = {
     val matchVec = VecInit(io.mshrInfo.map(s =>
     s.valid && s.bits.isPrefetch && sameAddr(a, s.bits) && !s.bits.willFree &&
       a.fromA && (a.opcode === AcquireBlock || a.opcode === AcquirePerm)
@@ -130,7 +131,8 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     val matched = matchVec.asUInt.orR
     assert(PopCount(matchVec) <= 1.U, "Multiple late prefetch MSHRs matched")
     val matchSrc = Mux1H(matchVec, io.mshrInfo.map(_.bits.reqSource))
-    (matched, matchSrc)
+    val matchLatency = Mux1H(matchVec, io.mshrInfo.map(_.bits.reqTimer))
+    (matched, matchSrc, matchLatency)
   }
 
   // count ways
@@ -202,6 +204,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   val latePrefetchRes = latePrefetch(in) // demand request hit entry of pf
   io.pfStatInMSHR.hitPf := latePrefetchRes._1 && io.in.valid && !sameAddr(in, RegNext(in))
   io.pfStatInMSHR.hitPfReqSrc := latePrefetchRes._2
+  io.pfStatInMSHR.hitPfLatency := latePrefetchRes._3
   io.pfStatInMSHR.pfLate := io.in.valid && dup
   io.pfStatInMSHR.pfLateReqSrc := io.in.bits.reqSource
   io.pfStatInMSHR.pfLateHitReqSrc := dupHitSrc
@@ -231,6 +234,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
         io.mainPipeBlock(1),
         0.U(1.W))
       entry.waitMS  := conflictMask(in)
+      entry.timer   := 1.U
       assert(PopCount(conflictMaskFromA(in)) <= 2.U)
     }
   }
@@ -254,6 +258,8 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   /* ======== Update rdy and masks ======== */
   buffer.zipWithIndex.foreach { case (e, i) =>
     when(e.valid) {
+      e.timer := e.timer + 1.U
+
       val waitMSUpdate  = WireInit(e.waitMS)
 //      val depMaskUpdate = WireInit(e.depMask)
 
@@ -312,6 +318,11 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
         e.valid := false.B
       }
   }
+
+  io.pfStatInMSHR.pfReleaseFromReqBuffer := chosenQ.io.deq.fire && !cancel &&
+    Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.task.fromA && e.task.opcode === Hint))
+  io.pfStatInMSHR.reqBufferPfReqSrc := Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.task.reqSource))
+  io.pfStatInMSHR.reqBufferHoldLatency := Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.timer))
 
   // for Dir to choose a free way
   io.out.bits.wayMask := Fill(cacheParams.ways, 1.U(1.W))
