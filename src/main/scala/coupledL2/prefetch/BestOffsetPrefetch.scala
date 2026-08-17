@@ -852,7 +852,7 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
     state := s_training
   }
 
-  io.trainReady := state === s_training
+  io.trainReady := state === s_training && !io.teacherPhaseEnd
   io.selectedOffset := studentSelectedOffset.asUInt
   io.selectedValid := studentSelectedValid
   io.selectedEnable := studentSelectedEnable
@@ -1258,13 +1258,12 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   rrTable.io.r <> scoreTable.io.test
   rrTable.io.w <> delayQueue.io.out
   delayQueue.io.pfCtrlOfDelayLatency := io.pfCtrlOfDelayLatency
-  // Student phase-end is a deliberate one-cycle bubble, so both teacher and RR updates stop here.
-  delayQueue.io.in.valid := io.train.valid && studentTrainReady
+  delayQueue.io.in.valid := io.train.valid && studentTrainReady && scoreTable.io.req.ready && s1_ready
   delayQueue.io.in.bits := s0_oldFullAddrNoOff
-  scoreTable.io.req.valid := io.train.valid && studentTrainReady
+  scoreTable.io.req.valid := io.train.valid && delayQueue.io.in.ready && studentTrainReady && s1_ready
   scoreTable.io.req.bits := s0_oldFullAddr
   student.foreach { learner =>
-    learner.io.train.valid := scoreTable.io.req.fire
+    learner.io.train.valid := io.train.valid && delayQueue.io.in.ready && scoreTable.io.req.ready && s1_ready
     learner.io.train.bits := s0_oldFullAddr
     learner.io.teacherPhaseEnd := scoreTable.io.phaseEndPulse
     learner.io.teacherBestOffset := scoreTable.io.phaseBestOffsetCommitted
@@ -1284,10 +1283,10 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
 
   // pipeline control signal
   if (virtualTrain) {
-    s0_ready := delayQueue.io.in.ready && scoreTable.io.req.ready && s1_ready && studentTrainReady
+    s0_ready := delayQueue.io.in.ready && scoreTable.io.req.ready && studentTrainReady && s1_ready
     s1_ready := reqFilter.io.in_req.ready || !s1_req_valid
   } else {
-    s0_ready := s1_ready && studentTrainReady
+    s0_ready := delayQueue.io.in.ready && scoreTable.io.req.ready && studentTrainReady && s1_ready
     s1_ready := io.req.ready || !s1_req_valid
   }
   when(s0_fire) {
@@ -1299,7 +1298,7 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
 
   // out value
   io.train.ready := s0_ready
-  io.resp.ready := rrTable.io.w.ready
+  io.resp.ready := true.B
   io.tlb_req.resp.ready := true.B
 
   // different situation
@@ -1384,55 +1383,63 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val student = if (enableStudentCover) Some(Module(new StudentCoverageLearner("pbop"))) else None
   val studentTrainReady = student.map(_.io.trainReady).getOrElse(true.B)
 
+  val s1_req_valid = RegInit(false.B)
+  val s0_ready, s1_ready = WireInit(false.B)
+  val s0_fire = s0_ready && io.train.valid
+  val s1_fire = s1_ready && s1_req_valid
+
+  /* s0 train */
   val prefetchOffset = scoreTable.io.prefetchOffset
   val prefetchDisable = scoreTable.io.prefetchDisable
   val studentSelectedOffset = student.map(_.io.selectedOffset).getOrElse(prefetchOffset)
   val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
   val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, prefetchOffset)
   val issueEnable = studentSelectedEnable || !prefetchDisable
-  val oldAddr = io.train.bits.addr
-  val oldAddrNoOff = oldAddr(oldAddr.getWidth-1, offsetBits)
-  val newAddr = oldAddr + signedExtend((issueOffset << offsetBits), fullAddressBits)
+  val s0_oldAddr = io.train.bits.addr
+  val s0_oldAddrNoOff = s0_oldAddr(s0_oldAddr.getWidth-1, offsetBits)
+  val s0_newAddr = s0_oldAddr + signedExtend((issueOffset << offsetBits), fullAddressBits)
+  val s0_crossPage = getPPN(s0_newAddr) =/= getPPN(s0_oldAddr) // unequal tags
 
   rrTable.io.r <> scoreTable.io.test
   rrTable.io.w <> delayQueue.io.out
   delayQueue.io.pfCtrlOfDelayLatency := io.pfCtrlOfDelayLatency
-  // Student phase-end is a deliberate one-cycle bubble, so both teacher and RR updates stop here.
-  delayQueue.io.in.valid := io.train.valid && studentTrainReady
-  delayQueue.io.in.bits := oldAddrNoOff
-  scoreTable.io.req.valid := io.train.valid && studentTrainReady
-  scoreTable.io.req.bits := oldAddr
+  delayQueue.io.in.valid := io.train.valid && scoreTable.io.req.ready && studentTrainReady && s1_ready
+  delayQueue.io.in.bits := s0_oldAddrNoOff
+  scoreTable.io.req.valid := io.train.valid && delayQueue.io.in.ready && studentTrainReady && s1_ready
+  scoreTable.io.req.bits := s0_oldAddr
   student.foreach { learner =>
-    learner.io.train.valid := scoreTable.io.req.fire
-    learner.io.train.bits := oldAddr
+    learner.io.train.valid := io.train.valid && delayQueue.io.in.ready && scoreTable.io.req.ready && s1_ready
+    learner.io.train.bits := s0_oldAddr
     learner.io.teacherPhaseEnd := scoreTable.io.phaseEndPulse
     learner.io.teacherBestOffset := scoreTable.io.phaseBestOffsetCommitted
     learner.io.teacherIssueEnable := scoreTable.io.phaseIssueEnable
   }
 
-  val req = Reg(new PrefetchReq)
-  val req_valid = RegInit(false.B)
-  val reqIssueOffset = RegInit(0.S(offsetWidth.W))
-  val crossPageReq = getPPN(newAddr) =/= getPPN(oldAddr) // unequal tags
-  when(io.req.fire) {
-    req_valid := false.B
-  }
-  when(scoreTable.io.req.fire) {
-    req.tag := parseFullAddress(newAddr)._1
-    req.set := parseFullAddress(newAddr)._2
-    req.needT := io.train.bits.needT
-    req.source := io.train.bits.source
-    reqIssueOffset := issueOffset.asSInt
-    req_valid := enable && !crossPageReq && issueEnable // stop prefetch when prefetch req crosses pages
+  /* s1 send req */
+  val s1_req = Reg(new PrefetchReq)
+  val s1_issueOffset = RegInit(0.S(offsetWidth.W))
+
+  s0_ready := delayQueue.io.in.ready && scoreTable.io.req.ready && studentTrainReady && s1_ready
+  s1_ready := io.req.ready || !s1_req_valid
+
+  when(s0_fire) {
+    s1_req.tag := parseFullAddress(s0_newAddr)._1
+    s1_req.set := parseFullAddress(s0_newAddr)._2
+    s1_req.needT := io.train.bits.needT
+    s1_req.source := io.train.bits.source
+    s1_issueOffset := issueOffset.asSInt
+    s1_req_valid := enable && !s0_crossPage && issueEnable // stop prefetch when prefetch req crosses pages
+  }.elsewhen(s1_fire) {
+    s1_req_valid := false.B
   }
 
   io.issueActive := enable && issueEnable
   io.issueOffset := issueOffset.asSInt
-  io.req.valid := req_valid
-  io.req.bits := req
+  io.req.valid := s1_req_valid
+  io.req.bits := s1_req
   io.req.bits.pfSource := MemReqSource.Prefetch2L2PBOP.id.U
-  io.train.ready := delayQueue.io.in.ready && scoreTable.io.req.ready && (!req_valid || io.req.ready) && studentTrainReady
-  io.resp.ready := rrTable.io.w.ready
+  io.train.ready := s0_ready
+  io.resp.ready := true.B
 
   for (off <- offsetList) {
     if (off < 0) {
@@ -1442,11 +1449,11 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     }
   }
   XSPerfAccumulate("bop_req", io.req.fire)
-  emitOffsetDistCounters("prefetch_sent_issue_offset", reqIssueOffset, io.req.fire)
+  emitOffsetDistCounters("prefetch_sent_issue_offset", s1_issueOffset, io.req.fire)
   XSPerfAccumulate("bop_train", io.train.fire)
   XSPerfAccumulate("bop_resp", io.resp.fire)
   XSPerfAccumulate("bop_train_stall_for_st_not_ready", io.train.valid && !scoreTable.io.req.ready)
-  XSPerfAccumulate("bop_drop_for_cross_page", scoreTable.io.req.fire && crossPageReq)
+  XSPerfAccumulate("bop_drop_for_cross_page", scoreTable.io.req.fire && s0_crossPage)
   XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
   XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && prefetchDisable)
   XSPerfAccumulate("bop_student_takeover", scoreTable.io.req.fire && studentSelectedEnable)

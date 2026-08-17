@@ -282,7 +282,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
             studentLargeOffsetPriorityEnable = false,
             studentLargeOffsetPriorityCoeffPct = 99,
             studentFilterEntries = 2048,
-            studentHashMode = "splitmix",
+            studentHashMode = "bop_rr",
             studentHashCount = 1,
             offsetList = Seq(
               -32, -30, -27, -25, -24, -20, -18, -16, -15,
