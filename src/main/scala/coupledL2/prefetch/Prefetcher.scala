@@ -214,7 +214,7 @@ class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
 }
 
 class Prefetcher(implicit p: Parameters) extends PrefetchModule {
-  val banks = 1 << bankBits
+  override val banks = 1 << bankBits
 
   val io = IO(new PrefetchTopIO)
   val tpio = IO(new Bundle() {
