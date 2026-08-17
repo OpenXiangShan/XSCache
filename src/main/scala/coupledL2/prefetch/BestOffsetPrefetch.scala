@@ -284,7 +284,7 @@ class RecentRequestTable(name: String)(implicit p: Parameters) extends BOPModule
   class WRRTEntry extends Bundle{
     val addr = UInt(fullAddrBits.W)
   }
-  val wrrt = ChiselDB.createTable(name+"WriteRecentRequestTable", new WRRTEntry, basicDB = false)
+  val wrrt = ChiselDB.createTable(name+"WriteRecentRequestTable", new WRRTEntry, basicDB = true)
   val e = Wire(new WRRTEntry)
   e.addr := wAddr
   wrrt.log(e, io.w.valid && !io.r.req.valid, site = "RecentRequestTable", clock, reset)
@@ -424,7 +424,7 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
     val offsets = Vec(offsetList.length, UInt(offsetWidth.W))
     val scores = Vec(offsetList.length, UInt(scoreBits.W))
   }
-  val l2BopTrainTable = ChiselDB.createTable(name+"OffsetScoreTable", new BopTrainEntry, basicDB = false)
+  val l2BopTrainTable = ChiselDB.createTable(name+"OffsetScoreTable", new BopTrainEntry, basicDB = true)
   val data = Wire(new BopTrainEntry)
   data.bestOffset := bestOffset
   data.bestScore := bestScore
@@ -434,6 +434,41 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
   }
   // l2BopTrainTable.log(data = data, en = (state === s_idle) && !isBad, site = name+"OffsetScoreTable", clock, reset)
   l2BopTrainTable.log(data = data, en = (state === s_idle) && !isBad, site = name+"OffsetScoreTable", clock, reset)
+
+  // Compact per-phase teacher snapshot for offline +72 vs -117 analysis.
+  class TeacherPhaseLog extends Bundle {
+    val bestOffset = UInt(offsetWidth.W)
+    val bestAbs = UInt(offsetWidth.W)
+    val bestNeg = Bool()
+    val bestScore = UInt(scoreBits.W)
+    val isBad = Bool()
+    val issueEnable = Bool()
+    val scorePos72 = UInt(scoreBits.W)
+    val scoreNeg117 = UInt(scoreBits.W)
+    val hasPos72 = Bool()
+    val hasNeg117 = Bool()
+  }
+  val teacherPhaseTable = ChiselDB.createTable(name+"TeacherPhaseLog", new TeacherPhaseLog, basicDB = true)
+  val teacherPhaseLog = Wire(new TeacherPhaseLog)
+  val pos72Idx = offsetList.indexOf(72)
+  val neg117Idx = offsetList.indexOf(-117)
+  val bestOffS = bestOffset.asSInt
+  teacherPhaseLog.bestOffset := bestOffset
+  teacherPhaseLog.bestAbs := Mux(bestOffS < 0.S, (-bestOffS).asUInt, bestOffS.asUInt)
+  teacherPhaseLog.bestNeg := bestOffS < 0.S
+  teacherPhaseLog.bestScore := bestScore
+  teacherPhaseLog.isBad := isBad
+  teacherPhaseLog.issueEnable := !isBad
+  teacherPhaseLog.hasPos72 := (pos72Idx >= 0).B
+  teacherPhaseLog.hasNeg117 := (neg117Idx >= 0).B
+  teacherPhaseLog.scorePos72 := (if (pos72Idx >= 0) st(pos72Idx).score else 0.U(scoreBits.W))
+  teacherPhaseLog.scoreNeg117 := (if (neg117Idx >= 0) st(neg117Idx).score else 0.U(scoreBits.W))
+  teacherPhaseTable.log(
+    data = teacherPhaseLog,
+    en = state === s_idle,
+    site = name+"TeacherPhaseLog",
+    clock, reset
+  )
 
 }
 
@@ -704,6 +739,92 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   io.selectedOffset := selectedOffset.asUInt
   io.selectedValid := selectedValid
   io.selectedEnable := selectedEnable
+
+  class StudentTrainLog extends Bundle {
+    val lineAddr = UInt(noOffsetAddrBits.W)
+    val queryIdx = UInt(studentFilterIdxBits.W)
+    val issueOffset = UInt(offsetWidth.W)
+    val issueEnable = Bool()
+    val valid = Vec(studentPoolSize, Bool())
+    val offset = Vec(studentPoolSize, UInt(offsetWidth.W))
+    val offsetAbs = Vec(studentPoolSize, UInt(offsetWidth.W))
+    val offsetNeg = Vec(studentPoolSize, Bool())
+    val hit = Vec(studentPoolSize, Bool())
+    val writeValid = Vec(studentPoolSize, Bool())
+    val writeIdx = Vec(studentPoolSize, UInt(studentFilterIdxBits.W))
+  }
+  val studentTrainTable = ChiselDB.createTable(name+"StudentTrainLog", new StudentTrainLog, basicDB = true)
+  val studentTrainLog = Wire(new StudentTrainLog)
+  studentTrainLog.lineAddr := io.train.bits(fullAddrBits - 1, offsetBits)
+  studentTrainLog.queryIdx := queryIdx
+  studentTrainLog.issueOffset := selectedOffset.asUInt
+  studentTrainLog.issueEnable := selectedEnable
+  for (i <- 0 until studentPoolSize) {
+    studentTrainLog.valid(i) := pool(i).valid
+    studentTrainLog.offset(i) := pool(i).offset.asUInt
+    studentTrainLog.offsetAbs(i) := pool(i).absOffset
+    studentTrainLog.offsetNeg(i) := pool(i).offset < 0.S
+    studentTrainLog.hit(i) := hitMask(i)
+    studentTrainLog.writeValid(i) := writeValids(i)
+    studentTrainLog.writeIdx(i) := writeIdxs(i)
+  }
+  studentTrainTable.log(
+    data = studentTrainLog,
+    en = state === s_training && io.train.valid,
+    site = name+"StudentTrainLog",
+    clock, reset
+  )
+
+  class StudentPhaseLog extends Bundle {
+    val trainCount = UInt(studentPhaseTrainBits.W)
+    val teacherOffset = UInt(offsetWidth.W)
+    val teacherIssueEnable = Bool()
+    val hasMatch = Bool()
+    val injected = Bool()
+    val injectIdx = UInt(studentPoolIdxBits.W)
+    val bestIdx = UInt(studentPoolIdxBits.W)
+    val worstIdx = UInt(studentPoolIdxBits.W)
+    val selectedOffset = UInt(offsetWidth.W)
+    val selectedEnable = Bool()
+    val selectedCov = UInt(studentPhaseTrainBits.W)
+    val worstCov = UInt(studentPhaseTrainBits.W)
+    val valid = Vec(studentPoolSize, Bool())
+    val offset = Vec(studentPoolSize, UInt(offsetWidth.W))
+    val offsetAbs = Vec(studentPoolSize, UInt(offsetWidth.W))
+    val offsetNeg = Vec(studentPoolSize, Bool())
+    val cov = Vec(studentPoolSize, UInt(studentPhaseTrainBits.W))
+    val lastCov = Vec(studentPoolSize, UInt(studentPhaseTrainBits.W))
+    val conf = Vec(studentPoolSize, UInt(studentConfBits.W))
+  }
+  val studentPhaseTable = ChiselDB.createTable(name+"StudentPhaseLog", new StudentPhaseLog, basicDB = true)
+  val studentPhaseLog = Wire(new StudentPhaseLog)
+  studentPhaseLog.trainCount := endTrainCount
+  studentPhaseLog.teacherOffset := endTeacherOffset
+  studentPhaseLog.teacherIssueEnable := endIssueEn
+  studentPhaseLog.hasMatch := endHasMatch
+  studentPhaseLog.injected := endIssueEn && !endHasMatch
+  studentPhaseLog.injectIdx := endInjectIdx
+  studentPhaseLog.bestIdx := endBestIdx
+  studentPhaseLog.worstIdx := endWorstIdx
+  studentPhaseLog.selectedOffset := endSelectedOffset.asUInt
+  studentPhaseLog.selectedEnable := endSelectedEnable
+  studentPhaseLog.selectedCov := endSelectedCov
+  studentPhaseLog.worstCov := endWorstCov
+  for (i <- 0 until studentPoolSize) {
+    studentPhaseLog.valid(i) := pool(i).valid
+    studentPhaseLog.offset(i) := pool(i).offset.asUInt
+    studentPhaseLog.offsetAbs(i) := pool(i).absOffset
+    studentPhaseLog.offsetNeg(i) := pool(i).offset < 0.S
+    studentPhaseLog.cov(i) := pool(i).curPhaseCov
+    studentPhaseLog.lastCov(i) := pool(i).lastPhaseCov
+    studentPhaseLog.conf(i) := pool(i).conf.asUInt
+  }
+  studentPhaseTable.log(
+    data = studentPhaseLog,
+    en = state === s_phaseEnd,
+    site = name+"StudentPhaseLog",
+    clock, reset
+  )
 
   XSPerfAccumulate("student_phase_end", state === s_phaseEnd)
   XSPerfAccumulate("student_takeover", state === s_phaseEnd && endSelectedEnable)
