@@ -284,7 +284,7 @@ class RecentRequestTable(name: String)(implicit p: Parameters) extends BOPModule
   class WRRTEntry extends Bundle{
     val addr = UInt(fullAddrBits.W)
   }
-  val wrrt = ChiselDB.createTable(name+"WriteRecentRequestTable", new WRRTEntry, basicDB = true)
+  val wrrt = ChiselDB.createTable(name+"WriteRecentRequestTable", new WRRTEntry, basicDB = false)
   val e = Wire(new WRRTEntry)
   e.addr := wAddr
   wrrt.log(e, io.w.valid && !io.r.req.valid, site = "RecentRequestTable", clock, reset)
@@ -424,7 +424,7 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
     val offsets = Vec(offsetList.length, UInt(offsetWidth.W))
     val scores = Vec(offsetList.length, UInt(scoreBits.W))
   }
-  val l2BopTrainTable = ChiselDB.createTable(name+"OffsetScoreTable", new BopTrainEntry, basicDB = true)
+  val l2BopTrainTable = ChiselDB.createTable(name+"OffsetScoreTable", new BopTrainEntry, basicDB = false)
   val data = Wire(new BopTrainEntry)
   data.bestOffset := bestOffset
   data.bestScore := bestScore
@@ -448,7 +448,7 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
     val hasPos72 = Bool()
     val hasNeg117 = Bool()
   }
-  val teacherPhaseTable = ChiselDB.createTable(name+"TeacherPhaseLog", new TeacherPhaseLog, basicDB = true)
+  val teacherPhaseTable = ChiselDB.createTable(name+"TeacherPhaseLog", new TeacherPhaseLog, basicDB = false)
   val teacherPhaseLog = Wire(new TeacherPhaseLog)
   val pos72Idx = offsetList.indexOf(72)
   val neg117Idx = offsetList.indexOf(-117)
@@ -487,7 +487,8 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   require(studentFilterEntries <= 4096, s"$name studentFilterEntries=$studentFilterEntries exceeds the maximum allowed size of 4096")
   require(studentFilterEntries >= 2, s"$name studentFilterEntries must be at least two")
   require(isPow2(studentFilterEntries), s"$name studentFilterEntries must be a power of two")
-  require(studentHashMode == "bop_rr" || studentHashMode == "splitmix", s"$name unsupported studentHashMode=$studentHashMode")
+  require(studentHashMode == "bop_rr" || studentHashMode == "pairs_low9", s"$name unsupported studentHashMode=$studentHashMode")
+  require(studentHashMode != "pairs_low9" || studentFilterIdxBits > 9, s"$name studentFilterEntries must be at least 1024 for pairs_low9 hash")
   require(studentCovThreshold >= 0 && studentCovThreshold <= 5, s"$name studentCovThreshold must be in [0, 5]")
 
   val io = IO(new Bundle {
@@ -500,24 +501,30 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
     val selectedEnable = Output(Bool())
   })
 
-  private val splitmixConst1 = BigInt("9E3779B97F4A7C15", 16).U(64.W)
-  private val splitmixConst2 = BigInt("BF58476D1CE4E5B9", 16).U(64.W)
-  private val splitmixConst3 = BigInt("94D049BB133111EB", 16).U(64.W)
-
-  private def splitmix64(x: UInt): UInt = {
-    val x64 = if (x.getWidth >= 64) x(63, 0)
-    else Cat(0.U((64 - x.getWidth).W), x)
-    val z1 = x64 + splitmixConst1
-    val z2 = ((z1 ^ (z1 >> 30)) * splitmixConst2)(63, 0)
-    val z3 = ((z2 ^ (z2 >> 27)) * splitmixConst3)(63, 0)
-    z3 ^ (z3 >> 31)
+  private def hashBitPairs(x: UInt, step: Int = 2): UInt = {
+    require(step > 0)
+    if (x.getWidth <= step) {
+      x
+    } else {
+      val remain = x.getWidth % step
+      val xortmp = (0 until (x.getWidth - remain) by step).map(i => x(i + step - 1, i)).reduce(_ ^ _)
+      if (remain == 0) {
+        xortmp
+      } else {
+        Cat(xortmp(step - 1, remain), xortmp(remain - 1, 0) ^ x(x.getWidth - 1, x.getWidth - remain))
+      }
+    }
   }
 
   private def filterIndex(addr: UInt): UInt = {
     val lineAddr = addr(fullAddrBits - 1, offsetBits)
     studentHashMode match {
       case "bop_rr" => (lineAddr ^ (lineAddr >> studentFilterIdxBits))(studentFilterIdxBits - 1, 0)
-      case "splitmix" => splitmix64(lineAddr)(studentFilterIdxBits - 1, 0)
+      case "pairs_low9" =>
+        val rawLowBits = 9
+        val hashBits = studentFilterIdxBits - rawLowBits
+        val high = lineAddr(lineAddr.getWidth - 1, 6)
+        Cat(hashBitPairs(high, hashBits), lineAddr(rawLowBits - 1, 0))
     }
   }
 
@@ -753,7 +760,7 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
     val writeValid = Vec(studentPoolSize, Bool())
     val writeIdx = Vec(studentPoolSize, UInt(studentFilterIdxBits.W))
   }
-  val studentTrainTable = ChiselDB.createTable(name+"StudentTrainLog", new StudentTrainLog, basicDB = true)
+  val studentTrainTable = ChiselDB.createTable(name+"StudentTrainLog", new StudentTrainLog, basicDB = false)
   val studentTrainLog = Wire(new StudentTrainLog)
   studentTrainLog.lineAddr := io.train.bits(fullAddrBits - 1, offsetBits)
   studentTrainLog.queryIdx := queryIdx
@@ -796,7 +803,7 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
     val lastCov = Vec(studentPoolSize, UInt(studentPhaseTrainBits.W))
     val conf = Vec(studentPoolSize, UInt(studentConfBits.W))
   }
-  val studentPhaseTable = ChiselDB.createTable(name+"StudentPhaseLog", new StudentPhaseLog, basicDB = true)
+  val studentPhaseTable = ChiselDB.createTable(name+"StudentPhaseLog", new StudentPhaseLog, basicDB = false)
   val studentPhaseLog = Wire(new StudentPhaseLog)
   studentPhaseLog.trainCount := endTrainCount
   studentPhaseLog.teacherOffset := endTeacherOffset
