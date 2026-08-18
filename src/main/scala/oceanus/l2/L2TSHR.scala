@@ -25,7 +25,7 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
     val fromDir = Input(new L2Directory.PathFromDirectory)
 
     val toDS = Output(new L2DataStorage.PathTSHRToDataStorage)
-    val fromDS = Output(new L2DataStorage.PathDataStorageToTSHR)
+    val fromDS = Input(new L2DataStorage.PathDataStorageToTSHR)
 
     val toAlloc = Output(new L2TSHRAlloc.PathFromTSHR)
     val fromAlloc = Input(new L2TSHRAlloc.PathToTSHR)
@@ -37,6 +37,8 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
     val TXREQ = Decoupled(new CHIBundleREQ)           // HN REQ
 
     val TXSNP = Decoupled(new FlitSNP)                // SNP to L1
+
+    val UpTXREQ = Decoupled(new FlitREQ)              // REQ from L2 to L2
 
     val UpRXRSP = Flipped(Valid(new FlitUpRSP))       // RSP from L1
     val UpRXDAT = Flipped(Valid(new FlitUpDAT))       // DAT from L1
@@ -95,7 +97,7 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   val tshr_inactive_vpipe = Wire(Bool())
   val tshr_inactive = tshr_inactive_rbe && tshr_inactive_vpipe
 
-  val tshr_inactivate = Wire(Bool()) // TODO: connect with vPipes and RBEs, act as instant 'willFree'
+  val tshr_inactivate = Wire(false.B) // fastest combinational path of vPipe free, might be implemented in future
 
   val tshr_wb_done_dir = Wire(Bool())
   val tshr_wb_done_ds = Wire(Bool())
@@ -126,10 +128,11 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
              which were only possible to be accurate after a Directory Read. */
   val meta = dirResult
   val meta_valid = Wire(Bool())
+
+  val meta_drop = Wire(Bool()) // modified meta drop by REQ L2 eviction
+
   val meta_modified = RegInit(L2Directory.MetaWriteMask.empty)
   val tag_modified = RegInit(false.B)
-
-  val repl = replResult
 
   val meta_write_EVT_meta = Wire(new L2Directory.Meta)
   val meta_write_EVT_mask = Wire(new L2Directory.MetaWriteMask)
@@ -143,7 +146,7 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
 
   val meta_commit_valid = Wire(Bool())
 
-  when (meta_commit_valid) {
+  when (meta_commit_valid || meta_drop) {
     meta_modified := L2Directory.MetaWriteMask.empty
     tag_modified := false.B
   }
@@ -195,6 +198,8 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   val tshr_buffer_wen_RXDAT_2 = tshr_buffer_wen_UpRXDAT_2 || tshr_buffer_wen_DnRXDAT_2
 
   val tshr_buffer_commit = WireInit(false.B)
+
+  val tshr_buffer_drop = WireInit(false.B) // ! working on this
 
   val tshr_buffer_halfWritten_0_q = RegInit(false.B)
   val tshr_buffer_halfWritten_2_q = RegInit(false.B)
@@ -253,7 +258,7 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
     }
   }
 
-  when (tshr_buffer_commit) {
+  when (tshr_buffer_commit || tshr_buffer_drop) {
     tshr_buffer_fullModified_q := false.B
   }
 
@@ -436,6 +441,9 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   meta_write_REQ_meta := vPipeREQ.io.tshr_meta_write_meta
   tag_write_REQ_mask := vPipeREQ.io.tshr_tag_write_en
 
+  meta_drop := vPipeREQ.io.dir_wb_cancel
+  tshr_buffer_drop := vPipeREQ.io.ds_wb_cancel
+
   io.toPCreditPool := vPipeREQ.io.toPCreditPool
   vPipeREQ.io.fromPCreditPool := io.fromPCreditPool
 
@@ -451,7 +459,7 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   vPipeREQ.io.L1EVT_active := vPipeEVT.io.EVT_active
 
   // connections between TX channels and TSHR local modules
-  io.TXREQ := vPipeREQ.io.DnTXREQ
+  io.TXREQ <> vPipeREQ.io.DnTXREQ
 
   io.TXSNP <> snoopAgent.io.txSnp
 
@@ -465,6 +473,8 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   fastArb(Seq(vPipeSNP.io.DnTXDAT, vPipeREQ.io.DnTXDAT), io.DnTXDAT, Some("DnTXDAT"))
   io.DnTXDAT.bits.Data.get := Mux(io.DnTXDAT.bits.DataID.get === 0.U, tshr_buffer_0, tshr_buffer_2)
 
+  io.UpTXREQ <> vPipeREQ.io.UpTXREQ
+
   // ----------------------------------------------------------------
 
   // Directory Proxy
@@ -477,16 +487,18 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
 
   proxyDir.io.tshr_alloc := tshr_alloc
   proxyDir.io.tshr_reuse := tshr_reuse
-  proxyDir.io.tshr_inactive := tshr_inactive || tshr_inactivate /* immediate inactivate if timing allows */
+  proxyDir.io.tshr_inactive := tshr_inactive
+  proxyDir.io.tshr_inactivate := tshr_inactivate
   proxyDir.io.tshr_dealloc := tshr_dealloc
 
   proxyDir.io.read_arbed := false.B // TODO: S0 Directory Arbitration from L2TSHRCtrl
   proxyDir.io.read_en := tshr_enter_dirRead
   proxyDir.io.repl_en := vPipeREQ.io.repl_en
 
-  proxyDir.io.meta_modified := meta_modified.asUInt.orR || tag_modified
-
-  vPipeREQ.io.dir_wb_aux // TODO: wb_aux
+  proxyDir.io.meta := meta
+  proxyDir.io.meta_way := meta.way
+  proxyDir.io.meta_modified := meta_modified
+  proxyDir.io.tag_modified := tag_modified
 
   rbeEVT.io.directoryReadDone := proxyDir.io.rd_done
   rbeSNP.io.directoryReadDone := proxyDir.io.rd_done
@@ -495,6 +507,8 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   vPipeREQ.io.repl_retry := proxyDir.io.repl_retry
   vPipeREQ.io.repl_done := proxyDir.io.repl_done
   vPipeREQ.io.repl_resp := replResult
+
+  proxyDir.io.wb_aux := vPipeREQ.io.dir_wb_aux
 
   meta_commit_valid := proxyDir.io.wb_accept
 
@@ -520,6 +534,7 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   proxyDS.io.tbuf_data_0 := tshr_buffer_0
   proxyDS.io.tbuf_data_2 := tshr_buffer_2
 
+  proxyDS.io.tshr_inactive := tshr_inactive
   proxyDS.io.tshr_inactivate := tshr_inactivate
   proxyDS.io.tshr_dealloc := tshr_dealloc
 
@@ -531,7 +546,7 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   proxyDS.io.ds_read_rbeSNP_en := false.B // TODO: Decode and decide with DirResult in L2TSHR/L2RBEDSRead
   proxyDS.io.ds_read_rbeREQ_en := false.B // TODO: Decode and decide with DirResult in L2TSHR/L2RBEDSRead
 
-  proxyDS.io.ds_read_vPipeEVT_en := false.B // TODO: connect EVT vPipe
+  proxyDS.io.ds_read_vPipeEVT_en := false.B // EVT vPipe never reads DS
   proxyDS.io.ds_read_vPipeSNP_en := vPipeSNP.io.ds_read_en
   proxyDS.io.ds_read_vPipeREQ_en := vPipeREQ.io.ds_rd_en
   proxyDS.io.ds_read_aux_en := false.B
@@ -550,9 +565,11 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   proxyDS.io.RXDAT_fire := io.UpRXDAT.fire || io.DnRXDAT.fire
 
 
-  // wb-locking refuses Directory Write & Data Storage Write on write-ready state
-  // TODO: check EVT wb lock / clear
-  proxyDir.io.wb_locked := /*vPipeEVT.io.dir_wb_locked || vPipeSNP.io.dir_wb_locked ||*/ vPipeREQ.io.dir_wb_locked
-  proxyDS.io.wb_locked := /*vPipeEVT.io.ds_wb_locked || vPipeSNP.io.ds_wb_locked ||*/ vPipeREQ.io.ds_wb_locked
+  // 'wb_locked' refuses Directory Write & Data Storage Write on write-ready state
+  // 'wb_cancel' drops non-arbiterated Directory Write & Data Storage write
+  proxyDir.io.wb_locked := vPipeREQ.io.dir_wb_locked
+  proxyDS.io.wb_locked := vPipeREQ.io.ds_wb_locked
 
+  proxyDir.io.wb_cancel := vPipeREQ.io.dir_wb_cancel
+  proxyDS.io.wb_cancel := vPipeREQ.io.ds_wb_cancel
 }
