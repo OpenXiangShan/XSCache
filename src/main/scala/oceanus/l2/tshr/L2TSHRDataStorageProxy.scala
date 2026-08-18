@@ -94,10 +94,10 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
     val ds_read_aux_en = Input(Bool()) // aux DS read enable that overrides all other conditions
 
     val rd_idle = Output(Bool())
-    val rd_accept = Output(Bool())
     val rd_done = Output(Bool())
 
     val wb_locked = Input(Bool())
+    val wb_cancel = Input(Bool())
     val wb_accept = Output(Bool())
     val wb_done = Output(Bool())
 
@@ -110,6 +110,9 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
 
   val configFlowDirRdResp = true
   val configFlowAheadRdResp = true
+
+  //
+  val tshr_inactive = io.tshr_inactive || io.tshr_inactivate
 
   //
   val ds_read_rbe_en = io.ds_read_rbeEVT_en || io.ds_read_rbeSNP_en || io.ds_read_rbeREQ_en
@@ -456,7 +459,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
     when (io.tbuf_wen_last) {
       // 1. [] -> DSWrite_PreArb
       state_dsWrite_next.PreArb := true.B
-    }.elsewhen (io.tshr_inactivate && !io.tbuf_modified) {
+    }.elsewhen (tshr_inactive && !io.tbuf_modified) {
       // 2. [] -> DSWrite_Done
       state_dsWrite_next.Done := true.B
     }
