@@ -1354,6 +1354,8 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
 
   val predictedAddr = addOffset(delayQueue.io.out.bits, issueOffset.asSInt)
   val samePage = getPPN(predictedAddr) === getPPN(delayQueue.io.out.bits)
+  val delayCovPass = delayCov >= (trainCount >> studentCovThreshold)
+  val scoreWouldIssue = studentSelectedEnable || !prefetchDisable
   when (scoreTable.io.phaseEndPulse) {
     filterTable := 0.U
   }.elsewhen (delayQueue.io.out.valid && samePage) {
@@ -1366,7 +1368,7 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     delayCov := 0.U
     trainCount := 0.U
     trainOffset := RegNext(issueOffset)
-    prefetchEnable := delayCov >= (trainCount >> studentCovThreshold)
+    prefetchEnable := delayCovPass
   }.elsewhen (queryValid) {
     when (filterTable(queryIdx)) {
       delayCov := delayCov + 1.U
@@ -1430,5 +1432,15 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   XSPerfAccumulate("bop_drop_for_cross_page", scoreTable.io.req.fire && s0_crossPage)
   XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
   XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && prefetchDisable)
+  XSPerfAccumulate("bop_drop_for_delay_cov",
+    scoreTable.io.req.fire && enable && scoreWouldIssue && !prefetchEnable && (issueOffset === trainOffset))
+  XSPerfAccumulate("bop_issue_on_offset_change",
+    scoreTable.io.req.fire && enable && !s0_crossPage && scoreWouldIssue && !prefetchEnable && (issueOffset =/= trainOffset))
   XSPerfAccumulate("bop_student_takeover", scoreTable.io.req.fire && studentSelectedEnable)
+  XSPerfAccumulate("delay_cov_keep", scoreTable.io.phaseEndPulse && delayCovPass)
+  XSPerfAccumulate("delay_cov_disable", scoreTable.io.phaseEndPulse && !delayCovPass)
+  emitCoverageHistogram("delay_cov", delayCov, scoreTable.io.phaseEndPulse)
+  emitCoverageHistogram("delay_train_count", trainCount, scoreTable.io.phaseEndPulse)
+  XSPerfAccumulate("delay_filter_write", delayQueue.io.out.valid && samePage)
+  XSPerfAccumulate("delay_filter_drop_cross_page", delayQueue.io.out.valid && !samePage)
 }
