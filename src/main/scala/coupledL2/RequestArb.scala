@@ -183,6 +183,8 @@ class RequestArb(implicit p: Parameters) extends L2Module
   io.dirRead_s1.bits.replacerInfo.channel := task_s1.bits.channel
   io.dirRead_s1.bits.replacerInfo.reqSource := task_s1.bits.reqSource
   io.dirRead_s1.bits.replacerInfo.refill_prefetch := s1_needs_replRead && (mshr_task_s1.bits.opcode === HintAck && mshr_task_s1.bits.dsWen)
+  io.dirRead_s1.bits.replacerInfo.l1dbpBypassCandidate := task_s1.bits.l1dbpBypassCandidate
+  io.dirRead_s1.bits.replacerInfo.l1dbpFinalBypass := task_s1.bits.l1dbpFinalBypass
   io.dirRead_s1.bits.refill := s1_needs_replRead
   io.dirRead_s1.bits.mshrId := task_s1.bits.mshrId
   io.dirRead_s1.bits.cmoAll := A_task.cmoAll

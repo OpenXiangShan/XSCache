@@ -255,8 +255,12 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   val promoteT_normal =  dirResult.hit && meta_no_client && meta.state === TIP
   val promoteT_L3     = !dirResult.hit && gotT
   val promoteT_alias  =  dirResult.hit && req.aliasTask.getOrElse(false.B) && (meta.state === TRUNK || meta.state === TIP)
+  val req_promoteT_base = (req_acquire || req_get || req_prefetch) &&
+    (promoteT_normal || promoteT_L3 || promoteT_alias)
+  val l1dbp_suppress_promoteT = req.fromA && req.l1dbpBypassCandidate &&
+    req.opcode === AcquireBlock && req.param === NtoB
   // under above circumstances, we grant T to L1 even if it wants B
-  val req_promoteT = (req_acquire || req_get || req_prefetch) && (promoteT_normal || promoteT_L3 || promoteT_alias)
+  val req_promoteT = req_promoteT_base && !l1dbp_suppress_promoteT
 
   assert(!(req_valid && req_prefetch && dirResult.hit), "MSHR can not receive prefetch hit req")
 
@@ -745,6 +749,10 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
         )
       )
     )
+    mp_grant.l1dbpBypassCandidate := req.l1dbpBypassCandidate
+    mp_grant.l1dbpFinalBypass := req.l1dbpBypassCandidate && req.opcode === AcquireBlock &&
+      req.param === NtoB && mp_grant.opcode === GrantData && mp_grant.param === toB &&
+      !denied && !corrupt
     mp_grant.size := 0.U(msgSizeBits.W)
     mp_grant.bufIdx := 0.U(bufIdxBits.W)
     mp_grant.needProbeAckData := false.B
@@ -781,13 +789,13 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
         Mux( // Acquire
           req_promoteT || req_needT,
           Mux(req_prefetch, TIP, TRUNK),
-          BRANCH
+          Mux(l1dbp_suppress_promoteT && (gotT || dirResult.hit && isT(meta.state)), TIP, BRANCH)
         )
       ),
       clients = Mux(
         req_prefetch,
         Mux(dirResult.hit, meta.clients, Fill(clientBits, false.B)),
-        Fill(clientBits, !(req_get && (!dirResult.hit || meta_no_client)))
+        Fill(clientBits, !mp_grant.l1dbpFinalBypass && !(req_get && (!dirResult.hit || meta_no_client)))
       ),
       alias = Some(aliasFinal),
       prefetch = req_prefetch || dirResult.hit && meta_pft,
@@ -815,24 +823,32 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     mp_grant.aMergeTask.vaddr.foreach(_ := merge_task.vaddr.getOrElse(0.U))
     mp_grant.aMergeTask.isKeyword.foreach(_ := merge_task.isKeyword.getOrElse(false.B))
     mp_grant.aMergeTask.opcode := odOpGen(merge_task.opcode)
+    val merge_l1dbp_suppress_promoteT = merge_task.l1dbpBypassCandidate &&
+      merge_task.opcode === AcquireBlock && merge_task.param === NtoB
+    val merge_promoteT = req_promoteT_base && !merge_l1dbp_suppress_promoteT
     mp_grant.aMergeTask.param := MuxLookup( // Acquire -> Grant
       merge_task.param,
       merge_task.param)(
       Seq(
-        NtoB -> Mux(req_promoteT, toT, toB),
+        NtoB -> Mux(merge_promoteT, toT, toB),
         BtoT -> toT,
         NtoT -> toT
       )
     )
+    mp_grant.aMergeTask.l1dbpBypassCandidate := merge_task.l1dbpBypassCandidate
+    mp_grant.aMergeTask.l1dbpFinalBypass := merge_task.l1dbpBypassCandidate &&
+      merge_task.opcode === AcquireBlock && merge_task.param === NtoB &&
+      mp_grant.aMergeTask.opcode === GrantData && mp_grant.aMergeTask.param === toB &&
+      !denied && !corrupt
     mp_grant.aMergeTask.sourceId := merge_task.sourceId
     mp_grant.aMergeTask.meta := MetaEntry(
       dirty = gotDirty || dirResult.hit && meta.dirty,
       state = Mux( // Acquire
-        req_promoteT || needT(merge_task.opcode, merge_task.param),
+        merge_promoteT || needT(merge_task.opcode, merge_task.param),
         TRUNK,
-        BRANCH
+        Mux(merge_l1dbp_suppress_promoteT && (gotT || dirResult.hit && isT(meta.state)), TIP, BRANCH)
       ),
-      clients = Fill(clientBits, true.B),
+      clients = Fill(clientBits, !mp_grant.aMergeTask.l1dbpFinalBypass),
       alias = Some(merge_task.alias.getOrElse(0.U)),
       prefetch = false.B,
       accessed = true.B

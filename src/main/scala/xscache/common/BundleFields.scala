@@ -35,3 +35,13 @@ case class AliasField(width: Int) extends BundleField[UInt](AliasKey, Output(UIn
 case object IsHitKey extends ControlKey[Bool](name = "isHitInL3")
 
 case class IsHitField() extends BundleField[Bool](IsHitKey, Output(Bool()), _ := true.B)
+
+case object L1DBPBypassCandidateKey extends ControlKey[Bool](name = "l1dbpBypassCandidate")
+
+case class L1DBPBypassCandidateField()
+  extends BundleField[Bool](L1DBPBypassCandidateKey, Output(Bool()), _ := false.B)
+
+case object L1DBPFinalBypassKey extends ControlKey[Bool](name = "l1dbpFinalBypass")
+
+case class L1DBPFinalBypassField()
+  extends BundleField[Bool](L1DBPFinalBypassKey, Output(Bool()), _ := false.B)

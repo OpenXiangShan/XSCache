@@ -316,7 +316,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
   /* ======== Resps to SinkA/B/C Reqs ======== */
   val sink_resp_s3 = WireInit(0.U.asTypeOf(Valid(new TaskBundle)))
-  val sink_resp_s3_a_promoteT = dirResult_s3.hit && isT(metaOnHit_s3.state)
+  val l1dbp_suppress_promoteT_s3 = req_s3.fromA && req_s3.l1dbpBypassCandidate &&
+    req_s3.opcode === AcquireBlock && req_s3.param === NtoB
+  val sink_resp_s3_a_promoteT = dirResult_s3.hit && isT(metaOnHit_s3.state) &&
+    !l1dbp_suppress_promoteT_s3
 
   // whether L2 should respond data to HN or not
   val retToSrc = req_s3.retToSrc.getOrElse(false.B)
@@ -435,6 +438,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       Mux(req_s3.param === NtoB && !sink_resp_s3_a_promoteT, toB, toT),
       0.U // reserved
     )
+    sink_resp_s3.bits.l1dbpFinalBypass := req_s3.l1dbpBypassCandidate &&
+      req_s3.opcode === AcquireBlock && req_s3.param === NtoB &&
+      sink_resp_s3.bits.opcode === GrantData && sink_resp_s3.bits.param === toB &&
+      !sink_resp_s3.bits.denied && !sink_resp_s3.bits.corrupt &&
+      !tagError_s3 && !dataError_s3
   }.elsewhen (req_s3.fromB) {
 
     sink_resp_s3.bits.opcode := 0.U
@@ -551,8 +559,12 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   )
   val metaW_s3_a = MetaEntry(
     dirty = metaOnHit_s3.dirty,
-    state = Mux(req_needT_s3 || sink_resp_s3_a_promoteT, TRUNK, metaOnHit_s3.state),
-    clients = Fill(clientBits, Mux(l2Error_s3, false.B, true.B)),
+    state = Mux(
+      req_needT_s3 || sink_resp_s3_a_promoteT,
+      TRUNK,
+      Mux(l1dbp_suppress_promoteT_s3 && isT(metaOnHit_s3.state), TIP, metaOnHit_s3.state)
+    ),
+    clients = Fill(clientBits, Mux(l2Error_s3 || sink_resp_s3.bits.l1dbpFinalBypass, false.B, true.B)),
     alias = Some(metaW_s3_a_alias),
     accessed = true.B,
     tagErr = metaOnHit_s3.tagErr,
@@ -828,6 +840,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   customL1Hint.io.s3.task      := task_s3
   // overwrite opcode: if sinkReq can respond, use sink_resp_s3.bits.opcode = Grant/GrantData
   customL1Hint.io.s3.task.bits.opcode := Mux(sink_resp_s3.valid, sink_resp_s3.bits.opcode, task_s3.bits.opcode)
+  customL1Hint.io.s3.task.bits.l1dbpFinalBypass := Mux(
+    sink_resp_s3.valid,
+    sink_resp_s3.bits.l1dbpFinalBypass,
+    task_s3.bits.l1dbpFinalBypass
+  )
   customL1Hint.io.s3.need_mshr := need_mshr_s3_a
 
   customL1Hint.io.l1Hint <> io.l1Hint
@@ -1003,6 +1020,13 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // num of mshr req
   XSPerfAccumulate("mshr_grant_req", task_s3.valid && mshr_grant_s3 && !retry)
   XSPerfAccumulate("mshr_grantdata_req", task_s3.valid && mshr_grantdata_s3 && !retry)
+  XSPerfAccumulate("l1dbp_mshr_grantdata_candidate",
+    task_s3.valid && mshr_grantdata_s3 && !retry && req_s3.l1dbpBypassCandidate)
+  XSPerfAccumulate("l1dbp_mshr_grantdata_promoted_toT",
+    task_s3.valid && mshr_grantdata_s3 && !retry && req_s3.l1dbpBypassCandidate &&
+      req_s3.param === toT && !req_s3.l1dbpFinalBypass)
+  XSPerfAccumulate("l1dbp_mshr_grantdata_final_bypass",
+    task_s3.valid && mshr_grantdata_s3 && !retry && req_s3.l1dbpFinalBypass)
   XSPerfAccumulate("mshr_accessackdata_req", task_s3.valid && mshr_accessackdata_s3 && !retry)
   XSPerfAccumulate("mshr_hintack_req", task_s3.valid && mshr_hintack_s3 && !retry)
   // XSPerfAccumulate("mshr_probeack_req", task_s3.valid && mshr_probeack_s3)

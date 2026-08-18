@@ -21,6 +21,7 @@ import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.tilelink._
+import xscache.common.L1DBPBypassCandidateKey
 import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLHints._
 import xscache.coupledL2.prefetch.PrefetchReq
@@ -65,6 +66,8 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task.size := a.size
     task.sourceId := a.source
     task.corrupt := a.corrupt
+    task.l1dbpBypassCandidate := a.user.lift(L1DBPBypassCandidateKey).getOrElse(false.B)
+    task.l1dbpFinalBypass := false.B
     task.bufIdx := 0.U(bufIdxBits.W)
     task.needProbeAckData := false.B
     task.mshrTask := false.B
@@ -198,6 +201,10 @@ class SinkA(implicit p: Parameters) extends L2Module {
   XSPerfAccumulate("sinkA_acquireblock_req", io.a.fire && io.a.bits.opcode === AcquireBlock)
   XSPerfAccumulate("sinkA_acquireperm_req", io.a.fire && io.a.bits.opcode === AcquirePerm)
   XSPerfAccumulate("sinkA_get_req", io.a.fire && io.a.bits.opcode === Get)
+  when (io.a.fire && io.a.bits.user.lift(L1DBPBypassCandidateKey).getOrElse(false.B)) {
+    assert(io.a.bits.opcode === AcquireBlock && io.a.bits.param === TLPermissions.NtoB,
+      "L1DBP candidate may only arrive on AcquireBlock NtoB")
+  }
   prefetchOpt.foreach {
     _ =>
       XSPerfAccumulate("sinkA_prefetch_req", io.prefetchReq.get.fire)

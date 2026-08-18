@@ -25,7 +25,8 @@ import freechips.rocketchip.util._
 import org.chipsalliance.cde.config.Field
 import xscache.coupledL2.prefetch._
 import utility.{Code, MemReqSource, ReqSourceKey}
-import xscache.common.{AliasKey, CacheParameters, IsHitKey, PrefetchKey, BankBitsKey}
+import xscache.common.{AliasKey, BankBitsKey, CacheParameters, IsHitKey, L1DBPBypassCandidateKey,
+  L1DBPFinalBypassField, PrefetchKey}
 
 case object EnableL2ClockGate extends Field[Boolean](true)
 
@@ -88,8 +89,9 @@ case class L2Param(
   echoField: Seq[BundleFieldBase] = Nil,
   reqField: Seq[BundleFieldBase] = Nil,
   respKey: Seq[BundleKeyBase] = Seq(IsHitKey),
-  reqKey: Seq[BundleKeyBase] = Seq(AliasKey, VaddrKey, PrefetchKey, ReqSourceKey, PCKey),
-  respField: Seq[BundleFieldBase] = Nil,
+  reqKey: Seq[BundleKeyBase] = Seq(AliasKey, VaddrKey, PrefetchKey, ReqSourceKey, PCKey,
+    L1DBPBypassCandidateKey),
+  respField: Seq[BundleFieldBase] = Seq(L1DBPFinalBypassField()),
 
   innerBuf: TLBufferParams = TLBufferParams(),
   outerBuf: TLBufferParams = TLBufferParams(

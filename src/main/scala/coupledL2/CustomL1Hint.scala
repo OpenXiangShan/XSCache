@@ -29,6 +29,7 @@ class HintQueueEntry(implicit p: Parameters) extends L2Bundle {
   val isGrantData = Bool()
   val isKeyword = Bool()
   val hasData = Bool()
+  val l1dbpFinalBypass = Bool()
 }
 
 class CustomL1HintIOBundle(implicit p: Parameters) extends L2Bundle {
@@ -86,6 +87,11 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   enqBits_s1.isKeyword := Mux(mshr_s1.mergeA, mshrMerge_s1.isKeyword.getOrElse(false.B), mshr_s1.isKeyword.getOrElse(false.B)) 
   enqBits_s1.isGrantData := mshr_GrantData_s1
   enqBits_s1.hasData := mshr_GrantData_s1 || mshr_AccessAckData_s1
+  enqBits_s1.l1dbpFinalBypass := Mux(
+    mshr_s1.mergeA,
+    mshrMerge_s1.l1dbpFinalBypass,
+    mshr_s1.l1dbpFinalBypass
+  ) && mshr_GrantData_s1
 
   // Hint for "chnTask Hit" will fire@s3
   val chn_Grant_s3     = task_s3.valid && !mshrReq_s3 && !need_mshr_s3 && task_s3.bits.fromA && task_s3.bits.opcode === Grant
@@ -97,6 +103,7 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   enqBits_s3.isKeyword := task_s3.bits.isKeyword.getOrElse(false.B)
   enqBits_s3.isGrantData := chn_GrantData_s3
   enqBits_s3.hasData := chn_GrantData_s3 || chn_AccessAckData_s3
+  enqBits_s3.l1dbpFinalBypass := task_s3.bits.l1dbpFinalBypass && chn_GrantData_s3
 
   // ==================== Hint Queue ====================
   val hintEntries = mshrsAll
@@ -130,4 +137,5 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   io.l1Hint.bits.sourceId := hintQueue.io.deq.bits.source
   io.l1Hint.bits.isKeyword := hintQueue.io.deq.bits.isKeyword
   io.l1Hint.bits.hasData := hintQueue.io.deq.bits.hasData
+  io.l1Hint.bits.l1dbpFinalBypass := hintQueue.io.deq.bits.l1dbpFinalBypass
 }

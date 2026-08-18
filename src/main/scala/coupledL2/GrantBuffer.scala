@@ -24,6 +24,7 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tilelink.TLMessages._
 import xscache.coupledL2.prefetch.PrefetchResp
+import xscache.common.L1DBPFinalBypassKey
 
 // record info of those with Grant sent, yet GrantAck not received
 // used to block Probe upwards
@@ -93,6 +94,7 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
     d.denied := task.denied
     d.data := data
     d.corrupt := task.corrupt || task.denied
+    d.user.lift(L1DBPFinalBypassKey).foreach(_ := task.l1dbpFinalBypass)
     d.echo.lift(IsKeywordKey).foreach(_ := false.B)
     d
   }
@@ -138,6 +140,8 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   mergeAtask.needProbeAckData := io.d_task.bits.task.needProbeAckData
   mergeAtask.denied := io.d_task.bits.task.denied
   mergeAtask.corrupt := io.d_task.bits.task.corrupt || io.d_task.bits.task.denied
+  mergeAtask.l1dbpBypassCandidate := io.d_task.bits.task.aMergeTask.l1dbpBypassCandidate
+  mergeAtask.l1dbpFinalBypass := io.d_task.bits.task.aMergeTask.l1dbpFinalBypass
   mergeAtask.mshrTask := io.d_task.bits.task.mshrTask
   mergeAtask.mshrId := io.d_task.bits.task.mshrId
   mergeAtask.aliasTask.foreach(_ := io.d_task.bits.task.aliasTask.getOrElse(0.U))
@@ -221,6 +225,27 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   XSPerfAccumulate("toTLBundleD_valid_isKeyword", deqValid && deqTask.isKeyword.getOrElse(false.B))
   XSPerfAccumulate("toTLBundleD_fire", deqValid && io.d.ready)
   XSPerfAccumulate("toTLBundleD_fire_isKeyword", deqValid && io.d.ready && deqTask.isKeyword.getOrElse(false.B))
+  val grantFirstFire = grantQueue.io.deq.fire &&
+    (deqTask.opcode === Grant || deqTask.opcode === GrantData)
+  XSPerfAccumulate("l2_grant_toB", grantFirstFire && deqTask.param === TLPermissions.toB)
+  XSPerfAccumulate("l2_grant_toT", grantFirstFire && deqTask.param === TLPermissions.toT)
+  XSPerfAccumulate("l2_grantdata_toB",
+    grantFirstFire && deqTask.opcode === GrantData && deqTask.param === TLPermissions.toB)
+  XSPerfAccumulate("l2_grantdata_toT",
+    grantFirstFire && deqTask.opcode === GrantData && deqTask.param === TLPermissions.toT)
+  XSPerfAccumulate("l2_l1dbp_grantdata_candidate",
+    grantFirstFire && deqTask.opcode === GrantData && deqTask.l1dbpBypassCandidate)
+  XSPerfAccumulate("l2_l1dbp_grantdata_final_bypass",
+    grantFirstFire && deqTask.opcode === GrantData && deqTask.l1dbpFinalBypass)
+  when (grantFirstFire && deqTask.l1dbpBypassCandidate) {
+    assert(deqTask.opcode === GrantData && deqTask.param === TLPermissions.toB,
+      "L1DBP candidate GrantData must not be promoted toT")
+  }
+  when (grantFirstFire && deqTask.l1dbpFinalBypass) {
+    assert(deqTask.l1dbpBypassCandidate && deqTask.opcode === GrantData &&
+      deqTask.param === TLPermissions.toB && !deqTask.denied && !deqTask.corrupt,
+      "L1DBP final bypass requires a clean GrantData toB for a candidate")
+  }
  /* val d_isKeyword = Mux(
     grantBufValid,
     grantBuf.task.isKeyword,

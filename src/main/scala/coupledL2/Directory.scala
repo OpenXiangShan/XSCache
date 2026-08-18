@@ -398,12 +398,20 @@ class Directory(implicit p: Parameters) extends L2Module {
   // [2]: 0-acquire, 1-release;
   // [1]: 0-non-prefetch, 1-prefetch;
   // [0]: 0-not-refill, 1-refill
+  // A fast-path L2 hit computes finalBypass in MainPipe s3, so derive the
+  // equivalent synthetic release here from the candidate request itself.
+  val l1dbpSyntheticRelease = req_s3.replacerInfo.l1dbpFinalBypass ||
+    (!refillReqValid_s3 && req_s3.replacerInfo.l1dbpBypassCandidate &&
+      req_s3.replacerInfo.channel(0) &&
+      req_s3.replacerInfo.opcode === AcquireBlock &&
+      hit_s3 && !error_s3 &&
+      !meta_s3.tagErr && !meta_s3.dataErr)
   rrip_req_type := Cat(Mux1H(hitOH, origin_bits_hold),
-    req_s3.replacerInfo.channel(2),
+    req_s3.replacerInfo.channel(2) || l1dbpSyntheticRelease,
     (!refillReqValid_s3 && req_s3.replacerInfo.channel(0) && req_s3.replacerInfo.opcode === Hint) ||
       (req_s3.replacerInfo.channel(2) && Mux1H(wayOH_s3, metaAll_s3).prefetch.getOrElse(false.B)) ||
       (refillReqValid_s3 && req_s3.replacerInfo.refill_prefetch),
-    req_s3.refill
+    req_s3.refill && !l1dbpSyntheticRelease
   )
   private val mbistPl = MbistPipeline.PlaceMbistPipeline(1, "L2Directory", mbist)
   if(cacheParams.replacement == "srrip"){

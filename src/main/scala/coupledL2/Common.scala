@@ -32,6 +32,9 @@ class ReplacerInfo(implicit p: Parameters) extends L2Bundle {
   val opcode = UInt(3.W)
   val reqSource = UInt(MemReqSource.reqSourceBits.W)
   val refill_prefetch = Bool()
+  val l1dbpBypassCandidate = Bool()
+  // A final L1DBP bypass is consumed by L2 as a synthetic release event.
+  val l1dbpFinalBypass = Bool()
 }
 
 trait HasTLChannelBits { this: Bundle =>
@@ -51,6 +54,8 @@ class MergeTaskBundle(implicit p: Parameters) extends L2Bundle {
   val sourceId = UInt(sourceIdBits.W) // tilelink sourceID
   val meta = new MetaEntry()
   val pc = pcBitOpt.map(_ => UInt(pcBitOpt.get.W))    // pc of demand req 
+  val l1dbpBypassCandidate = Bool()
+  val l1dbpFinalBypass = Bool()
 }
 
 // We generate a Task for every TL request
@@ -75,6 +80,8 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   val needProbeAckData = Bool()           // only used for SinkB reqs, whether L3 needs probeAckData
   val denied = Bool()
   val corrupt = Bool()
+  val l1dbpBypassCandidate = Bool()
+  val l1dbpFinalBypass = Bool()
 
   // MSHR may send Release(Data) or Grant(Data) or ProbeAck(Data) through Main Pipe
   val mshrTask = Bool()                   // is task from mshr
@@ -404,6 +411,7 @@ class PrefetchRecv extends Bundle {
 class L2ToL1Hint(implicit p: Parameters) extends L2Bundle {
   val sourceId = UInt(sourceIdBits.W)    // tilelink sourceID
   val isKeyword = Bool()       // miss entry keyword
+  val l1dbpFinalBypass = Bool()
 }
 
 class L2ToL1HintInsideL2(implicit p: Parameters) extends L2ToL1Hint {
