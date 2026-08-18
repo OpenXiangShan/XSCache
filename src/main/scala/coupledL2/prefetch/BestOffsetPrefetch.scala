@@ -1342,20 +1342,22 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val s0_newAddr = s0_oldAddr + signedExtend((issueOffset << offsetBits), fullAddressBits)
   val s0_crossPage = getPPN(s0_newAddr) =/= getPPN(s0_oldAddr) // unequal tags
 
+  private def addOffset(addr: UInt, offset: SInt): UInt = {
+    val offsetBytes = signedExtend(offset.asUInt << offsetBits, fullAddrBits)
+    (addr + offsetBytes)(fullAddrBits - 1, 0)
+  }
+
   private def filterIndex(addr: UInt): UInt = {
     val lineAddr = addr(fullAddrBits - 1, offsetBits)
-    studentHashMode match {
-      case "bop_rr" => (lineAddr ^ (lineAddr >> studentFilterIdxBits))(studentFilterIdxBits - 1, 0)
-      case "splitmix" => splitmix64(lineAddr)(studentFilterIdxBits - 1, 0)
-    }
+    (lineAddr ^ (lineAddr >> studentFilterIdxBits))(studentFilterIdxBits - 1, 0)
   }
-  
-  val predictedAddr = addOffset(delayQueue.io.out.bits, issueOffset)
+
+  val predictedAddr = addOffset(delayQueue.io.out.bits, issueOffset.asSInt)
   val samePage = getPPN(predictedAddr) === getPPN(delayQueue.io.out.bits)
   when (scoreTable.io.phaseEndPulse) {
     filterTable := 0.U
-  }.elsewhen (delayQueue.io.out.valid) {
-    filterTable(filterIndex(predictedAddr)) := 1.U
+  }.elsewhen (delayQueue.io.out.valid && samePage) {
+    filterTable := filterTable.bitSet(filterIndex(predictedAddr), true.B)
   }
 
   val queryIdx = filterIndex(s0_oldAddr)
