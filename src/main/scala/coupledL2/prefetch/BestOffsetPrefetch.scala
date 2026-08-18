@@ -1364,12 +1364,13 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
 
   val queryIdx = filterIndex(s0_oldAddr)
   val queryValid = io.train.valid && scoreTable.io.req.ready && studentTrainReady && s1_ready
+  val isOK = !io.train.bits.hit || io.train.bits.reqsource === MemReqSource.Prefetch2L2PBOP.id.U
   when (scoreTable.io.phaseEndPulse) {
     delayCov := 0.U
     trainCount := 0.U
     trainOffset := RegNext(issueOffset)
     prefetchEnable := delayCovPass
-  }.elsewhen (queryValid) {
+  }.elsewhen (queryValid && isOK) {
     when (filterTable(queryIdx)) {
       delayCov := delayCov + 1.U
     }
