@@ -277,7 +277,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
             studentPoolSize = 8,
             studentFilterEntries = 2048,
             studentHashMode = "bop_rr",
-            studentCovThreshold = 5,
+            studentCovThreshold = 4,
             studentConfUseEMA = false,
             offsetList = Seq(
               -32, -30, -27, -25, -24, -20, -18, -16, -15,

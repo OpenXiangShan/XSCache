@@ -1324,17 +1324,53 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val s0_fire = s0_ready && io.train.valid
   val s1_fire = s1_ready && s1_req_valid
 
+  val filterTable = RegInit(0.U(studentFilterEntries.W))
+  val delayCov = RegInit(0.U(studentPhaseTrainBits.W))
+  val trainCount = RegInit(0.U(studentPhaseTrainBits.W))
+  val trainOffset = RegInit(0.U(offsetWidth.W))
+  val prefetchEnable = RegInit(true.B)
+
   /* s0 train */
   val prefetchOffset = scoreTable.io.prefetchOffset
   val prefetchDisable = scoreTable.io.prefetchDisable
   val studentSelectedOffset = student.map(_.io.selectedOffset).getOrElse(prefetchOffset)
   val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
   val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, prefetchOffset)
-  val issueEnable = studentSelectedEnable || !prefetchDisable
+  val issueEnable = (studentSelectedEnable || !prefetchDisable) && (prefetchEnable || (issueOffset =/= trainOffset))
   val s0_oldAddr = io.train.bits.addr
   val s0_oldAddrNoOff = s0_oldAddr(s0_oldAddr.getWidth-1, offsetBits)
   val s0_newAddr = s0_oldAddr + signedExtend((issueOffset << offsetBits), fullAddressBits)
   val s0_crossPage = getPPN(s0_newAddr) =/= getPPN(s0_oldAddr) // unequal tags
+
+  private def filterIndex(addr: UInt): UInt = {
+    val lineAddr = addr(fullAddrBits - 1, offsetBits)
+    studentHashMode match {
+      case "bop_rr" => (lineAddr ^ (lineAddr >> studentFilterIdxBits))(studentFilterIdxBits - 1, 0)
+      case "splitmix" => splitmix64(lineAddr)(studentFilterIdxBits - 1, 0)
+    }
+  }
+  
+  val predictedAddr = addOffset(delayQueue.io.out.bits, issueOffset)
+  val samePage = getPPN(predictedAddr) === getPPN(delayQueue.io.out.bits)
+  when (scoreTable.io.phaseEndPulse) {
+    filterTable := 0.U
+  }.elsewhen (delayQueue.io.out.valid) {
+    filterTable(filterIndex(predictedAddr)) := 1.U
+  }
+
+  val queryIdx = filterIndex(s0_oldAddr)
+  val queryValid = io.train.valid && scoreTable.io.req.ready && studentTrainReady && s1_ready
+  when (scoreTable.io.phaseEndPulse) {
+    delayCov := 0.U
+    trainCount := 0.U
+    trainOffset := RegNext(issueOffset)
+    prefetchEnable := delayCov >= (trainCount >> studentCovThreshold)
+  }.elsewhen (queryValid) {
+    when (filterTable(queryIdx)) {
+      delayCov := delayCov + 1.U
+    }
+    trainCount := trainCount + 1.U
+  }
 
   rrTable.io.r <> scoreTable.io.test
   rrTable.io.w <> delayQueue.io.out
