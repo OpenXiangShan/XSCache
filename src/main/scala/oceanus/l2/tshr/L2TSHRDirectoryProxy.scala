@@ -279,11 +279,14 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       /*
       1.
       */
-      when (io.meta_modified.any || io.tag_modified) {
-        // 1. [] -> DirWrite_PreArb
+      when (io.wb_cancel) {
+        // 1. [] -> DirWrite_Done
+        state_dirWrite_next.Done := true.B
+      }.elsewhen (io.meta_modified.any || io.tag_modified || io.wb_aux) {
+        // 2. [] -> DirWrite_PreArb
         state_dirWrite_next.PreArb := true.B
       }.elsewhen (tshr_inactive) {
-        // 2. [] -> DirWrite_Done
+        // 3. [] -> DirWrite_Done
         state_dirWrite_next.Done := true.B
       }
     }
@@ -297,6 +300,10 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
         // 1. DirWrite_PreArb -> DirWrite_Done
         state_dirWrite_next.PreArb := false.B
         state_dirWrite_next.Done := true.B
+      }.elsewhen (io.wb_cancel) {
+        // 2. DirWrite_PreArb -> DirWrite_Done
+        state_dirWrite_next.PreArb := false.B
+        state_dirWrite_next.Done := true.B
       }
     }
 
@@ -305,7 +312,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       /*
       1. 
       */
-      when (io.meta_modified.any || io.tag_modified) {
+      when ((io.meta_modified.any || io.tag_modified) && !io.wb_cancel) {
         // 1. DirWrite_Done -> DirWrite_PreArb
         state_dirWrite_next.Done := false.B
         state_dirWrite_next.PreArb := true.B
@@ -318,12 +325,15 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       /* 
       1.  
       */
-      when (tshr_inactive) {
-        when (io.meta_modified.any || io.tag_modified) {
-        // 1. [] -> DirWrite_PreArb
+      when (io.wb_cancel) {
+        // 1. [] -> DirWrite_Done
+        state_dirWrite_next.Done := true.B
+      }.elsewhen (tshr_inactive || io.wb_aux) {
+        when (io.meta_modified.any || io.tag_modified || io.wb_aux) {
+        // 2. [] -> DirWrite_PreArb
         state_dirWrite_next.PreArb := true.B
         }.otherwise {
-          // 2. [] -> DirWrite_Done
+          // 3. [] -> DirWrite_Done
           state_dirWrite_next.Done := true.B
         }
       }
@@ -341,6 +351,10 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
         // 2. DirWrite_PreArb -> DirWrite_Done
         state_dirWrite_next.PreArb := false.B
         state_dirWrite_next.Done := true.B
+      }.elsewhen (io.wb_cancel) {
+        // 3. DirWrite_PreArb -> DirWrite_Done
+        state_dirWrite_next.PreArb := false.B
+        state_dirWrite_next.Done := true.B
       }
     }
 
@@ -349,7 +363,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       /*
       1.
       */
-      when (io.meta_modified.any || io.tag_modified) {
+      when ((io.meta_modified.any || io.tag_modified) && !io.wb_cancel) {
         // 1. DirWrite_Done -> []
         state_dirWrite_next.Done := false.B
       }
