@@ -493,6 +493,7 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
 
   val io = IO(new Bundle {
     val train = Flipped(DecoupledIO(UInt(fullAddrBits.W)))
+    val delayOut = Flipped(ValidIO(UInt(fullAddrBits.W)))
     val teacherPhaseEnd = Input(Bool())
     val teacherBestOffset = Input(UInt(offsetWidth.W))
     val teacherIssueEnable = Input(Bool())
@@ -643,8 +644,8 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   val writeValids = Wire(Vec(studentPoolSize, Bool()))
   val writeIdxs = Wire(Vec(studentPoolSize, UInt(studentFilterIdxBits.W)))
   for (i <- 0 until studentPoolSize) {
-    val predictedAddr = addOffset(io.train.bits, pool(i).offset)
-    val samePage = getPPN(predictedAddr) === getPPN(io.train.bits)
+    val predictedAddr = addOffset(io.delayOut.bits, pool(i).offset)
+    val samePage = getPPN(predictedAddr) === getPPN(io.delayOut.bits)
     writeValids(i) := pool(i).valid && (crossPage.B || samePage)
     writeIdxs(i) := filterIndex(predictedAddr)
   }
@@ -687,16 +688,22 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
       endTrainCount := phaseTrainCount
       endTeacherOffset := io.teacherBestOffset
       state := s_phaseEnd
-    }.elsewhen(io.train.valid) {
-      phaseTrainCount := phaseTrainCount + 1.U
-      for (i <- 0 until studentPoolSize) {
-        // Accumulate coverage for recorded lines
-        when(pool(i).valid && hitMask(i)) {
-          pool(i).curPhaseCov := pool(i).curPhaseCov + 1.U
+    }.otherwise {
+      when (io.train.valid) {
+        phaseTrainCount := phaseTrainCount + 1.U
+        for (i <- 0 until studentPoolSize) {
+          // Accumulate coverage for recorded lines
+          when(pool(i).valid && hitMask(i)) {
+            pool(i).curPhaseCov := pool(i).curPhaseCov + 1.U
+          }
         }
-        // Write predictions to filter table
-        when(writeValids(i)) {
-          filterTable(i) := filterTable(i).bitSet(writeIdxs(i), true.B)
+      }
+      when (io.delayOut.valid) {
+        for (i <- 0 until studentPoolSize) {
+          // Write predictions to filter table
+          when(writeValids(i)) {
+            filterTable(i) := filterTable(i).bitSet(writeIdxs(i), true.B)
+          }
         }
       }
     }
@@ -1241,6 +1248,8 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   student.foreach { learner =>
     learner.io.train.valid := io.train.valid && delayQueue.io.in.ready && scoreTable.io.req.ready && s1_ready
     learner.io.train.bits := s0_oldFullAddr
+    learner.io.delayOut.valid := delayQueue.io.out.valid
+    learner.io.delayOut.bits := delayQueue.io.out.bits
     learner.io.teacherPhaseEnd := scoreTable.io.phaseEndPulse
     learner.io.teacherBestOffset := scoreTable.io.phaseBestOffsetCommitted
     learner.io.teacherIssueEnable := scoreTable.io.phaseIssueEnable
@@ -1349,6 +1358,8 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   student.foreach { learner =>
     learner.io.train.valid := io.train.valid && delayQueue.io.in.ready && scoreTable.io.req.ready && s1_ready
     learner.io.train.bits := s0_oldAddr
+    learner.io.delayOut.valid := delayQueue.io.out.valid
+    learner.io.delayOut.bits := delayQueue.io.out.bits
     learner.io.teacherPhaseEnd := scoreTable.io.phaseEndPulse
     learner.io.teacherBestOffset := scoreTable.io.phaseBestOffsetCommitted
     learner.io.teacherIssueEnable := scoreTable.io.phaseIssueEnable
