@@ -69,7 +69,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
     val repl_resp = Input(new L2Directory.ReplReadResult)
 
     val dir_wb_locked = Output(Bool())
+    val dir_wb_cancel = Output(Bool())
+
     val ds_wb_locked = Output(Bool())
+    val ds_wb_cancel = Output(Bool())
 
     val dir_wb_aux = Output(Bool())
 
@@ -234,22 +237,22 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
 
   val w_ds_resp = RegInit(false.B) // Waiting for response from Data Storage
 
-  val w_s_dn_rd_compack = RegInit(false.B) // Waiting to schedule downstream TXRSP CompAck of Read and normal subsequence
-  val s_dn_rd_compack = RegInit(false.B) // Scheduling downstream TXRSP CompAck of Read and normal subsequence
+  val w_s_rd_dn_compack = RegInit(false.B) // Waiting to schedule downstream TXRSP CompAck of Read and normal subsequence
+  val s_rd_dn_compack = RegInit(false.B) // Scheduling downstream TXRSP CompAck of Read and normal subsequence
 
-  val w_dn_rd_data0 = RegInit(false.B) // Waiting for downstream RXDAT CompData/DataSepResp (DataID = 0)
-  val w_dn_rd_data2 = RegInit(false.B) // Waiting for downstream RXDAT CompData/DataSepResp (DataID = 2)
-  val w_dn_rd_comp = RegInit(false.B) // Waiting for downstream RXRSP CompData/RespSepData
+  val w_rd_dn_data0 = RegInit(false.B) // Waiting for downstream RXDAT CompData/DataSepResp (DataID = 0)
+  val w_rd_dn_data2 = RegInit(false.B) // Waiting for downstream RXDAT CompData/DataSepResp (DataID = 2)
+  val w_rd_dn_comp = RegInit(false.B) // Waiting for downstream RXRSP CompData/RespSepData
 
-  val w_up_rd_compack = RegInit(false.B) // Waiting for Upstream RXRSP CompAck
+  val w_rd_up_compack = RegInit(false.B) // Waiting for Upstream RXRSP CompAck
 
-  val w_s_up_rd_compdata0 = RegInit(false.B) // Waiting to schedule upstream TXDAT CompData (DataID = 0) of Read subsequence
-  val w_s_up_rd_compdata2 = RegInit(false.B) // Waiting to schedule upstream TXDAT CompData (DataID = 2) of Read subsequence
-  val s_up_rd_compdata0 = RegInit(false.B) // Scheduling upstream TXDAT CompData (DataID = 0) of Read subsequence
-  val s_up_rd_compdata2 = RegInit(false.B) // Scheduling upstream TXDAT CompData (DataID = 2) of Read subsequence
+  val w_s_rd_up_compdata0 = RegInit(false.B) // Waiting to schedule upstream TXDAT CompData (DataID = 0) of Read subsequence
+  val w_s_rd_up_compdata2 = RegInit(false.B) // Waiting to schedule upstream TXDAT CompData (DataID = 2) of Read subsequence
+  val s_rd_up_compdata0 = RegInit(false.B) // Scheduling upstream TXDAT CompData (DataID = 0) of Read subsequence
+  val s_rd_up_compdata2 = RegInit(false.B) // Scheduling upstream TXDAT CompData (DataID = 2) of Read subsequence
 
-  val w_s_up_rd_comp = RegInit(false.B) // Waiting to schedule upstream TXRSP Comp of Read subsequence
-  val s_up_rd_comp = RegInit(false.B) // Scheduling upstream TXRSP Comp for Read subsequence
+  val w_s_rd_up_comp = RegInit(false.B) // Waiting to schedule upstream TXRSP Comp of Read subsequence
+  val s_rd_up_comp = RegInit(false.B) // Scheduling upstream TXRSP Comp for Read subsequence
 
   val w_unlock_dir = RegInit(false.B) // Waiting for unlocking Directory Write-Back
   val w_unlock_ds = RegInit(false.B) // Waiting for unlocking Data Storage Write-Back
@@ -261,15 +264,15 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
 
   val w_evict_s_dn_txreq = RegInit(false.B) // Waiting to schedule downstream TXREQ of EvictBack subsequence
 
-  val w_dn_evict_comp = RegInit(false.B) // Waiting for downstream RXRSP Comp terminal of EvictBack subsequence
-  val w_dn_evict_compdbid = RegInit(false.B) // Waiting for downstream RXRSP Comp/CompDBIDResp with DBID of EvictBack subsequence
+  val w_evict_dn_comp = RegInit(false.B) // Waiting for downstream RXRSP Comp terminal of EvictBack subsequence
+  val w_evict_dn_compdbid = RegInit(false.B) // Waiting for downstream RXRSP Comp/CompDBIDResp with DBID of EvictBack subsequence
 
-  val w_s_dn_evict_cbwrdata0 = RegInit(false.B)
-  val w_s_dn_evict_cbwrdata2 = RegInit(false.B)
-  val s_dn_evict_cbwrdata0 = RegInit(false.B)
-  val s_dn_evict_cbwrdata2 = RegInit(false.B)
+  val w_s_evict_dn_cbwrdata0 = RegInit(false.B)
+  val w_s_evict_dn_cbwrdata2 = RegInit(false.B)
+  val s_evict_dn_cbwrdata0 = RegInit(false.B)
+  val s_evict_dn_cbwrdata2 = RegInit(false.B)
 
-  val s_dn_evict_compack = RegInit(false.B)
+  val s_evict_dn_compack = RegInit(false.B)
 
   val w_evict_peer_unlock_ds = RegInit(false.B)
 
@@ -284,12 +287,20 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   val active = w_snpresp0 || w_snpresp2 || s_snpcompack ||
                s_dn_txreq || w_dn_pcrdgrant ||
                w_ds_resp ||
-               s_dn_rd_compack || w_dn_rd_data0 || w_dn_rd_data2 || w_dn_rd_comp ||
-               w_up_rd_compack ||
-               w_s_up_rd_compdata0 || s_up_rd_compdata0 || w_s_up_rd_compdata2 || s_up_rd_compdata2 ||
-               w_s_up_rd_comp || s_up_rd_comp ||
+               s_rd_dn_compack || w_rd_dn_data0 || w_rd_dn_data2 || w_rd_dn_comp ||
+               w_rd_up_compack ||
+               w_s_rd_up_compdata0 || s_rd_up_compdata0 || w_s_rd_up_compdata2 || s_rd_up_compdata2 ||
+               w_s_rd_up_comp || s_rd_up_comp ||
                w_unlock_dir || w_unlock_ds ||
-               w_s_repl || s_repl || s_evict
+               w_s_repl || s_repl || s_evict ||
+               w_evict_s_dn_txreq ||
+               w_evict_dn_comp || w_evict_dn_compdbid ||
+               w_s_evict_dn_cbwrdata0 || w_s_evict_dn_cbwrdata2 ||
+               s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2 ||
+               s_evict_dn_compack ||
+               w_evict_peer_unlock_ds
+
+  io.free := !active
 
   // ----------------------------------------------------------------
 
@@ -422,7 +433,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   }
 
   when (sched_compack_txreq_rd) {
-    w_s_dn_rd_compack := true.B
+    w_s_rd_dn_compack := true.B
   }
 
   when (dn_rxrsp_opcode.is(CHI_RetryAck)) {
@@ -587,9 +598,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   // -- Interactions with downstream CHI RXRSP, RXDAT channel
   // TODO: handle RespErr here or somewhere else
   val dn_rxdat_compdata = dn_rxdat_opcode.is(CHI_CompData)
-  val dn_rxdat_compdata_first = dn_rxdat_compdata && w_dn_rd_data0 && w_dn_rd_data2
+  val dn_rxdat_compdata_first = dn_rxdat_compdata && w_rd_dn_data0 && w_rd_dn_data2
   val dn_rxdat_datasepresp = dn_rxdat_opcode.is(CHI_DataSepResp)
-  val dn_rxdat_datasepresp_first = dn_rxdat_datasepresp && w_dn_rd_data0 && w_dn_rd_data2
+  val dn_rxdat_datasepresp_first = dn_rxdat_datasepresp && w_rd_dn_data0 && w_rd_dn_data2
 
   val dn_rxrsp_comp = dn_rxdat_opcode.is(CHI_Comp)
   val dn_rxrsp_respsepdata = dn_rxdat_opcode.is(CHI_RespSepData)
@@ -604,66 +615,66 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
                                  fire_txreq_writeevictfull ||
                                  fire_txreq_writeevictorevict
 
-  val dn_rd_decided = !(w_dn_rd_data0 && w_dn_rd_data2)
+  val dn_rd_decided = !(w_rd_dn_data0 && w_rd_dn_data2)
 
   when (expect_dn_rd_comp_and_data) {
-    w_dn_rd_data0 := true.B
-    w_dn_rd_data2 := true.B
-    w_dn_rd_comp := true.B
+    w_rd_dn_data0 := true.B
+    w_rd_dn_data2 := true.B
+    w_rd_dn_comp := true.B
   }
 
   when (expect_dn_evict_comp) {
-    w_dn_evict_comp := true.B
+    w_evict_dn_comp := true.B
   }
 
   when (expect_dn_evict_compdbid) {
-    w_dn_evict_compdbid := true.B
+    w_evict_dn_compdbid := true.B
   }
 
   when (dn_rxrsp_comp) {
     p_homenid := io.DnRXRSP.bits.SrcID.get
     p_dbid := io.DnRXRSP.bits.DBID.get
-    w_dn_rd_data0 := false.B
-    w_dn_rd_data2 := false.B
-    w_dn_rd_comp := false.B
-    w_dn_evict_comp := false.B
-    w_dn_evict_compdbid := false.B
+    w_rd_dn_data0 := false.B
+    w_rd_dn_data2 := false.B
+    w_rd_dn_comp := false.B
+    w_evict_dn_comp := false.B
+    w_evict_dn_compdbid := false.B
   }
 
   when (dn_rxrsp_compdbidresp) {
     p_homenid := io.DnRXRSP.bits.SrcID.get
     p_dbid := io.DnRXRSP.bits.DBID.get
-    w_dn_evict_compdbid := false.B
+    w_evict_dn_compdbid := false.B
   }
 
   when (dn_rxdat_compdata) {
     p_homenid := io.DnRXDAT.bits.HomeNID.get
     p_dbid := io.DnRXDAT.bits.DBID.get
-    w_dn_rd_comp := false.B
+    w_rd_dn_comp := false.B
     when (io.DnRXDAT.bits.DataID.get === 0.U) {
-      w_dn_rd_data0 := false.B
+      w_rd_dn_data0 := false.B
     }.otherwise {
-      w_dn_rd_data2 := false.B
+      w_rd_dn_data2 := false.B
     }
   }
 
   when (dn_rxrsp_respsepdata) {
     p_homenid := io.DnRXRSP.bits.SrcID.get
     p_dbid := io.DnRXRSP.bits.DBID.get
-    w_dn_rd_comp := false.B
+    w_rd_dn_comp := false.B
   }
 
   when (dn_rxdat_datasepresp) {
     p_homenid := io.DnRXDAT.bits.HomeNID.get
     p_dbid := io.DnRXDAT.bits.DBID.get
     when (io.DnRXDAT.bits.DataID.get === 0.U) {
-      w_dn_rd_data0 := false.B
+      w_rd_dn_data0 := false.B
     }.otherwise {
-      w_dn_rd_data2 := false.B
+      w_rd_dn_data2 := false.B
     }
   }
 
-  assert(!(w_dn_evict_comp && dn_rxrsp_compdbidresp), "")
+  assert(!(w_evict_dn_comp && dn_rxrsp_compdbidresp), "")
   // ----------------------------------------------------------------
 
   // -- Interactions with downstream CHI TXRSP channel
@@ -673,24 +684,24 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
                             dn_rxrsp_comp ||
                             dn_rxrsp_respsepdata
 
-  val issue_dn_rd_compack = w_s_dn_rd_compack && allow_dn_rd_compack
+  val issue_dn_rd_compack = w_s_rd_dn_compack && allow_dn_rd_compack
 
-  val issue_dn_evict_compack = w_dn_evict_compdbid && dn_rxrsp_comp
+  val issue_dn_evict_compack = w_evict_dn_compdbid && dn_rxrsp_comp
 
   when (issue_dn_rd_compack) {
-    s_dn_rd_compack := true.B
+    s_rd_dn_compack := true.B
   }
 
   when (issue_dn_evict_compack) {
-    s_dn_evict_compack := true.B
+    s_evict_dn_compack := true.B
   }
 
   when (dn_txrsp_compack) {
-    s_dn_rd_compack := false.B
-    s_dn_evict_compack := false.B
+    s_rd_dn_compack := false.B
+    s_evict_dn_compack := false.B
   }
 
-  io.DnTXRSP.valid := s_dn_rd_compack || s_dn_evict_compack
+  io.DnTXRSP.valid := s_rd_dn_compack || s_evict_dn_compack
   io.DnTXRSP.bits.QoS.get := 14.U // Default at 14, (**DOT NOT use 15**, maybe better policy in future)
   io.DnTXRSP.bits.TgtID.get := p_homenid
   io.DnTXRSP.bits.SrcID.get := nodeId.U
@@ -712,27 +723,27 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   val allow_dn_evict_cbwrdata0 = !w_snpresp0 && !w_ds_resp
   val allow_dn_evict_cbwrdata2 = !w_snpresp2 && !w_ds_resp
 
-  val sched_dn_evict_cbwrdata = w_dn_evict_compdbid && dn_rxrsp_compdbidresp
+  val sched_dn_evict_cbwrdata = w_evict_dn_compdbid && dn_rxrsp_compdbidresp
 
-  val issue_dn_evict_cbwrdata0 = w_s_dn_evict_cbwrdata0 && allow_dn_evict_cbwrdata0
-  val issue_dn_evict_cbwrdata2 = w_s_dn_evict_cbwrdata2 && allow_dn_evict_cbwrdata2
+  val issue_dn_evict_cbwrdata0 = w_s_evict_dn_cbwrdata0 && allow_dn_evict_cbwrdata0
+  val issue_dn_evict_cbwrdata2 = w_s_evict_dn_cbwrdata2 && allow_dn_evict_cbwrdata2
 
   when (sched_dn_evict_cbwrdata) {
-    w_s_dn_evict_cbwrdata0 := true.B
-    w_s_dn_evict_cbwrdata2 := true.B
+    w_s_evict_dn_cbwrdata0 := true.B
+    w_s_evict_dn_cbwrdata2 := true.B
   }
 
   when (issue_dn_evict_cbwrdata0) {
-    w_s_dn_evict_cbwrdata0 := false.B
-    s_dn_evict_cbwrdata0 := true.B
+    w_s_evict_dn_cbwrdata0 := false.B
+    s_evict_dn_cbwrdata0 := true.B
   }
 
   when (issue_dn_evict_cbwrdata2) {
-    w_s_dn_evict_cbwrdata2 := false.B
-    s_dn_evict_cbwrdata2 := true.B
+    w_s_evict_dn_cbwrdata2 := false.B
+    s_evict_dn_cbwrdata2 := true.B
   }
 
-  io.DnTXDAT.valid := s_dn_evict_cbwrdata0 || s_dn_evict_cbwrdata2
+  io.DnTXDAT.valid := s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2
   io.DnTXDAT.bits.QoS.get := 14.U // Default at 14, (**DOT NOT use 15**, maybe better policy in future)
   io.DnTXDAT.bits.TgtID.get := p_homenid
   io.DnTXDAT.bits.SrcID.get := nodeId.U
@@ -749,7 +760,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   io.DnTXDAT.bits.CBusy.get := 0.U
   io.DnTXDAT.bits.DBID.get := 0.U
   io.DnTXDAT.bits.CCID.get := 0.U
-  io.DnTXDAT.bits.DataID.get := Mux(s_dn_evict_cbwrdata0, 0.U, 2.U)
+  io.DnTXDAT.bits.DataID.get := Mux(s_evict_dn_cbwrdata0, 0.U, 2.U)
   io.DnTXDAT.bits.TagOp.get := 0.U
   io.DnTXDAT.bits.Tag.get := 0.U
   io.DnTXDAT.bits.TU.get := 0.U
@@ -771,14 +782,14 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   val expect_up_rd_compack = expect_up_rd_compack_sat || expect_up_rd_compack_unsat
 
   when (expect_up_rd_compack) {
-    w_up_rd_compack := true.B
+    w_rd_up_compack := true.B
   }
 
   when (up_rxrsp_compack) {
-    w_up_rd_compack := false.B
+    w_rd_up_compack := false.B
   }
 
-  assert(!(up_rxrsp_compack && !w_up_rd_compack), s"Receiving upstream RXRSP CompAck on non-valid 'w_up_rd_compack' in TSHR #${tshrId} REQ vPipe")
+  assert(!(up_rxrsp_compack && !w_rd_up_compack), s"Receiving upstream RXRSP CompAck on non-valid 'w_up_rd_compack' in TSHR #${tshrId} REQ vPipe")
   // ----------------------------------------------------------------
 
   // -- Interactions with TSHR local meta
@@ -869,7 +880,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   // - EvictBack related meta/tag updates
   val meta_wr_state_evictback_I_evict = s_evict && evictback_txreq_opcode === CHI_Evict.U
 
-  val meta_wr_state_evictback_I_write = w_dn_evict_compdbid && 
+  val meta_wr_state_evictback_I_write = w_evict_dn_compdbid && 
                                         (dn_rxrsp_comp || dn_rxrsp_compdbidresp)
 
   val meta_wr_state_evictback_I = meta_wr_state_evictback_I_evict ||
@@ -991,7 +1002,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
 
   val allow_up_rd_comp = sa_resp_decided && 
                          dn_rd_decided && 
-                         !w_dn_rd_comp
+                         !w_rd_dn_comp
 
   val sched_up_rd_comp_readunique_sat = rxreq_satisfied_readunique &&
                                         rxreq_client_present && !rxreq.ExpCompData
@@ -1006,32 +1017,32 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   val sched_up_rd_comp = sched_up_rd_comp_readunique
 
   when (sched_up_rd_comp) {
-    w_s_up_rd_comp := true.B
+    w_s_rd_up_comp := true.B
   }
 
-  val issue_up_rd_comp = w_s_up_rd_comp && allow_up_rd_comp
+  val issue_up_rd_comp = w_s_rd_up_comp && allow_up_rd_comp
 
   when (issue_up_rd_comp) {
-    w_s_up_rd_comp := false.B
-    s_up_rd_comp := true.B
+    w_s_rd_up_comp := false.B
+    s_rd_up_comp := true.B
   }
 
   when (up_txrsp_comp) {
-    s_up_rd_comp := false.B
+    s_rd_up_comp := false.B
   }
 
   val up_txrsp_opcode = ParallelPriorityMux(Seq(
-    (s_up_rd_comp, CCHIOpcode.Comp.U)
+    (s_rd_up_comp, CCHIOpcode.Comp.U)
   ))
 
   val up_txrsp_resp = ParallelPriorityMux(Seq(
-    (s_up_rd_comp, ParallelPriorityMux(Seq(
+    (s_rd_up_comp, ParallelPriorityMux(Seq(
       (p_rxreq_readunique, CCHIResp.UC.U),
       (p_rxreq_readshared, Mux(dirResult.state === MetaState.UU || meta_wr_state_UU, CCHIResp.UC.U, CCHIResp.SC.U))
     )))
   ))
 
-  io.UpTXRSP.valid := s_up_rd_comp
+  io.UpTXRSP.valid := s_rd_up_comp
   io.UpTXRSP.bits.TxnID := p_rxreq.TxnID
   io.UpTXRSP.bits.SrcID := nodeId.U
   io.UpTXRSP.bits.TgtID := p_rxreq.SrcID
@@ -1040,7 +1051,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   io.UpTXRSP.bits.RespErr := 0.U // TODO: RespErr
   io.UpTXRSP.bits.Resp := up_txrsp_resp
   io.UpTXRSP.bits.CBusy := 0.U // TODO: CBusy, may be assigned in TSHR top
-  io.UpTXRSP.bits.WayValid := s_up_rd_comp
+  io.UpTXRSP.bits.WayValid := s_rd_up_comp
   io.UpTXRSP.bits.Way := dirResult.way
   io.UpTXRSP.bits.TraceTag := false.B // TODO: TraceTag propagation
   // ----------------------------------------------------------------
@@ -1049,8 +1060,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   val up_txdat_compdata0 = io.UpTXDAT.fire && io.UpTXDAT.bits.Opcode === CCHIOpcode.CompData.U && io.UpTXDAT.bits.DataID === 0.U
   val up_txdat_compdata2 = io.UpTXDAT.fire && io.UpTXDAT.bits.Opcode === CCHIOpcode.CompData.U && io.UpTXDAT.bits.DataID === 1.U
 
-  val allow_up_rd_compdata0 = !w_ds_resp && !w_snpresp0 && !w_dn_rd_data0 && !io.L1EVT_active
-  val allow_up_rd_compdata2 = !w_ds_resp && !w_snpresp2 && !w_dn_rd_data2 && !io.L1EVT_active
+  val allow_up_rd_compdata0 = !w_ds_resp && !w_snpresp0 && !w_rd_dn_data0 && !io.L1EVT_active
+  val allow_up_rd_compdata2 = !w_ds_resp && !w_snpresp2 && !w_rd_dn_data2 && !io.L1EVT_active
 
   val sched_up_rd_compdata_sat_readunique = rxreq_satisfied_readunique && 
                                             (!rxreq_client_present || rxreq.ExpCompData)
@@ -1075,29 +1086,29 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
                              sched_up_rd_compdata_unsat
 
   when (sched_up_rd_compdata) {
-    w_s_up_rd_compdata0 := true.B
-    w_s_up_rd_compdata2 := true.B
+    w_s_rd_up_compdata0 := true.B
+    w_s_rd_up_compdata2 := true.B
   }
 
-  val issue_up_rd_compdata0 = w_s_up_rd_compdata0 && allow_up_rd_compdata0
-  val issue_up_rd_compdata2 = w_s_up_rd_compdata2 && allow_up_rd_compdata2
+  val issue_up_rd_compdata0 = w_s_rd_up_compdata0 && allow_up_rd_compdata0
+  val issue_up_rd_compdata2 = w_s_rd_up_compdata2 && allow_up_rd_compdata2
 
   when (issue_up_rd_compdata0) {
-    w_s_up_rd_compdata0 := false.B
-    s_up_rd_compdata0 := true.B
+    w_s_rd_up_compdata0 := false.B
+    s_rd_up_compdata0 := true.B
   }
 
   when (issue_up_rd_compdata2) {
-    w_s_up_rd_compdata2 := false.B
-    s_up_rd_compdata2 := true.B
+    w_s_rd_up_compdata2 := false.B
+    s_rd_up_compdata2 := true.B
   }
 
   when (up_txdat_compdata0) {
-    s_up_rd_compdata0 := false.B
+    s_rd_up_compdata0 := false.B
   }
 
   when (up_txdat_compdata2) {
-    s_up_rd_compdata2 := false.B
+    s_rd_up_compdata2 := false.B
   }
 
   val up_txdat_resp = ParallelPriorityMux(Seq(
@@ -1105,9 +1116,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
     (p_rxreq_readshared, Mux(dirResult.state === MetaState.UU || meta_wr_state_UU, CCHIResp.UC.U, CCHIResp.SC.U))
   ))
 
-  val up_txdat_dataid = Mux(s_up_rd_compdata0, 0.U, 1.U) // TODO: cirtical word first maybe
+  val up_txdat_dataid = Mux(s_rd_up_compdata0, 0.U, 1.U) // TODO: cirtical word first maybe
 
-  io.UpTXDAT.valid := s_up_rd_compdata0 || s_up_rd_compdata2
+  io.UpTXDAT.valid := s_rd_up_compdata0 || s_rd_up_compdata2
   io.UpTXDAT.bits.TxnID := p_rxreq.TxnID
   io.UpTXDAT.bits.SrcID := nodeId.U
   io.UpTXDAT.bits.TgtID := p_rxreq.SrcID
@@ -1180,12 +1191,17 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   io.dir_wb_locked := w_unlock_dir
   io.ds_wb_locked := w_unlock_ds
 
+  // Clean local Meta (to Directory) and TSHR Buffer (to Data Storage) modified state and 
+  // cancel all non-arbitered Directory & Data Storage write back for L2 Eviction
+  io.dir_wb_cancel := meta_wr_state_evictback_I
+  io.ds_wb_cancel := s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2 || s_evict_dn_compack
+
   // Activate Directory write-back immediately on replacement Directory lock released by eviction
   // to clear the replacer reading lock in Directory
   io.dir_wb_aux := unlock_dir
 
   io.UpTXREQ.valid := s_evict
-  io.UpTXREQ.bits.TxnID := 0.U // TODO: TxnID translations
+  io.UpTXREQ.bits.TxnID := tshrId.U
   io.UpTXREQ.bits.SrcID := nodeId.U
   io.UpTXREQ.bits.TgtID := nodeId.U
   io.UpTXREQ.bits.Opcode := CCHIOpcode.EvictBack.U
@@ -1234,7 +1250,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   // ----------------------------------------------------------------
 
   // -- Blocking same-PA RXSNP, on waiting of L1 CompAck
-  io.blockRBE.SNP := w_up_rd_compack
+  io.blockRBE.SNP := w_rd_up_compack
   // ----------------------------------------------------------------
 
 
