@@ -641,11 +641,13 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   })
 
   // Generate filter-table writes for pool offsets
+  val writeAddr = if (virtualTrain) io.delayOut.bits else io.train.bits
+  val writeEnable = if (virtualTrain) io.delayOut.valid else io.train.valid
   val writeValids = Wire(Vec(studentPoolSize, Bool()))
   val writeIdxs = Wire(Vec(studentPoolSize, UInt(studentFilterIdxBits.W)))
   for (i <- 0 until studentPoolSize) {
-    val predictedAddr = addOffset(io.delayOut.bits, pool(i).offset)
-    val samePage = getPPN(predictedAddr) === getPPN(io.delayOut.bits)
+    val predictedAddr = addOffset(writeAddr, pool(i).offset)
+    val samePage = getPPN(predictedAddr) === getPPN(writeAddr)
     writeValids(i) := pool(i).valid && (crossPage.B || samePage)
     writeIdxs(i) := filterIndex(predictedAddr)
   }
@@ -698,7 +700,7 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
           }
         }
       }
-      when (io.delayOut.valid) {
+      when (writeEnable) {
         for (i <- 0 until studentPoolSize) {
           // Write predictions to filter table
           when(writeValids(i)) {
