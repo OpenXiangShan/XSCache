@@ -62,6 +62,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
     val tshr_alloc = Input(Bool())
     val tshr_reuse = Input(Bool())
     val tshr_inactive = Input(Bool())
+    val tshr_inactivate = Input(Bool())
     val tshr_dealloc = Input(Bool())
 
     val read_arbed = Input(Bool())
@@ -71,7 +72,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
     val meta = Input(new L2Directory.Meta)
     val meta_way = Input(UInt(4.W)) // TODO: parameterize with l2 way count
     val meta_modified = Input(new L2Directory.MetaWriteMask)
-    val tag_modifed = Input(Bool())
+    val tag_modified = Input(Bool())
 
     val rd_idle = Output(Bool())
     val rd_accept = Output(Bool())
@@ -84,6 +85,8 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
     val repl_retry = Output(Bool())
 
     val wb_locked = Input(Bool())
+    val wb_cancel = Input(Bool())
+    val wb_aux = Input(Bool())
     val wb_accept = Output(Bool())
     val wb_done = Output(Bool())
   })
@@ -105,6 +108,9 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   val fromDir_ReplRdArbComp = fromDir_en && io.fromDir.ReplRdArbComp
   val fromDir_ReplRdResp = fromDir_en && io.fromDir.ReplRdResp
   val fromDir_ReplRdRetryAck = fromDir_en && io.fromDir.ReplRdRetryAck
+
+  //
+  val tshr_inactive = io.tshr_inactivate || io.tshr_inactive
 
   // Directory read states
   val state_dirRead = RegInit(new DirReadFSM, DirReadFSM.init)
@@ -273,10 +279,10 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       /*
       1.
       */
-      when (io.meta_modified.any) {
+      when (io.meta_modified.any || io.tag_modified) {
         // 1. [] -> DirWrite_PreArb
         state_dirWrite_next.PreArb := true.B
-      }.elsewhen (io.tshr_inactive) {
+      }.elsewhen (tshr_inactive) {
         // 2. [] -> DirWrite_Done
         state_dirWrite_next.Done := true.B
       }
@@ -299,7 +305,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       /*
       1. 
       */
-      when (io.meta_modified.any) {
+      when (io.meta_modified.any || io.tag_modified) {
         // 1. DirWrite_Done -> DirWrite_PreArb
         state_dirWrite_next.Done := false.B
         state_dirWrite_next.PreArb := true.B
@@ -312,8 +318,8 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       /* 
       1.  
       */
-      when (io.tshr_inactive) {
-        when (io.meta_modified.any) {
+      when (tshr_inactive) {
+        when (io.meta_modified.any || io.tag_modified) {
         // 1. [] -> DirWrite_PreArb
         state_dirWrite_next.PreArb := true.B
         }.otherwise {
@@ -343,7 +349,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       /*
       1.
       */
-      when (io.meta_modified.any) {
+      when (io.meta_modified.any || io.tag_modified) {
         // 1. DirWrite_Done -> []
         state_dirWrite_next.Done := false.B
       }
@@ -366,7 +372,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   io.toDir.WAY := io.meta_way
   io.toDir.META := io.meta
   io.toDir.META_WEN := io.meta_modified
-  io.toDir.TAG_WEN := io.tag_modifed
+  io.toDir.TAG_WEN := io.tag_modified
   io.toDir.DirRd := state_dirRead.PreArb
   io.toDir.DirWb := state_dirWrite.PreArb && !io.wb_locked
   io.toDir.ReplRd := state_dirRead.ReplPreArb
