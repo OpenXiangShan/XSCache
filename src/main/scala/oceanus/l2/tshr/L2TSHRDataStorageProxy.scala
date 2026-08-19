@@ -86,7 +86,6 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
     val ds_read_vPipeSNP_en = Input(Bool())
     val ds_read_vPipeREQ_en = Input(Bool())
 
-    // TODO: support cancel here?
     val ds_read_EVT_cancel = Input(Bool())
     val ds_read_SNP_cancel = Input(Bool())
     val ds_read_REQ_cancel = Input(Bool())
@@ -131,6 +130,9 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
   }
 
   val ds_read_nonAhead_en = ds_read_postRBE_en || ds_read_postRBE_en_q || io.ds_read_aux_en
+
+  //
+  val ds_read_cancel = io.ds_read_EVT_cancel || io.ds_read_SNP_cancel || io.ds_read_REQ_cancel
 
   //
   val fromDir_en = io.fromDir.TSHRID === id.U
@@ -343,7 +345,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
     }
   }
 
-  when (io.RXDAT_fire) {
+  when (io.RXDAT_fire || ds_read_cancel) {
     /*
 
     */
