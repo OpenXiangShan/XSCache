@@ -474,7 +474,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     true.B,
     vbopDegree.orR,
     pbopDegree.orR,
-    tpDegree.orR
+    tpDegree.orR,
+    true.B
   )
 
   for (i <- 0 until banks) {
