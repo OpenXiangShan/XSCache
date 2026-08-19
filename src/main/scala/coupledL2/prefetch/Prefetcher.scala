@@ -230,7 +230,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   // l2 receive need 2 cycles to transmit from core
   val pfRcv_en = RegNextN(pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pf_recv_en, 2, Some(true.B))
-  val pbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pbop_en
+  val pbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pbop_en && false.B
   val vbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_vbop_en
   val tp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_tp_en
   val cdp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_cdp_en
@@ -310,6 +310,10 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
               -125, -120, -108, -100, -96, -90, -81, -80,
               -75, -72, -64, -60, -54, -50, -48, -45,
               -40, -36, 32, 36, 40, 45, 48,
+              -32, -30, -27, -25, -24, -20, -18, -16, -15,
+              -12, -10, -9, -8, -6, -5, -4, -3, -2, -1,
+              1, 2, 3, 4, 5, 6, 8, 9, 10,
+              12, 15, 16, 18, 20, 24, 25, 27, 30,
               50, 54, 60, 64, 72, 75, 80, 81,
               90, 96, 100, 108, 120, 125, 128, 135,
               144, 150, 160, 162, 180, 192, 200, 216,
