@@ -198,8 +198,8 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   private val blockRefillFaultMode = p(L2DirectoryBlockRefillFaultModeKey).U(2.W)
 
   val io = IO(new Bundle {
-    val toDir   = Flipped(Vec(nMSHR, new L2Directory.PathToDirectory))
-    val fromDir = Vec(nMSHR, new L2Directory.PathFromDirectory)
+    val toDir   = Input(Vec(nMSHR, new L2Directory.PathToDirectory))
+    val fromDir = Output(Vec(nMSHR, new L2Directory.PathFromDirectory))
     val tshrIdle = Input(Vec(nMSHR, Bool()))
     val debugStateWrite = if (enableDirStateProbe) {
       Some(Output(new Bundle {
