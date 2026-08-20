@@ -89,6 +89,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
     val self_unlock_ds = Input(Bool())
 
     val L1EVT_active = Input(Bool())
+
+    val L2EVT_active = Output(Bool())
   })
 
   val dirResult = io.tshr_dirResult
@@ -140,6 +142,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
 
   val rxreq_readunique = rxreq_opcode.is(CCHIOpcode.ReadUnique)
   val rxreq_readshared = rxreq_opcode.is(CCHIOpcode.ReadShared)
+  val rxreq_evictback = rxreq_opcode.is(CCHIOpcode.EvictBack)
 
   def satisfied(opcode: CCHIOpcode, state: UInt): (Bool, Bool) = (
     rxreq_opcode.is(opcode) && (dirResult.state >= state && dirResult.hit), 
@@ -349,11 +352,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   //  - SnpCompAck should be issued with scheduling bit set, and after all data beats to upstream/downstream
   //    were sent.
   when (io.toSA.SnpToClean) {
-    s_snpcompack := true.B
+    // s_snpcompack := true.B
   }
 
   when (io.toSA.SnpCompAck) {
-    s_snpcompack := false.B
+    // s_snpcompack := false.B
   }
 
   io.toSA.SnpCompAck := false.B // TODO: interact with upstream data sending
@@ -567,7 +570,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   io.DnTXREQ.bits.QoS.get := 14.U // Default at 14, (**DOT NOT use 15**, maybe better policy in future)
   io.DnTXREQ.bits.TgtID.get := 0.U // Support E-SAM only currently
   io.DnTXREQ.bits.SrcID.get := nodeId.U
-  io.DnTXREQ.bits.TxnID.get := 0.U // TODO: TxnID translations
+  io.DnTXREQ.bits.TxnID.get := tshrId.U
   io.DnTXREQ.bits.ReturnNID_StashNID_SLCRepHint.get := 0.U // Not providing SLCRepHint/StashNID, default to 0
   io.DnTXREQ.bits.StashNIDValid_Endian_Deep.get := 0.U
   io.DnTXREQ.bits.ReturnTxnID_StashLPIDValid_StashLPID.get := 0.U
@@ -589,6 +592,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   io.DnTXREQ.bits.MPAM.foreach(_ := 0.U) // TODO: Not supporting MTE, wire up with NS bit
   io.DnTXREQ.bits.RSVDC.foreach(_ := 0.U)
 
+  val fire_txreq_pcrdreturn = io.DnTXREQ.fire && io.DnTXREQ.bits.Opcode.get === CHI_PCrdReturn.U
+
   val fire_txreq_evict = io.DnTXREQ.fire && io.DnTXREQ.bits.Opcode.get === CHI_Evict.U
   val fire_txreq_writeevictfull = io.DnTXREQ.fire && io.DnTXREQ.bits.Opcode.get === CHI_WriteEvictFull.U
   val fire_txreq_writeevictorevict = io.DnTXREQ.fire && io.DnTXREQ.bits.Opcode.get === CHI_WriteEvictOrEvict.U
@@ -602,18 +607,20 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   val dn_rxdat_datasepresp = dn_rxdat_opcode.is(CHI_DataSepResp)
   val dn_rxdat_datasepresp_first = dn_rxdat_datasepresp && w_rd_dn_data0 && w_rd_dn_data2
 
-  val dn_rxrsp_comp = dn_rxdat_opcode.is(CHI_Comp)
-  val dn_rxrsp_respsepdata = dn_rxdat_opcode.is(CHI_RespSepData)
-  val dn_rxrsp_compdbidresp = dn_rxdat_opcode.is(CHI_CompDBIDResp)
+  val dn_rxrsp_comp = dn_rxrsp_opcode.is(CHI_Comp)
+  val dn_rxrsp_respsepdata = dn_rxrsp_opcode.is(CHI_RespSepData)
+  val dn_rxrsp_compdbidresp = dn_rxrsp_opcode.is(CHI_CompDBIDResp)
 
   val expect_dn_rd_comp_and_data = rxreq_unsatisfied_readshared ||
                                    rxreq_unsatisfied_readunique
 
   val expect_dn_evict_comp = fire_txreq_evict
-
   val expect_dn_evict_compdbid = fire_txreq_writebackfull ||
                                  fire_txreq_writeevictfull ||
                                  fire_txreq_writeevictorevict
+
+  val cancel_dn_evict_comp = w_evict_dn_comp && fire_txreq_pcrdreturn
+  val cancel_dn_evict_compdbid = w_evict_dn_compdbid && fire_txreq_pcrdreturn
 
   val dn_rd_decided = !(w_rd_dn_data0 && w_rd_dn_data2)
 
@@ -644,6 +651,14 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   when (dn_rxrsp_compdbidresp) {
     p_homenid := io.DnRXRSP.bits.SrcID.get
     p_dbid := io.DnRXRSP.bits.DBID.get
+    w_evict_dn_compdbid := false.B
+  }
+
+  when (cancel_dn_evict_comp) {
+    w_evict_dn_comp := false.B
+  }
+
+  when (cancel_dn_evict_compdbid) {
     w_evict_dn_compdbid := false.B
   }
 
@@ -689,6 +704,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   val issue_dn_evict_compack = w_evict_dn_compdbid && dn_rxrsp_comp
 
   when (issue_dn_rd_compack) {
+    w_s_rd_dn_compack := false.B
     s_rd_dn_compack := true.B
   }
 
@@ -719,6 +735,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   
   // -- Interactions with downstream CHI TXDAT channel
   val dn_txdat_cbwrdata0 = io.DnTXDAT.fire && io.DnTXDAT.bits.Opcode.get === CHI_CopyBackWrData.U && io.DnTXDAT.bits.DataID.get === 0.U
+  val dn_txdat_cbwrdata2 = io.DnTXDAT.fire && io.DnTXDAT.bits.Opcode.get === CHI_CopyBackWrData.U && io.DnTXDAT.bits.DataID.get === 2.U
 
   val allow_dn_evict_cbwrdata0 = !w_snpresp0 && !w_ds_resp
   val allow_dn_evict_cbwrdata2 = !w_snpresp2 && !w_ds_resp
@@ -741,6 +758,14 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   when (issue_dn_evict_cbwrdata2) {
     w_s_evict_dn_cbwrdata2 := false.B
     s_evict_dn_cbwrdata2 := true.B
+  }
+
+  when (dn_txdat_cbwrdata0) {
+    s_evict_dn_cbwrdata0 := false.B
+  }
+
+  when (dn_txdat_cbwrdata2) {
+    s_evict_dn_cbwrdata2 := false.B
   }
 
   io.DnTXDAT.valid := s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2
@@ -878,7 +903,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   // --------------------------------
 
   // - EvictBack related meta/tag updates
-  val meta_wr_state_evictback_I_evict = s_evict && evictback_txreq_opcode === CHI_Evict.U
+  val meta_wr_state_evictback_I_evict = fire_txreq_evict
 
   val meta_wr_state_evictback_I_write = w_evict_dn_compdbid && 
                                         (dn_rxrsp_comp || dn_rxrsp_compdbidresp)
@@ -1046,7 +1071,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   io.UpTXRSP.bits.TxnID := p_rxreq.TxnID
   io.UpTXRSP.bits.SrcID := nodeId.U
   io.UpTXRSP.bits.TgtID := p_rxreq.SrcID
-  io.UpTXRSP.bits.DBID := 0.U // TODO: TxnID translations
+  io.UpTXRSP.bits.DBID := tshrId.U
   io.UpTXRSP.bits.Opcode := up_txrsp_opcode
   io.UpTXRSP.bits.RespErr := 0.U // TODO: RespErr
   io.UpTXRSP.bits.Resp := up_txrsp_resp
@@ -1122,7 +1147,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   io.UpTXDAT.bits.TxnID := p_rxreq.TxnID
   io.UpTXDAT.bits.SrcID := nodeId.U
   io.UpTXDAT.bits.TgtID := p_rxreq.SrcID
-  io.UpTXDAT.bits.DBID := 0.U // TODO: TxnID translations
+  io.UpTXDAT.bits.DBID := tshrId.U
   io.UpTXDAT.bits.Opcode := CCHIOpcode.CompData.U
   io.UpTXDAT.bits.RespErr := 0.U // TODO: RespErr
   io.UpTXDAT.bits.Resp := up_txdat_resp
@@ -1162,8 +1187,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
     s_evict := false.B
   }
 
-  val lock_dir = expect_replace || p_rxreq_evictback
-  val lock_ds = expect_replace || p_rxreq_evictback
+  val lock_dir = expect_replace || rxreq_unsatisfied_evictback
+  val lock_ds = expect_replace || rxreq_unsatisfied_evictback
 
   val unlock_self_evictback = RegNext(meta_wr_state_evictback_I) && !meta_wr_state_evictback_I
 
@@ -1218,34 +1243,37 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   // ----------------------------------------------------------------
 
   // -- Interactions with peer Refill unlock
-  val evictback_peer_unlock_dir = p_rxreq_evictback
+  val evictback_peer_unlock_dir = rxreq_evictback
 
-  val evictback_peer_unlock_ds_immediate = p_rxreq_evictback &&
-                                           io.ds_rd_done
+  val evictback_peer_unlock_ds_immediate = rxreq_unsatisfied_evictback && io.ds_rd_done ||
+                                           rxreq_satisfied_evictback
 
-  val evictback_peer_unlock_ds_wait = p_rxreq_evictback &&
-                                      !io.ds_rd_done
+  val sched_evictback_peer_unlock_ds = rxreq_evictback &&
+                                      !evictback_peer_unlock_ds_immediate
 
-  val evictback_peer_unlock_ds_late = w_evict_peer_unlock_ds &&
-                                      io.ds_rd_done
+  val allow_evictback_peer_unlock_ds = w_evict_peer_unlock_ds &&
+                                      (io.ds_rd_done || ds_cancel_evictback || fire_txreq_evict)
+
+  val evictback_peer_unlock_ds_late = allow_evictback_peer_unlock_ds
 
   val evictback_peer_unlock_ds = evictback_peer_unlock_ds_immediate ||
-                                 evictback_peer_unlock_ds_late                                      
+                                 evictback_peer_unlock_ds_late
 
-  when (evictback_peer_unlock_ds_wait) {
+  when (sched_evictback_peer_unlock_ds) {
     w_evict_peer_unlock_ds := true.B
   }
 
-  when (io.ds_rd_done) {
+  when (allow_evictback_peer_unlock_ds) {
     w_evict_peer_unlock_ds := false.B
   }
 
   io.peer_unlock_dir.zipWithIndex.foreach { case (unlock_dir, i) => {
-    unlock_dir := evictback_peer_unlock_dir && p_rxreq.TxnID === i.U
+    unlock_dir := evictback_peer_unlock_dir && rxreq.TxnID === i.U
   }}
 
   io.peer_unlock_ds.zipWithIndex.foreach { case (unlock_ds, i) => {
-    unlock_ds := evictback_peer_unlock_ds && p_rxreq.TxnID === i.U
+    unlock_ds := evictback_peer_unlock_ds_immediate && rxreq.TxnID === i.U ||
+                 evictback_peer_unlock_ds_late && p_rxreq.TxnID === i.U
   }}
   // ----------------------------------------------------------------
 
@@ -1255,6 +1283,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   io.blockRBE.REQ := active
   // ----------------------------------------------------------------
 
-
+  // -- L2 Eviction (EvictBack) active
+  io.L2EVT_active := w_evict_s_dn_txreq ||
+                     w_evict_dn_comp || w_evict_dn_compdbid ||
+                     w_s_evict_dn_cbwrdata0 || w_s_evict_dn_cbwrdata2 ||
+                     s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2 ||
+                     s_evict_dn_compack
+  // ----------------------------------------------------------------
   // TODO list:
 }
