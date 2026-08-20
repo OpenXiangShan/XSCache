@@ -30,13 +30,13 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
     val toAlloc = Output(new L2TSHRAlloc.PathFromTSHR)
     val fromAlloc = Input(new L2TSHRAlloc.PathToTSHR)
 
-    val RXEVT = Input(new FlitEVT)                    // L1 EVT
-    val RXSNP = Input(new CHIBundleSNP)               // HN SNP
-    val RXREQ = Input(new FlitREQ)                    // L1/L2 REQ
+    val UpRXEVT = Input(new FlitEVT)                    // L1 EVT
+    val DnRXSNP = Input(new CHIBundleSNP)               // HN SNP
+    val UpRXREQ = Input(new FlitREQ)                    // L1/L2 REQ
 
-    val TXREQ = Decoupled(new CHIBundleREQ)           // HN REQ
+    val DnTXREQ = Decoupled(new CHIBundleREQ)           // HN REQ
 
-    val TXSNP = Decoupled(new FlitSNP)                // SNP to L1
+    val UpTXSNP = Decoupled(new FlitSNP)                // SNP to L1
 
     val UpTXREQ = Decoupled(new FlitREQ)              // REQ from L2 to L2
 
@@ -87,8 +87,8 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   val tshr_enter_SNP = io.fromAlloc.alloc.SNP || io.fromAlloc.reuse.SNP
   val tshr_enter_REQ = io.fromAlloc.alloc.REQ || io.fromAlloc.reuse.REQ
 
-  val tshr_enter_EVT_WayValid_Evict = tshr_enter_EVT && io.RXEVT.WayValid && io.RXEVT.Opcode === Evict.U
-  val tshr_enter_EVT_WayValid_WriteBackFull = tshr_enter_EVT && io.RXEVT.WayValid && io.RXEVT.Opcode === WriteBackFull.U
+  val tshr_enter_EVT_WayValid_Evict = tshr_enter_EVT && io.UpRXEVT.WayValid && io.UpRXEVT.Opcode === Evict.U
+  val tshr_enter_EVT_WayValid_WriteBackFull = tshr_enter_EVT && io.UpRXEVT.WayValid && io.UpRXEVT.Opcode === WriteBackFull.U
 
   val tshr_enter_dirRead = !tshr_enter_EVT_WayValid_Evict &&
                            !tshr_enter_EVT_WayValid_WriteBackFull
@@ -330,9 +330,9 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   io.toAlloc.busy.SNP := !rbeSNP.io.in.ready
   io.toAlloc.busy.REQ := !rbeREQ.io.in.ready
 
-  rbeEVT.io.in.bits := io.RXEVT
-  rbeSNP.io.in.bits := io.RXSNP
-  rbeREQ.io.in.bits := io.RXREQ
+  rbeEVT.io.in.bits := io.UpRXEVT
+  rbeSNP.io.in.bits := io.DnRXSNP
+  rbeREQ.io.in.bits := io.UpRXREQ
 
   rbeEVT.io.in.valid := tshr_enter_EVT
   rbeSNP.io.in.valid := tshr_enter_SNP
@@ -431,7 +431,7 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   meta_write_SNP_meta := vPipeSNP.io.tshr_meta_write_meta
 
   vPipeSNP.io.EVT_active := vPipeEVT.io.EVT_active
-  vPipeSNP.io.REQ_evict := false.B // TODO: connect with REQ vPipe
+  vPipeSNP.io.REQ_evict := vPipeREQ.io.L2EVT_active
 
   // connections between TSHR local and REQ vPipe
   vPipeREQ.io.tshr_paddr := tshr_paddr
@@ -459,9 +459,9 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   vPipeREQ.io.L1EVT_active := vPipeEVT.io.EVT_active
 
   // connections between TX channels and TSHR local modules
-  io.TXREQ <> vPipeREQ.io.DnTXREQ
+  io.DnTXREQ <> vPipeREQ.io.DnTXREQ
 
-  io.TXSNP <> snoopAgent.io.txSnp
+  io.UpTXSNP <> snoopAgent.io.txSnp
 
   fastArb(Seq(vPipeEVT.io.UpTXRSP, vPipeREQ.io.UpTXRSP), io.UpTXRSP, Some("UpTXRSP"))
 
