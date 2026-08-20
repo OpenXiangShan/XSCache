@@ -210,8 +210,8 @@ class DataStorage(implicit val p: Parameters) extends Module with HasL2Params {
 
   val MAX_AGE = 15.U(4.W)
   val io = IO(new Bundle {
-    val fromTSHR = Flipped(Vec(nMSHR, new L2DataStorage.PathTSHRToDataStorage))
-    val toTSHR   = Vec(nMSHR, new L2DataStorage.PathDataStorageToTSHR)
+    val fromTSHR = Input(Vec(nMSHR, new L2DataStorage.PathTSHRToDataStorage))
+    val toTSHR   = Output(Vec(nMSHR, new L2DataStorage.PathDataStorageToTSHR))
     val error    = Output(Bool())
     val debugWinIdx = Output(UInt(log2Ceil(nMSHR).W))
     val debugReqSet = Output(UInt(setBits.W))
