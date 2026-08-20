@@ -55,7 +55,6 @@ case class BOPParameters(
   studentFilterEntries: Int = 1024,
   studentHashMode: String = "bop_rr",
   studentCovThreshold: Int = 0,
-  studentConfUseEMA: Boolean = false,
   offsetList: Seq[Int] = Seq(
     -256, -250, -243, -240, -225, -216, -200,
     -192, -180, -162, -160, -150, -144, -135, -128,
@@ -112,7 +111,6 @@ trait HasBOPParams extends HasPrefetcherHelper {
   def studentFilterEntries = bopParams.studentFilterEntries
   def studentHashMode = bopParams.studentHashMode
   def studentCovThreshold = bopParams.studentCovThreshold
-  def studentConfUseEMA = bopParams.studentConfUseEMA
 
   def scores = offsetList.length
   def offsetWidth = log2Up(offsetList.max) + 2 // -32 <= offset <= 31
@@ -121,9 +119,8 @@ trait HasBOPParams extends HasPrefetcherHelper {
   def scoreTableIdxBits = log2Up(scores)
   def studentPoolIdxBits = log2Up(studentPoolSize)
   def studentFilterIdxBits = log2Up(studentFilterEntries)
-  // Q4.4 fixed-point confidence: four integer bits and four fractional bits.
-  def studentConfBits = 8
-  def studentConfFracBits = 4
+  // Signed confidence values are -1, 0, or +1.
+  def studentConfBits = 2
   def studentPhaseTrainBits = log2Up(scores * (roundMax + 2) + 1)
   def studentPhaseTrainMax = scores * (roundMax + 2)
   // val prefetchIdWidth = log2Up(inflightEntries)
@@ -582,19 +579,6 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
     }
   }
 
-  private val confOne = (1 << studentConfFracBits).S(studentConfBits.W)
-  private val confMinusOne = (-1 << studentConfFracBits).S(studentConfBits.W)
-
-  // Optionally apply EMA with A = 1/2. Values are represented in Q4.4 fixed-point.
-  private def updateConfidence(oldConf: SInt, update: SInt): SInt = {
-    if (studentConfUseEMA) {
-      val averaged = (oldConf +& update) >> 1
-      averaged(studentConfBits - 1, 0).asSInt
-    } else {
-      update
-    }
-  }
-
   val pool = RegInit(VecInit(Seq.fill(studentPoolSize)(0.U.asTypeOf(new StudentPoolEntry))))
   val filterTable = RegInit(
     VecInit(Seq.fill(studentPoolSize)(0.U(studentFilterEntries.W)))
@@ -707,17 +691,17 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
     filterTable.foreach(_ := 0.U)
     phaseTrainCount := 0.U
 
-    // EMA confidence update: winner +1, loser -1, all others 0.
+    // Confidence update: winner +1, loser -1, all others 0.
     // If winner and loser are the same entry, no confidence is updated.
     when (endBestIdx =/= endWorstIdx) {
       for (i <- 0 until studentPoolSize) {
         when (pool(i).valid) {
           val update = Mux(
             endBestIdx === i.U,
-            confOne,
-            Mux(endWorstIdx === i.U, confMinusOne, 0.S(studentConfBits.W))
+            1.S(studentConfBits.W),
+            Mux(endWorstIdx === i.U, (-1).S(studentConfBits.W), 0.S(studentConfBits.W))
           )
-          pool(i).conf := updateConfidence(pool(i).conf, update)
+          pool(i).conf := update
         }
       }
     }
