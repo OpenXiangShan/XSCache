@@ -475,7 +475,6 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
 class StudentPoolEntry(implicit p: Parameters) extends BOPBundle {
   val valid = Bool()
   val offset = SInt(offsetWidth.W)
-  val absOffset = UInt(offsetWidth.W)
   val conf = SInt(studentConfBits.W)
   val lastPhaseCov = UInt(studentPhaseTrainBits.W)
   val curPhaseCov = UInt(studentPhaseTrainBits.W)
@@ -537,39 +536,20 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   private def absOffset(offset: SInt): UInt = {
     Mux(offset < 0.S, (-offset).asUInt, offset.asUInt)
   }
-  
+
   private def isBetter(lhs: StudentPoolEntry, rhs: StudentPoolEntry): Bool = {
     (lhs.curPhaseCov > rhs.curPhaseCov) ||
-      (lhs.curPhaseCov === rhs.curPhaseCov && (
-        (lhs.conf > rhs.conf) ||
-          (lhs.conf === rhs.conf && (
-            (lhs.absOffset < rhs.absOffset) ||
-              (lhs.absOffset === rhs.absOffset && lhs.offset < rhs.offset)
-          ))
-      ))
+      (lhs.curPhaseCov === rhs.curPhaseCov && lhs.conf > rhs.conf)
   }
 
   private def isWorse(lhs: StudentPoolEntry, rhs: StudentPoolEntry): Bool = {
     (lhs.curPhaseCov < rhs.curPhaseCov) ||
-      (lhs.curPhaseCov === rhs.curPhaseCov && (
-        (lhs.conf < rhs.conf) ||
-          (lhs.conf === rhs.conf && (
-            (lhs.absOffset < rhs.absOffset) ||
-              (lhs.absOffset === rhs.absOffset && lhs.offset < rhs.offset)
-          ))
-      ))
+      (lhs.curPhaseCov === rhs.curPhaseCov && lhs.conf < rhs.conf)
   }
 
-  // Replacement is confidence-first; it is independent of phase winner/loser ranking.
   private def isVictim(lhs: StudentPoolEntry, rhs: StudentPoolEntry): Bool = {
     (lhs.conf < rhs.conf) ||
-      (lhs.conf === rhs.conf && (
-        (lhs.lastPhaseCov < rhs.lastPhaseCov) ||
-          (lhs.lastPhaseCov === rhs.lastPhaseCov && (
-            (lhs.absOffset > rhs.absOffset) ||
-              (lhs.absOffset === rhs.absOffset && lhs.offset < rhs.offset)
-          ))
-      ))
+      (lhs.conf === rhs.conf && lhs.lastPhaseCov < rhs.lastPhaseCov)
   }
 
   private type SelectNode = (StudentPoolEntry, UInt)
@@ -625,7 +605,9 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   val phaseTrainCount = RegInit(0.U(studentPhaseTrainBits.W))
   val endHasMatch = RegInit(false.B)
   val endIssueEn = RegInit(false.B)
-  val endInjectIdx = RegInit(0.U(studentPoolIdxBits.W))
+  val endHasFree = RegInit(false.B)
+  val endFreeIdx = RegInit(0.U(studentPoolIdxBits.W))
+  val endVictimIdx = RegInit(0.U(studentPoolIdxBits.W))
   val endWorstIdx = RegInit(0.U(studentPoolIdxBits.W))
   val endBestIdx = RegInit(0.U(studentPoolIdxBits.W))
   val endTrainCount = RegInit(0.U(studentPhaseTrainBits.W))
@@ -657,7 +639,7 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   val bestIdx = selectTree(selectSeq, isBetter)._2
   val worstIdx = selectTree(selectSeq, isWorse)._2
 
-  // Compute teacher match and injection index
+  // Compute teacher match and phase-end injection inputs
   val victimIdx = selectTree(selectSeq, isVictim)._2
   val matchVec = VecInit(pool.map { t =>
     t.valid && io.teacherIssueEnable && (io.teacherBestOffset.asSInt === t.offset)
@@ -666,7 +648,7 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   val hasMatch = matchVec.orR
   val hasFree = freeVec.orR
   val freeIdx = PriorityEncoder(freeVec)
-  val injectIdx = Mux(hasFree, freeIdx, victimIdx)
+  val endInjectIdx = Mux(endHasFree, endFreeIdx, endVictimIdx)
 
   val endSelectedValid = pool(endBestIdx).valid
   // Select the coverage through an explicit mux so XSLog's tapAndRead does not
@@ -684,7 +666,9 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
     when(io.teacherPhaseEnd) {
       endHasMatch := hasMatch
       endIssueEn := io.teacherIssueEnable
-      endInjectIdx := injectIdx
+      endHasFree := hasFree
+      endFreeIdx := freeIdx
+      endVictimIdx := victimIdx
       endWorstIdx := worstIdx
       endBestIdx := bestIdx
       endTrainCount := phaseTrainCount
@@ -742,7 +726,6 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
     when (endIssueEn && !endHasMatch) {
       pool(endInjectIdx).valid := true.B
       pool(endInjectIdx).offset := endTeacherOffset.asSInt
-      pool(endInjectIdx).absOffset := absOffset(endTeacherOffset.asSInt)
       pool(endInjectIdx).conf := 0.S
       pool(endInjectIdx).curPhaseCov := 0.U
       pool(endInjectIdx).lastPhaseCov := 0.U
@@ -778,7 +761,7 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   for (i <- 0 until studentPoolSize) {
     studentTrainLog.valid(i) := pool(i).valid
     studentTrainLog.offset(i) := pool(i).offset.asUInt
-    studentTrainLog.offsetAbs(i) := pool(i).absOffset
+    studentTrainLog.offsetAbs(i) := absOffset(pool(i).offset)
     studentTrainLog.offsetNeg(i) := pool(i).offset < 0.S
     studentTrainLog.hit(i) := hitMask(i)
     studentTrainLog.writeValid(i) := writeValids(i)
@@ -829,7 +812,7 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   for (i <- 0 until studentPoolSize) {
     studentPhaseLog.valid(i) := pool(i).valid
     studentPhaseLog.offset(i) := pool(i).offset.asUInt
-    studentPhaseLog.offsetAbs(i) := pool(i).absOffset
+    studentPhaseLog.offsetAbs(i) := absOffset(pool(i).offset)
     studentPhaseLog.offsetNeg(i) := pool(i).offset < 0.S
     studentPhaseLog.cov(i) := pool(i).curPhaseCov
     studentPhaseLog.lastCov(i) := pool(i).lastPhaseCov
