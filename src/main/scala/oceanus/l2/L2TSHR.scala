@@ -17,7 +17,16 @@ import freechips.rocketchip.util.SeqToAugmentedSeq
 import oceanus.l2.tshr.L2TSHRDirectoryProxy
 
 
-class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2Params {
+trait L2TSHRLocatable extends L2SliceLocatable {
+
+  val tshrId: Int
+
+  def getTxnID = getTxnIDFromTSHRId(tshrId)
+}
+
+class L2TSHR(val sliceNum: Int, val sliceId: Int, val tshrId: Int)(implicit val p: Parameters) extends Module 
+    with HasL2Params 
+    with L2SliceLocatable {
 
   val io = IO(new Bundle {
 
@@ -68,16 +77,6 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
     val valid = Output(Bool())
   })
 
-  // TSHR payloads
-  val tshr_paddr = Reg(UInt(paramL2.physicalAddrWidth.W))
-
-  when (tshr_alloc) {
-    tshr_paddr := io.fromAlloc.paddr
-  }
-  
-  io.toAlloc.paddr := tshr_paddr
-
-
   // TSHR valid
   val tshr_alloc = io.fromAlloc.alloc.asUInt.orR
   val tshr_reuse = io.fromAlloc.reuse.asUInt.orR
@@ -93,11 +92,20 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   val tshr_enter_dirRead = !tshr_enter_EVT_WayValid_Evict &&
                            !tshr_enter_EVT_WayValid_WriteBackFull
 
+  // TSHR payloads
+  val tshr_paddr = Reg(UInt(paramL2.physicalAddrWidth.W))
+
+  when (tshr_alloc) {
+    tshr_paddr := io.fromAlloc.paddr
+  }
+
+  io.toAlloc.paddr := tshr_paddr
+
   val tshr_inactive_rbe = Wire(Bool())
   val tshr_inactive_vpipe = Wire(Bool())
   val tshr_inactive = tshr_inactive_rbe && tshr_inactive_vpipe
 
-  val tshr_inactivate = Wire(false.B) // fastest combinational path of vPipe free, might be implemented in future
+  val tshr_inactivate = WireInit(false.B) // fastest combinational path of vPipe free, might be implemented in future
 
   val tshr_wb_done_dir = Wire(Bool())
   val tshr_wb_done_ds = Wire(Bool())
@@ -151,13 +159,13 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
     tag_modified := false.B
   }
 
-  when (io.fromDir.DirRdResp && io.fromDir.TSHRID === id.U) {
+  when (io.fromDir.DirRdResp && io.fromDir.TSHRID === tshrId.U) {
     meta_modified.unmaskAndWrite(meta, io.fromDir.META)
     meta.way := io.fromDir.META.way
     meta.hit := io.fromDir.META.hit
   }
   
-  when (io.fromDir.ReplRdResp && io.fromDir.TSHRID === id.U) {
+  when (io.fromDir.ReplRdResp && io.fromDir.TSHRID === tshrId.U) {
     replResult := io.fromDir.REPL
     meta.way := io.fromDir.REPL.way
   }
@@ -171,17 +179,17 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   }
 
   assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.asUInt.orR)) <= 1.U,
-    s"TSHR #${id} multiple active meta writes on one cycle")
+    s"TSHR #${tshrId} multiple active meta writes on one cycle")
   assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.state)) <= 1.U, 
-    s"TSHR #${id} multiple active write on meta.state")
+    s"TSHR #${tshrId} multiple active write on meta.state")
   assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.dirty)) <= 1.U, 
-    s"TSHR #${id} multiple active write on meta.dirty")
+    s"TSHR #${tshrId} multiple active write on meta.dirty")
   assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.clients.asUInt.orR)) <= 1.U, 
-    s"TSHR #${id} multiple active write on meta.clients")
+    s"TSHR #${tshrId} multiple active write on meta.clients")
   assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.asUInt.orR)) <= 1.U, 
-    s"TSHR #${id} multiple active write on meta")
+    s"TSHR #${tshrId} multiple active write on meta")
 
-  assert(!(tshr_dealloc && meta_modified.asUInt.orR), s"TSHR #${id} deallocated with un-committed modified meta")
+  assert(!(tshr_dealloc && meta_modified.asUInt.orR), s"TSHR #${tshrId} deallocated with un-committed modified meta")
 
   
   // TSHR Buffer
@@ -213,11 +221,11 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   val tshr_buffer_wen_last = WireInit(false.B)
 
   when (tshr_buffer_wen_DS) {
-    tshr_buffer_0 := io.fromDS.DATA(0, 255)
-    tshr_buffer_2 := io.fromDS.DATA(256, 511)
+    tshr_buffer_0 := io.fromDS.DATA(255, 0)
+    tshr_buffer_2 := io.fromDS.DATA(511, 256)
   }
 
-  assert(!(tshr_dealloc && tshr_buffer_modified), s"TSHR #${id} deallocated with un-committed modified data")
+  assert(!(tshr_dealloc && tshr_buffer_modified), s"TSHR #${tshrId} deallocated with un-committed modified data")
 
   when (tshr_buffer_wen_UpRXDAT_0) { tshr_buffer_0 := io.UpRXDAT.bits.Data }
   when (tshr_buffer_wen_UpRXDAT_2) { tshr_buffer_2 := io.UpRXDAT.bits.Data }
@@ -351,15 +359,17 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   val ds_read_rbeREQ_en = Wire(Bool())
 
   ds_read_rbeEVT_en := false.B
+  ds_read_rbeSNP_en := false.B
+  ds_read_rbeREQ_en := false.B
   
   // TODO
 
 
   // -- vPipes and TSHR local modules
-  val vPipeEVT = Module(new L2VPipeEVT(Seq(/*TODO: client devices*/)))
-  val vPipeSNP = Module(new L2VPipeSNP(Seq(/*TODO: client devices*/)))
-  val vPipeREQ = Module(new L2VPipeREQ(Seq(/*TODO: client devices*/), id, 0))
-  val snoopAgent = Module(new L2SnoopAgent(id))
+  val vPipeEVT = Module(new L2VPipeEVT(Seq(/*TODO: client devices*/), sliceNum, sliceId, tshrId, 0)) // TODO: nodeId
+  val vPipeSNP = Module(new L2VPipeSNP(Seq(/*TODO: client devices*/), tshrId, 0)) // TODO: nodeId
+  val vPipeREQ = Module(new L2VPipeREQ(Seq(/*TODO: client devices*/), sliceNum, sliceId, tshrId, 0)) // TODO: nodeId
+  val snoopAgent = Module(new L2SnoopAgent(tshrId))
 
   tshr_inactive_vpipe := vPipeEVT.io.free && vPipeSNP.io.free && vPipeREQ.io.free
 
@@ -431,7 +441,7 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   meta_write_SNP_meta := vPipeSNP.io.tshr_meta_write_meta
 
   vPipeSNP.io.EVT_active := vPipeEVT.io.EVT_active
-  vPipeSNP.io.REQ_evict := vPipeREQ.io.L2EVT_active
+  vPipeSNP.io.REQ_evict := vPipeREQ.io.L2EVT_opcode
 
   // connections between TSHR local and REQ vPipe
   vPipeREQ.io.tshr_paddr := tshr_paddr
@@ -478,7 +488,7 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   // ----------------------------------------------------------------
 
   // Directory Proxy
-  val proxyDir = Module(new L2TSHRDirectoryProxy(id))
+  val proxyDir = Module(new L2TSHRDirectoryProxy(tshrId))
 
   io.toDir := proxyDir.io.toDir
   proxyDir.io.fromDir := io.fromDir
@@ -516,7 +526,7 @@ class L2TSHR(val id: Int)(implicit val p: Parameters) extends Module with HasL2P
   tshr_wb_done_dir := proxyDir.io.wb_done
 
   // Data Storage Proxy
-  val proxyDS = Module(new L2TSHRDataStorageProxy(id))
+  val proxyDS = Module(new L2TSHRDataStorageProxy(tshrId))
 
   proxyDS.io.fromDir := io.fromDir
 

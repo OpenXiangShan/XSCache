@@ -12,7 +12,9 @@ import org.chipsalliance.cde.config.Parameters
 
 class L2VPipeEVT(
     clientComponents: Seq[CCHIComponent],
-    tshrId: Int = 0,
+    val sliceNum: Int = 0,
+    val sliceId: Int = 0,
+    val tshrId: Int = 0,
     nodeId: Int = 0
 )(implicit val p: Parameters)
     extends Module
@@ -24,7 +26,7 @@ class L2VPipeEVT(
   val io = IO(new Bundle {
     val UpRXEVT = Flipped(Valid(new FlitEVT))
     val UpTXRSP = Decoupled(new FlitDnRSP)
-    val UpRXDAT = Flipped(Valid(new CHIBundleDAT))
+    val UpRXDAT = Flipped(Valid(new FlitUpDAT))
 
     val tshr_paddr = Input(UInt(paramL2.physicalAddrWidth.W))
     val tshr_dirResult = Input(new L2Directory.MetaReadResult)
@@ -61,9 +63,9 @@ class L2VPipeEVT(
 
   io.EVT_active := inflightEvict
   io.evtDataReadyOut := RegNext(io.UpRXDAT.valid &&
-    io.UpRXDAT.bits.TxnID.get === pDbid &&
-    io.UpRXDAT.bits.Opcode.get === CHI_CopyBackWrData.asUIntForDAT &&
-    io.UpRXDAT.bits.DataID.get === 2.U, false.B)
+    io.UpRXDAT.bits.TxnID === pDbid &&
+    io.UpRXDAT.bits.Opcode === CCHIOpcode.CopyBackWrData.U &&
+    io.UpRXDAT.bits.DataID === 2.U, false.B)
 
   io.free := state === sIdle
 
@@ -80,10 +82,10 @@ class L2VPipeEVT(
   val copyBackWrDataMatch =
     dataArmed &&
       io.UpRXDAT.valid &&
-      io.UpRXDAT.bits.TxnID.get === pDbid &&
-      io.UpRXDAT.bits.Opcode.get === CHI_CopyBackWrData.asUIntForDAT
-  val isBeat0 = copyBackWrDataMatch && io.UpRXDAT.bits.DataID.get === 0.U
-  val isBeat2 = copyBackWrDataMatch && io.UpRXDAT.bits.DataID.get === 2.U
+      io.UpRXDAT.bits.TxnID === pDbid &&
+      io.UpRXDAT.bits.Opcode === CCHIOpcode.CopyBackWrData.U
+  val isBeat0 = copyBackWrDataMatch && io.UpRXDAT.bits.DataID === 0.U
+  val isBeat2 = copyBackWrDataMatch && io.UpRXDAT.bits.DataID === 2.U
   val evtDataReady = RegNext(isBeat2, false.B)
 
   when (state === sIdle && io.UpRXEVT.valid) {
