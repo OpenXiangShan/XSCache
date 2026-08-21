@@ -339,7 +339,7 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
   val pf_recv_node: Option[BundleBridgeSink[PrefetchRecv]] =
     if(hasReceiver) Some(BundleBridgeSink(Some(() => new PrefetchRecv))) else None
   val l3_pf_recv_node: Option[BundleBridgeSink[PrefetchRecv]] =
-    if(prefetchOpt.nonEmpty) Some(BundleBridgeSink(Some(() => new PrefetchRecv))) else None
+    if(hasReceiver) Some(BundleBridgeSink(Some(() => new PrefetchRecv))) else None
 
   val addressRange = Seq(AddressSet(0x00000000L, 0xffffffffffffL)) // TODO: parameterize this
   val managerParameters = TLSlavePortParameters.v1(
@@ -581,10 +581,6 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
 
     val stashPrefetchIdBits = TXNID_WIDTH - bankBits - 2
     require(stashPrefetchIdBits > 0)
-    require(
-      idsAll <= (1 << stashPrefetchIdBits),
-      s"normal TxnID space idsAll=$idsAll overlaps stash prefetch ID space"
-    )
 
     def setSliceID(txnID: UInt, sliceID: UInt, mmioReq: Bool): UInt = {
       val entryID = txnID(stashPrefetchIdBits - 1, 0)
@@ -743,14 +739,14 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       txreq_arb.io.out.bits.txnID,
       setSliceID(txreq_arb.io.out.bits.txnID, txreq_arb.io.chosen, txreqFromMMIO)
     )
-    when(txreq.valid) {
-      when(txreqFromStashPrefetch) {
-        assert(isStashPrefetchID(txreq.bits.txnID), "stash prefetch TxnID is not marked")
-      }.otherwise {
-        assert(!isStashPrefetchID(txreq.bits.txnID), "normal TxnID overlaps stash prefetch ID")
-      }
+    when(txreq.valid && !txreqFromStashPrefetch && !txreqFromMMIO) {
+      assert(
+        txreq_arb.io.out.bits.txnID < (1 << stashPrefetchIdBits).U,
+        "normal TxnID %d exceeds stash prefetch ID space (2^%d)",
+        txreq_arb.io.out.bits.txnID,
+        stashPrefetchIdBits.U
+      )
     }
-
     val txrsp = Wire(DecoupledIO(new CHIRSP))
     fastArb(slices.map(_.io.out.tx.rsp), txrsp, Some("txrsp"))
 
