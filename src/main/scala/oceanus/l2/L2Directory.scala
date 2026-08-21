@@ -99,11 +99,7 @@ object L2Directory {
   }
 
   object MetaWriteMask {
-    def empty(implicit p: Parameters): MetaWriteMask = {
-      val zero = new MetaWriteMask
-      zero.elements.foreach(_._2 := 0.U)
-      zero
-    }
+    def empty(implicit p: Parameters): MetaWriteMask = 0.U.asTypeOf(new MetaWriteMask)
   }
 
   class ReplReadResult(implicit override val p: Parameters) extends Bundle with HasL2Params {
