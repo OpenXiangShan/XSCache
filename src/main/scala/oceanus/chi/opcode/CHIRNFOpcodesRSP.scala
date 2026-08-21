@@ -52,7 +52,7 @@ trait CHIRNFOpcodesRSP extends HasCHIParameters {
     class RSPOpcodeDecoder(paramOpcodeSupported          : Seq[CHIOpcode]    = Seq(),
                   paramEnableUnsupportedCheck   : Boolean           = false)
         (implicit p: Parameters)
-        extends CHIOpcodeDecoder(REQ, paramOpcodeSupported, Seq(
+        extends CHIOpcodeDecoder(RSP, paramOpcodeSupported, Seq(
         //  ========================
             CHI_RespLCrdReturn,
         //  ------------------------
