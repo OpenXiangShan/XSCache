@@ -397,6 +397,8 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
   ) && !nested_writeBackFull && !nested_writeEvictX
 
   io.toSA.SnpCompAck := do_sa_snpcompack
+  io.toSA.CLIENTS := io.tshr_dirResult.clients
+  io.toSA.ALIAS := io.tshr_dirResult.alias
   // ---------------------------------------------------------
 
   // -- Send DnTXRSP & DnTXDAT -------------------------------
