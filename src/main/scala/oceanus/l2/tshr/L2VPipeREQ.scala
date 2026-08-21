@@ -19,15 +19,16 @@ object L2VPipeREQ {
 
 }
 
-class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)(implicit val p: Parameters) 
+class L2VPipeREQ(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sliceId: Int, val tshrId: Int, nodeId: Int)(implicit val p: Parameters) 
     extends Module 
     with CHIRNFOpcodesREQ 
     with CHIRNFOpcodesRSP
     with CHIRNFOpcodesDAT
-    with HasL2Params {
+    with HasL2Params
+    with L2TSHRLocatable {
 
   val io = IO(new Bundle {
-    val UpRXREQ = Valid(Input(new FlitREQStripped))
+    val UpRXREQ = Flipped(Valid(new FlitREQStripped))
 
     val DnTXREQ = Decoupled(new CHIBundleREQ)
 
@@ -38,10 +39,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
     val DnTXDAT = Decoupled(new CHIBundleDAT)
 
     val UpRXRSP = Flipped(Valid(new FlitUpRSP))
-    val UpRXDAT = Flipped(Valid(new FlitUpDATWithoutData))
+    val UpRXDAT = Flipped(Valid(new FlitUpDAT))
 
     val UpTXRSP = Decoupled(new FlitDnRSP)
-    val UpTXDAT = Decoupled(new FlitDnDATWithoutData)
+    val UpTXDAT = Decoupled(new FlitDnDAT)
 
     val UpTXREQ = Decoupled(new FlitREQ)
 
@@ -90,7 +91,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
 
     val L1EVT_active = Input(Bool())
 
-    val L2EVT_active = Output(Bool())
+    val L2EVT_opcode = Valid(UInt(paramCHI.reqOpcodeWidth.W))
   })
 
   val dirResult = io.tshr_dirResult
@@ -361,6 +362,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
 
   io.toSA.SnpCompAck := false.B // TODO: interact with upstream data sending
 
+  io.toSA.CLIENTS := io.tshr_dirResult.clients
+  io.toSA.ALIAS := io.tshr_dirResult.alias
+
   // waiting state transitions
   //  - SnpResp/SnpRespData0/SnpRespData2 were all allowed to be received on the same cycle of the issue of
   //    SnpMakeInvalid/SnpToInvalid/SnpToShared/SnpToClean.
@@ -570,7 +574,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   io.DnTXREQ.bits.QoS.get := 14.U // Default at 14, (**DOT NOT use 15**, maybe better policy in future)
   io.DnTXREQ.bits.TgtID.get := 0.U // Support E-SAM only currently
   io.DnTXREQ.bits.SrcID.get := nodeId.U
-  io.DnTXREQ.bits.TxnID.get := tshrId.U
+  io.DnTXREQ.bits.TxnID.get := getTxnID
   io.DnTXREQ.bits.ReturnNID_StashNID_SLCRepHint.get := 0.U // Not providing SLCRepHint/StashNID, default to 0
   io.DnTXREQ.bits.StashNIDValid_Endian_Deep.get := 0.U
   io.DnTXREQ.bits.ReturnTxnID_StashLPIDValid_StashLPID.get := 0.U
@@ -725,9 +729,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   io.DnTXRSP.bits.Opcode.get := CHI_CompAck.U
   io.DnTXRSP.bits.RespErr.get := 0.U
   io.DnTXRSP.bits.Resp.get := 0.U
-  io.DnTXRSP.bits.FwdState.get := 0.U
+  io.DnTXRSP.bits.FwdState(0.U)
   io.DnTXRSP.bits.CBusy.get := 0.U
-  io.DnTXRSP.bits.DBID.get := 0.U
+  io.DnTXRSP.bits.DBID(0.U)
   io.DnTXRSP.bits.PCrdType.get := 0.U
   io.DnTXRSP.bits.TagOp.get := 0.U
   io.DnTXRSP.bits.TraceTag.get := 0.U // TODO: maybe wire with L2-L3 TraceTag
@@ -781,7 +785,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
     Mux(dirResult.dirty, CHIFieldResp.CopyBackWrData_UD_PD.U, CHIFieldResp.CopyBackWrData_UC.U),
     Mux(dirResult.state === MetaState.S, CHIFieldResp.CopyBackWrData_SC.U, CHIFieldResp.CopyBackWrData_I.U)
   )
-  io.DnTXDAT.bits.FwdState.get := 0.U
+  io.DnTXDAT.bits.FwdState(0.U)
   io.DnTXDAT.bits.CBusy.get := 0.U
   io.DnTXDAT.bits.DBID.get := 0.U
   io.DnTXDAT.bits.CCID.get := 0.U
@@ -792,6 +796,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   io.DnTXDAT.bits.TraceTag.get := 0.U // TODO: maybe wire with L2-L3 TraceTag
   io.DnTXDAT.bits.RSVDC.foreach(_ := 0.U)
   io.DnTXDAT.bits.BE.get := Fill(paramCHI.datBEWidth, dirResult.state =/= MetaState.I)
+  io.DnTXDAT.bits.Data.get := DontCare
+  io.DnTXDAT.bits.DataCheck.foreach(_ := DontCare)
+  io.DnTXDAT.bits.Poison.foreach(_ := DontCare)
   // *NOTICE: Data, DataCheck, Poison is assigned in TSHR top
   // ----------------------------------------------------------------
 
@@ -960,6 +967,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
 
   io.tshr_meta_write_en.clients.zip(p_rxreq_client).foreach { case (en, client) => en := client && meta_wr_client }
   io.tshr_meta_write_meta.clients.zip(p_rxreq_client).foreach { case (meta, client) => meta := client && meta_wr_client_set }
+
+  io.tshr_meta_write_en.alias := false.B // TODO: alias related
+  io.tshr_meta_write_meta.alias := 0.U
   // ----------------------------------------------------------------
 
   // -- Interactions with TSHR local data and Data Storage Read
@@ -1147,7 +1157,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   io.UpTXDAT.bits.TxnID := p_rxreq.TxnID
   io.UpTXDAT.bits.SrcID := nodeId.U
   io.UpTXDAT.bits.TgtID := p_rxreq.SrcID
-  io.UpTXDAT.bits.DBID := tshrId.U
+  io.UpTXDAT.bits.DBID := getTxnID
   io.UpTXDAT.bits.Opcode := CCHIOpcode.CompData.U
   io.UpTXDAT.bits.RespErr := 0.U // TODO: RespErr
   io.UpTXDAT.bits.Resp := up_txdat_resp
@@ -1157,6 +1167,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   io.UpTXDAT.bits.Way := dirResult.way
   io.UpTXDAT.bits.DataID := up_txdat_dataid
   io.UpTXDAT.bits.TraceTag := false.B // TODO: TraceTag propagation
+  io.UpTXDAT.bits.Data := DontCare
+  // *NOTICE: Data is assigned in TSHR top
   // ----------------------------------------------------------------
 
   // -- Interactions with replacer and eviction through loop-back REQ
@@ -1226,7 +1238,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   io.dir_wb_aux := unlock_dir
 
   io.UpTXREQ.valid := s_evict
-  io.UpTXREQ.bits.TxnID := tshrId.U
+  io.UpTXREQ.bits.TxnID := getTxnID
   io.UpTXREQ.bits.SrcID := nodeId.U
   io.UpTXREQ.bits.TgtID := nodeId.U
   io.UpTXREQ.bits.Opcode := CCHIOpcode.EvictBack.U
@@ -1268,12 +1280,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   }
 
   io.peer_unlock_dir.zipWithIndex.foreach { case (unlock_dir, i) => {
-    unlock_dir := evictback_peer_unlock_dir && rxreq.TxnID === i.U
+    unlock_dir := evictback_peer_unlock_dir && getTSHRIdFromTxnID(rxreq.TxnID) === i.U
   }}
 
   io.peer_unlock_ds.zipWithIndex.foreach { case (unlock_ds, i) => {
-    unlock_ds := evictback_peer_unlock_ds_immediate && rxreq.TxnID === i.U ||
-                 evictback_peer_unlock_ds_late && p_rxreq.TxnID === i.U
+    unlock_ds := evictback_peer_unlock_ds_immediate && getTSHRIdFromTxnID(rxreq.TxnID) === i.U ||
+                 evictback_peer_unlock_ds_late && getTSHRIdFromTxnID(p_rxreq.TxnID) === i.U
   }}
   // ----------------------------------------------------------------
 
@@ -1284,11 +1296,15 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], tshrId: Int, nodeId: Int)
   // ----------------------------------------------------------------
 
   // -- L2 Eviction (EvictBack) active
-  io.L2EVT_active := w_evict_s_dn_txreq ||
+  val evict_active = w_evict_s_dn_txreq ||
                      w_evict_dn_comp || w_evict_dn_compdbid ||
                      w_s_evict_dn_cbwrdata0 || w_s_evict_dn_cbwrdata2 ||
                      s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2 ||
                      s_evict_dn_compack
+
+  io.L2EVT_opcode.valid := evict_active
+  io.L2EVT_opcode.bits := evictback_txreq_opcode
   // ----------------------------------------------------------------
   // TODO list:
+  //  - L1 Alias support
 }

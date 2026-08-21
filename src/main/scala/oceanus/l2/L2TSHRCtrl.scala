@@ -16,7 +16,19 @@ import freechips.rocketchip.util.SeqToAugmentedSeq
 import oceanus.compactchi.CCHIOpcode._
 
 
-class L2TSHRCtrl(implicit val p: Parameters) extends Module with HasL2Params {
+trait L2SliceLocatable {
+
+  val sliceNum: Int
+  val sliceId: Int
+
+  def getTSHRIdFromTxnID(txnId: UInt) = txnId >> log2Ceil(sliceNum)
+
+  def getTxnIDFromTSHRId(tshrId: Int) = (tshrId.U << log2Ceil(sliceNum)) | sliceId.U(log2Ceil(sliceNum).W)
+}
+
+class L2TSHRCtrl(val sliceNum: Int, val sliceId: Int)(implicit val p: Parameters) extends Module 
+                                                                                  with HasL2Params 
+                                                                                  with L2SliceLocatable {
 
   val io = IO(new Bundle {
     val UpRXEVT = Flipped(Decoupled(new FlitEVT))
@@ -49,26 +61,24 @@ class L2TSHRCtrl(implicit val p: Parameters) extends Module with HasL2Params {
     val fromClientTableEVT = Input(Vec(paramL2.mshrSize, Vec(1, Bool()))) // TODO: parameterize with coherent l2 client count
   })
 
-  def getTSHRIdFromTxnID(txnId: UInt) = txnId
-
   // -- RX channel connections
-  val tshrs = Seq.tabulate(paramL2.mshrSize)(i => Module(new L2TSHR(i)))
+  val tshrs = Seq.tabulate(paramL2.mshrSize)(i => Module(new L2TSHR(sliceNum, sliceId, i)))
 
   tshrs.foreach { case t => 
     t.io.UpRXEVT := io.UpRXEVT.bits
     t.io.DnRXSNP := io.DnRXSNP.bits
     t.io.UpRXREQ := io.UpRXREQ.bits
 
-    t.io.UpRXRSP.valid := io.UpRXRSP.valid && getTSHRIdFromTxnID(io.UpRXRSP.bits.TxnID) === t.id.U 
+    t.io.UpRXRSP.valid := io.UpRXRSP.valid && getTSHRIdFromTxnID(io.UpRXRSP.bits.TxnID) === t.tshrId.U 
     t.io.UpRXRSP.bits := io.UpRXRSP.bits
 
-    t.io.UpRXDAT.valid := io.UpRXDAT.valid && getTSHRIdFromTxnID(io.UpRXDAT.bits.TxnID) === t.id.U
+    t.io.UpRXDAT.valid := io.UpRXDAT.valid && getTSHRIdFromTxnID(io.UpRXDAT.bits.TxnID) === t.tshrId.U
     t.io.UpRXDAT.bits := io.UpRXDAT.bits
 
-    t.io.DnRXRSP.valid := io.DnRXRSP.valid && getTSHRIdFromTxnID(io.DnRXRSP.bits.TxnID.get) === t.id.U
+    t.io.DnRXRSP.valid := io.DnRXRSP.valid && getTSHRIdFromTxnID(io.DnRXRSP.bits.TxnID.get) === t.tshrId.U
     t.io.DnRXRSP.bits := io.DnRXRSP.bits
 
-    t.io.DnRXDAT.valid := io.DnRXDAT.valid && getTSHRIdFromTxnID(io.DnRXDAT.bits.TxnID.get) === t.id.U
+    t.io.DnRXDAT.valid := io.DnRXDAT.valid && getTSHRIdFromTxnID(io.DnRXDAT.bits.TxnID.get) === t.tshrId.U
     t.io.DnRXDAT.bits := io.DnRXDAT.bits
   }
 
@@ -92,9 +102,9 @@ class L2TSHRCtrl(implicit val p: Parameters) extends Module with HasL2Params {
   tshrAlloc.io.fromTSHRCtrl.RXREQ <> io.UpRXREQ
 
   tshrs.foreach { case t => 
-    tshrAlloc.io.fromTSHR(t.id).bits := t.io.toAlloc
-    tshrAlloc.io.fromTSHR(t.id).valid := t.io.valid
-    t.io.fromAlloc := tshrAlloc.io.toTSHR(t.id)
+    tshrAlloc.io.fromTSHR(t.tshrId).bits := t.io.toAlloc
+    tshrAlloc.io.fromTSHR(t.tshrId).valid := t.io.valid
+    t.io.fromAlloc := tshrAlloc.io.toTSHR(t.tshrId)
   }
   // ----------------------------------------------------------------
 
