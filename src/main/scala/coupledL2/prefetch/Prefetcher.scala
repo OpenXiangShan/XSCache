@@ -298,7 +298,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
             badScore = 2,
             crossPage = true,
             useDelayOut = true,
-            enableStudentCover = true,
+            enableStudentCover = false,
             studentPoolSize = 4,
             studentFilterEntries = 4096,
             studentHashMode = "pairs_low9",
