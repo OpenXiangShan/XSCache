@@ -274,7 +274,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
             badScore = 1,
             crossPage = false,
             useDelayOut = false,
-            enableStudentCover = true,
+            enableStudentCover = false,
             studentPoolSize = 8,
             studentFilterEntries = 2048,
             studentHashMode = "bop_rr",
