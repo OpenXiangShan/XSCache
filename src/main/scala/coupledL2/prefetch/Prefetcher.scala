@@ -299,7 +299,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
             crossPage = true,
             useDelayOut = true,
             enableStudentCover = true,
-            studentPoolSize = 4,
+            studentPoolSize = 2,
             studentFilterEntries = 4096,
             studentHashMode = "pairs_low9",
             studentCovThreshold = 0,
