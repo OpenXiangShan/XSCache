@@ -26,7 +26,8 @@
 
 package xscache.coupledL2.prefetch
 
-import utility.{ChiselDB, Constantin, MemReqSource, ParallelPriorityMux, XSPerfAccumulate, TwoLevelRRArbiter, ArbPerf}
+import utility.{ArbPerf, ChiselDB, Constantin, MemReqSource, ParallelPriorityMux, TwoLevelRRArbiter,
+  XSPerfAccumulate, XSPerfHistogram, XSPerfMax}
 import utility.sram.SRAMTemplate
 import org.chipsalliance.cde.config.Parameters
 import chisel3.DontCare.:=
@@ -118,6 +119,24 @@ trait HasBOPParams extends HasPrefetcherHelper {
 
 abstract class BOPBundle(implicit val p: Parameters) extends Bundle with HasBOPParams
 abstract class BOPModule(implicit val p: Parameters) extends Module with HasBOPParams
+
+private[prefetch] object BOPPerf {
+  def addEventGap(perfName: String, event: Bool)(implicit p: Parameters): Unit = {
+    val seen = RegInit(false.B)
+    val gap = RegInit(0.U(16.W))
+    val sampledGap = Mux(gap.andR, gap, gap + 1.U)
+
+    when(event) {
+      seen := true.B
+      gap := 0.U
+    }.elsewhen(seen && !gap.andR) {
+      gap := gap + 1.U
+    }
+
+    XSPerfHistogram(perfName, sampledGap, event && seen, 1, 10, 1)
+    XSPerfMax(perfName + "_max", sampledGap, event && seen)
+  }
+}
 
 class ScoreTableEntry(implicit p: Parameters) extends BOPBundle {
   // val offset = UInt(offsetWidth.W)
@@ -213,6 +232,22 @@ class RecentRequestTable(name: String)(implicit p: Parameters) extends BOPModule
   io.r.resp.bits.ptr := RegEnable(s1_ptr, s1_valid)
   io.r.resp.bits.hit := RegEnable(s1_hit, s1_valid)
 
+  val writeWaitCycles = RegInit(0.U(16.W))
+  when(io.w.fire || !io.w.valid) {
+    writeWaitCycles := 0.U
+  }.elsewhen(!writeWaitCycles.andR) {
+    writeWaitCycles := writeWaitCycles + 1.U
+  }
+
+  XSPerfAccumulate(name + "_rr_read_fire", rrTable.io.r.req.fire)
+  XSPerfAccumulate(name + "_rr_read_hit", io.r.resp.valid && io.r.resp.bits.hit)
+  XSPerfAccumulate(name + "_rr_write_valid", io.w.valid)
+  XSPerfAccumulate(name + "_rr_write_fire", io.w.fire)
+  XSPerfAccumulate(name + "_rr_write_stall", io.w.valid && !io.w.ready)
+  XSPerfAccumulate(name + "_rr_write_blocked_by_read", io.w.valid && io.r.req.valid)
+  XSPerfHistogram(name + "_rr_write_wait", writeWaitCycles, io.w.fire, 0, 10, 1)
+  XSPerfMax(name + "_rr_write_wait_max", writeWaitCycles, io.w.valid)
+
   class WRRTEntry extends Bundle{
     val addr = UInt(fullAddrBits.W)
   }
@@ -226,6 +261,7 @@ class RecentRequestTable(name: String)(implicit p: Parameters) extends BOPModule
 class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPModule {
   val io = IO(new Bundle {
     val req = Flipped(DecoupledIO(UInt(fullAddrBits.W)))
+    val trainFire = Input(Bool())
     val prefetchOffset = Output(UInt(offsetWidth.W))
     val prefetchDisable = Output(Bool())
     val test = new TestOffsetBundle
@@ -312,6 +348,60 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
   io.test.req.bits.addr := io.req.bits
   io.test.req.bits.testOffset := testOffset
   io.test.req.bits.ptr := ptr
+
+  val perfPhaseActive = RegInit(false.B)
+  val perfPhaseCycles = RegInit(0.U(32.W))
+  val perfPhaseRealTrains = RegInit(0.U(16.W))
+  val perfPhaseTests = RegInit(0.U(16.W))
+  val perfPhaseHits = RegInit(0.U(16.W))
+  val perfPhaseDone = state === s_idle && perfPhaseActive
+
+  def perfSatInc(value: UInt): UInt = Mux(value.andR, value, value + 1.U)
+
+  when(state === s_learn) {
+    perfPhaseActive := true.B
+    perfPhaseCycles := perfSatInc(perfPhaseCycles)
+    when(io.trainFire) {
+      perfPhaseRealTrains := perfSatInc(perfPhaseRealTrains)
+    }
+    when(io.test.req.fire) {
+      perfPhaseTests := perfSatInc(perfPhaseTests)
+    }
+    when(io.test.resp.valid && io.test.resp.bits.hit) {
+      perfPhaseHits := perfSatInc(perfPhaseHits)
+    }
+  }
+
+  when(perfPhaseDone) {
+    perfPhaseActive := false.B
+    perfPhaseCycles := 0.U
+    perfPhaseRealTrains := 0.U
+    perfPhaseTests := 0.U
+    perfPhaseHits := 0.U
+  }
+
+  val perfRespPtr = Mux(io.test.resp.valid, io.test.resp.bits.ptr, 0.U)
+  val perfRespNewScore = st(perfRespPtr).score + 1.U
+  val perfEndByScoreMax = state === s_learn && io.test.resp.valid && io.test.resp.bits.hit &&
+    perfRespNewScore >= scoreMax.U
+  val perfEndByRoundMax = state === s_learn && round >= roundMaxConstant && !perfEndByScoreMax
+
+  XSPerfAccumulate(name + "_score_test_fire", io.test.req.fire)
+  XSPerfAccumulate(name + "_score_test_without_train_fire", io.test.req.fire && !io.trainFire)
+  XSPerfAccumulate(name + "_phase_complete", perfPhaseDone)
+  XSPerfAccumulate(name + "_phase_cycles_sum", Mux(perfPhaseDone, perfPhaseCycles, 0.U))
+  XSPerfAccumulate(name + "_phase_real_trains_sum", Mux(perfPhaseDone, perfPhaseRealTrains, 0.U))
+  XSPerfAccumulate(name + "_phase_tests_sum", Mux(perfPhaseDone, perfPhaseTests, 0.U))
+  XSPerfAccumulate(name + "_phase_hits_sum", Mux(perfPhaseDone, perfPhaseHits, 0.U))
+  XSPerfAccumulate(name + "_phase_rounds_sum", Mux(perfPhaseDone, round, 0.U))
+  XSPerfAccumulate(name + "_phase_best_score_sum", Mux(perfPhaseDone, bestScore, 0.U))
+  XSPerfAccumulate(name + "_phase_end_scoremax", perfEndByScoreMax)
+  XSPerfAccumulate(name + "_phase_end_roundmax", perfEndByRoundMax)
+  XSPerfAccumulate(name + "_phase_end_bad", perfPhaseDone && isBad)
+  XSPerfMax(name + "_phase_cycles_max", perfPhaseCycles, perfPhaseDone)
+  XSPerfMax(name + "_phase_real_trains_max", perfPhaseRealTrains, perfPhaseDone)
+  XSPerfHistogram(name + "_phase_rounds", round, perfPhaseDone, 0, roundMax + 5, 5)
+  XSPerfHistogram(name + "_phase_best_score", bestScore, perfPhaseDone, 0, scoreMax + 1, 1)
 
   XSPerfAccumulate("total_learn_phase", state === s_idle)
   XSPerfAccumulate("total_bop_disable", state === s_idle && isBad)
@@ -662,11 +752,19 @@ class DelayQueue(name: String = "")(implicit p: Parameters) extends  BOPModule{
   }
 
   /* Perf */
+  val perfEnq = io.in.valid && !full
+  val perfDeq = outValid && io.out.ready
+  val perfDropFull = io.in.valid && full
+
   XSPerfAccumulate("full", full)
   XSPerfAccumulate("empty", empty)
   XSPerfAccumulate("entryNumber", PopCount(valids.asUInt))
   XSPerfAccumulate("inNumber", io.in.valid)
   XSPerfAccumulate("outNumber", io.out.valid)
+  XSPerfAccumulate(name + "_delayq_enq", perfEnq)
+  XSPerfAccumulate(name + "_delayq_deq", perfDeq)
+  XSPerfAccumulate(name + "_delayq_drop_full", perfDropFull)
+  XSPerfHistogram(name + "_delayq_occupancy", PopCount(valids.asUInt), true.B, 0, dQEntries + 1, 1)
 
 }
 
@@ -711,6 +809,7 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   delayQueue.io.in.bits := s0_oldFullAddrNoOff
   scoreTable.io.req.valid := io.train.valid
   scoreTable.io.req.bits := s0_oldFullAddr
+  scoreTable.io.trainFire := io.train.fire
 
   /* s1 get or send req */
   val s1_needT = RegEnable(io.train.bits.needT, s0_fire)
@@ -782,6 +881,10 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   XSPerfAccumulate("bop_req", io.req.fire)
   XSPerfAccumulate("bop_train", io.train.fire)
   XSPerfAccumulate("bop_resp", io.resp.fire)
+  BOPPerf.addEventGap("vbop_train_accept_gap", io.train.fire)
+  XSPerfAccumulate("vbop_train_valid", io.train.valid)
+  XSPerfAccumulate("vbop_train_stall", io.train.valid && !io.train.ready)
+  XSPerfAccumulate("vbop_delayq_attempt_without_train_fire", delayQueue.io.in.valid && !io.train.fire)
   XSPerfAccumulate("bop_train_stall_for_st_not_ready", io.train.valid && !scoreTable.io.req.ready)
   if(virtualTrain){
     XSPerfAccumulate("bop_train_stall_for_tlb_not_ready", io.train.valid && !io.tlb_req.req.ready)
@@ -824,6 +927,7 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   delayQueue.io.in.bits := oldAddrNoOff
   scoreTable.io.req.valid := io.train.valid
   scoreTable.io.req.bits := oldAddr
+  scoreTable.io.trainFire := io.train.fire
 
   val req = Reg(new PrefetchReq)
   val req_valid = RegInit(false.B)
@@ -856,6 +960,10 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   XSPerfAccumulate("bop_req", io.req.fire)
   XSPerfAccumulate("bop_train", io.train.fire)
   XSPerfAccumulate("bop_resp", io.resp.fire)
+  BOPPerf.addEventGap("pbop_train_accept_gap", io.train.fire)
+  XSPerfAccumulate("pbop_train_valid", io.train.valid)
+  XSPerfAccumulate("pbop_train_stall", io.train.valid && !io.train.ready)
+  XSPerfAccumulate("pbop_delayq_attempt_without_train_fire", delayQueue.io.in.valid && !io.train.fire)
   XSPerfAccumulate("bop_train_stall_for_st_not_ready", io.train.valid && !scoreTable.io.req.ready)
   XSPerfAccumulate("bop_drop_for_cross_page", scoreTable.io.req.fire && crossPage)
   XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)

@@ -334,6 +334,9 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     vbop_train_buf.io.enq.bits  := train.bits
     XSPerfAccumulate("vbop_train_drop", vbop_train_buf.io.enq.valid && !vbop_train_buf.io.enq.ready)
     XSPerfAccumulate("vbop_train_accept", vbop_train_buf.io.enq.fire)
+    XSPerfAccumulate("vbop_train_arrival", vbop_train_buf.io.enq.valid)
+    XSPerfHistogram("vbop_train_buf_occupancy", vbop_train_buf.io.count, true.B, 0, 5, 1)
+    BOPPerf.addEventGap("vbop_train_arrival_gap", vbop_train_buf.io.enq.valid)
 
     vbop.get.io.enable := vbop_en
     vbop.get.io.pfCtrlOfDelayLatency := delay_latency
@@ -348,6 +351,9 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     pbop_train_buf.io.enq.bits  := train.bits
     XSPerfAccumulate("pbop_train_drop", pbop_train_buf.io.enq.valid && !pbop_train_buf.io.enq.ready)
     XSPerfAccumulate("pbop_train_accept", pbop_train_buf.io.enq.fire)
+    XSPerfAccumulate("pbop_train_arrival", pbop_train_buf.io.enq.valid)
+    XSPerfHistogram("pbop_train_buf_occupancy", pbop_train_buf.io.count, true.B, 0, 5, 1)
+    BOPPerf.addEventGap("pbop_train_arrival_gap", pbop_train_buf.io.enq.valid)
 
     pbop.get.io.enable := pbop_en
     pbop.get.io.pfCtrlOfDelayLatency := delay_latency
