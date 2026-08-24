@@ -564,21 +564,25 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   })
 
   // Generate filter-table writes for pool offsets
-  val s0_writeAddr = Wire(UInt(fullAddrBits.W))
-  s0_writeAddr := (if (useDelayOut) RegNext(io.delayOut.bits) else io.train.bits)
-  val s0_writeEnable = (if (useDelayOut) RegNext(io.delayOut.valid, false.B) else io.train.valid) &&
+  val s0_writeAddr = if (useDelayOut) io.delayOut.bits else io.train.bits
+  val s0_writeEnable = (if (useDelayOut) io.delayOut.valid else io.train.valid) &&
     state === s_training && !io.teacherPhaseEnd
-  val s0_writeValids = Wire(Vec(studentPoolSize, Bool()))
+  val s0_writePPNs = Wire(Vec(studentPoolSize, UInt((fullAddrBits - pageOffsetBits).W)))
   val s0_writeIdxs = Wire(Vec(studentPoolSize, UInt(studentFilterIdxBits.W)))
   for (i <- 0 until studentPoolSize) {
     val predictedAddr = addOffset(s0_writeAddr, pool(i).offset)
-    val samePage = getPPN(predictedAddr) === getPPN(s0_writeAddr)
-    s0_writeValids(i) := pool(i).valid && (crossPage.B || samePage)
+    s0_writePPNs(i) := getPPN(predictedAddr)
     s0_writeIdxs(i) := filterIndex(predictedAddr)
   }
   val s1_writeEnable = RegNext(s0_writeEnable, false.B)
-  val s1_writeValids = RegEnable(s0_writeValids, s0_writeEnable)
+  val s1_writePPN = RegEnable(getPPN(s0_writeAddr), s0_writeEnable)
+  val s1_writePPNs = RegEnable(s0_writePPNs, s0_writeEnable)
   val s1_writeIdxs = RegEnable(s0_writeIdxs, s0_writeEnable)
+  val s1_writeValids = Wire(Vec(studentPoolSize, Bool()))
+  for (i <- 0 until studentPoolSize) {
+    val samePage = s1_writePPNs(i) === s1_writePPN
+    s1_writeValids(i) := pool(i).valid && (crossPage.B || samePage)
+  }
 
   val selectInputs = (0 until studentPoolSize).map { i =>
     val in = Wire(Valid(UInt(studentPoolIdxBits.W)))
