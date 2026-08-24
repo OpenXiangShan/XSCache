@@ -387,7 +387,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sl
 
   val allow_txreq_evictback = sa_resp_decision
 
-  val sched_txreq_evictback = rxreq_unsatisfied_evictback
+  val sched_txreq_evictback = rxreq_unsatisfied_evictback && !sa_resp_decision
 
   when (sched_txreq_evictback) {
     w_evict_s_dn_txreq := true.B
@@ -400,7 +400,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sl
   val issue_txreq_readunique = rxreq_unsatisfied_readunique
   val issue_txreq_makeunique = rxreq_unsatisfied_makeunique
 
-  val issue_txreq_evictback = w_evict_s_dn_txreq && allow_txreq_evictback
+  val issue_txreq_evictback = w_evict_s_dn_txreq && allow_txreq_evictback ||
+                              rxreq_unsatisfied_evictback && sa_resp_decision
 
   val issue_txreq = issue_txreq_stashshared ||
                     issue_txreq_stashunique ||
@@ -1081,7 +1082,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sl
   io.UpTXRSP.bits.TxnID := p_rxreq.TxnID
   io.UpTXRSP.bits.SrcID := nodeId.U
   io.UpTXRSP.bits.TgtID := p_rxreq.SrcID
-  io.UpTXRSP.bits.DBID := tshrId.U
+  io.UpTXRSP.bits.DBID := getTxnID
   io.UpTXRSP.bits.Opcode := up_txrsp_opcode
   io.UpTXRSP.bits.RespErr := 0.U // TODO: RespErr
   io.UpTXRSP.bits.Resp := up_txrsp_resp
@@ -1236,7 +1237,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sl
   // Activate Directory write-back immediately on replacement Directory lock released by eviction
   // to clear the replacer reading lock in Directory
   io.dir_wb_aux := unlock_dir
-
   io.UpTXREQ.valid := s_evict
   io.UpTXREQ.bits.TxnID := getTxnID
   io.UpTXREQ.bits.SrcID := nodeId.U
