@@ -302,7 +302,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
             useDelayOut = false,
             enableStudentCover = true,
             studentPoolSize = 8,
-            studentFilterEntries = 2048,
+            studentFilterTableBits = 2048,
             studentHashMode = "bop_rr",
             studentCovThreshold = 5,
             offsetList = Seq(
@@ -326,7 +326,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
             useDelayOut = true,
             enableStudentCover = true,
             studentPoolSize = 4,
-            studentFilterEntries = 4096,
+            studentFilterTableBits = 4096,
             studentHashMode = "pairs_low9",
             studentCovThreshold = 0,
             offsetList = Seq(
