@@ -459,10 +459,12 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val reqsValid = reqs.map(_.map(_.valid).getOrElse(false.B))
   val reqsBits = reqs.map(_.map(_.bits).getOrElse(0.U.asTypeOf(new PrefetchReq)))
   val reqsSetAddr = reqsBits.map(_.setaddr)
+
+  private val pftQueueEntries = inflightEntries / banks
   val pftQueue = Seq.tabulate(banks) { _ =>
     Module(new OverwriteQueue(
       gen = new PrefetchReq,
-      entries = inflightEntries,
+      entries = pftQueueEntries,
       hasFlow = true
     ))
   }
