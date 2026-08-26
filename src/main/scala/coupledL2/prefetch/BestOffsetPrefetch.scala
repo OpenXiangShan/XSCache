@@ -143,32 +143,6 @@ trait HasBOPParams extends HasPrefetcherHelper {
 
 abstract class BOPBundle(implicit val p: Parameters) extends Bundle with HasBOPParams
 abstract class BOPModule(implicit val p: Parameters) extends Module with HasBOPParams {
-  protected def alignUp(value: Int, step: Int): Int = ((value + step - 1) / step) * step
-
-  private def emitHistogramRange(
-    perfName: String,
-    perfCnt: UInt,
-    enable: Bool,
-    start: Int,
-    stop: Int,
-    step: Int,
-    leftStrict: Boolean = false,
-    rightStrict: Boolean = false
-  ): Unit = {
-    if (stop > start) {
-      XSPerfHistogram(
-        perfName,
-        perfCnt,
-        enable,
-        start,
-        stop,
-        step,
-        left_strict = leftStrict,
-        right_strict = rightStrict
-      )
-    }
-  }
-
   protected def emitOffsetDistCounters(prefix: String, offset: SInt, enable: Bool): Unit = {
     for (off <- offsetList) {
       val counterName =
@@ -176,18 +150,6 @@ abstract class BOPModule(implicit val p: Parameters) extends Module with HasBOPP
         else prefix + "_pos_" + off.toString
       XSPerfAccumulate(counterName, enable && offset === off.S(offsetWidth.W))
     }
-  }
-
-  protected def emitCoverageHistogram(prefix: String, coverage: UInt, enable: Bool): Unit = {
-    val rawUpper = studentPhaseTrainMax + 1
-    emitHistogramRange(prefix, coverage, enable, 0, math.min(32, rawUpper), 1, rightStrict = true)
-    emitHistogramRange(prefix, coverage, enable, 32, math.min(128, rawUpper), 8,
-      leftStrict = true, rightStrict = true)
-    emitHistogramRange(prefix, coverage, enable, 128, math.min(512, rawUpper), 32,
-      leftStrict = true, rightStrict = true)
-    emitHistogramRange(prefix, coverage, enable, 512, math.min(2048, rawUpper), 128,
-      leftStrict = true, rightStrict = true)
-    emitHistogramRange(prefix, coverage, enable, 2048, alignUp(rawUpper, 512), 512, leftStrict = true)
   }
 }
 
@@ -778,12 +740,13 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   io.selectedEnable := selectedEnable
 
   XSPerfAccumulate("student_phase_end", state === s_phaseEnd)
-  XSPerfAccumulate("student_takeover", state === s_phaseEnd && endSelectedEnable)
   XSPerfAccumulate("student_fallback", state === s_phaseEnd && !endSelectedEnable)
   val studentMetricEnable = state === s_phaseEnd && endSelectedValid
   emitOffsetDistCounters("student_best_offset", endSelectedOffset, studentMetricEnable)
-  emitCoverageHistogram("student_best_cov", endSelectedCov, studentMetricEnable)
-  emitCoverageHistogram("student_worst_cov", endWorstCov, studentMetricEnable)
+  XSPerfHistogram("student_best_cov", endSelectedCov, studentMetricEnable, 0, 3072, 128)
+  XSPerfHistogram("student_worst_cov", endWorstCov, studentMetricEnable, 0, 3072, 128)
+  XSPerfHistogram("student_train_count", endTrainCount, state === s_phaseEnd, 1024, 4096, 256)
+  XSPerfHistogram("student_best_worst_gap", endSelectedCov - endWorstCov, studentMetricEnable, 0, 768, 64)
 }
 
 class BopReqBundle(implicit p: Parameters) extends BOPBundle{
@@ -1212,18 +1175,12 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   io.req <> reqFilter.io.out_req
   io.req.valid := reqFilter.io.out_req.valid
 
-  for (off <- offsetList) {
-    if (off < 0) {
-      XSPerfAccumulate("best_offset_neg_" + (-off).toString, prefetchOffset === off.S(offsetWidth.W).asUInt)
-    } else {
-      XSPerfAccumulate("best_offset_pos_" + off.toString, prefetchOffset === off.U)
-    }
-  }
   XSPerfAccumulate("bop_req", io.req.fire)
   emitOffsetDistCounters("prefetch_sent_issue_offset", reqFilter.io.out_issueOffset, io.req.fire)
   XSPerfAccumulate("bop_train", io.train.fire)
   XSPerfAccumulate("bop_resp", io.resp.fire)
   XSPerfAccumulate("bop_train_stall_for_st_not_ready", io.train.valid && !scoreTable.io.req.ready)
+  XSPerfAccumulate("bop_train_stall_for_stu_not_ready", io.train.valid && !studentTrainReady)
   XSPerfAccumulate("bop_train_stall_for_tlb_not_ready", io.train.valid && !io.tlb_req.req.ready)
   XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
   XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && prefetchDisable)
@@ -1319,18 +1276,12 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   io.train.ready := s0_ready
   io.resp.ready := true.B
 
-  for (off <- offsetList) {
-    if (off < 0) {
-      XSPerfAccumulate("best_offset_neg_" + (-off).toString, prefetchOffset === off.S(offsetWidth.W).asUInt)
-    } else {
-      XSPerfAccumulate("best_offset_pos_" + off.toString, prefetchOffset === off.U)
-    }
-  }
   XSPerfAccumulate("bop_req", io.req.fire)
   emitOffsetDistCounters("prefetch_sent_issue_offset", reqSkidBuffer.io.deq.bits.issueOffset, io.req.fire)
   XSPerfAccumulate("bop_train", io.train.fire)
   XSPerfAccumulate("bop_resp", io.resp.fire)
   XSPerfAccumulate("bop_train_stall_for_st_not_ready", io.train.valid && !scoreTable.io.req.ready)
+  XSPerfAccumulate("bop_train_stall_for_stu_not_ready", io.train.valid && !studentTrainReady)
   XSPerfAccumulate("bop_drop_for_cross_page", scoreTable.io.req.fire && s0_crossPage)
   XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
   XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && prefetchDisable)
