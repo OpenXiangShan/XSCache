@@ -301,8 +301,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
             crossPage = false,
             useDelayOut = false,
             enableStudentCover = true,
-            studentPoolSize = 8,
-            studentFilterTableBits = 2048,
+            studentPoolSize = 4,
+            studentFilterTableBits = 4096,
             studentHashMode = "bop_rr",
             studentCovThreshold = 5,
             offsetList = Seq(
