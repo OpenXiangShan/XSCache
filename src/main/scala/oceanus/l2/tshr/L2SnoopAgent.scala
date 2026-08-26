@@ -22,9 +22,9 @@ object SnoopOpcodeDerive {
   // The uop encodes the caller's intent; the emitted SNP opcode is derived here
   // from the directory snapshot. Directory dirty is intentionally excluded:
   // L2 dirty belongs to DS ownership, while the directory cannot know L1 dirty.
-  def apply(intent: Intent.Type, state: UInt, clients: UInt, hit: Bool): (Bool, UInt) = {
+  def apply(intent: Intent.Type, state: UInt, clients: UInt, hit: Bool, aliasMismatch: Bool): (Bool, UInt) = {
     val hasClient = clients.orR
-    val invalidate = isInvalidate(intent)
+    val invalidate = isInvalidate(intent) || aliasMismatch
     val needSnoop = hit && hasClient && (invalidate || state === L2Directory.MetaState.UU)
     val opcode = Mux(
       invalidate,
@@ -35,9 +35,9 @@ object SnoopOpcodeDerive {
     (needSnoop, opcode)
   }
 
-  def apply(intent: Int, state: Int, clients: Int, hit: Boolean): Result = {
+  def apply(intent: Int, state: Int, clients: Int, hit: Boolean, aliasMismatch: Boolean): Result = {
     val hasClient = clients != 0
-    val invalidate = isInvalidate(intent)
+    val invalidate = isInvalidate(intent) || aliasMismatch
     val needSnoop = hit && hasClient && (invalidate || state == L2Directory.MetaState.UU.litValue.toInt)
     val opcode =
       if (invalidate) {
@@ -108,6 +108,7 @@ class L2SnoopAgent(tshrId: Int)(implicit val p: Parameters) extends Module with 
   val slotUop = RegInit(0.U.asTypeOf(new L2SnoopAgent.PathToSnoopAgent))
   val slotPaddr = Reg(UInt(paramL2.physicalAddrWidth.W))
   val slotOpcode = Reg(UInt(2.W))
+  val slotAlias = RegInit(0.U(2.W))
 
   val seenData0 = RegInit(false.B)
   val passDirtyReg = RegInit(false.B)
@@ -134,8 +135,13 @@ class L2SnoopAgent(tshrId: Int)(implicit val p: Parameters) extends Module with 
     uopBitsIn.SnpToClean
   )
   val accept = uopAnyValid && !busy && armed
+  // dirResult.clients = directory holders; uop.CLIENTS = requester came from L1D.
+  val aliasMismatch = io.tshr_dirResult.hit &&
+    io.tshr_dirResult.clients.asUInt.orR &&
+    uopBitsIn.CLIENTS.asUInt.orR &&
+    (io.tshr_dirResult.alias =/= uopBitsIn.ALIAS)
   val (acceptNeedSnoop, acceptOpcode) =
-    SnoopOpcodeDerive(intent, io.tshr_dirResult.state, io.tshr_dirResult.clients.asUInt, io.tshr_dirResult.hit)
+    SnoopOpcodeDerive(intent, io.tshr_dirResult.state, io.tshr_dirResult.clients.asUInt, io.tshr_dirResult.hit, aliasMismatch)
 
   val rspMatch =
     state === sWaitCore &&
@@ -165,7 +171,7 @@ class L2SnoopAgent(tshrId: Int)(implicit val p: Parameters) extends Module with 
   io.txSnp.bits.TxnID := tshrId.U
   io.txSnp.bits.Opcode := slotOpcode
   io.txSnp.bits.Addr := slotPaddr >> 3
-  io.txSnp.bits.alias := slotUop.ALIAS
+  io.txSnp.bits.alias := slotAlias
 
   when (!uopAnyValid) {
     armed := true.B
@@ -193,6 +199,7 @@ class L2SnoopAgent(tshrId: Int)(implicit val p: Parameters) extends Module with 
     slotUop := uopBitsIn
     slotPaddr := io.tshr_paddr
     slotOpcode := acceptOpcode
+    slotAlias := io.tshr_dirResult.alias
     state := sSnpReq
   }
 
