@@ -135,7 +135,7 @@ class L2SnoopAgent(tshrId: Int)(implicit val p: Parameters) extends Module with 
   )
   val accept = uopAnyValid && !busy && armed
   val (acceptNeedSnoop, acceptOpcode) =
-    SnoopOpcodeDerive(intent, io.tshr_dirResult.state, uopBitsIn.CLIENTS.asUInt, io.tshr_dirResult.hit)
+    SnoopOpcodeDerive(intent, io.tshr_dirResult.state, io.tshr_dirResult.clients.asUInt, io.tshr_dirResult.hit)
 
   val rspMatch =
     state === sWaitCore &&
