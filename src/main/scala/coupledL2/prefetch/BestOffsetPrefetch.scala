@@ -190,28 +190,37 @@ class RecentRequestTable(name: String)(implicit p: Parameters) extends BOPModule
   rrTable.io.w.req.bits.data(0).valid := true.B
   rrTable.io.w.req.bits.data(0).tag := tag(wAddr)
 
-  val rAddr = io.r.req.bits.addr - signedExtend((io.r.req.bits.testOffset << offsetBits), fullAddrBits)
   val rData = Wire(rrTableEntry())
-  rrTable.io.r.req.valid := io.r.req.fire
-  rrTable.io.r.req.bits.setIdx := idx(rAddr)
   rData := rrTable.io.r.resp.data(0)
 
   assert(!RegNext(io.w.fire && io.r.req.fire), "single port SRAM should not read and write at the same time")
 
   /** s0: req handshake */
   val s0_valid = rrTable.io.r.req.fire
-  /** s1: rrTable read result */
+  val s0_rAddr = io.r.req.bits.addr - signedExtend((io.r.req.bits.testOffset << offsetBits), fullAddrBits)
+  /** s1: rrTable read req */
   val s1_valid = RegNext(s0_valid, false.B)
-  val s1_ptr = RegNext(io.r.req.bits.ptr)
-  val s1_hit = rData.valid && rData.tag === RegNext(tag(rAddr))
-  /** s2: return resp to ScoreTable */
+  val s1_setIdx = RegEnable(idx(s0_rAddr), s0_valid)
+  val s1_tag = RegEnable(tag(s0_rAddr), s0_valid)
+  val s1_ptr = RegEnable(io.r.req.bits.ptr, s0_valid)
+  /** s2: rrTable read result */
   val s2_valid = RegNext(s1_valid, false.B)
+  val s2_tag = RegEnable(s1_tag, s1_valid)
+  val s2_hit = rData.valid && rData.tag === s2_tag
+  val s2_ptr = RegEnable(s1_ptr, s1_valid)
+  /** s3: return resp to ScoreTable */
+  val s3_valid = RegNext(s2_valid, false.B)
+  val s3_hit = RegEnable(s2_hit, s2_valid)
+  val s3_ptr = RegEnable(s2_ptr, s2_valid)
+
+  rrTable.io.r.req.valid := s1_valid
+  rrTable.io.r.req.bits.setIdx := s1_setIdx
 
   io.w.ready := rrTable.io.w.req.ready && !io.r.req.valid
   io.r.req.ready := true.B
-  io.r.resp.valid := s2_valid
-  io.r.resp.bits.ptr := RegEnable(s1_ptr, s1_valid)
-  io.r.resp.bits.hit := RegEnable(s1_hit, s1_valid)
+  io.r.resp.valid := s3_valid
+  io.r.resp.bits.ptr := s3_ptr
+  io.r.resp.bits.hit := s3_hit
 
   class WRRTEntry extends Bundle{
     val addr = UInt(fullAddrBits.W)
