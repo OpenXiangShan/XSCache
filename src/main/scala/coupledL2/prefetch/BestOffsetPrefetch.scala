@@ -646,13 +646,17 @@ class DelayQueue(name: String = "")(implicit p: Parameters) extends  BOPModule{
     }
     */
   }
-  when(outValid && io.out.ready) {
+
+  val pending = Module(new Queue(UInt(fullAddrBits.W), entries = 2))
+  pending.io.enq.valid := outValid
+  pending.io.enq.bits := Cat(queue(head).addrNoOffset, 0.U(offsetBits.W))
+
+  when(outValid && pending.io.enq.ready) {
     valids(head) := false.B
     head := head + 1.U
   }
   io.in.ready := true.B
-  io.out.valid := outValid
-  io.out.bits := Cat(queue(head).addrNoOffset, 0.U(offsetBits.W))
+  io.out <> pending.io.deq
 
   /* Update */
   for(i <- 0 until dQEntries){
@@ -667,7 +671,6 @@ class DelayQueue(name: String = "")(implicit p: Parameters) extends  BOPModule{
   XSPerfAccumulate("entryNumber", PopCount(valids.asUInt))
   XSPerfAccumulate("inNumber", io.in.valid)
   XSPerfAccumulate("outNumber", io.out.valid)
-
 }
 
 class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
