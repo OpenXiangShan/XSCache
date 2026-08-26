@@ -23,6 +23,7 @@ class FlitREQStripped extends Bundle {
   val SrcID = UInt(8.W) // TODO: configured by UpstreamNodeID_Width
   val TgtID = UInt(8.W) // TODO: configured by DownstreamNodeID_Width
   val Opcode = UInt(6.W) // TODO: variable width between different types of components
+  val TagAlias = UInt(2.W) //  TODO: configurable by TagAlias_Width
   val Size = UInt(3.W)
   val NS = Bool()
   val Order = UInt(2.W)
