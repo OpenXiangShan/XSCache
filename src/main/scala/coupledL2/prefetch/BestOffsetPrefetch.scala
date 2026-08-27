@@ -57,6 +57,8 @@ case class BOPParameters(
   studentFilterEntryBits: Int = 64,
   studentHashMode: String = "bop_rr",
   studentCovThreshold: Int = 0,
+  teacherDisableGateEnable: Boolean = false,
+  teacherDisableConfThreshold: Int = 14,
   offsetList: Seq[Int] = Seq(
     -256, -250, -243, -240, -225, -216, -200,
     -192, -180, -162, -160, -150, -144, -135, -128,
@@ -118,6 +120,8 @@ trait HasBOPParams extends HasPrefetcherHelper {
   def studentFilterEntryIdxBits = log2Ceil(studentFilterTableEntries)
   def studentHashMode = bopParams.studentHashMode
   def studentCovThreshold = bopParams.studentCovThreshold
+  def teacherDisableGateEnable = bopParams.teacherDisableGateEnable
+  def teacherDisableConfThreshold = bopParams.teacherDisableConfThreshold
 
   def scores = offsetList.length
   def offsetWidth = log2Up(offsetList.max) + 2 // -32 <= offset <= 31
@@ -150,6 +154,80 @@ abstract class BOPModule(implicit val p: Parameters) extends Module with HasBOPP
         else prefix + "_pos_" + off.toString
       XSPerfAccumulate(counterName, enable && offset === off.S(offsetWidth.W))
     }
+  }
+
+  protected def teacherDisableConfidence(phaseEnd: Bool, teacherIssueEnable: Bool): (UInt, UInt) = {
+    require(teacherDisableConfThreshold > 0 && teacherDisableConfThreshold <= 15)
+    val confidence = RegInit(0.U(4.W))
+    val confidenceAfterDisable = Mux(confidence >= 13.U, 15.U, confidence + 2.U)
+    val confidenceAfterEnable = Mux(confidence === 0.U, 0.U, confidence - 1.U)
+    val nextConfidence = Mux(teacherIssueEnable, confidenceAfterEnable, confidenceAfterDisable)
+    when(phaseEnd) {
+      confidence := nextConfidence
+    }
+    (confidence, nextConfidence)
+  }
+
+  protected def emitTeacherDisableConfCounters(
+    phaseEnd: Bool,
+    teacherIssueEnable: Bool,
+    phaseStart: Bool,
+    teacherDisable: Bool,
+    studentSelectedEnable: Bool,
+    confidence: UInt,
+    nextConfidence: UInt,
+    issueCandidate: Bool,
+    confidenceBlocksIssue: Bool,
+    suppressStudentOverride: Bool,
+    trainFire: Bool
+  ): Unit = {
+    val qualified = confidence >= teacherDisableConfThreshold.U
+    val nextQualified = nextConfidence >= teacherDisableConfThreshold.U
+    val studentOverrideTeacherDisable = teacherDisable && studentSelectedEnable
+
+    XSPerfAccumulate("bop_teacher_conf_update", phaseEnd)
+    XSPerfAccumulate("bop_teacher_conf_disable_update", phaseEnd && !teacherIssueEnable)
+    XSPerfAccumulate("bop_teacher_conf_enable_update", phaseEnd && teacherIssueEnable)
+    XSPerfAccumulate("bop_teacher_conf_at_max", phaseEnd && !teacherIssueEnable && nextConfidence === 15.U)
+    XSPerfAccumulate("bop_teacher_conf_at_min", phaseEnd && teacherIssueEnable && nextConfidence === 0.U)
+    XSPerfAccumulate("bop_teacher_conf_enter", phaseEnd && !qualified && nextQualified)
+    XSPerfAccumulate("bop_teacher_conf_exit", phaseEnd && qualified && !nextQualified)
+    XSPerfHistogram("bop_teacher_disable_conf", nextConfidence, phaseEnd, 0, 16, 1)
+
+    XSPerfAccumulate("bop_teacher_conf_qualified_phase", phaseStart && qualified)
+    XSPerfAccumulate("bop_conf_suppress_phase",
+      phaseStart && issueCandidate && confidenceBlocksIssue)
+    XSPerfAccumulate("bop_conf_allow_phase",
+      phaseStart && issueCandidate && !confidenceBlocksIssue)
+    XSPerfAccumulate("bop_no_issue_candidate_phase",
+      phaseStart && !issueCandidate)
+    XSPerfAccumulate("bop_teacher_enable_conf_suppress_phase",
+      phaseStart && !teacherDisable && confidenceBlocksIssue)
+    XSPerfAccumulate("bop_student_selected_conf_suppress_phase",
+      phaseStart && studentSelectedEnable && confidenceBlocksIssue)
+    XSPerfAccumulate("bop_student_override_teacher_disable_phase",
+      phaseStart && studentOverrideTeacherDisable)
+    XSPerfAccumulate("bop_student_override_conf_suppress_phase",
+      phaseStart && suppressStudentOverride)
+    XSPerfAccumulate("bop_student_override_conf_allow_phase",
+      phaseStart && studentOverrideTeacherDisable && !suppressStudentOverride)
+
+    XSPerfAccumulate("bop_conf_suppress_req",
+      trainFire && issueCandidate && confidenceBlocksIssue)
+    XSPerfAccumulate("bop_conf_allow_req",
+      trainFire && issueCandidate && !confidenceBlocksIssue)
+    XSPerfAccumulate("bop_no_issue_candidate_req",
+      trainFire && !issueCandidate)
+    XSPerfAccumulate("bop_teacher_enable_conf_suppress_req",
+      trainFire && !teacherDisable && confidenceBlocksIssue)
+    XSPerfAccumulate("bop_student_selected_conf_suppress_req",
+      trainFire && studentSelectedEnable && confidenceBlocksIssue)
+    XSPerfAccumulate("bop_student_override_teacher_disable_req",
+      trainFire && studentOverrideTeacherDisable)
+    XSPerfAccumulate("bop_student_override_conf_suppress_req",
+      trainFire && suppressStudentOverride)
+    XSPerfAccumulate("bop_student_override_conf_allow_req",
+      trainFire && studentOverrideTeacherDisable && !suppressStudentOverride)
   }
 }
 
@@ -1116,7 +1194,15 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val studentSelectedOffset = student.map(_.io.selectedOffset).getOrElse(prefetchOffset)
   val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
   val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, prefetchOffset)
-  val issueEnable = studentSelectedEnable || !prefetchDisable
+  val (teacherDisableConf, nextTeacherDisableConf) = teacherDisableConfidence(
+    scoreTable.io.phaseEndPulse,
+    scoreTable.io.phaseIssueEnable
+  )
+  val issueCandidate = studentSelectedEnable || !prefetchDisable
+  val confidenceBlocksIssue = teacherDisableGateEnable.B &&
+    teacherDisableConf >= teacherDisableConfThreshold.U
+  val suppressStudentOverride = prefetchDisable && studentSelectedEnable && confidenceBlocksIssue
+  val issueEnable = issueCandidate && !confidenceBlocksIssue
   // NOTE: vaddr from l1 to l2 has no offset bits
   val s0_oldFullAddr = Cat(io.train.bits.vaddr.getOrElse(0.U), 0.U(offsetBits.W))
   val s0_oldFullAddrNoOff = s0_oldFullAddr(s0_oldFullAddr.getWidth-1, offsetBits)
@@ -1185,6 +1271,19 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
   XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && prefetchDisable)
   XSPerfAccumulate("bop_student_takeover", scoreTable.io.req.fire && studentSelectedEnable)
+  emitTeacherDisableConfCounters(
+    scoreTable.io.phaseEndPulse,
+    scoreTable.io.phaseIssueEnable,
+    RegNext(scoreTable.io.phaseEndPulse, false.B),
+    prefetchDisable,
+    studentSelectedEnable,
+    teacherDisableConf,
+    nextTeacherDisableConf,
+    issueCandidate,
+    confidenceBlocksIssue,
+    suppressStudentOverride,
+    scoreTable.io.req.fire
+  )
   XSPerfAccumulate("bop_l2_feedback_control_drop", enable && s1_req_valid && io.fdbkDegree === 0.U)
 }
 
@@ -1219,7 +1318,15 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val studentSelectedOffset = student.map(_.io.selectedOffset).getOrElse(prefetchOffset)
   val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
   val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, prefetchOffset)
-  val issueEnable = studentSelectedEnable || !prefetchDisable
+  val (teacherDisableConf, nextTeacherDisableConf) = teacherDisableConfidence(
+    scoreTable.io.phaseEndPulse,
+    scoreTable.io.phaseIssueEnable
+  )
+  val issueCandidate = studentSelectedEnable || !prefetchDisable
+  val confidenceBlocksIssue = teacherDisableGateEnable.B &&
+    teacherDisableConf >= teacherDisableConfThreshold.U
+  val suppressStudentOverride = prefetchDisable && studentSelectedEnable && confidenceBlocksIssue
+  val issueEnable = issueCandidate && !confidenceBlocksIssue
   val s0_oldAddr = io.train.bits.addr
   val s0_oldAddrNoOff = s0_oldAddr(s0_oldAddr.getWidth-1, offsetBits)
   val s0_newAddr = s0_oldAddr + signedExtend((issueOffset << offsetBits), fullAddressBits)
@@ -1286,5 +1393,18 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
   XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && prefetchDisable)
   XSPerfAccumulate("bop_student_takeover", scoreTable.io.req.fire && studentSelectedEnable)
+  emitTeacherDisableConfCounters(
+    scoreTable.io.phaseEndPulse,
+    scoreTable.io.phaseIssueEnable,
+    RegNext(scoreTable.io.phaseEndPulse, false.B),
+    prefetchDisable,
+    studentSelectedEnable,
+    teacherDisableConf,
+    nextTeacherDisableConf,
+    issueCandidate,
+    confidenceBlocksIssue,
+    suppressStudentOverride,
+    scoreTable.io.req.fire
+  )
   XSPerfAccumulate("bop_l2_feedback_control_drop", enable && s1_req_valid && io.fdbkDegree === 0.U)
 }
