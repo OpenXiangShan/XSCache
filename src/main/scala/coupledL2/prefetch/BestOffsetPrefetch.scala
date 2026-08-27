@@ -184,19 +184,11 @@ class RecentRequestTable(name: String)(implicit p: Parameters) extends BOPModule
     )
   )
 
-  val wAddr = io.w.bits
-  rrTable.io.w.req.valid := io.w.valid && !io.r.req.valid
-  rrTable.io.w.req.bits.setIdx := idx(wAddr)
-  rrTable.io.w.req.bits.data(0).valid := true.B
-  rrTable.io.w.req.bits.data(0).tag := tag(wAddr)
-
   val rData = Wire(rrTableEntry())
   rData := rrTable.io.r.resp.data(0)
 
-  assert(!RegNext(io.w.fire && io.r.req.fire), "single port SRAM should not read and write at the same time")
-
   /** s0: req handshake */
-  val s0_valid = rrTable.io.r.req.fire
+  val s0_valid = io.r.req.valid
   val s0_rAddr = io.r.req.bits.addr - signedExtend((io.r.req.bits.testOffset << offsetBits), fullAddrBits)
   /** s1: rrTable read req */
   val s1_valid = RegNext(s0_valid, false.B)
@@ -215,8 +207,15 @@ class RecentRequestTable(name: String)(implicit p: Parameters) extends BOPModule
 
   rrTable.io.r.req.valid := s1_valid
   rrTable.io.r.req.bits.setIdx := s1_setIdx
+  rrTable.io.w.req.valid := io.w.valid && !s1_valid
+  rrTable.io.w.req.bits.setIdx := idx(io.w.bits)
+  rrTable.io.w.req.bits.data(0).valid := true.B
+  rrTable.io.w.req.bits.data(0).tag := tag(io.w.bits)
 
-  io.w.ready := rrTable.io.w.req.ready && !io.r.req.valid
+  assert(!(rrTable.io.r.req.valid && rrTable.io.w.req.valid),
+    "single port SRAM should not read and write at the same time")
+
+  io.w.ready := rrTable.io.w.req.ready && !s1_valid
   io.r.req.ready := true.B
   io.r.resp.valid := s3_valid
   io.r.resp.bits.ptr := s3_ptr
@@ -227,9 +226,8 @@ class RecentRequestTable(name: String)(implicit p: Parameters) extends BOPModule
   }
   val wrrt = ChiselDB.createTable(name+"WriteRecentRequestTable", new WRRTEntry, basicDB = false)
   val e = Wire(new WRRTEntry)
-  e.addr := wAddr
-  wrrt.log(e, io.w.valid && !io.r.req.valid, site = "RecentRequestTable", clock, reset)
-
+  e.addr := io.w.bits
+  wrrt.log(e, io.w.fire, site = "RecentRequestTable", clock, reset)
 }
 
 class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPModule {
