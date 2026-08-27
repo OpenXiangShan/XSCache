@@ -459,14 +459,16 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val reqsValid = reqs.map(_.map(_.valid).getOrElse(false.B))
   val reqsBits = reqs.map(_.map(_.bits).getOrElse(0.U.asTypeOf(new PrefetchReq)))
   val reqsSetAddr = reqsBits.map(_.setaddr)
+
+  private val pftQueueEntries = inflightEntries / banks
   val pftQueue = Seq.tabulate(banks) { _ =>
     Module(new OverwriteQueue(
       gen = new PrefetchReq,
-      entries = inflightEntries,
+      entries = pftQueueEntries,
       hasFlow = true
     ))
   }
-  val pipe = Seq.tabulate(banks) { _ => Module(new Pipeline(new PrefetchReq, 1)) }
+  val pipe = Seq.tabulate(banks) { _ => Module(new Queue(new PrefetchReq, entries = 2)) }
   val select = Wire(Vec(banks, Vec(SRC_NUM, Bool())))
   val selectOH = Wire(Vec(banks, Vec(SRC_NUM, Bool())))
   val reqsAllowed = Seq(
@@ -485,8 +487,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     selectOH(i) := VecInit(PriorityEncoderOH(select(i).asUInt).asBools)
     pftQueue(i).io.enq.valid := select(i).asUInt.orR
     pftQueue(i).io.enq.bits := ParallelPriorityMux(select(i).asUInt, reqsBits)
-    pipe(i).io.in <> pftQueue(i).io.deq
-    io.req(i) <> pipe(i).io.out
+    pipe(i).io.enq <> pftQueue(i).io.deq
+    io.req(i) <> pipe(i).io.deq
   }
 
   for ((reqOpt, j) <- reqs.zipWithIndex) {

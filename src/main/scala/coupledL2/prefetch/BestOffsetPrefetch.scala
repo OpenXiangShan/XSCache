@@ -184,43 +184,50 @@ class RecentRequestTable(name: String)(implicit p: Parameters) extends BOPModule
     )
   )
 
-  val wAddr = io.w.bits
-  rrTable.io.w.req.valid := io.w.valid && !io.r.req.valid
-  rrTable.io.w.req.bits.setIdx := idx(wAddr)
-  rrTable.io.w.req.bits.data(0).valid := true.B
-  rrTable.io.w.req.bits.data(0).tag := tag(wAddr)
-
-  val rAddr = io.r.req.bits.addr - signedExtend((io.r.req.bits.testOffset << offsetBits), fullAddrBits)
   val rData = Wire(rrTableEntry())
-  rrTable.io.r.req.valid := io.r.req.fire
-  rrTable.io.r.req.bits.setIdx := idx(rAddr)
   rData := rrTable.io.r.resp.data(0)
 
-  assert(!RegNext(io.w.fire && io.r.req.fire), "single port SRAM should not read and write at the same time")
-
   /** s0: req handshake */
-  val s0_valid = rrTable.io.r.req.fire
-  /** s1: rrTable read result */
+  val s0_valid = io.r.req.valid
+  val s0_rAddr = io.r.req.bits.addr - signedExtend((io.r.req.bits.testOffset << offsetBits), fullAddrBits)
+  /** s1: rrTable read req */
   val s1_valid = RegNext(s0_valid, false.B)
-  val s1_ptr = RegNext(io.r.req.bits.ptr)
-  val s1_hit = rData.valid && rData.tag === RegNext(tag(rAddr))
-  /** s2: return resp to ScoreTable */
+  val s1_setIdx = RegEnable(idx(s0_rAddr), s0_valid)
+  val s1_tag = RegEnable(tag(s0_rAddr), s0_valid)
+  val s1_ptr = RegEnable(io.r.req.bits.ptr, s0_valid)
+  /** s2: rrTable read result */
   val s2_valid = RegNext(s1_valid, false.B)
+  val s2_tag = RegEnable(s1_tag, s1_valid)
+  val s2_hit = rData.valid && rData.tag === s2_tag
+  val s2_ptr = RegEnable(s1_ptr, s1_valid)
+  /** s3: return resp to ScoreTable */
+  val s3_valid = RegNext(s2_valid, false.B)
+  val s3_hit = RegEnable(s2_hit, s2_valid)
+  val s3_ptr = RegEnable(s2_ptr, s2_valid)
 
-  io.w.ready := rrTable.io.w.req.ready && !io.r.req.valid
+  rrTable.io.r.req.valid := s1_valid
+  rrTable.io.r.req.bits.setIdx := s1_setIdx
+  rrTable.io.w.req.valid := io.w.valid && !s1_valid
+  rrTable.io.w.req.bits.setIdx := idx(io.w.bits)
+  rrTable.io.w.req.bits.data(0).valid := true.B
+  rrTable.io.w.req.bits.data(0).tag := tag(io.w.bits)
+
+  assert(!(rrTable.io.r.req.valid && rrTable.io.w.req.valid),
+    "single port SRAM should not read and write at the same time")
+
+  io.w.ready := rrTable.io.w.req.ready && !s1_valid
   io.r.req.ready := true.B
-  io.r.resp.valid := s2_valid
-  io.r.resp.bits.ptr := RegEnable(s1_ptr, s1_valid)
-  io.r.resp.bits.hit := RegEnable(s1_hit, s1_valid)
+  io.r.resp.valid := s3_valid
+  io.r.resp.bits.ptr := s3_ptr
+  io.r.resp.bits.hit := s3_hit
 
   class WRRTEntry extends Bundle{
     val addr = UInt(fullAddrBits.W)
   }
   val wrrt = ChiselDB.createTable(name+"WriteRecentRequestTable", new WRRTEntry, basicDB = false)
   val e = Wire(new WRRTEntry)
-  e.addr := wAddr
-  wrrt.log(e, io.w.valid && !io.r.req.valid, site = "RecentRequestTable", clock, reset)
-
+  e.addr := io.w.bits
+  wrrt.log(e, io.w.fire, site = "RecentRequestTable", clock, reset)
 }
 
 class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPModule {
@@ -646,13 +653,17 @@ class DelayQueue(name: String = "")(implicit p: Parameters) extends  BOPModule{
     }
     */
   }
-  when(outValid && io.out.ready) {
+
+  val pending = Module(new Queue(UInt(fullAddrBits.W), entries = 2))
+  pending.io.enq.valid := outValid
+  pending.io.enq.bits := Cat(queue(head).addrNoOffset, 0.U(offsetBits.W))
+
+  when(outValid && pending.io.enq.ready) {
     valids(head) := false.B
     head := head + 1.U
   }
   io.in.ready := true.B
-  io.out.valid := outValid
-  io.out.bits := Cat(queue(head).addrNoOffset, 0.U(offsetBits.W))
+  io.out <> pending.io.deq
 
   /* Update */
   for(i <- 0 until dQEntries){
@@ -667,7 +678,6 @@ class DelayQueue(name: String = "")(implicit p: Parameters) extends  BOPModule{
   XSPerfAccumulate("entryNumber", PopCount(valids.asUInt))
   XSPerfAccumulate("inNumber", io.in.valid)
   XSPerfAccumulate("outNumber", io.out.valid)
-
 }
 
 class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
