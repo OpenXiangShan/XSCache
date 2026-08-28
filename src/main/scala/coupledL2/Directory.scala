@@ -435,6 +435,24 @@ class Directory(implicit p: Parameters) extends L2Module {
                     Mux(match_b, true.B,
                       Mux(PSEL(9)===0.U, false.B, true.B)))    // false.B - srrip, true.B - brrip
 
+    // DRRIP diagnostics.  These counters make the set-dueling decision and
+    // the selected victim state visible without requiring an address trace.
+    val victimRrpv = Wire(Vec(ways, UInt(2.W)))
+    victimRrpv.zipWithIndex.foreach { case (v, i) => v := repl_state_s3(2 * i + 1, 2 * i) }
+    val selectedVictimRrpv = Mux1H(finalReplOH, victimRrpv)
+    XSPerfAccumulate("drrip_srrip_select", refillReqValid_s3 && !repl_type)
+    XSPerfAccumulate("drrip_brrip_select", refillReqValid_s3 && repl_type)
+    XSPerfAccumulate("drrip_srrip_leader_miss", refillReqValid_s3 && match_a && !hit_s3)
+    XSPerfAccumulate("drrip_brrip_leader_miss", refillReqValid_s3 && match_b && !hit_s3)
+    XSPerfAccumulate("drrip_psel_inc", refillReqValid_s3 && match_a && !hit_s3 && PSEL =/= 1023.U)
+    XSPerfAccumulate("drrip_psel_dec", refillReqValid_s3 && match_b && !hit_s3 && PSEL =/= 0.U)
+    XSPerfAccumulate("drrip_victim_rrpv0", refillReqValid_s3 && selectedVictimRrpv === 0.U)
+    XSPerfAccumulate("drrip_victim_rrpv1", refillReqValid_s3 && selectedVictimRrpv === 1.U)
+    XSPerfAccumulate("drrip_victim_rrpv2", refillReqValid_s3 && selectedVictimRrpv === 2.U)
+    XSPerfAccumulate("drrip_victim_rrpv3", refillReqValid_s3 && selectedVictimRrpv === 3.U)
+    XSPerfAccumulate("drrip_prefetch_refill", refillReqValid_s3 && rrip_req_type(1) && rrip_req_type(0))
+    XSPerfAccumulate("drrip_demand_refill", refillReqValid_s3 && !rrip_req_type(1) && rrip_req_type(0))
+
     val next_state_s3 = repl.get_next_state(repl_state_s3, wayOH_s3, hit_s3, inv, repl_type, rrip_req_type)
 
     val repl_init = Wire(Vec(ways, UInt(2.W)))
