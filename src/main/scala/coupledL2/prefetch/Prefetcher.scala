@@ -305,6 +305,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
             studentFilterTableBits = 2048,
             studentHashMode = "bop_rr",
             studentCovThreshold = 5,
+            issueGateEnable = true,
+            issueConfThreshold = 14,
             offsetList = Seq(
               -32, -30, -27, -25, -24, -20, -18, -16, -15,
               -12, -10, -9, -8, -6, -5, -4, -3, -2, -1,
@@ -329,6 +331,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
             studentFilterTableBits = 4096,
             studentHashMode = "pairs_low9",
             studentCovThreshold = 0,
+            issueGateEnable = true,
+            issueConfThreshold = 14,
             offsetList = Seq(
               -117, -147, -91, 117, 147, 91,
               -256, -250, -243, -240, -225, -216, -200,

@@ -57,6 +57,8 @@ case class BOPParameters(
   studentFilterEntryBits: Int = 64,
   studentHashMode: String = "bop_rr",
   studentCovThreshold: Int = 0,
+  issueGateEnable: Boolean = false,
+  issueConfThreshold: Int = 14,
   offsetList: Seq[Int] = Seq(
     -256, -250, -243, -240, -225, -216, -200,
     -192, -180, -162, -160, -150, -144, -135, -128,
@@ -118,6 +120,8 @@ trait HasBOPParams extends HasPrefetcherHelper {
   def studentFilterEntryIdxBits = log2Ceil(studentFilterTableEntries)
   def studentHashMode = bopParams.studentHashMode
   def studentCovThreshold = bopParams.studentCovThreshold
+  def issueGateEnable = bopParams.issueGateEnable
+  def issueConfThreshold = bopParams.issueConfThreshold
 
   def scores = offsetList.length
   def offsetWidth = log2Up(offsetList.max) + 2 // -32 <= offset <= 31
@@ -150,6 +154,17 @@ abstract class BOPModule(implicit val p: Parameters) extends Module with HasBOPP
         else prefix + "_pos_" + off.toString
       XSPerfAccumulate(counterName, enable && offset === off.S(offsetWidth.W))
     }
+  }
+
+  protected def issueConf(phaseEnd: Bool, teacherDisable: Bool): Bool = {
+    val conf = RegInit(0.U(4.W))
+    val confAfterDisable = Mux(conf >= 13.U, 15.U, conf + 2.U)
+    val confAfterEnable = Mux(conf === 0.U, 0.U, conf - 1.U)
+    val nextConf = Mux(teacherDisable, confAfterDisable, confAfterEnable)
+    when(phaseEnd) {
+      conf := nextConf
+    }
+    conf < issueConfThreshold.U
   }
 }
 
@@ -1111,12 +1126,14 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val s1_fire = s1_ready && s1_req_valid
 
   /* s0 train */
-  val prefetchOffset = scoreTable.io.prefetchOffset
-  val prefetchDisable = scoreTable.io.prefetchDisable
-  val studentSelectedOffset = student.map(_.io.selectedOffset).getOrElse(prefetchOffset)
+  val phaseEnd = scoreTable.io.phaseEndPulse
+  val teacherOffset = scoreTable.io.prefetchOffset
+  val teacherDisable = scoreTable.io.prefetchDisable
+  val studentSelectedOffset = student.map(_.io.selectedOffset).getOrElse(teacherOffset)
   val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
-  val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, prefetchOffset)
-  val issueEnable = studentSelectedEnable || !prefetchDisable
+  val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, teacherOffset)
+  val issueGate = if (issueGateEnable) !issueConf(phaseEnd, teacherDisable) else true.B
+  val issueEnable = (studentSelectedEnable || !teacherDisable) && issueGate
   // NOTE: vaddr from l1 to l2 has no offset bits
   val s0_oldFullAddr = Cat(io.train.bits.vaddr.getOrElse(0.U), 0.U(offsetBits.W))
   val s0_oldFullAddrNoOff = s0_oldFullAddr(s0_oldFullAddr.getWidth-1, offsetBits)
@@ -1183,7 +1200,8 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   XSPerfAccumulate("bop_train_stall_for_stu_not_ready", io.train.valid && !studentTrainReady)
   XSPerfAccumulate("bop_train_stall_for_tlb_not_ready", io.train.valid && !io.tlb_req.req.ready)
   XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
-  XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && prefetchDisable)
+  XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && !issueEnable)
+  XSPerfAccumulate("bop_phase_auto_disable", phaseEnd && !issueEnable)
   XSPerfAccumulate("bop_student_takeover", scoreTable.io.req.fire && studentSelectedEnable)
   XSPerfAccumulate("bop_l2_feedback_control_drop", enable && s1_req_valid && io.fdbkDegree === 0.U)
 }
@@ -1214,12 +1232,14 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val s1_fire = s1_ready && s1_req_valid
 
   /* s0 train */
-  val prefetchOffset = scoreTable.io.prefetchOffset
-  val prefetchDisable = scoreTable.io.prefetchDisable
-  val studentSelectedOffset = student.map(_.io.selectedOffset).getOrElse(prefetchOffset)
+  val phaseEnd = scoreTable.io.phaseEndPulse
+  val teacherOffset = scoreTable.io.prefetchOffset
+  val teacherDisable = scoreTable.io.prefetchDisable
+  val studentSelectedOffset = student.map(_.io.selectedOffset).getOrElse(teacherOffset)
   val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
-  val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, prefetchOffset)
-  val issueEnable = studentSelectedEnable || !prefetchDisable
+  val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, teacherOffset)
+  val issueGate = if (issueGateEnable) !issueConf(phaseEnd, teacherDisable) else true.B
+  val issueEnable = (studentSelectedEnable || !teacherDisable) && issueGate
   val s0_oldAddr = io.train.bits.addr
   val s0_oldAddrNoOff = s0_oldAddr(s0_oldAddr.getWidth-1, offsetBits)
   val s0_newAddr = s0_oldAddr + signedExtend((issueOffset << offsetBits), fullAddressBits)
@@ -1284,7 +1304,8 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   XSPerfAccumulate("bop_train_stall_for_stu_not_ready", io.train.valid && !studentTrainReady)
   XSPerfAccumulate("bop_drop_for_cross_page", scoreTable.io.req.fire && s0_crossPage)
   XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
-  XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && prefetchDisable)
+  XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && !issueEnable)
+  XSPerfAccumulate("bop_phase_auto_disable", phaseEnd && !issueEnable)
   XSPerfAccumulate("bop_student_takeover", scoreTable.io.req.fire && studentSelectedEnable)
   XSPerfAccumulate("bop_l2_feedback_control_drop", enable && s1_req_valid && io.fdbkDegree === 0.U)
 }
