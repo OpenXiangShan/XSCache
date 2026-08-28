@@ -1132,7 +1132,7 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val studentSelectedOffset = student.map(_.io.selectedOffset).getOrElse(teacherOffset)
   val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
   val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, teacherOffset)
-  val issueGate = if (issueGateEnable) !issueConf(phaseEnd, teacherDisable) else true.B
+  val issueGate = if (issueGateEnable) issueConf(phaseEnd, teacherDisable) else true.B
   val issueEnable = (studentSelectedEnable || !teacherDisable) && issueGate
   // NOTE: vaddr from l1 to l2 has no offset bits
   val s0_oldFullAddr = Cat(io.train.bits.vaddr.getOrElse(0.U), 0.U(offsetBits.W))
@@ -1238,7 +1238,7 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val studentSelectedOffset = student.map(_.io.selectedOffset).getOrElse(teacherOffset)
   val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
   val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, teacherOffset)
-  val issueGate = if (issueGateEnable) !issueConf(phaseEnd, teacherDisable) else true.B
+  val issueGate = if (issueGateEnable) issueConf(phaseEnd, teacherDisable) else true.B
   val issueEnable = (studentSelectedEnable || !teacherDisable) && issueGate
   val s0_oldAddr = io.train.bits.addr
   val s0_oldAddrNoOff = s0_oldAddr(s0_oldAddr.getWidth-1, offsetBits)
