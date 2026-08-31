@@ -194,7 +194,7 @@ class LCredit2Decoupled[T <: Bundle](
     assert(!accept || queue.io.enq.ready)
 
     io.out <> queue.io.deq
-    val opcodeElements = queue.io.deq.bits.elements.filter(_._1 == "opcode")
+    val opcodeElements = queue.io.deq.bits.elements.filter(_._1.equalsIgnoreCase("opcode"))
     require (opcodeElements.size == 1)
     for ((_, opcode) <- opcodeElements) {
       when (queue.io.deq.valid && opcode === 0.U) {
@@ -220,7 +220,7 @@ class LCredit2Decoupled[T <: Bundle](
         lsb += elementWidth
       }
     }
-    val opcodeElements = io.out.bits.elements.filter(_._1 == "opcode")
+    val opcodeElements = io.out.bits.elements.filter(_._1.equalsIgnoreCase("opcode"))
     require (opcodeElements.size == 1)
     for ((_, opcode) <- opcodeElements) {
       when (opcode === 0.U) {
