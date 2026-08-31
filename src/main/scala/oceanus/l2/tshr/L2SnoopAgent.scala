@@ -160,11 +160,16 @@ class L2SnoopAgent(tshrId: Int)(implicit val p: Parameters) extends Module with 
 
   val done = rspMatch || datBeat2
   val directDone = accept && !acceptNeedSnoop
+  val pdValid = rspMatch || datBeat0 || datBeat2
 
   io.fromSA.SnpResp := rspMatch || directDone
   io.fromSA.SnpRespData0 := datBeat0
   io.fromSA.SnpRespData2 := datBeat2
-  io.fromSA.PASSDIRTY := Mux(rspMatch, io.UpRXRSP.bits.Resp(2), Mux(datBeat2, passDirtyReg || io.UpRXDAT.bits.Resp(2), false.B))
+  // CHI IHI0050E 13.10.44 requires Resp to be constant across all data flits;
+  // any data beat carries the final PassDirty value, so no latch is needed.
+  io.fromSA.PASSDIRTY := Mux(pdValid,
+    Mux(rspMatch, io.UpRXRSP.bits.Resp(2), io.UpRXDAT.bits.Resp(2)),
+    false.B)
 
   io.txSnp.valid := state === sSnpReq
   io.txSnp.bits := 0.U.asTypeOf(new FlitSNP)
@@ -229,6 +234,8 @@ class L2SnoopAgent(tshrId: Int)(implicit val p: Parameters) extends Module with 
     s"L2SnoopAgent #${tshrId}: SNP and REQ uops arrived in the same cycle")
   assert(!(datBeat2 && !seenData0),
     s"L2SnoopAgent #${tshrId}: SnpRespData DataID 2 arrived before DataID 0")
+  assert(!datBeat2 || (passDirtyReg === io.UpRXDAT.bits.Resp(2)),
+    s"L2SnoopAgent #${tshrId}: PassDirty must be constant across all beats of a data response (IHI0050E 13.10.44)")
   assert(!(uopAnyValid && !armed && holdCount >= 4.U),
     s"L2SnoopAgent #${tshrId}: uop input valid stayed high after completion; deassert before reusing the request")
 
