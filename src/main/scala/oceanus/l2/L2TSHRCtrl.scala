@@ -19,16 +19,21 @@ import oceanus.compactchi.CCHIOpcode._
 trait L2SliceLocatable {
 
   val sliceNum: Int
-  val sliceId: Int
+  val sliceIdx: Int
+  val sliceNID: Int
 
   def getTSHRIdFromTxnID(txnId: UInt) = txnId >> log2Ceil(sliceNum)
 
-  def getTxnIDFromTSHRId(tshrId: Int) = (tshrId.U << log2Ceil(sliceNum)) | sliceId.U(log2Ceil(sliceNum).W)
+  def getSliceIdxFromTxnID(txnId: UInt) = if (sliceNum > 1) txnId(log2Ceil(sliceNum) - 1, 0) else 0.U
+
+  def routeSliceFromTxnID(txnId: UInt) = getSliceIdxFromTxnID(txnId) === sliceIdx.U
+
+  def getTxnIDFromTSHRId(tshrId: Int) = (tshrId.U << log2Ceil(sliceNum)) | sliceIdx.U(log2Ceil(sliceNum).W)
 }
 
-class L2TSHRCtrl(val sliceNum: Int, val sliceId: Int)(implicit val p: Parameters) extends Module 
-                                                                                  with HasL2Params 
-                                                                                  with L2SliceLocatable {
+class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int)(implicit val p: Parameters) extends Module 
+    with HasL2Params 
+    with L2SliceLocatable {
 
   val io = IO(new Bundle {
     val UpRXEVT = Flipped(Decoupled(new FlitEVT))
@@ -62,7 +67,7 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceId: Int)(implicit val p: Parameters
   })
 
   // -- RX channel connections
-  val tshrs = Seq.tabulate(paramL2.mshrSize)(i => Module(new L2TSHR(sliceNum, sliceId, i)))
+  val tshrs = Seq.tabulate(paramL2.mshrSize)(i => Module(new L2TSHR(sliceNum, sliceIdx, sliceNID, i)))
 
   tshrs.foreach { case t => 
     t.io.UpRXEVT := io.UpRXEVT.bits

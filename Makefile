@@ -65,6 +65,30 @@ test-top-l2l3-openllc:
 test-top-l2l3l2-openllc:
 	mill -i XSCache.test.runMain xscache.openLLC.TestTopSoC_DualCore -td $(BUILD_DIR_LLC) --target systemverilog --split-verilog
 
+BUILD_DIR_TSHRCTRL = ./build/l2tshrctrl
+TOP_V_TSHRCTRL = $(BUILD_DIR_TSHRCTRL)/TestTop_L2TSHRCtrl.sv
+
+test-top-tshrctrl:
+	mill -i XSCache.test.runMain oceanus.TestTop_L2TSHRCtrl -td $(BUILD_DIR_TSHRCTRL) --target systemverilog --split-verilog
+	if [ -f "$(TOP_V_TSHRCTRL).conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(TOP_V_TSHRCTRL).conf" "$(BUILD_DIR_TSHRCTRL)"; fi
+
+BUILD_DIR_L2TOP = ./build/l2top
+
+# defaults to 2 slices; override with NUM_SLICE=<1-4>
+test-top-l2top: NUM_SLICE = 2
+test-top-l2top:
+	mill -i XSCache.test.runMain oceanus.TestTop_L2Top -td $(BUILD_DIR_L2TOP) --slices $(NUM_SLICE) --target systemverilog --split-verilog
+	if [ -f "$(BUILD_DIR_L2TOP)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2TOP)/TestTop.sv.conf" "$(BUILD_DIR_L2TOP)"; fi
+
+BUILD_DIR_L2OPENLLC = ./build/l2openllc
+
+# defaults to 1 L2 x 2 slices; override with NUM_L2=<n> / NUM_SLICE=<1-4>
+NUM_L2 ?= 1
+test-top-l2openllc: NUM_SLICE = 2
+test-top-l2openllc:
+	mill -i XSCache.test.runMain oceanus.TestTop_L2OpenLLC -td $(BUILD_DIR_L2OPENLLC) --l2 $(NUM_L2) --slices $(NUM_SLICE) --target systemverilog --split-verilog
+	if [ -f "$(BUILD_DIR_L2OPENLLC)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2OPENLLC)/TestTop.sv.conf" "$(BUILD_DIR_L2OPENLLC)"; fi
+
 clean:
 	rm -rf ./build
 

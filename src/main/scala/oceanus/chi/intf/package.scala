@@ -44,6 +44,9 @@ package object intf {
 
             src.rxsactive   := dst.rxsactive
             dst.txsactive   := src.txsactive
+
+            dst.syscoreq    := src.syscoreq
+            src.syscoack    := dst.syscoack
         }
     }
 
@@ -86,6 +89,9 @@ package object intf {
 
             src.rxsactive   := dst.rxsactive
             dst.txsactive   := src.txsactive
+
+            dst.syscoreq    := src.syscoreq
+            src.syscoack    := dst.syscoack
         }
     }
 }

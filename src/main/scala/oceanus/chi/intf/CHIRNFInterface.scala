@@ -40,6 +40,10 @@ class CHIRNFInterface(implicit val p: Parameters) extends Bundle with HasCHIPara
     val txsactive           = Output(Bool())
     val rxsactive           = Input(Bool())
 
+    // SYSCO
+    val syscoreq            = Output(Bool())
+    val syscoack            = Input(Bool())
+
 
     // utility functions - convert to raw interface
     def asToRaw = {
@@ -48,7 +52,7 @@ class CHIRNFInterface(implicit val p: Parameters) extends Bundle with HasCHIPara
         raw
     }
 
-    def awToRaw(raw: CHIRNFRawInterface) = {
+    def asToRaw(raw: CHIRNFRawInterface) = {
         raw :<<= this
         raw
     }
@@ -102,6 +106,10 @@ class CHIRNFRawInterface(implicit val p: Parameters) extends Bundle with HasCHIP
     // SACTIVE
     val txsactive           = Output(Bool())
     val rxsactive           = Input(Bool())
+
+    // SYSCO
+    val syscoreq            = Output(Bool())
+    val syscoack            = Input(Bool())
 }
 
 object CHIRNFRawInterface {

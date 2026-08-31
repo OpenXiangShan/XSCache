@@ -32,7 +32,7 @@ class L2DownstreamCHI(
     val pCrdGrant = Valid(new L2PCreditPool.Entry)
 
     val out = new CHIRNFInterface
-    val linkEnable = Input(Bool())
+    val exitco = Option.when(true /*TODO: Disable when L2 could never be powered down*/)(Input(Bool()))
   })
 
   val txState = RegInit(LinkStates.STOP)
@@ -119,12 +119,16 @@ class L2DownstreamCHI(
 
   val rxDeact = rxsnpDeact && rxrspDeact && rxdatDeact
 
-  io.out.txlinkactivereq := RegNext(io.linkEnable, init = false.B)
+  val exitco = io.exitco.getOrElse(false.B)
+  val exitcoDone = !io.out.syscoreq && !io.out.syscoack && RegNext(true.B, init = false.B)
+
+  io.out.txlinkactivereq := RegNext(!exitcoDone, init = false.B)
   io.out.rxlinkactiveack := RegNext(
     RegNext(io.out.rxlinkactivereq, init = false.B) || !rxDeact,
     init = false.B
   )
-  io.out.txsactive := RegNext(io.linkEnable, init = false.B)
+  io.out.syscoreq := RegNext(!exitco, init = false.B)
+  io.out.txsactive := RegNext(!exitcoDone, init = false.B)
 
   private def nextLinkState(req: Bool, ack: Bool): UInt =
     MuxLookup(Cat(req, ack), LinkStates.STOP)(Seq(
