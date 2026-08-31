@@ -19,7 +19,12 @@ object L2VPipeREQ {
 
 }
 
-class L2VPipeREQ(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sliceId: Int, val tshrId: Int, nodeId: Int)(implicit val p: Parameters) 
+class L2VPipeREQ(clientComponents: Seq[CCHIComponent], 
+                 val sliceNum: Int, 
+                 val sliceIdx: Int, 
+                 val sliceNID: Int, 
+                 val tshrId: Int, 
+                 nodeId: Int)(implicit val p: Parameters) 
     extends Module 
     with CHIRNFOpcodesREQ 
     with CHIRNFOpcodesRSP
@@ -362,8 +367,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sl
 
   io.toSA.SnpCompAck := false.B // TODO: interact with upstream data sending
 
-  io.toSA.CLIENTS := io.tshr_dirResult.clients
-  io.toSA.ALIAS := io.tshr_dirResult.alias
+  io.toSA.CLIENTS := io.fromClientTable
+  io.toSA.ALIAS := rxreq.TagAlias
 
   // waiting state transitions
   //  - SnpResp/SnpRespData0/SnpRespData2 were all allowed to be received on the same cycle of the issue of
@@ -1244,6 +1249,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sl
   io.UpTXREQ.bits.Opcode := CCHIOpcode.EvictBack.U
   io.UpTXREQ.bits.Size := CCHISize.B64.U
   io.UpTXREQ.bits.Addr := io.repl_resp.paddr
+  io.UpTXREQ.bits.TagAlias := 0.U
   io.UpTXREQ.bits.NS := false.B
   io.UpTXREQ.bits.Order := 0.U
   io.UpTXREQ.bits.MemAttr := 0.U

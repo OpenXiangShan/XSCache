@@ -22,21 +22,25 @@ class L2PCreditPool(val sliceNum: Int)(implicit val p: Parameters) extends Modul
 
   class EmptyBundle extends Bundle
 
-  // TODO: maybe we need a more timing-friendly implementation in future
-
   val io = IO(new Bundle {
     val pCrdGrant = Flipped(Valid(new L2PCreditPool.Entry))
-    val mshrQuery = Vec(sliceNum, Vec(paramL2.mshrSize, Valid(new L2PCreditPool.Entry)))
+    val mshrQuery = Input(Vec(sliceNum, Vec(paramL2.mshrSize, Valid(new L2PCreditPool.Entry))))
     val mshrGrant = Output(Vec(sliceNum, Vec(paramL2.mshrSize, Bool())))
   })
 
-  val queue = Module(new Queue(new L2PCreditPool.Entry, entryCount))
+  val queue = Module(new Queue(new L2PCreditPool.Entry, entryCount - 2))
+
+  val queueSkid = Module(new Queue(new L2PCreditPool.Entry, 2))
 
   queue.io.enq.valid := io.pCrdGrant.valid
   queue.io.enq.bits := io.pCrdGrant.bits
 
+  queueSkid.io.enq.bits := queue.io.deq.bits
+  queueSkid.io.enq.valid := queue.io.deq.valid
+  queue.io.deq.ready := queueSkid.io.enq.ready
+
   val mshrPCrdHitVec = io.mshrQuery.flatten.map { case m => {
-    m.valid && queue.io.deq.valid && m.bits.srcId === queue.io.deq.bits.srcId && m.bits.pCrdType === queue.io.deq.bits.pCrdType 
+    m.valid && queueSkid.io.deq.valid && m.bits.srcId === queueSkid.io.deq.bits.srcId && m.bits.pCrdType === queueSkid.io.deq.bits.pCrdType 
   }}
 
   val mshrPCrdArbIn = mshrPCrdHitVec.zip(io.mshrGrant.flatten).map { case (hit, grant) => {
@@ -49,7 +53,7 @@ class L2PCreditPool(val sliceNum: Int)(implicit val p: Parameters) extends Modul
   val mshrPCrdArbOut = {
     val p = Wire(Decoupled(new EmptyBundle))
     p.ready := true.B
-    queue.io.deq.ready := p.valid
+    queueSkid.io.deq.ready := p.valid
     p
   }
 
