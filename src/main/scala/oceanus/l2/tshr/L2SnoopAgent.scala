@@ -74,6 +74,7 @@ object L2SnoopAgent {
   class PathToSnoopAgent extends PathToSnoopAgentUOPs {
     val CLIENTS = Vec(1, Bool())  
     val ALIAS = UInt(2.W)
+    val isL2Evict = Bool()
   }
 
   class PathFromSnoopAgent extends PathFromSnoopAgentUOPs {
@@ -96,52 +97,91 @@ class L2SnoopAgent(tshrId: Int)(implicit val p: Parameters) extends Module with 
     val UpRXDAT = Flipped(Valid(new FlitUpDAT))
 
     val fromSA = Output(new L2SnoopAgent.PathFromSnoopAgent)
+    val fromSAForSNP = Output(new L2SnoopAgent.PathFromSnoopAgent)
+    val fromSAForREQ = Output(new L2SnoopAgent.PathFromSnoopAgent)
+    val dbg = Output(new Bundle {
+      val slotSNPValid = Bool()
+      val slotREQValid = Bool()
+      val slotSNPEvict = Bool()
+      val slotREQEvict = Bool()
+      val slotSNPOp = UInt(4.W)
+      val slotREQOp = UInt(4.W)
+      val acceptSNP = Bool()
+      val acceptREQ = Bool()
+      val startService = Bool()
+      val startFromSNP = Bool()
+      val startFromREQ = Bool()
+      val serviceFromSNP = Bool()
+      val serviceFromREQ = Bool()
+      val state = UInt(2.W)
+    })
   })
 
   val sIdle :: sSnpReq :: sWaitCore :: Nil = Enum(3)
   val state = RegInit(sIdle)
 
   val busy = RegInit(false.B)
-  val armed = RegInit(true.B)
-  val holdCount = RegInit(0.U(3.W))
+  val armedSNP = RegInit(true.B)
+  val armedREQ = RegInit(true.B)
+  val holdCountSNP = RegInit(0.U(3.W))
+  val holdCountREQ = RegInit(0.U(3.W))
 
-  val slotUop = RegInit(0.U.asTypeOf(new L2SnoopAgent.PathToSnoopAgent))
-  val slotPaddr = Reg(UInt(paramL2.physicalAddrWidth.W))
-  val slotOpcode = Reg(UInt(2.W))
-  val slotAlias = RegInit(0.U(2.W))
+  val slotSNPValid = RegInit(false.B)
+  val slotREQUop = RegInit(0.U.asTypeOf(new L2SnoopAgent.PathToSnoopAgent))
+  val slotSNPUop = RegInit(0.U.asTypeOf(new L2SnoopAgent.PathToSnoopAgent))
+  val slotREQAlias = RegInit(0.U(2.W))
+  val slotSNPAlias = RegInit(0.U(2.W))
+  val slotREQValid = RegInit(false.B)
+  val serviceAlias = RegInit(0.U(2.W))
+  val servicePaddr = Reg(UInt(paramL2.physicalAddrWidth.W))
+  val serviceOpcode = Reg(UInt(2.W))
+  val serviceFromSNP = RegInit(false.B)
+  val serviceFromREQ = RegInit(false.B)
 
   val seenData0 = RegInit(false.B)
   val passDirtyReg = RegInit(false.B)
 
   val uopValids = Seq(io.uopFromSNP.valid, io.uopFromREQ.valid)
   val uopAnyValid = uopValids.reduce(_ || _)
-  val uopBitsIn = Wire(new L2SnoopAgent.PathToSnoopAgent)
-  uopBitsIn := Mux(io.uopFromSNP.valid, io.uopFromSNP.bits, io.uopFromREQ.bits)
 
-  val intent = Wire(SnoopOpcodeDerive.Intent())
-  intent := SnoopOpcodeDerive.Intent.SnpToShared
-  when (uopBitsIn.SnpMakeInvalid) {
-    intent := SnoopOpcodeDerive.Intent.SnpMakeInvalid
-  }.elsewhen (uopBitsIn.SnpToInvalid) {
-    intent := SnoopOpcodeDerive.Intent.SnpToInvalid
-  }.elsewhen (uopBitsIn.SnpToClean) {
-    intent := SnoopOpcodeDerive.Intent.SnpToClean
+  def intentOf(uop: L2SnoopAgent.PathToSnoopAgent): SnoopOpcodeDerive.Intent.Type = {
+    val intent = Wire(SnoopOpcodeDerive.Intent())
+    intent := SnoopOpcodeDerive.Intent.SnpToShared
+    when (uop.SnpMakeInvalid) {
+      intent := SnoopOpcodeDerive.Intent.SnpMakeInvalid
+    }.elsewhen (uop.SnpToInvalid) {
+      intent := SnoopOpcodeDerive.Intent.SnpToInvalid
+    }.elsewhen (uop.SnpToClean) {
+      intent := SnoopOpcodeDerive.Intent.SnpToClean
+    }
+    intent
   }
 
-  val uopBits = Seq(
-    uopBitsIn.SnpMakeInvalid,
-    uopBitsIn.SnpToInvalid,
-    uopBitsIn.SnpToShared,
-    uopBitsIn.SnpToClean
+  def uopBits(uop: L2SnoopAgent.PathToSnoopAgent): Seq[Bool] = Seq(
+    uop.SnpMakeInvalid,
+    uop.SnpToInvalid,
+    uop.SnpToShared,
+    uop.SnpToClean
   )
-  val accept = uopAnyValid && !busy && armed
-  // dirResult.clients = directory holders; uop.CLIENTS = requester came from L1D.
+
+  val acceptSNP = io.uopFromSNP.valid && armedSNP
+  val acceptREQ = io.uopFromREQ.valid && armedREQ
+
+  val chooseSlotREQEvict = slotREQValid && slotREQUop.isL2Evict
+  val chooseSlotSNP = slotSNPValid && !chooseSlotREQEvict
+  val chooseSlotREQ = slotREQValid && !chooseSlotSNP
+  val startService = state === sIdle && !busy && (chooseSlotREQEvict || chooseSlotSNP || chooseSlotREQ)
+  val startUop = Wire(new L2SnoopAgent.PathToSnoopAgent)
+  startUop := Mux(chooseSlotSNP, slotSNPUop, slotREQUop)
+  val startFromSNP = startService && chooseSlotSNP
+  val startFromREQ = startService && chooseSlotREQ
+  val startAlias = Mux(chooseSlotSNP, slotSNPAlias, slotREQAlias)
   val aliasMismatch = io.tshr_dirResult.hit &&
     io.tshr_dirResult.clients.asUInt.orR &&
-    uopBitsIn.CLIENTS.asUInt.orR &&
-    (io.tshr_dirResult.alias =/= uopBitsIn.ALIAS)
-  val (acceptNeedSnoop, acceptOpcode) =
-    SnoopOpcodeDerive(intent, io.tshr_dirResult.state, io.tshr_dirResult.clients.asUInt, io.tshr_dirResult.hit, aliasMismatch)
+    startUop.CLIENTS.asUInt.orR &&
+    (io.tshr_dirResult.alias =/= startUop.ALIAS)
+  val (startNeedSnoop, startOpcode) =
+    SnoopOpcodeDerive(intentOf(startUop), io.tshr_dirResult.state, io.tshr_dirResult.clients.asUInt, io.tshr_dirResult.hit, aliasMismatch)
 
   val rspMatch =
     state === sWaitCore &&
@@ -159,30 +199,74 @@ class L2SnoopAgent(tshrId: Int)(implicit val p: Parameters) extends Module with 
   val datBeat2 = datMatch && io.UpRXDAT.bits.DataID === 2.U
 
   val done = rspMatch || datBeat2
-  val directDone = accept && !acceptNeedSnoop
-  val pdValid = rspMatch || datBeat0 || datBeat2
+  val directDone = startService && !startNeedSnoop
+  val doneForSNP = serviceFromSNP
+  val doneForREQ = serviceFromREQ
+  val directForSNP = directDone && startFromSNP
+  val directForREQ = directDone && startFromREQ
+  val passDirty = Mux(rspMatch, io.UpRXRSP.bits.Resp(2), Mux(datBeat2, passDirtyReg || io.UpRXDAT.bits.Resp(2), false.B))
 
-  io.fromSA.SnpResp := rspMatch || directDone
-  io.fromSA.SnpRespData0 := datBeat0
-  io.fromSA.SnpRespData2 := datBeat2
-  // CHI IHI0050E 13.10.44 requires Resp to be constant across all data flits;
-  // any data beat carries the final PassDirty value, so no latch is needed.
-  io.fromSA.PASSDIRTY := Mux(pdValid,
-    Mux(rspMatch, io.UpRXRSP.bits.Resp(2), io.UpRXDAT.bits.Resp(2)),
-    false.B)
+  io.fromSAForSNP.SnpResp := (rspMatch && doneForSNP) || directForSNP
+  io.fromSAForSNP.SnpRespData0 := datBeat0 && serviceFromSNP
+  io.fromSAForSNP.SnpRespData2 := datBeat2 && serviceFromSNP
+  io.fromSAForSNP.PASSDIRTY := Mux(doneForSNP, passDirty, false.B)
+
+  io.fromSAForREQ.SnpResp := (rspMatch && doneForREQ) || directForREQ
+  io.fromSAForREQ.SnpRespData0 := datBeat0 && serviceFromREQ
+  io.fromSAForREQ.SnpRespData2 := datBeat2 && serviceFromREQ
+  io.fromSAForREQ.PASSDIRTY := Mux(doneForREQ, passDirty, false.B)
+
+  io.fromSA.SnpResp := io.fromSAForSNP.SnpResp || io.fromSAForREQ.SnpResp
+  io.fromSA.SnpRespData0 := io.fromSAForSNP.SnpRespData0 || io.fromSAForREQ.SnpRespData0
+  io.fromSA.SnpRespData2 := io.fromSAForSNP.SnpRespData2 || io.fromSAForREQ.SnpRespData2
+  io.fromSA.PASSDIRTY := io.fromSAForSNP.PASSDIRTY || io.fromSAForREQ.PASSDIRTY
+
+  io.dbg.slotSNPValid := slotSNPValid
+  io.dbg.slotREQValid := slotREQValid
+  io.dbg.slotSNPEvict := slotSNPUop.isL2Evict
+  io.dbg.slotREQEvict := slotREQUop.isL2Evict
+  io.dbg.slotSNPOp := Cat(slotSNPUop.SnpMakeInvalid, slotSNPUop.SnpToInvalid, slotSNPUop.SnpToShared, slotSNPUop.SnpToClean)
+  io.dbg.slotREQOp := Cat(slotREQUop.SnpMakeInvalid, slotREQUop.SnpToInvalid, slotREQUop.SnpToShared, slotREQUop.SnpToClean)
+  io.dbg.acceptSNP := acceptSNP
+  io.dbg.acceptREQ := acceptREQ
+  io.dbg.startService := startService
+  io.dbg.startFromSNP := startFromSNP
+  io.dbg.startFromREQ := startFromREQ
+  io.dbg.serviceFromSNP := serviceFromSNP
+  io.dbg.serviceFromREQ := serviceFromREQ
+  io.dbg.state := state
 
   io.txSnp.valid := state === sSnpReq
   io.txSnp.bits := 0.U.asTypeOf(new FlitSNP)
   io.txSnp.bits.TxnID := tshrId.U
-  io.txSnp.bits.Opcode := slotOpcode
-  io.txSnp.bits.Addr := slotPaddr >> 3
-  io.txSnp.bits.alias := slotAlias
+  io.txSnp.bits.Opcode := serviceOpcode
+  io.txSnp.bits.Addr := servicePaddr >> 3
+  io.txSnp.bits.alias := serviceAlias
 
-  when (!uopAnyValid) {
-    armed := true.B
-    holdCount := 0.U
-  }.elsewhen (!armed && holdCount =/= 7.U) {
-    holdCount := holdCount + 1.U
+  when (!io.uopFromSNP.valid) {
+    armedSNP := true.B
+    holdCountSNP := 0.U
+  }.elsewhen (!armedSNP && holdCountSNP =/= 7.U) {
+    holdCountSNP := holdCountSNP + 1.U
+  }
+  when (!io.uopFromREQ.valid) {
+    armedREQ := true.B
+    holdCountREQ := 0.U
+  }.elsewhen (!armedREQ && holdCountREQ =/= 7.U) {
+    holdCountREQ := holdCountREQ + 1.U
+  }
+
+  when (acceptSNP) {
+    slotSNPUop := io.uopFromSNP.bits
+    slotSNPAlias := io.tshr_dirResult.alias
+    slotSNPValid := true.B
+    armedSNP := false.B
+  }
+  when (acceptREQ) {
+    slotREQUop := io.uopFromREQ.bits
+    slotREQAlias := io.tshr_dirResult.alias
+    slotREQValid := true.B
+    armedREQ := false.B
   }
 
   when (datBeat0) {
@@ -192,19 +276,23 @@ class L2SnoopAgent(tshrId: Int)(implicit val p: Parameters) extends Module with 
 
   when (done) {
     busy := false.B
-    armed := false.B
     seenData0 := false.B
     passDirtyReg := false.B
+    serviceFromSNP := false.B
+    serviceFromREQ := false.B
     state := sIdle
   }.elsewhen (directDone) {
-    busy := false.B
-    armed := false.B
-  }.elsewhen (accept && acceptNeedSnoop) {
+    when (startFromSNP) { slotSNPValid := false.B }
+    when (startFromREQ) { slotREQValid := false.B }
+  }.elsewhen (startService && startNeedSnoop) {
     busy := true.B
-    slotUop := uopBitsIn
-    slotPaddr := io.tshr_paddr
-    slotOpcode := acceptOpcode
-    slotAlias := io.tshr_dirResult.alias
+    serviceFromSNP := startFromSNP
+    serviceFromREQ := startFromREQ
+    serviceAlias := startAlias
+    servicePaddr := io.tshr_paddr
+    serviceOpcode := startOpcode
+    when (startFromSNP) { slotSNPValid := false.B }
+    when (startFromREQ) { slotREQValid := false.B }
     state := sSnpReq
   }
 
@@ -216,27 +304,39 @@ class L2SnoopAgent(tshrId: Int)(implicit val p: Parameters) extends Module with 
     }
   }
 
-  when (accept) {
-    assert(PopCount(uopBits) === 1.U,
-      s"L2SnoopAgent #${tshrId}: accepted invalid or multi-hot uop")
+  when (acceptSNP) {
+    assert(!slotSNPValid,
+      s"L2SnoopAgent #${tshrId}: SNP slot accepted a new uop while occupied")
+    assert(PopCount(uopBits(io.uopFromSNP.bits)) === 1.U,
+      s"L2SnoopAgent #${tshrId}: accepted invalid or multi-hot SNP uop")
+  }
+  when (acceptREQ) {
+    assert(!slotREQValid,
+      s"L2SnoopAgent #${tshrId}: REQ slot accepted a new uop while occupied")
+    assert(PopCount(uopBits(io.uopFromREQ.bits)) === 1.U,
+      s"L2SnoopAgent #${tshrId}: accepted invalid or multi-hot REQ uop")
+  }
+  when (startService) {
     assert(io.tshr_dirResult.state === L2Directory.MetaState.I ||
            io.tshr_dirResult.state === L2Directory.MetaState.S ||
            io.tshr_dirResult.state === L2Directory.MetaState.US ||
            io.tshr_dirResult.state === L2Directory.MetaState.UU,
-      s"L2SnoopAgent #${tshrId}: accepted uop with illegal directory state")
-    assert(io.tshr_dirResult.hit || !acceptNeedSnoop,
+      s"L2SnoopAgent #${tshrId}: started service with illegal directory state")
+    assert(io.tshr_dirResult.hit || !startNeedSnoop,
       s"L2SnoopAgent #${tshrId}: missed directory line requested an upstream snoop")
   }
 
   assert(!(rspMatch && datMatch),
     s"L2SnoopAgent #${tshrId}: matched dataless and data response in the same cycle")
-  assert(PopCount(uopValids) <= 1.U,
-    s"L2SnoopAgent #${tshrId}: SNP and REQ uops arrived in the same cycle")
+  assert(PopCount(Seq(serviceFromSNP, serviceFromREQ)) <= 1.U,
+    s"L2SnoopAgent #${tshrId}: service latched multiple sources")
+  assert(!busy || PopCount(Seq(serviceFromSNP, serviceFromREQ)) === 1.U,
+    s"L2SnoopAgent #${tshrId}: service did not retain its source")
   assert(!(datBeat2 && !seenData0),
     s"L2SnoopAgent #${tshrId}: SnpRespData DataID 2 arrived before DataID 0")
-  assert(!datBeat2 || (passDirtyReg === io.UpRXDAT.bits.Resp(2)),
-    s"L2SnoopAgent #${tshrId}: PassDirty must be constant across all beats of a data response (IHI0050E 13.10.44)")
-  assert(!(uopAnyValid && !armed && holdCount >= 4.U),
-    s"L2SnoopAgent #${tshrId}: uop input valid stayed high after completion; deassert before reusing the request")
+  assert(!(io.uopFromSNP.valid && !armedSNP && holdCountSNP >= 4.U),
+    s"L2SnoopAgent #${tshrId}: SNP uop input valid stayed high after acceptance; deassert before reusing the request")
+  assert(!(io.uopFromREQ.valid && !armedREQ && holdCountREQ >= 4.U),
+    s"L2SnoopAgent #${tshrId}: REQ uop input valid stayed high after acceptance; deassert before reusing the request")
 
 }
