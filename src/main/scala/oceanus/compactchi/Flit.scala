@@ -9,6 +9,7 @@ class FlitEVTStripped extends Bundle {
   val TgtID = UInt(8.W) // TODO: configured by DownstreamNodeID_Width
   val Opcode = UInt(1.W)
   val NS = Bool()
+  val MemAttr = Bool() // allocate hint per CCHI spec; currently not consumed by L2
   val WayValid = Bool()
   val Way = UInt(2.W) // TODO: configured by L2 way count
   val TraceTag = UInt(1.W)
