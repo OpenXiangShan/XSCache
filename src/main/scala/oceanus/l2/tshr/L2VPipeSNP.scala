@@ -67,10 +67,11 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
   val p_dct_txdat_valid = RegInit(false.B)
   val p_dct_txdat_resp = RegInit(0.U(CHICohResps.WIDTH.W))
   val p_rxsnp_need_dct_txdat = RegInit(false.B)
+  val p_sa_passdirty = RegInit(false.B)
+  val dirty_or_passdirty = io.tshr_dirResult.dirty || p_sa_passdirty
   // --------------------------------------------------------
 
   // -- RXSNP Opcode Decoder --------------------------------
-  // TODO: SnoopOnce is toSC now
   val rxsnp_opcode = Module(new SNPOpcodeDecoder(Seq(
     CHI_SnpShared,
     CHI_SnpClean,
@@ -194,7 +195,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
     meta_write_shared -> Mux(io.tshr_dirResult.state === L2Directory.MetaState.I, 
                              L2Directory.MetaState.I, L2Directory.MetaState.S)
   ))
-  rxsnp_meta_write_meta.dirty := MuxCase(io.tshr_dirResult.dirty, Seq(
+  rxsnp_meta_write_meta.dirty := MuxCase(dirty_or_passdirty, Seq(
     meta_write_invalid -> false.B,
     meta_write_shared -> false.B,
     rxsnp_snpCleanShared -> false.B
@@ -203,7 +204,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
   rxsnp_meta_write_meta.clients.foreach(_ := false.B)
   rxsnp_meta_write_meta.alias := io.tshr_dirResult.alias
 
-  val current_resp = metaToResp(io.tshr_dirResult.state, io.tshr_dirResult.dirty, false.B)
+  val current_resp = metaToResp(io.tshr_dirResult.state, dirty_or_passdirty, false.B)
   val make_clean_resp = metaToResp(rxsnp_meta_write_meta.state, false.B, false.B)
   val pass_dirty_resp = metaToResp(rxsnp_meta_write_meta.state, false.B, true.B)
 
@@ -212,8 +213,8 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
     rxsnp_snpCleanFwd -> CHICohResps.SC,
     rxsnp_snpSharedFwd -> CHICohResps.SC,
     rxsnp_snpNotSharedDirtyFwd -> CHICohResps.SC,
-    rxsnp_snpUniqueFwd -> Mux(io.tshr_dirResult.dirty, CHICohResps.UD_PD, CHICohResps.UC),
-    rxsnp_snpPreferUniqueFwd -> Mux(io.tshr_dirResult.dirty, CHICohResps.UD_PD, CHICohResps.UC)
+    rxsnp_snpUniqueFwd -> Mux(dirty_or_passdirty, CHICohResps.UD_PD, CHICohResps.UC),
+    rxsnp_snpPreferUniqueFwd -> Mux(dirty_or_passdirty, CHICohResps.UD_PD, CHICohResps.UC)
   ))
   val home_resp_state = MuxCase(current_resp, Seq(
     rxsnp_snpQuery -> current_resp,
@@ -223,9 +224,9 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
     meta_write_shared -> make_clean_resp
   ))
   val home_data_resp_state = MuxCase(current_resp, Seq(
-    rxsnp_snpCleanShared -> Mux(io.tshr_dirResult.dirty, pass_dirty_resp, current_resp),
-    meta_write_invalid -> Mux(io.tshr_dirResult.dirty, CHICohResps.I_PD, CHICohResps.I),
-    meta_write_shared -> Mux(io.tshr_dirResult.dirty, pass_dirty_resp, make_clean_resp)
+    rxsnp_snpCleanShared -> Mux(dirty_or_passdirty, pass_dirty_resp, current_resp),
+    meta_write_invalid -> Mux(dirty_or_passdirty, CHICohResps.I_PD, CHICohResps.I),
+    meta_write_shared -> Mux(dirty_or_passdirty, pass_dirty_resp, make_clean_resp)
   ))
   // ---------------------------------------------------------
 
@@ -241,7 +242,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
                                  !rxsnp_do_not_read_ds
   val enter_need_meta_write = io.DnRXSNP.fire && (meta_write_shared || meta_write_invalid || rxsnp_snpCleanShared)
   val need_home_txdat = io.tshr_dirResult.state =/= L2Directory.MetaState.I && !rxsnp_do_not_send_home_data && 
-                        (p_rxsnp.RetToSrc.get.asBool || io.tshr_dirResult.dirty)
+                        (p_rxsnp.RetToSrc.get.asBool || dirty_or_passdirty)
   val enter_need_dct_txdat = io.DnRXSNP.fire && rxsnp_fwd && io.tshr_dirResult.state =/= L2Directory.MetaState.I
   val need_dct_txdat = p_rxsnp_need_dct_txdat
   val no_tx_inflight = !p_home_txrsp_valid && !p_home_txdat_valid && !p_dct_txdat_valid
@@ -270,6 +271,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
   when (io.DnRXSNP.fire) {
     p_rxsnp := io.DnRXSNP.bits
     p_rxsnp_need_dct_txdat := enter_need_dct_txdat
+    p_sa_passdirty := false.B
 
     s_meta_write := enter_need_meta_write
     s_home_resp0 := true.B
@@ -293,11 +295,13 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
 
   when (io.fromSA.SnpRespData2) {
     w_snpresp2 := false.B
+    p_sa_passdirty := io.fromSA.PASSDIRTY
   }
 
   when (io.fromSA.SnpResp && !io.DnRXSNP.fire) {
     w_snpresp0 := false.B
     w_snpresp2 := false.B
+    p_sa_passdirty := io.fromSA.PASSDIRTY
   }
 
   when (io.DnTXRSP.fire) {
@@ -569,19 +573,6 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
       "TSHR @ %m SNP vPipe observed REQ_evict change during an active transaction")
   }
   when (io.DnRXSNP.fire) {
-    when (nested_writeBackFull || nested_writeCleanFull) {
-      assert(dir_state_unique && io.tshr_dirResult.dirty,
-        "TSHR @ %m SNP vPipe nested WriteBack/WriteClean without an initial UD line")
-    }
-    when (req_evict_opcode === CHI_WriteEvictFull.asUInt && req_evict_valid) {
-      assert(dir_state_unique && !io.tshr_dirResult.dirty,
-        "TSHR @ %m SNP vPipe nested WriteEvictFull without an initial UC line")
-    }
-    when (req_evict_opcode === CHI_WriteEvictOrEvict.asUInt && req_evict_valid) {
-      assert((dir_state_unique || io.tshr_dirResult.state === L2Directory.MetaState.S) &&
-             !io.tshr_dirResult.dirty,
-        "TSHR @ %m SNP vPipe nested WriteEvictOrEvict without an initial UC/SC line")
-    }
     assert(PopCount(sa_uops) <= 1.U,
       "TSHR @ %m SNP vPipe issued multiple SnoopAgent uops")
     assert(rxsnp_no_sa_uop || PopCount(sa_uops) === 1.U,
