@@ -114,7 +114,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       preArb_UpEVTs(i)(j).bits := postSAM_t1p0.UpEVT.bits
       preArb_UpEVTs(i)(j).valid := postSAM_t1p0.UpEVT.valid && postSAM_t1p0.UpEVT.bits.TgtID === config.slices(i).U
     }}
-    fastArb(preArb_UpEVTs(i), slice.io.UpRXEVT)
+    fastArb(preArb_UpEVTs(i), slice.io.UpRXEVT, Some(s"UpRXEVT_$i"))
   }}
 
   // - Upstream RXREQ routing (Including local loop-back)
@@ -132,8 +132,8 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     }}
     val slice_io_UpRXREQ_remote = Wire(Decoupled(new FlitREQ))
     val slice_io_UpRXREQ_local = slice.io.UpTXREQ
-    fastArb(preArb_UpREQs(i), slice_io_UpRXREQ_remote)
-    arb(Seq(slice_io_UpRXREQ_local, slice_io_UpRXREQ_remote), slice.io.UpRXREQ)
+    fastArb(preArb_UpREQs(i), slice_io_UpRXREQ_remote, Some(s"UpRXREQ_remote_$i"))
+    arb(Seq(slice_io_UpRXREQ_local, slice_io_UpRXREQ_remote), slice.io.UpRXREQ, Some(s"UpRXREQ_$i"))
   }}
 
   // - Upstream RXRSP routing
@@ -153,7 +153,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     slice.io.UpRXRSP.bits := slice_io_UpRXRSP_decoupled.bits
     slice.io.UpRXRSP.valid := slice_io_UpRXRSP_decoupled.valid
     slice_io_UpRXRSP_decoupled.ready := true.B
-    fastArb(preArb_UpRSPs(i), slice_io_UpRXRSP_decoupled)
+    fastArb(preArb_UpRSPs(i), slice_io_UpRXRSP_decoupled, Some(s"UpRXRSP_$i"))
   }}
 
   // - Upstream RXDAT routing
@@ -173,7 +173,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     slice.io.UpRXDAT.bits := slice_io_UpRXDAT_decoupled.bits
     slice.io.UpRXDAT.valid := slice_io_UpRXDAT_decoupled.valid
     slice_io_UpRXDAT_decoupled.ready := true.B
-    fastArb(preArb_UpDATs(i), slice_io_UpRXDAT_decoupled)
+    fastArb(preArb_UpDATs(i), slice_io_UpRXDAT_decoupled, Some(s"UpRXDAT_$i"))
   }}
 
   // - Upstream TXSNP routing
@@ -191,7 +191,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       preArb_DnSNPs(i)(j).bits := postSAM_DnSNP.bits
       preArb_DnSNPs(i)(j).valid := postSAM_DnSNP.valid && postSAM_DnSNP.bits.TgtID === port._2.U
     }}
-    fastArb(preArb_DnSNPs(i), port._1)
+    fastArb(preArb_DnSNPs(i), port._1, Some(s"DnSNP_$i"))
   }}
 
   // - Upstream TXRSP routing
@@ -209,7 +209,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       preArb_DnRSPs(i)(j).bits := postSAM_DnRSP.bits
       preArb_DnRSPs(i)(j).valid := postSAM_DnRSP.valid && postSAM_DnRSP.bits.TgtID === port._2.U
     }}
-    fastArb(preArb_DnRSPs(i), port._1)
+    fastArb(preArb_DnRSPs(i), port._1, Some(s"DnRSP_$i"))
   }}
 
   // - Upstream TXDAT routing
@@ -227,7 +227,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       preArb_DnDATs(i)(j).bits := postSAM_DnDAT.bits
       preArb_DnDATs(i)(j).valid := postSAM_DnDAT.valid && postSAM_DnDAT.bits.TgtID === port._2.U
     }}
-    fastArb(preArb_DnDATs(i), port._1)
+    fastArb(preArb_DnDATs(i), port._1, Some(s"DnDAT_$i"))
   }}
 
 
