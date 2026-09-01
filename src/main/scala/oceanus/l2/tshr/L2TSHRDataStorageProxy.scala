@@ -600,7 +600,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
   //          It is assumed that no Data could be fast enough to be returned to TSHR Buffer in S0, S1, S2 from L1 and L3,
   //          otherwise consider clear all AheadPreArb on any RXDAT fire.
   io.toDS.WAY := Mux(state_dsRead.AheadPreArb_S1 || state_dsRead.AheadPreArb_S2, ds_read_ahead_way_q, io.meta_way) // TODO: meta assertions on PreArb, PostArb, Done
-  io.toDS.SET := L2Address.set(io.tshr_paddr)
+  io.toDS.SET := io.tshr_paddr >> offsetBits
   io.toDS.DATA := Cat(io.tbuf_data_2, io.tbuf_data_0)
 
   io.toDS.DSBufRd := state_dsRead.PreArb
