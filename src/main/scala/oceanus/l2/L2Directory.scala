@@ -441,11 +441,9 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     io.debugStateWrite.get.client0 := winReq.META.clients(0)
   }
 
-  // DirWb completion is observed one cycle after grant, when the write has landed.
-  val dirWbArb_v    = RegNext(grantDirWb, false.B)
-  val dirWbArb_tshr = RegNext(winReq.TSHRID, 0.U)
-  val dirWbDoneSet  = RegEnable(reqSet, 0.U, grantDirWb)
-  val dirWbDoneWay  = RegEnable(winReq.WAY(wayBits - 1, 0), 0.U, grantDirWb)
+  // DirWb completion is combinational at the grant cycle: the write lands at the
+  // edge ending that cycle and is observed by any access granted from the next
+  // cycle on (single grant per cycle, latency-1 synchronous SRAM).
 
   // ══════════════════════════════════════════════════════════════════
   // S3: hit detect, way select, PLRU update
@@ -498,8 +496,8 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     blockRefillAge(s3_set)(way_s3) := 0.U
   }
 
-  when(dirWbArb_v) {
-    val entry = blockRefill(dirWbDoneSet)(dirWbDoneWay)
+  when(grantDirWb) {
+    val entry = blockRefill(reqSet)(winReq.WAY(wayBits - 1, 0))
     when(entry.locked) {
       entry.dirWbDone := true.B
     }
@@ -554,9 +552,9 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     io.debugRetry.get.victimWay := victimWay
     io.debugRetry.get.blockRefillMaskS2 := blockRefillMask_s2
     io.debugRetry.get.freeWayMaskS3 := freeWayMask_s3
-    io.debugRetry.get.dirWbDone := dirWbArb_v
-    io.debugRetry.get.dirWbDoneSet := dirWbDoneSet
-    io.debugRetry.get.dirWbDoneWay := dirWbDoneWay
+    io.debugRetry.get.dirWbDone := grantDirWb
+    io.debugRetry.get.dirWbDoneSet := reqSet
+    io.debugRetry.get.dirWbDoneWay := winReq.WAY(wayBits - 1, 0)
     io.debugRetry.get.blockRefillLocked := VecInit(blockRefill.map(setLocks =>
       VecInit(setLocks.map(_.locked)).asUInt
     ))
@@ -584,12 +582,12 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     o.ReplRdRetryAck := false.B
   }
 
-  // ArbComp — DirRd/ReplRd: combinational at grant cycle (N)
+  // ArbComp — combinational at grant cycle (N) for all three operations.
+  // For DirWb the write lands at the edge ending the grant cycle; any access
+  // granted from cycle N+1 on observes it, so no delayed completion is needed.
   when(grantDirRd)  { io.fromDir(winIdx).DirRdArbComp  := true.B }
   when(grantReplRd) { io.fromDir(winIdx).ReplRdArbComp := true.B }
-
-  // ArbComp — DirWb: delayed one cycle (N+1) so the write has landed
-  when(dirWbArb_v) { io.fromDir(dirWbArb_tshr).DirWbArbComp := true.B }
+  when(grantDirWb)  { io.fromDir(winIdx).DirWbArbComp  := true.B }
 
   // Resp at S3 — routed one-to-one to the originating TSHR
   when(s3_valid) {
