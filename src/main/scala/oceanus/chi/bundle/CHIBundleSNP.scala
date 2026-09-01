@@ -21,17 +21,17 @@ class CHIBundleSNP(implicit p: Parameters) extends AbstractCHIBundle {
     val FwdNID          = CHIFieldUInt(paramCHI.snpFwdNIDWidth)
     //  ----------------------------------------------------------------
     val FwdTxnID_StashLPIDValid_StashLPID_VMIDExt   = CHIFieldUInt(
-            paramCHI.snpFwdNIDWidth 
+            paramCHI.snpFwdTxnIDWidth
         max(paramCHI.snpStashLPIDValidWidth + paramCHI.snpStashLPIDWidth)
         max paramCHI.snpVMIDExtWidth)
 
-    def FwdTxnID        = CHIFieldUInt(paramCHI.snpFwdNIDWidth        , 0                           , FwdTxnID_StashLPIDValid_StashLPID_VMIDExt)
+    def FwdTxnID        = CHIFieldUInt(paramCHI.snpFwdTxnIDWidth      , 0                           , FwdTxnID_StashLPIDValid_StashLPID_VMIDExt)
     def StashLPIDValid  = CHIFieldUInt(paramCHI.snpStashLPIDValidWidth, paramCHI.snpStashLPIDWidth  , FwdTxnID_StashLPIDValid_StashLPID_VMIDExt)
     def StashLPID       = CHIFieldUInt(paramCHI.snpStashLPIDWidth     , 0                           , FwdTxnID_StashLPIDValid_StashLPID_VMIDExt)
     def VMIDExt         = CHIFieldUInt(paramCHI.snpVMIDExtWidth       , 0                           , FwdTxnID_StashLPIDValid_StashLPID_VMIDExt)
 
     def FwdTxnID    (fwdTxnID       : UInt) = CHIFieldAssign(FwdTxnID_StashLPIDValid_StashLPID_VMIDExt,
-                                                (paramCHI.snpFwdNIDWidth        , 0, fwdTxnID))
+                                                (paramCHI.snpFwdTxnIDWidth      , 0, fwdTxnID))
     def StashLPID   (stashLPIDValid : UInt,
                      stashLPID      : UInt) = CHIFieldAssign(FwdTxnID_StashLPIDValid_StashLPID_VMIDExt,
                                                 (paramCHI.snpStashLPIDValidWidth, paramCHI.snpStashLPIDWidth, stashLPIDValid),
