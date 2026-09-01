@@ -523,170 +523,170 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
   }
   when (meta_write_any) {
     assert(!meta_write_seen,
-      s"TSHR #${tshrId} SNP vPipe committed meta more than once for one transaction")
+      "TSHR @ %m SNP vPipe committed meta more than once for one transaction")
     meta_write_seen := true.B
   }
   when (io.DnTXRSP.fire || fire_home_data2) {
     assert(!home_complete_seen,
-      s"TSHR #${tshrId} SNP vPipe completed more than one Home response")
+      "TSHR @ %m SNP vPipe completed more than one Home response")
     home_complete_seen := true.B
   }
   when (fire_dct_data2) {
     assert(!dct_complete_seen,
-      s"TSHR #${tshrId} SNP vPipe completed DCT more than once")
+      "TSHR @ %m SNP vPipe completed DCT more than once")
     dct_complete_seen := true.B
   }
   when (io.toSA.SnpCompAck) {
     assert(!compack_seen,
-      s"TSHR #${tshrId} SNP vPipe emitted SnpCompAck more than once")
+      "TSHR @ %m SNP vPipe emitted SnpCompAck more than once")
     compack_seen := true.B
   }
   when (active_q && !active) {
     assert(home_complete_seen,
-      s"TSHR #${tshrId} SNP vPipe completed without a Home response")
+      "TSHR @ %m SNP vPipe completed without a Home response")
     assert(meta_write_seen === expect_meta_write,
-      s"TSHR #${tshrId} SNP vPipe meta-write completion count disagrees with entry decode")
+      "TSHR @ %m SNP vPipe meta-write completion count disagrees with entry decode")
     assert(dct_complete_seen === expect_dct,
-      s"TSHR #${tshrId} SNP vPipe DCT completion count disagrees with entry decode")
+      "TSHR @ %m SNP vPipe DCT completion count disagrees with entry decode")
     assert(compack_seen === expect_compack,
-      s"TSHR #${tshrId} SNP vPipe SnpCompAck completion count disagrees with entry decode")
+      "TSHR @ %m SNP vPipe SnpCompAck completion count disagrees with entry decode")
   }
 
   // RXSNP acceptance and CHI request-field legality.
   assert(!(io.DnRXSNP.fire && active),
-    s"TSHR #${tshrId} SNP vPipe accepted a new snoop while active")
+    "TSHR @ %m SNP vPipe accepted a new snoop while active")
   assert(req_evict_supported,
-    s"TSHR #${tshrId} SNP vPipe observed an unsupported REQ_evict opcode")
+    "TSHR @ %m SNP vPipe observed an unsupported REQ_evict opcode")
   when (io.DnRXSNP.fire || active) {
     assert(io.tshr_dirResult.state =/= L2Directory.MetaState.I ||
            (!io.tshr_dirResult.dirty && !io.tshr_dirResult.clients.asUInt.orR),
-      s"TSHR #${tshrId} SNP vPipe observed dirty data or clients while local meta was invalid")
+      "TSHR @ %m SNP vPipe observed dirty data or clients while local meta was invalid")
   }
   when (active) {
     assert(req_evict_valid === req_evict_valid_q &&
            (!req_evict_valid || req_evict_opcode === req_evict_opcode_q),
-      s"TSHR #${tshrId} SNP vPipe observed REQ_evict change during an active transaction")
+      "TSHR @ %m SNP vPipe observed REQ_evict change during an active transaction")
   }
   when (io.DnRXSNP.fire) {
     when (nested_writeBackFull || nested_writeCleanFull) {
       assert(dir_state_unique && io.tshr_dirResult.dirty,
-        s"TSHR #${tshrId} SNP vPipe nested WriteBack/WriteClean without an initial UD line")
+        "TSHR @ %m SNP vPipe nested WriteBack/WriteClean without an initial UD line")
     }
     when (req_evict_opcode === CHI_WriteEvictFull.asUInt && req_evict_valid) {
       assert(dir_state_unique && !io.tshr_dirResult.dirty,
-        s"TSHR #${tshrId} SNP vPipe nested WriteEvictFull without an initial UC line")
+        "TSHR @ %m SNP vPipe nested WriteEvictFull without an initial UC line")
     }
     when (req_evict_opcode === CHI_WriteEvictOrEvict.asUInt && req_evict_valid) {
       assert((dir_state_unique || io.tshr_dirResult.state === L2Directory.MetaState.S) &&
              !io.tshr_dirResult.dirty,
-        s"TSHR #${tshrId} SNP vPipe nested WriteEvictOrEvict without an initial UC/SC line")
+        "TSHR @ %m SNP vPipe nested WriteEvictOrEvict without an initial UC/SC line")
     }
     assert(PopCount(sa_uops) <= 1.U,
-      s"TSHR #${tshrId} SNP vPipe issued multiple SnoopAgent uops")
+      "TSHR @ %m SNP vPipe issued multiple SnoopAgent uops")
     assert(rxsnp_no_sa_uop || PopCount(sa_uops) === 1.U,
-      s"TSHR #${tshrId} SNP vPipe did not issue exactly one required SnoopAgent uop")
+      "TSHR @ %m SNP vPipe did not issue exactly one required SnoopAgent uop")
     assert(!rxsnp_no_sa_uop || PopCount(sa_uops) === 0.U,
-      s"TSHR #${tshrId} SNP vPipe issued a SnoopAgent uop on a no-SA path")
+      "TSHR @ %m SNP vPipe issued a SnoopAgent uop on a no-SA path")
     assert(!rxsnp_ret_to_src_must_be_zero || !io.DnRXSNP.bits.RetToSrc.get.asBool,
-      s"TSHR #${tshrId} SNP vPipe received RetToSrc=1 on an opcode that requires zero")
+      "TSHR @ %m SNP vPipe received RetToSrc=1 on an opcode that requires zero")
     assert(!rxsnp_do_not_go_to_sd_must_be_one || io.DnRXSNP.bits.DoNotGoToSD.get.asBool,
-      s"TSHR #${tshrId} SNP vPipe received DoNotGoToSD=0 on an opcode that requires one")
+      "TSHR @ %m SNP vPipe received DoNotGoToSD=0 on an opcode that requires one")
     assert(!rxsnp_snpQuery || !io.DnRXSNP.bits.DoNotGoToSD.get.asBool,
-      s"TSHR #${tshrId} SNP vPipe received DoNotGoToSD=1 on SnpQuery")
+      "TSHR @ %m SNP vPipe received DoNotGoToSD=1 on SnpQuery")
     assert(rxsnp_fwd || io.DnRXSNP.bits.FwdNID.get === 0.U,
-      s"TSHR #${tshrId} SNP vPipe received FwdNID on a non-Fwd snoop")
+      "TSHR @ %m SNP vPipe received FwdNID on a non-Fwd snoop")
     assert(rxsnp_fwd || rxsnp_stash || io.DnRXSNP.bits.FwdTxnID.get === 0.U,
-      s"TSHR #${tshrId} SNP vPipe received FwdTxnID on a non-Fwd non-stash snoop")
+      "TSHR @ %m SNP vPipe received FwdTxnID on a non-Fwd non-stash snoop")
   }
 
   // External completion events must match an outstanding wait state.
   assert(!io.fromSA.SnpRespData0 || w_snpresp0,
-    s"TSHR #${tshrId} SNP vPipe received unexpected or duplicate SA DataID 0")
+    "TSHR @ %m SNP vPipe received unexpected or duplicate SA DataID 0")
   assert(!io.fromSA.SnpRespData2 || w_snpresp2,
-    s"TSHR #${tshrId} SNP vPipe received unexpected or duplicate SA DataID 2")
+    "TSHR @ %m SNP vPipe received unexpected or duplicate SA DataID 2")
   assert(!io.fromSA.SnpResp || w_snpresp0 || w_snpresp2 || enter_send_sa_uop,
-    s"TSHR #${tshrId} SNP vPipe received an unexpected SA SnpResp")
+    "TSHR @ %m SNP vPipe received an unexpected SA SnpResp")
   assert(!io.fromSA.SnpResp || enter_send_sa_uop || (w_snpresp0 && w_snpresp2),
-    s"TSHR #${tshrId} SNP vPipe mixed SA data beats with a no-data SnpResp")
+    "TSHR @ %m SNP vPipe mixed SA data beats with a no-data SnpResp")
   assert(!(io.fromSA.SnpResp && (io.fromSA.SnpRespData0 || io.fromSA.SnpRespData2)),
-    s"TSHR #${tshrId} SNP vPipe received SA SnpResp and SnpRespData together")
+    "TSHR @ %m SNP vPipe received SA SnpResp and SnpRespData together")
   when (io.fromSA.SnpRespData0 || io.fromSA.SnpRespData2) {
     assert(!rxsnp_snpMakeInvalid && !rxsnp_snpMakeInvalidStash,
-      s"TSHR #${tshrId} SNP vPipe received data for a MakeInvalid SnoopAgent request")
+      "TSHR @ %m SNP vPipe received data for a MakeInvalid SnoopAgent request")
   }
 
   // State bits and transaction ownership.
   assert(!(s_home_resp0 && !s_home_resp2),
-    s"TSHR #${tshrId} SNP vPipe has Home DataID 0 pending after DataID 2 completed")
+    "TSHR @ %m SNP vPipe has Home DataID 0 pending after DataID 2 completed")
   assert(!(s_dct_resp0 && !s_dct_resp2),
-    s"TSHR #${tshrId} SNP vPipe has DCT DataID 0 pending after DataID 2 completed")
+    "TSHR @ %m SNP vPipe has DCT DataID 0 pending after DataID 2 completed")
   assert(PopCount(Seq(p_home_txrsp_valid, p_home_txdat_valid, p_dct_txdat_valid)) <= 1.U,
-    s"TSHR #${tshrId} SNP vPipe has multiple downstream transmit owners")
+    "TSHR @ %m SNP vPipe has multiple downstream transmit owners")
   assert(PopCount(sa_uops :+ io.toSA.SnpCompAck) <= 1.U,
-    s"TSHR #${tshrId} SNP vPipe issued multiple SnoopAgent operations")
+    "TSHR @ %m SNP vPipe issued multiple SnoopAgent operations")
   assert(!sa_uops.reduce(_ || _) || io.DnRXSNP.fire,
-    s"TSHR #${tshrId} SNP vPipe issued a SnoopAgent request outside the snoop entry cycle")
+    "TSHR @ %m SNP vPipe issued a SnoopAgent request outside the snoop entry cycle")
   assert(PopCount(Seq(do_home_snpresp, do_home_snprespdata0, do_dct_snprespdata0)) <= 1.U,
-    s"TSHR #${tshrId} SNP vPipe scheduled multiple downstream responses")
+    "TSHR @ %m SNP vPipe scheduled multiple downstream responses")
   assert(!(s_dct_resp0 || s_dct_resp2 || p_dct_txdat_valid) || need_dct_txdat,
-    s"TSHR #${tshrId} SNP vPipe scheduled DCT without a latched DCT decision")
+    "TSHR @ %m SNP vPipe scheduled DCT without a latched DCT decision")
   assert(!p_dct_txdat_valid || (!s_home_resp0 && !s_home_resp2 &&
                                 !p_home_txrsp_valid && !p_home_txdat_valid),
-    s"TSHR #${tshrId} SNP vPipe started DCT before the Home response completed")
+    "TSHR @ %m SNP vPipe started DCT before the Home response completed")
   assert(!p_home_txrsp_valid || (s_home_resp0 && s_home_resp2),
-    s"TSHR #${tshrId} SNP vPipe TXRSP owner does not match Home scheduling state")
+    "TSHR @ %m SNP vPipe TXRSP owner does not match Home scheduling state")
   assert(!(p_home_txrsp_valid || p_home_txdat_valid || p_dct_txdat_valid) ||
          !(w_snpresp0 || w_snpresp2 || w_ds_read),
-    s"TSHR #${tshrId} SNP vPipe established a downstream valid before all data sources completed")
+    "TSHR @ %m SNP vPipe established a downstream valid before all data sources completed")
   when (active) {
     assert(!need_dct_txdat || rxsnp_fwd,
-      s"TSHR #${tshrId} SNP vPipe latched DCT work for a non-Fwd snoop")
+      "TSHR @ %m SNP vPipe latched DCT work for a non-Fwd snoop")
     assert(!s_meta_write || meta_write_invalid || meta_write_shared || rxsnp_snpCleanShared,
-      s"TSHR #${tshrId} SNP vPipe retained a meta write for an opcode that does not modify meta")
+      "TSHR @ %m SNP vPipe retained a meta write for an opcode that does not modify meta")
     assert(!s_snpcompack || (rxsnp_snpCleanShared &&
            !nested_writeBackFull && !nested_writeEvictX),
-      s"TSHR #${tshrId} SNP vPipe retained SnpCompAck on a non-ToClean path")
+      "TSHR @ %m SNP vPipe retained SnpCompAck on a non-ToClean path")
   }
   when (p_home_txdat_valid) {
     assert((p_txdat_dataID === 0.U && s_home_resp0 && s_home_resp2) ||
            (p_txdat_dataID === 2.U && !s_home_resp0 && s_home_resp2),
-      s"TSHR #${tshrId} SNP vPipe Home TXDAT DataID disagrees with scheduling state")
+      "TSHR @ %m SNP vPipe Home TXDAT DataID disagrees with scheduling state")
   }
   when (p_dct_txdat_valid) {
     assert((p_txdat_dataID === 0.U && s_dct_resp0 && s_dct_resp2) ||
            (p_txdat_dataID === 2.U && !s_dct_resp0 && s_dct_resp2),
-      s"TSHR #${tshrId} SNP vPipe DCT TXDAT DataID disagrees with scheduling state")
+      "TSHR @ %m SNP vPipe DCT TXDAT DataID disagrees with scheduling state")
   }
   assert(!active_q || !active || p_rxsnp.asUInt === p_rxsnp_q,
-    s"TSHR #${tshrId} SNP vPipe request payload changed during an active transaction")
+    "TSHR @ %m SNP vPipe request payload changed during an active transaction")
 
   // Output-channel exclusivity, ownership, ordering, and stability.
   assert(!(io.DnTXRSP.valid && io.DnTXDAT.valid),
-    s"TSHR #${tshrId} SNP vPipe asserted TXRSP and TXDAT valid together")
+    "TSHR @ %m SNP vPipe asserted TXRSP and TXDAT valid together")
   assert(!(io.DnTXDAT.valid && p_txdat_dataID =/= 0.U && p_txdat_dataID =/= 2.U),
-    s"TSHR #${tshrId} SNP vPipe emitted an unsupported TXDAT DataID")
+    "TSHR @ %m SNP vPipe emitted an unsupported TXDAT DataID")
   assert(!io.DnTXRSP.valid || active,
-    s"TSHR #${tshrId} SNP vPipe asserted TXRSP valid while inactive")
+    "TSHR @ %m SNP vPipe asserted TXRSP valid while inactive")
   assert(!io.DnTXDAT.valid || active,
-    s"TSHR #${tshrId} SNP vPipe asserted TXDAT valid while inactive")
+    "TSHR @ %m SNP vPipe asserted TXDAT valid while inactive")
   assert(!(io.DnTXRSP.fire && (w_snpresp0 || w_snpresp2 || w_ds_read)),
-    s"TSHR #${tshrId} SNP vPipe sent TXRSP before all data sources completed")
+    "TSHR @ %m SNP vPipe sent TXRSP before all data sources completed")
   assert(!(io.DnTXDAT.fire && (w_snpresp0 || w_snpresp2 || w_ds_read)),
-    s"TSHR #${tshrId} SNP vPipe sent TXDAT before all data sources completed")
+    "TSHR @ %m SNP vPipe sent TXDAT before all data sources completed")
   assert(!io.DnTXRSP.valid || io.DnTXRSP.bits.Resp.get < CHICohResps.I_PD,
-    s"TSHR #${tshrId} SNP vPipe used PassDirty on a response without data")
+    "TSHR @ %m SNP vPipe used PassDirty on a response without data")
   when (io.DnTXRSP.valid) {
     assert(io.DnTXRSP.bits.Opcode.get === Mux(need_dct_txdat, CHI_SnpRespFwded.U, CHI_SnpResp.U),
-      s"TSHR #${tshrId} SNP vPipe emitted an incorrect Home TXRSP opcode")
+      "TSHR @ %m SNP vPipe emitted an incorrect Home TXRSP opcode")
     assert(io.DnTXRSP.bits.QoS.get === p_rxsnp.QoS.get &&
            io.DnTXRSP.bits.TgtID.get === p_rxsnp.SrcID.get &&
            io.DnTXRSP.bits.SrcID.get === nodeId.U &&
            io.DnTXRSP.bits.TxnID.get === p_rxsnp.TxnID.get &&
            io.DnTXRSP.bits.RespErr.get === 0.U &&
            io.DnTXRSP.bits.TraceTag.get === p_rxsnp.TraceTag.get,
-      s"TSHR #${tshrId} SNP vPipe emitted incorrect Home TXRSP routing or control fields")
+      "TSHR @ %m SNP vPipe emitted incorrect Home TXRSP routing or control fields")
     assert(need_dct_txdat || io.DnTXRSP.bits.FwdState_DataPull.get === 0.U,
-      s"TSHR #${tshrId} SNP vPipe drove FwdState/DataPull on a non-Fwd Home TXRSP")
+      "TSHR @ %m SNP vPipe drove FwdState/DataPull on a non-Fwd Home TXRSP")
   }
   when (io.DnTXDAT.valid) {
     assert(io.DnTXDAT.bits.QoS.get === p_rxsnp.QoS.get &&
@@ -695,132 +695,132 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
            io.DnTXDAT.bits.DBID.get === p_rxsnp.TxnID.get &&
            io.DnTXDAT.bits.RespErr.get === 0.U &&
            io.DnTXDAT.bits.TraceTag.get === p_rxsnp.TraceTag.get,
-      s"TSHR #${tshrId} SNP vPipe emitted incorrect TXDAT common routing or control fields")
+      "TSHR @ %m SNP vPipe emitted incorrect TXDAT common routing or control fields")
   }
   when (p_dct_txdat_valid) {
     assert(io.DnTXDAT.bits.Opcode.get === CHI_CompData.U,
-      s"TSHR #${tshrId} SNP vPipe DCT data does not use CompData")
+      "TSHR @ %m SNP vPipe DCT data does not use CompData")
     assert(io.DnTXDAT.bits.FwdState_DataPull_DataSource.get === 0.U,
-      s"TSHR #${tshrId} SNP vPipe drove FwdState/DataPull/DataSource on CompData")
+      "TSHR @ %m SNP vPipe drove FwdState/DataPull/DataSource on CompData")
     assert(p_dct_txdat_resp =/= CHICohResps.SD && p_dct_txdat_resp =/= CHICohResps.SD_PD,
-      s"TSHR #${tshrId} SNP vPipe emitted an unsupported SD DCT response")
+      "TSHR @ %m SNP vPipe emitted an unsupported SD DCT response")
     assert(io.DnTXDAT.bits.TgtID.get === p_rxsnp.FwdNID.get &&
            io.DnTXDAT.bits.TxnID.get === p_rxsnp.FwdTxnID.get &&
            io.DnTXDAT.bits.HomeNID.get === p_rxsnp.SrcID.get &&
            io.DnTXDAT.bits.DBID.get === p_rxsnp.TxnID.get,
-      s"TSHR #${tshrId} SNP vPipe emitted incorrect DCT routing IDs")
+      "TSHR @ %m SNP vPipe emitted incorrect DCT routing IDs")
   }
   when (p_home_txdat_valid) {
     assert(io.DnTXDAT.bits.Opcode.get === Mux(need_dct_txdat, CHI_SnpRespDataFwded.U, CHI_SnpRespData.U),
-      s"TSHR #${tshrId} SNP vPipe emitted an incorrect Home TXDAT opcode")
+      "TSHR @ %m SNP vPipe emitted an incorrect Home TXDAT opcode")
     assert(io.DnTXDAT.bits.TgtID.get === p_rxsnp.SrcID.get &&
            io.DnTXDAT.bits.TxnID.get === p_rxsnp.TxnID.get &&
            (need_dct_txdat || io.DnTXDAT.bits.FwdState_DataPull_DataSource.get === 0.U),
-      s"TSHR #${tshrId} SNP vPipe emitted incorrect Home TXDAT routing IDs")
+      "TSHR @ %m SNP vPipe emitted incorrect Home TXDAT routing IDs")
   }
   when (io.DnTXDAT.valid) {
     assert(io.DnTXDAT.bits.BE.get.andR,
-      s"TSHR #${tshrId} SNP vPipe emitted a full-line response without all byte enables")
+      "TSHR @ %m SNP vPipe emitted a full-line response without all byte enables")
   }
   when (txrsp_stalled_q) {
     assert(io.DnTXRSP.valid && io.DnTXRSP.bits.asUInt === txrsp_bits_q,
-      s"TSHR #${tshrId} SNP vPipe changed TXRSP payload while stalled")
+      "TSHR @ %m SNP vPipe changed TXRSP payload while stalled")
   }
   when (txdat_stalled_q) {
     assert(io.DnTXDAT.valid && io.DnTXDAT.bits.asUInt === txdat_bits_q,
-      s"TSHR #${tshrId} SNP vPipe changed TXDAT payload while stalled")
+      "TSHR @ %m SNP vPipe changed TXDAT payload while stalled")
   }
 
   // Meta updates and buffer ownership.
   assert(meta_write_any === do_meta_write,
-    s"TSHR #${tshrId} SNP vPipe meta-write output disagrees with its commit event")
+    "TSHR @ %m SNP vPipe meta-write output disagrees with its commit event")
   when (meta_write_any) {
     assert(active && s_meta_write && io.tshr_meta_write_en.dirty,
-      s"TSHR #${tshrId} SNP vPipe emitted an inactive meta write or failed to write dirty")
+      "TSHR @ %m SNP vPipe emitted an inactive meta write or failed to write dirty")
     assert(io.tshr_meta_write_en.asUInt === rxsnp_meta_write_en.asUInt,
-      s"TSHR #${tshrId} SNP vPipe emitted a meta-write mask inconsistent with snoop decode")
+      "TSHR @ %m SNP vPipe emitted a meta-write mask inconsistent with snoop decode")
     assert(!rxsnp_snpQuery,
-      s"TSHR #${tshrId} SNP vPipe modified meta for SnpQuery")
+      "TSHR @ %m SNP vPipe modified meta for SnpQuery")
     assert(!io.tshr_meta_write_meta.dirty &&
            io.tshr_meta_write_meta.alias === io.tshr_dirResult.alias,
-      s"TSHR #${tshrId} SNP vPipe meta write did not commit clean data or preserve alias")
+      "TSHR @ %m SNP vPipe meta write did not commit clean data or preserve alias")
     assert(io.tshr_meta_write_en.state === (meta_write_invalid || meta_write_shared),
-      s"TSHR #${tshrId} SNP vPipe state-write mask disagrees with snoop transition")
+      "TSHR @ %m SNP vPipe state-write mask disagrees with snoop transition")
     assert(io.tshr_meta_write_en.clients.asUInt.orR === meta_write_invalid,
-      s"TSHR #${tshrId} SNP vPipe client-write mask disagrees with invalidation")
+      "TSHR @ %m SNP vPipe client-write mask disagrees with invalidation")
     when (io.tshr_meta_write_en.state) {
       assert(io.tshr_meta_write_meta.state === L2Directory.MetaState.I ||
              io.tshr_meta_write_meta.state === L2Directory.MetaState.S,
-        s"TSHR #${tshrId} SNP vPipe state write did not target I or SC")
+        "TSHR @ %m SNP vPipe state write did not target I or SC")
     }.otherwise {
       assert(rxsnp_snpCleanShared && !io.tshr_meta_write_en.clients.asUInt.orR,
-        s"TSHR #${tshrId} SNP vPipe emitted a dirty-only write outside SnpCleanShared")
+        "TSHR @ %m SNP vPipe emitted a dirty-only write outside SnpCleanShared")
     }
     when (io.tshr_meta_write_en.clients.asUInt.orR) {
       assert(io.tshr_meta_write_meta.state === L2Directory.MetaState.I &&
              !io.tshr_meta_write_meta.clients.asUInt.orR,
-        s"TSHR #${tshrId} SNP vPipe client invalidation did not write local I/no-clients")
+        "TSHR @ %m SNP vPipe client invalidation did not write local I/no-clients")
     }
   }
   assert(!io.ds_read_en || io.DnRXSNP.fire,
-    s"TSHR #${tshrId} SNP vPipe asserted ds_read_en outside the request-entry cycle")
+    "TSHR @ %m SNP vPipe asserted ds_read_en outside the request-entry cycle")
   when (io.ds_read_en) {
     assert(!io.ds_read_done && io.tshr_dirResult.state =/= L2Directory.MetaState.I &&
            !rxsnp_do_not_read_ds,
-      s"TSHR #${tshrId} SNP vPipe issued an unnecessary or already-completed DS read")
+      "TSHR @ %m SNP vPipe issued an unnecessary or already-completed DS read")
   }
   assert(!(io.DnTXRSP.valid || io.DnTXDAT.valid) || io.blockRBE.EVT,
-    s"TSHR #${tshrId} SNP vPipe did not block EVT while owning a downstream response")
+    "TSHR @ %m SNP vPipe did not block EVT while owning a downstream response")
   assert(!(io.EVT_active && io.blockRBE.EVT),
-    s"TSHR #${tshrId} SNP vPipe observed EVT active while the SNP data path blocked EVT")
+    "TSHR @ %m SNP vPipe observed EVT active while the SNP data path blocked EVT")
   assert(io.free === !active && io.blockRBE.SNP === active && io.blockRBE.REQ === active,
-    s"TSHR #${tshrId} SNP vPipe free/RBE ownership outputs disagree with active state")
+    "TSHR @ %m SNP vPipe free/RBE ownership outputs disagree with active state")
   assert(io.blockRBE.EVT === block_vpipe_evt,
-    s"TSHR #${tshrId} SNP vPipe EVT block output disagrees with buffer ownership")
+    "TSHR @ %m SNP vPipe EVT block output disagrees with buffer ownership")
   when (io.toSA.SnpCompAck) {
     assert(active && rxsnp_opcode.is(CHI_SnpCleanShared) &&
            !w_snpresp0 && !w_snpresp2 && !w_ds_read &&
            !s_home_resp0 && !s_home_resp2 &&
            !s_dct_resp0 && !s_dct_resp2 &&
            !p_home_txrsp_valid && !p_home_txdat_valid && !p_dct_txdat_valid,
-      s"TSHR #${tshrId} SNP vPipe emitted SnpCompAck before SnpCleanShared completed")
+      "TSHR @ %m SNP vPipe emitted SnpCompAck before SnpCleanShared completed")
   }
 
   // Opcode-specific negative behavior.
   when (active && rxsnp_snpQuery) {
     assert(!w_snpresp0 && !w_snpresp2 && !w_ds_read && !s_meta_write &&
            !s_dct_resp0 && !s_dct_resp2 && !io.DnTXDAT.valid,
-      s"TSHR #${tshrId} SNP vPipe performed data, SA, DCT, or meta work for SnpQuery")
+      "TSHR @ %m SNP vPipe performed data, SA, DCT, or meta work for SnpQuery")
   }
   when (active && rxsnp_snpMakeInvalid) {
     assert(!w_ds_read && !need_dct_txdat && !io.DnTXDAT.valid,
-      s"TSHR #${tshrId} SNP vPipe read or returned data for SnpMakeInvalid")
+      "TSHR @ %m SNP vPipe read or returned data for SnpMakeInvalid")
   }
   when (active && rxsnp_snpMakeInvalidStash) {
     assert(!w_ds_read && !need_dct_txdat && !io.DnTXDAT.valid,
-      s"TSHR #${tshrId} SNP vPipe read or returned data for SnpMakeInvalidStash")
+      "TSHR @ %m SNP vPipe read or returned data for SnpMakeInvalidStash")
   }
   when (active && (rxsnp_snpStashUnique || rxsnp_snpStashShared)) {
     assert(!w_snpresp0 && !w_snpresp2 && !w_ds_read && !s_meta_write &&
            !s_dct_resp0 && !s_dct_resp2 && !io.DnTXDAT.valid,
-      s"TSHR #${tshrId} SNP vPipe performed SA, DS, meta, data, or DCT work on an ignored Stash snoop")
+      "TSHR @ %m SNP vPipe performed SA, DS, meta, data, or DCT work on an ignored Stash snoop")
   }
   when (io.DnTXRSP.valid && rxsnp_stash) {
     assert(io.DnTXRSP.bits.FwdState_DataPull.get === 0.U,
-      s"TSHR #${tshrId} SNP vPipe requested DataPull on a no-DataPull Stash path")
+      "TSHR @ %m SNP vPipe requested DataPull on a no-DataPull Stash path")
     when (rxsnp_snpStashUnique || rxsnp_snpStashShared) {
       assert(io.DnTXRSP.bits.Opcode.get === CHI_SnpResp.U &&
              io.DnTXRSP.bits.Resp.get === CHICohResps.I,
-        s"TSHR #${tshrId} SNP vPipe emitted a non-I response on an ignored Stash snoop")
+        "TSHR @ %m SNP vPipe emitted a non-I response on an ignored Stash snoop")
     }
   }
   when (io.DnTXDAT.valid && rxsnp_stash) {
     assert(rxsnp_snpUniqueStash && io.DnTXDAT.bits.FwdState_DataPull_DataSource.get === 0.U,
-      s"TSHR #${tshrId} SNP vPipe emitted illegal Stash data or requested DataPull")
+      "TSHR @ %m SNP vPipe emitted illegal Stash data or requested DataPull")
   }
   when (active && !rxsnp_fwd) {
     assert(!need_dct_txdat && !s_dct_resp0 && !s_dct_resp2 && !p_dct_txdat_valid,
-      s"TSHR #${tshrId} SNP vPipe scheduled DCT for a non-Fwd snoop")
+      "TSHR @ %m SNP vPipe scheduled DCT for a non-Fwd snoop")
   }
   // ---------------------------------------------------------
 }
