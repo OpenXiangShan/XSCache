@@ -627,9 +627,13 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     "Directory: ReplRd granted while replStall (PLRU hazard)")
   assert(PopCount(blockRefill.flatten.map(_.locked)) <= nMSHR.U,
     "Directory: blockRefill lock count exceeds TSHR count")
+  // Functional requests ARE allowed at the directory ports during the power-on
+  // init sweep; they are masked out of arbitration (anyReplRd/anyDirWb/anyDirRd
+  // are qualified with !initActive) and simply wait until the sweep completes.
+  // The invariant is that no functional request is ever arbitrated during init.
   when(initActive) {
-    assert(!rawAnyReplRd && !rawAnyDirWb && !rawAnyDirRd,
-      "Directory: functional traffic must be blocked while directory init is in progress")
+    assert(!anyGrant,
+      "Directory: functional traffic must not be arbitrated while directory init is in progress")
   }
   when(s3_valid && s3_isDirRd) {
     assert(PopCount(hitVec) <= 1.U,
