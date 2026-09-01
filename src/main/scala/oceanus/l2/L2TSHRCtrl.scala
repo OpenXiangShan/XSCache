@@ -22,7 +22,9 @@ trait L2SliceLocatable {
   val sliceIdx: Int
   val sliceNID: Int
 
-  def getTSHRIdFromTxnID(txnId: UInt) = txnId >> log2Ceil(sliceNum)
+  def getTSHRIdFromDnTxnID(txnId: UInt) = txnId >> log2Ceil(sliceNum)
+
+  def getTSHRIdFromUpTxnID(txnId: UInt) = txnId
 
   def getSliceIdxFromTxnID(txnId: UInt) = if (sliceNum > 1) txnId(log2Ceil(sliceNum) - 1, 0) else 0.U
 
@@ -74,16 +76,16 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int)(implic
     t.io.DnRXSNP := io.DnRXSNP.bits
     t.io.UpRXREQ := io.UpRXREQ.bits
 
-    t.io.UpRXRSP.valid := io.UpRXRSP.valid && getTSHRIdFromTxnID(io.UpRXRSP.bits.TxnID) === t.tshrId.U 
+    t.io.UpRXRSP.valid := io.UpRXRSP.valid && getTSHRIdFromUpTxnID(io.UpRXRSP.bits.TxnID) === t.tshrId.U 
     t.io.UpRXRSP.bits := io.UpRXRSP.bits
 
-    t.io.UpRXDAT.valid := io.UpRXDAT.valid && getTSHRIdFromTxnID(io.UpRXDAT.bits.TxnID) === t.tshrId.U
+    t.io.UpRXDAT.valid := io.UpRXDAT.valid && getTSHRIdFromUpTxnID(io.UpRXDAT.bits.TxnID) === t.tshrId.U
     t.io.UpRXDAT.bits := io.UpRXDAT.bits
 
-    t.io.DnRXRSP.valid := io.DnRXRSP.valid && getTSHRIdFromTxnID(io.DnRXRSP.bits.TxnID.get) === t.tshrId.U
+    t.io.DnRXRSP.valid := io.DnRXRSP.valid && getTSHRIdFromDnTxnID(io.DnRXRSP.bits.TxnID.get) === t.tshrId.U
     t.io.DnRXRSP.bits := io.DnRXRSP.bits
 
-    t.io.DnRXDAT.valid := io.DnRXDAT.valid && getTSHRIdFromTxnID(io.DnRXDAT.bits.TxnID.get) === t.tshrId.U
+    t.io.DnRXDAT.valid := io.DnRXDAT.valid && getTSHRIdFromDnTxnID(io.DnRXDAT.bits.TxnID.get) === t.tshrId.U
     t.io.DnRXDAT.bits := io.DnRXDAT.bits
   }
 
