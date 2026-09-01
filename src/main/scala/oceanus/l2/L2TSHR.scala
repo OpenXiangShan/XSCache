@@ -89,7 +89,8 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   val tshr_enter_EVT_WayValid_Evict = tshr_enter_EVT && io.UpRXEVT.WayValid && io.UpRXEVT.Opcode === Evict.U
   val tshr_enter_EVT_WayValid_WriteBackFull = tshr_enter_EVT && io.UpRXEVT.WayValid && io.UpRXEVT.Opcode === WriteBackFull.U
 
-  val tshr_enter_dirRead = !tshr_enter_EVT_WayValid_Evict &&
+  val tshr_enter_dirRead = tshr_enter &&
+                           !tshr_enter_EVT_WayValid_Evict &&
                            !tshr_enter_EVT_WayValid_WriteBackFull
 
   // TSHR payloads
