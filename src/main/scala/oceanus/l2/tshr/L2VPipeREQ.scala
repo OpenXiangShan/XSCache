@@ -370,6 +370,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.toSA.CLIENTS := io.fromClientTable
   io.toSA.ALIAS := rxreq.TagAlias
 
+  io.toSA.isL2Evict := rxreq_evictback
+
   // waiting state transitions
   //  - SnpResp/SnpRespData0/SnpRespData2 were all allowed to be received on the same cycle of the issue of
   //    SnpMakeInvalid/SnpToInvalid/SnpToShared/SnpToClean.
