@@ -21,7 +21,9 @@ trait L2TSHRLocatable extends L2SliceLocatable {
 
   val tshrId: Int
 
-  def getTxnID = getTxnIDFromTSHRId(tshrId)
+  def getDnTxnID = getTxnIDFromTSHRId(tshrId)
+
+  def getUpTxnID = tshrId.U
 }
 
 class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId: Int)(implicit val p: Parameters) extends Module 
@@ -437,6 +439,9 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   // connections between TSHR local and SNP vPipe
   vPipeSNP.io.tshr_paddr := tshr_paddr
   vPipeSNP.io.tshr_dirResult := dirResult
+  vPipeSNP.io.tbuf_modified := tshr_buffer_modified
+  vPipeSNP.io.tbuf_half0_ready := tshr_buffer_halfWritten_0_q || tshr_buffer_fullModified_q
+  vPipeSNP.io.tbuf_half2_ready := tshr_buffer_halfWritten_2_q || tshr_buffer_fullModified_q
 
   meta_write_SNP_mask := vPipeSNP.io.tshr_meta_write_en
   meta_write_SNP_meta := vPipeSNP.io.tshr_meta_write_meta

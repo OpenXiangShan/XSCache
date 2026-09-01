@@ -582,7 +582,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.DnTXREQ.bits.QoS.get := 14.U // Default at 14, (**DOT NOT use 15**, maybe better policy in future)
   io.DnTXREQ.bits.TgtID.get := 0.U // Support E-SAM only currently
   io.DnTXREQ.bits.SrcID.get := nodeId.U
-  io.DnTXREQ.bits.TxnID.get := getTxnID
+  io.DnTXREQ.bits.TxnID.get := getDnTxnID
   io.DnTXREQ.bits.ReturnNID_StashNID_SLCRepHint.get := 0.U // Not providing SLCRepHint/StashNID, default to 0
   io.DnTXREQ.bits.StashNIDValid_Endian_Deep.get := 0.U
   io.DnTXREQ.bits.ReturnTxnID_StashLPIDValid_StashLPID.get := 0.U
@@ -1087,9 +1087,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   io.UpTXRSP.valid := s_rd_up_comp
   io.UpTXRSP.bits.TxnID := p_rxreq.TxnID
-  io.UpTXRSP.bits.SrcID := nodeId.U
+  io.UpTXRSP.bits.SrcID := sliceNID.U
   io.UpTXRSP.bits.TgtID := p_rxreq.SrcID
-  io.UpTXRSP.bits.DBID := getTxnID
+  io.UpTXRSP.bits.DBID := getUpTxnID
   io.UpTXRSP.bits.Opcode := up_txrsp_opcode
   io.UpTXRSP.bits.RespErr := 0.U // TODO: RespErr
   io.UpTXRSP.bits.Resp := up_txrsp_resp
@@ -1163,9 +1163,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   io.UpTXDAT.valid := s_rd_up_compdata0 || s_rd_up_compdata2
   io.UpTXDAT.bits.TxnID := p_rxreq.TxnID
-  io.UpTXDAT.bits.SrcID := nodeId.U
+  io.UpTXDAT.bits.SrcID := sliceNID.U
   io.UpTXDAT.bits.TgtID := p_rxreq.SrcID
-  io.UpTXDAT.bits.DBID := getTxnID
+  io.UpTXDAT.bits.DBID := getUpTxnID
   io.UpTXDAT.bits.Opcode := CCHIOpcode.CompData.U
   io.UpTXDAT.bits.RespErr := 0.U // TODO: RespErr
   io.UpTXDAT.bits.Resp := up_txdat_resp
@@ -1245,8 +1245,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // to clear the replacer reading lock in Directory
   io.dir_wb_aux := unlock_dir
   io.UpTXREQ.valid := s_evict
-  io.UpTXREQ.bits.TxnID := getTxnID
-  io.UpTXREQ.bits.SrcID := nodeId.U
+  io.UpTXREQ.bits.TxnID := getUpTxnID
+  io.UpTXREQ.bits.SrcID := sliceNID.U
   io.UpTXREQ.bits.TgtID := nodeId.U
   io.UpTXREQ.bits.Opcode := CCHIOpcode.EvictBack.U
   io.UpTXREQ.bits.Size := CCHISize.B64.U
@@ -1288,12 +1288,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   }
 
   io.peer_unlock_dir.zipWithIndex.foreach { case (unlock_dir, i) => {
-    unlock_dir := evictback_peer_unlock_dir && getTSHRIdFromTxnID(rxreq.TxnID) === i.U
+    unlock_dir := evictback_peer_unlock_dir && getTSHRIdFromUpTxnID(rxreq.TxnID) === i.U
   }}
 
   io.peer_unlock_ds.zipWithIndex.foreach { case (unlock_ds, i) => {
-    unlock_ds := evictback_peer_unlock_ds_immediate && getTSHRIdFromTxnID(rxreq.TxnID) === i.U ||
-                 evictback_peer_unlock_ds_late && getTSHRIdFromTxnID(p_rxreq.TxnID) === i.U
+    unlock_ds := evictback_peer_unlock_ds_immediate && getTSHRIdFromUpTxnID(rxreq.TxnID) === i.U ||
+                 evictback_peer_unlock_ds_late && getTSHRIdFromUpTxnID(p_rxreq.TxnID) === i.U
   }}
   // ----------------------------------------------------------------
 
