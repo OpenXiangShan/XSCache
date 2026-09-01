@@ -30,10 +30,6 @@ object L2Common {
   }
 }
 
-object L2Address {
-  def set(pa: UInt)(implicit p: Parameters): UInt = pa // TODO: extract real set index from PA
-}
-
 object FSMPerfHistogram {
   def apply(name: String, prev: Bool, next: Bool)(implicit p: Parameters): Unit = {
     val counter = RegInit(0.U(32.W))
