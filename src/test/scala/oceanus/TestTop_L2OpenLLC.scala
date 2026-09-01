@@ -13,7 +13,6 @@ import oceanus.l2.{L2Configuration, L2Params, L2ParamsKey, L2Top}
 import oceanus.chi.{CHIParameters, CHIParametersKey, EnumCHIChannel, EnumCHIIssue}
 import oceanus.chi.bundle.{CHIBundleDAT, CHIBundleREQ, CHIBundleRSP, CHIBundleSNP}
 import oceanus.chi.link.OceanusChannelAdapter
-import oceanus.compactchi.{CCHIInterfaceType1, CCHIInterfaceType4}
 import xscache.chi.{ChannelIO, CHIIssue, HasCHIMsgParameters, Issue}
 import xscache.coupledL2.L2Param
 import xscache.openLLC.{OpenLLC, OpenLLCParam, OpenLLCParamKey, OpenNCB}
@@ -21,7 +20,7 @@ import cc.xiangshan.openncb.{EnumAXIMasterOrder, EnumCHIDataCheck, NCBParameters
 
 /*  Oceanus L2 (CCHI upstream / CHI RN-F downstream) -> OpenLLC -> OpenNCB -> AXI4.
  *
- *       CCHI upstream ports (exported, one set per L2)
+ *       CCHI upstream ports (exported, one Type-1 + two Type-4 per L2)
  *                     |
  *                L2Top x numL2
  *                     |  CHIRNFInterface (oceanus.chi bundles)
@@ -29,19 +28,28 @@ import cc.xiangshan.openncb.{EnumAXIMasterOrder, EnumCHIDataCheck, NCBParameters
  *                     |  PortIO (xscache.chi legacy bundles)
  *                 OpenLLC rn(i)
  *                     |
- *                 OpenLLC sn -> OpenNCB -> AXI4 (exported as mem_axi)
+ *                 OpenLLC sn -> OpenNCB -> AXI4 (exported as axi_m0_*)
  *
  *  The oceanus CHIParameters below is pinned so that every oceanus flit is
  *  bit-width-identical to its legacy Eb counterpart (REQ 162 / SNP 115 /
  *  RSP 73 / DAT 422); OceanusChannelAdapter re-slices the raw flits.
+ *
+ *  Top-level port naming follows the Cohestra V3 contract (CHIron
+ *  cchi/cohestra/cohestra_v3), exported pin-by-pin via suggestName:
+ *    cchi_t1p{P}_{rxevt,rxreq,txsnp,txrsp,rxrsp,txdat,rxdat}_{valid,ready,bits_*}
+ *      - one Type-1 port per L2; DUT inputs on rx*, DUT outputs on tx*
+ *    cchi_t4p{2i}/cchi_t4p{2i+1}_{rxreq,txdat}_*
+ *      - the two Type-4 ports of L2 i (no cohestra concept yet; same scheme)
+ *    axi_m0_{awvalid,awready,awid,awaddr,awlen,awsize,awburst,
+ *            wvalid,wready,wdata,wstrb,wlast,
+ *            bvalid,bready,bid,bresp,
+ *            arvalid,arready,arid,araddr,arlen,arsize,arburst,
+ *            rvalid,rready,rid,rdata,rresp,rlast}
+ *      - flat AXI4 master port toward memory (DUT is the master)
+ *    clock / reset (high-active)
+ *  Internal CCHI channel names (UpEVT/DnSNP/...) intentionally do not appear
+ *  in the emitted port names.
  */
-
-class CCHIUpstreamPorts extends Bundle {
-  val t1p0 = new CCHIInterfaceType1
-  val t4p0 = new CCHIInterfaceType4
-  val t4p1 = new CCHIInterfaceType4
-}
-
 class TestTop_L2OpenLLC(val numL2: Int, val numSlices: Int)(implicit p: Parameters) extends LazyModule
   with HasCHIMsgParameters {
 
@@ -69,13 +77,56 @@ class TestTop_L2OpenLLC(val numL2: Int, val numSlices: Int)(implicit p: Paramete
     val l2s = Seq.fill(numL2)(Module(new L2Top(l2cfg)))
     val l3 = Module(new OpenLLC())
 
-    // -- Exported upstream CCHI ports, one set per L2
-    val io_cchi = IO(Vec(numL2, new CCHIUpstreamPorts))
+    // -- Cohestra V3 pin-level export ------------------------------------------
+    // Every external pin is an individual IO named via suggestName, so emitted
+    // port names follow the cohestra_v3 contract (see header) regardless of how
+    // the internal bundles/channels are named.
 
+    /* Export a Decoupled channel as {prefix}_valid / {prefix}_ready /
+     * {prefix}_bits_<field> pins. dutDrives = true for channels the DUT
+     * sources (valid/bits are outputs, ready is an input). */
+    def exportChannel[T <: Bundle](prefix: String, chan: ReadyValidIO[T], dutDrives: Boolean): Unit = {
+      val vld = IO(if (dutDrives) Output(Bool()) else Input(Bool())).suggestName(s"${prefix}_valid")
+      val rdy = IO(if (dutDrives) Input(Bool()) else Output(Bool())).suggestName(s"${prefix}_ready")
+      if (dutDrives) { vld := chan.valid; chan.ready := rdy }
+      else           { chan.valid := vld; rdy := chan.ready }
+      chan.bits.elements.foreach { case (name, field) =>
+        val pin = IO(if (dutDrives) Output(chiselTypeOf(field)) else Input(chiselTypeOf(field)))
+          .suggestName(s"${prefix}_bits_${name}")
+        if (dutDrives) pin := field else field := pin
+      }
+    }
+
+    /* Export an AXI4 channel as flat axi_m0_<chan><sig> pins over a field
+     * whitelist (lock/cache/prot/qos/user/echo sidebands stay internal). */
+    def exportAXIChannel[T <: Bundle](chan: ReadyValidIO[T], chanName: String,
+                                      fields: Seq[String], dutDrives: Boolean): Unit = {
+      val vld = IO(if (dutDrives) Output(Bool()) else Input(Bool())).suggestName(s"axi_m0_${chanName}valid")
+      val rdy = IO(if (dutDrives) Input(Bool()) else Output(Bool())).suggestName(s"axi_m0_${chanName}ready")
+      if (dutDrives) { vld := chan.valid; chan.ready := rdy }
+      else           { chan.valid := vld; rdy := chan.ready }
+      fields.foreach { name =>
+        val field = chan.bits.elements(name)
+        val pin = IO(if (dutDrives) Output(chiselTypeOf(field)) else Input(chiselTypeOf(field)))
+          .suggestName(s"axi_m0_${chanName}${name}")
+        if (dutDrives) pin := field else field := pin
+      }
+    }
+
+    // -- Exported upstream CCHI ports, one Type-1 + two Type-4 per L2
     l2s.zipWithIndex.foreach { case (l2, i) =>
-      io_cchi(i).t1p0 <> l2.io.t1p0
-      io_cchi(i).t4p0 <> l2.io.t4p0
-      io_cchi(i).t4p1 <> l2.io.t4p1
+      exportChannel(s"cchi_t1p${i}_rxevt", l2.io.t1p0.UpEVT, dutDrives = false)
+      exportChannel(s"cchi_t1p${i}_rxreq", l2.io.t1p0.UpREQ, dutDrives = false)
+      exportChannel(s"cchi_t1p${i}_txsnp", l2.io.t1p0.DnSNP, dutDrives = true)
+      exportChannel(s"cchi_t1p${i}_txrsp", l2.io.t1p0.DnRSP, dutDrives = true)
+      exportChannel(s"cchi_t1p${i}_rxrsp", l2.io.t1p0.UpRSP, dutDrives = false)
+      exportChannel(s"cchi_t1p${i}_txdat", l2.io.t1p0.DnDAT, dutDrives = true)
+      exportChannel(s"cchi_t1p${i}_rxdat", l2.io.t1p0.UpDAT, dutDrives = false)
+
+      exportChannel(s"cchi_t4p${2*i}_rxreq",   l2.io.t4p0.UpREQ, dutDrives = false)
+      exportChannel(s"cchi_t4p${2*i}_txdat",   l2.io.t4p0.DnDAT, dutDrives = true)
+      exportChannel(s"cchi_t4p${2*i+1}_rxreq", l2.io.t4p1.UpREQ, dutDrives = false)
+      exportChannel(s"cchi_t4p${2*i+1}_txdat", l2.io.t4p1.DnDAT, dutDrives = true)
     }
 
     // -- Downstream CHI: oceanus CHIRNFInterface <-> legacy PortIO via OceanusChannelAdapter
@@ -142,7 +193,13 @@ class TestTop_L2OpenLLC(val numL2: Int, val numSlices: Int)(implicit p: Paramete
     l3.io.nodeID := numL2.U(NODEID_WIDTH.W)
     l3.io.debugTopDown := DontCare
 
-    mem.makeIOs()(ValName("mem_axi"))
+    // -- AXI4 memory master, flat cohestra_v3 naming (axi_m0_*); DUT is the master
+    val memAxi = mem.in.head._1
+    exportAXIChannel(memAxi.aw, "aw", Seq("id", "addr", "len", "size", "burst"), dutDrives = true)
+    exportAXIChannel(memAxi.w,  "w",  Seq("data", "strb", "last"),               dutDrives = true)
+    exportAXIChannel(memAxi.b,  "b",  Seq("id", "resp"),                         dutDrives = false)
+    exportAXIChannel(memAxi.ar, "ar", Seq("id", "addr", "len", "size", "burst"), dutDrives = true)
+    exportAXIChannel(memAxi.r,  "r",  Seq("id", "data", "resp", "last"),         dutDrives = false)
 
     // -- Logging
     val log = IO(new Bundle {
