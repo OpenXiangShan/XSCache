@@ -180,17 +180,17 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   }
 
   assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.asUInt.orR)) <= 1.U,
-    s"TSHR #${tshrId} multiple active meta writes on one cycle")
+    "TSHR @ %m multiple active meta writes on one cycle")
   assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.state)) <= 1.U, 
-    s"TSHR #${tshrId} multiple active write on meta.state")
+    "TSHR @ %m multiple active write on meta.state")
   assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.dirty)) <= 1.U, 
-    s"TSHR #${tshrId} multiple active write on meta.dirty")
+    "TSHR @ %m multiple active write on meta.dirty")
   assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.clients.asUInt.orR)) <= 1.U, 
-    s"TSHR #${tshrId} multiple active write on meta.clients")
+    "TSHR @ %m multiple active write on meta.clients")
   assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.asUInt.orR)) <= 1.U, 
-    s"TSHR #${tshrId} multiple active write on meta")
+    "TSHR @ %m multiple active write on meta")
 
-  assert(!(tshr_dealloc && meta_modified.asUInt.orR), s"TSHR #${tshrId} deallocated with un-committed modified meta")
+  assert(!(tshr_dealloc && meta_modified.asUInt.orR), "TSHR @ %m deallocated with un-committed modified meta")
 
   
   // TSHR Buffer
@@ -226,7 +226,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
     tshr_buffer_2 := io.fromDS.DATA(511, 256)
   }
 
-  assert(!(tshr_dealloc && tshr_buffer_modified), s"TSHR #${tshrId} deallocated with un-committed modified data")
+  assert(!(tshr_dealloc && tshr_buffer_modified), "TSHR @ %m deallocated with un-committed modified data")
 
   when (tshr_buffer_wen_UpRXDAT_0) { tshr_buffer_0 := io.UpRXDAT.bits.Data }
   when (tshr_buffer_wen_UpRXDAT_2) { tshr_buffer_2 := io.UpRXDAT.bits.Data }

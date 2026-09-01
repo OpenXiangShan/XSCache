@@ -287,9 +287,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // TODO: more state bits here
 
-  assert(!(rxreq_fire && w_snpresp0), s"RXREQ fired on valid 'w_snpresp0' in TSHR #${tshrId} REQ vPipe")
-  assert(!(rxreq_fire && w_snpresp2), s"RXREQ fired on valid 'w_snpresp2' in TSHR #${tshrId} REQ vPipe")
-  assert(!(rxreq_fire && s_snpcompack), s"RXREQ fired on valid 's_snpcompack' in TSHR #${tshrId} REQ vPipe")
+  assert(!(rxreq_fire && w_snpresp0), "RXREQ fired on valid 'w_snpresp0' in TSHR @ %m REQ vPipe")
+  assert(!(rxreq_fire && w_snpresp2), "RXREQ fired on valid 'w_snpresp2' in TSHR @ %m REQ vPipe")
+  assert(!(rxreq_fire && s_snpcompack), "RXREQ fired on valid 's_snpcompack' in TSHR @ %m REQ vPipe")
   // ----------------------------------------------------------------
 
   // -- State enchantment signals
@@ -463,7 +463,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.toPCreditPool.bits.pCrdType := p_retryack_pcrdtype
   io.toPCreditPool.bits.srcId := p_retryack_srcid
 
-  assert(!(io.fromPCreditPool && !w_dn_pcrdgrant), s"P-Credit granted on non-retry state in TSHR #${tshrId} REQ vPipe")
+  assert(!(io.fromPCreditPool && !w_dn_pcrdgrant), "P-Credit granted on non-retry state in TSHR @ %m REQ vPipe")
   // ----------------------------------------------------------------
 
   // -- Interactions with downstream CHI TXREQ channel
@@ -827,7 +827,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     w_rd_up_compack := false.B
   }
 
-  assert(!(up_rxrsp_compack && !w_rd_up_compack), s"Receiving upstream RXRSP CompAck on non-valid 'w_up_rd_compack' in TSHR #${tshrId} REQ vPipe")
+  assert(!(up_rxrsp_compack && !w_rd_up_compack), "Receiving upstream RXRSP CompAck on non-valid 'w_up_rd_compack' in TSHR @ %m REQ vPipe")
   // ----------------------------------------------------------------
 
   // -- Interactions with TSHR local meta

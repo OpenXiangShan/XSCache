@@ -306,37 +306,37 @@ class L2SnoopAgent(tshrId: Int)(implicit val p: Parameters) extends Module with 
 
   when (acceptSNP) {
     assert(!slotSNPValid,
-      s"L2SnoopAgent #${tshrId}: SNP slot accepted a new uop while occupied")
+      s"L2SnoopAgent @ %m: SNP slot accepted a new uop while occupied")
     assert(PopCount(uopBits(io.uopFromSNP.bits)) === 1.U,
-      s"L2SnoopAgent #${tshrId}: accepted invalid or multi-hot SNP uop")
+      s"L2SnoopAgent @ %m: accepted invalid or multi-hot SNP uop")
   }
   when (acceptREQ) {
     assert(!slotREQValid,
-      s"L2SnoopAgent #${tshrId}: REQ slot accepted a new uop while occupied")
+      s"L2SnoopAgent @ %m: REQ slot accepted a new uop while occupied")
     assert(PopCount(uopBits(io.uopFromREQ.bits)) === 1.U,
-      s"L2SnoopAgent #${tshrId}: accepted invalid or multi-hot REQ uop")
+      s"L2SnoopAgent @ %m: accepted invalid or multi-hot REQ uop")
   }
   when (startService) {
     assert(io.tshr_dirResult.state === L2Directory.MetaState.I ||
            io.tshr_dirResult.state === L2Directory.MetaState.S ||
            io.tshr_dirResult.state === L2Directory.MetaState.US ||
            io.tshr_dirResult.state === L2Directory.MetaState.UU,
-      s"L2SnoopAgent #${tshrId}: started service with illegal directory state")
+      s"L2SnoopAgent @ %m: started service with illegal directory state")
     assert(io.tshr_dirResult.hit || !startNeedSnoop,
-      s"L2SnoopAgent #${tshrId}: missed directory line requested an upstream snoop")
+      s"L2SnoopAgent @ %m: missed directory line requested an upstream snoop")
   }
 
   assert(!(rspMatch && datMatch),
-    s"L2SnoopAgent #${tshrId}: matched dataless and data response in the same cycle")
+    s"L2SnoopAgent @ %m: matched dataless and data response in the same cycle")
   assert(PopCount(Seq(serviceFromSNP, serviceFromREQ)) <= 1.U,
-    s"L2SnoopAgent #${tshrId}: service latched multiple sources")
+    s"L2SnoopAgent @ %m: service latched multiple sources")
   assert(!busy || PopCount(Seq(serviceFromSNP, serviceFromREQ)) === 1.U,
-    s"L2SnoopAgent #${tshrId}: service did not retain its source")
+    s"L2SnoopAgent @ %m: service did not retain its source")
   assert(!(datBeat2 && !seenData0),
-    s"L2SnoopAgent #${tshrId}: SnpRespData DataID 2 arrived before DataID 0")
+    s"L2SnoopAgent @ %m: SnpRespData DataID 2 arrived before DataID 0")
   assert(!(io.uopFromSNP.valid && !armedSNP && holdCountSNP >= 4.U),
-    s"L2SnoopAgent #${tshrId}: SNP uop input valid stayed high after acceptance; deassert before reusing the request")
+    s"L2SnoopAgent @ %m: SNP uop input valid stayed high after acceptance; deassert before reusing the request")
   assert(!(io.uopFromREQ.valid && !armedREQ && holdCountREQ >= 4.U),
-    s"L2SnoopAgent #${tshrId}: REQ uop input valid stayed high after acceptance; deassert before reusing the request")
+    s"L2SnoopAgent @ %m: REQ uop input valid stayed high after acceptance; deassert before reusing the request")
 
 }
