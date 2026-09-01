@@ -380,7 +380,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
                                     vPipeSNP.io.toSA.SnpToShared ||
                                     vPipeSNP.io.toSA.SnpToClean
   snoopAgent.io.uopFromSNP.bits := vPipeSNP.io.toSA
-  vPipeSNP.io.fromSA := snoopAgent.io.fromSA
+  vPipeSNP.io.fromSA := snoopAgent.io.fromSAForSNP
 
   // connections between REQ vPipe and Snoop Agent
   snoopAgent.io.uopFromREQ.valid := vPipeREQ.io.toSA.SnpMakeInvalid ||
@@ -388,7 +388,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
                                     vPipeREQ.io.toSA.SnpToShared ||
                                     vPipeREQ.io.toSA.SnpToClean
   snoopAgent.io.uopFromREQ.bits := vPipeREQ.io.toSA
-  vPipeREQ.io.fromSA := snoopAgent.io.fromSA
+  vPipeREQ.io.fromSA := snoopAgent.io.fromSAForREQ
 
   // connections between TSHR local / RX and Snoop Agent
   snoopAgent.io.tshr_paddr := tshr_paddr
