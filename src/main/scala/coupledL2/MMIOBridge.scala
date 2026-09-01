@@ -396,8 +396,8 @@ class MMIOBridgeImp(outer: MMIOBridge) extends LazyModuleImp(outer)
   }
   io.tx.req <> txreqArb.io.out
   // arb(entries.map(_.io.chi.tx.req), io.tx.req, Some("mmio_txreq"))
-  arb(entries.map(_.io.chi.tx.dat), io.tx.dat, Some("mmio_txdat"))
-  arb(entries.map(_.io.resp), bus.d, Some("mmio_channel_D"))
+  fastArb(entries.map(_.io.chi.tx.dat), io.tx.dat, Some("mmio_txdat"))
+  fastArb(entries.map(_.io.resp), bus.d, Some("mmio_channel_D"))
 
   bus.a.ready := Cat(readys).orR
 
