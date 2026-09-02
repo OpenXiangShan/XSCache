@@ -372,7 +372,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   val vPipeEVT = Module(new L2VPipeEVT(Seq(/*TODO: client devices*/), sliceNum, sliceIdx, tshrId, 0)) // TODO: nodeId
   val vPipeSNP = Module(new L2VPipeSNP(Seq(/*TODO: client devices*/), tshrId, 0)) // TODO: nodeId
   val vPipeREQ = Module(new L2VPipeREQ(Seq(/*TODO: client devices*/), sliceNum, sliceIdx, sliceNID, tshrId, 0)) // TODO: nodeId
-  val snoopAgent = Module(new L2SnoopAgent(tshrId))
+  val snoopAgent = Module(new L2SnoopAgent(tshrId, sliceNID))
 
   tshr_inactive_vpipe := vPipeEVT.io.free && vPipeSNP.io.free && vPipeREQ.io.free
 

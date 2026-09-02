@@ -82,7 +82,7 @@ object L2SnoopAgent {
   }
 }
 
-class L2SnoopAgent(tshrId: Int)(implicit val p: Parameters) extends Module with HasL2Params {
+class L2SnoopAgent(tshrId: Int, sliceNID: Int)(implicit val p: Parameters) extends Module with HasL2Params {
 
   val io = IO(new Bundle {
     val uopFromSNP = Flipped(Valid(new L2SnoopAgent.PathToSnoopAgent))
@@ -238,6 +238,7 @@ class L2SnoopAgent(tshrId: Int)(implicit val p: Parameters) extends Module with 
 
   io.txSnp.valid := state === sSnpReq
   io.txSnp.bits := 0.U.asTypeOf(new FlitSNP)
+  io.txSnp.bits.SrcID := sliceNID.U // RN echoes SrcID into SnpResp.TgtID; must be our slice NID for L2Top demux
   io.txSnp.bits.TxnID := tshrId.U
   io.txSnp.bits.Opcode := serviceOpcode
   io.txSnp.bits.Addr := servicePaddr >> 3
