@@ -65,7 +65,7 @@ class L2VPipeEVT(
   io.evtDataReadyOut := RegNext(io.UpRXDAT.valid &&
     io.UpRXDAT.bits.TxnID === pDbid &&
     io.UpRXDAT.bits.Opcode === CCHIOpcode.CopyBackWrData.U &&
-    io.UpRXDAT.bits.DataID === 2.U, false.B)
+    io.UpRXDAT.bits.DataID === 1.U, false.B) // upstream DataID: packed beat index {0,1}
 
   io.free := state === sIdle
 
@@ -85,7 +85,7 @@ class L2VPipeEVT(
       io.UpRXDAT.bits.TxnID === pDbid &&
       io.UpRXDAT.bits.Opcode === CCHIOpcode.CopyBackWrData.U
   val isBeat0 = copyBackWrDataMatch && io.UpRXDAT.bits.DataID === 0.U
-  val isBeat2 = copyBackWrDataMatch && io.UpRXDAT.bits.DataID === 2.U
+  val isBeat2 = copyBackWrDataMatch && io.UpRXDAT.bits.DataID === 1.U // upstream DataID: packed beat index {0,1}
   val evtDataReady = RegNext(isBeat2, false.B)
 
   when (state === sIdle && io.UpRXEVT.valid) {

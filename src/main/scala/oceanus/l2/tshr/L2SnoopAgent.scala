@@ -196,7 +196,8 @@ class L2SnoopAgent(tshrId: Int, sliceNID: Int)(implicit val p: Parameters) exten
       io.UpRXDAT.bits.Opcode === CCHIOpcode.SnpRespData.U
 
   val datBeat0 = datMatch && io.UpRXDAT.bits.DataID === 0.U
-  val datBeat2 = datMatch && io.UpRXDAT.bits.DataID === 2.U
+  // Upstream RXDAT DataID carries a packed beat index ({0,1} for the two 256-bit halves), not the CHI chunk index {0,2}
+  val datBeat2 = datMatch && io.UpRXDAT.bits.DataID === 1.U
 
   val done = rspMatch || datBeat2
   val directDone = startService && !startNeedSnoop
