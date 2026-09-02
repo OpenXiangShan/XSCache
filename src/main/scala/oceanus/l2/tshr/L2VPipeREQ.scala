@@ -221,6 +221,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val p_dbid = Reg(UInt(paramCHI.rspDBIDWidth.W))
   val p_homenid = Reg(UInt(paramCHI.nodeIdWidth.W))
 
+  val p_cbwrdata_meta = Reg(new L2Directory.Meta) 
+
   // ----------------------------------------------------------------
 
   // -- Interaction with Client Table
@@ -781,6 +783,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val issue_dn_evict_cbwrdata2 = w_s_evict_dn_cbwrdata2 && allow_dn_evict_cbwrdata2
 
   when (sched_dn_evict_cbwrdata) {
+    p_cbwrdata_meta := io.tshr_dirResult
     w_s_evict_dn_cbwrdata0 := true.B
     w_s_evict_dn_cbwrdata2 := true.B
   }
@@ -812,9 +815,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.DnTXDAT.bits.Opcode.get := CHI_CopyBackWrData.U
   io.DnTXDAT.bits.RespErr.get := 0.U // TODO: RespErr
   io.DnTXDAT.bits.Resp.get := Mux(
-    dirResult.state === MetaState.US || dirResult.state === MetaState.UU,
-    Mux(dirResult.dirty, CHIFieldResp.CopyBackWrData_UD_PD.U, CHIFieldResp.CopyBackWrData_UC.U),
-    Mux(dirResult.state === MetaState.S, CHIFieldResp.CopyBackWrData_SC.U, CHIFieldResp.CopyBackWrData_I.U)
+    p_cbwrdata_meta.state === MetaState.US || p_cbwrdata_meta.state === MetaState.UU,
+    Mux(p_cbwrdata_meta.dirty, CHIFieldResp.CopyBackWrData_UD_PD.U, CHIFieldResp.CopyBackWrData_UC.U),
+    Mux(p_cbwrdata_meta.state === MetaState.S, CHIFieldResp.CopyBackWrData_SC.U, CHIFieldResp.CopyBackWrData_I.U)
   )
   io.DnTXDAT.bits.FwdState(0.U)
   io.DnTXDAT.bits.CBusy.get := 0.U
@@ -826,7 +829,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.DnTXDAT.bits.TU.get := 0.U
   io.DnTXDAT.bits.TraceTag.get := 0.U // TODO: maybe wire with L2-L3 TraceTag
   io.DnTXDAT.bits.RSVDC.foreach(_ := 0.U)
-  io.DnTXDAT.bits.BE.get := Fill(paramCHI.datBEWidth, dirResult.state =/= MetaState.I)
+  io.DnTXDAT.bits.BE.get := Fill(paramCHI.datBEWidth, p_cbwrdata_meta.state =/= MetaState.I)
   io.DnTXDAT.bits.Data.get := DontCare
   io.DnTXDAT.bits.DataCheck.foreach(_ := DontCare)
   io.DnTXDAT.bits.Poison.foreach(_ := DontCare)
