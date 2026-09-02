@@ -148,6 +148,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val rxreq_readunique = rxreq_opcode.is(CCHIOpcode.ReadUnique)
   val rxreq_readshared = rxreq_opcode.is(CCHIOpcode.ReadShared)
+  val rxreq_makeunique = rxreq_opcode.is(CCHIOpcode.MakeUnique)
   val rxreq_evictback = rxreq_opcode.is(CCHIOpcode.EvictBack)
 
   def satisfied(opcode: CCHIOpcode, state: UInt): (Bool, Bool) = (
@@ -419,7 +420,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                     issue_txreq_evictback
 
   val sched_compack_txreq_rd = issue_txreq_readshared ||
-                               issue_txreq_readunique
+                               issue_txreq_readunique ||
+                               issue_txreq_makeunique
 
   val reissue_txreq = io.fromPCreditPool
 
@@ -523,9 +525,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  ReadShared          ReadNotSharedDirty    64B
   //  -  ReadUnique          ReadUnique            64B
   //                         MakeReadUnique        64B
+  //  -  MakeUnique          MakeUnique            64B
   val txreq_size = ParallelMux(Seq(
     (p_rxreq_readshared,      Size64B.U),
-    (p_rxreq_readunique,      Size64B.U)
+    (p_rxreq_readunique,      Size64B.U),
+    (p_rxreq_makeunique,      Size64B.U)
   ))
 
   // Field 'LikelyShared':
@@ -533,9 +537,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  ReadShared          ReadNotSharedDirty    0 (1 not utilized for now)
   //  -  ReadUnique          ReadUnique            0
   //                         MakeReadUnique        0
+  //  -  MakeUnique          MakeUnique            0
   val txreq_likelyshared = ParallelMux(Seq(
     (p_rxreq_readshared,      false.B),
-    (p_rxreq_readunique,      false.B)
+    (p_rxreq_readunique,      false.B),
+    (p_rxreq_makeunique,      false.B)
   ))
 
   // Field 'Order':
@@ -543,9 +549,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  ReadShared          ReadNotSharedDirty    0b00 (No Ordering)
   //  -  ReadUnique          ReadUnique            0b00 (No Ordering)
   //                         MakeReadUnique        0b00 (No Ordering)
+  //  -  MakeUnique          MakeUnique            0b00 (No Ordering)
   val txreq_order = ParallelMux(Seq(
     (p_rxreq_readshared,      NoOrdering.U),
-    (p_rxreq_readunique,      NoOrdering.U)
+    (p_rxreq_readunique,      NoOrdering.U),
+    (p_rxreq_makeunique,      NoOrdering.U)
   ))
 
   // Field 'MemAttr':
@@ -553,9 +561,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  ReadShared          ReadNotSharedDirty    Cacheable + EWA + Allocate
   //  -  ReadUnique          ReadUnique            Cacheable + EWA + Allocate
   //                         MakeReadUnique        Cacheable + EWA + Allocate
+  //  -  MakeUnique          MakeUnique            Cacheable + EWA
   val txreq_memattr = ParallelMux(Seq(
     (p_rxreq_readshared,      Cacheable.U | EWA.U | Allocate.U),
-    (p_rxreq_readunique,      Cacheable.U | EWA.U | Allocate.U)
+    (p_rxreq_readunique,      Cacheable.U | EWA.U | Allocate.U),
+    (p_rxreq_makeunique,      Cacheable.U | EWA.U)
   ))
 
   // Field 'SnpAttr':
@@ -563,9 +573,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  ReadShared          ReadNotSharedDirty    1
   //  -  ReadUnique          ReadUnique            1
   //                         MakeReadUnique        1
+  //  -  MakeUnique          MakeUnique            1
   val txreq_snpattr = ParallelMux(Seq(
     (p_rxreq_readshared,      true.B),
-    (p_rxreq_readunique,      true.B)
+    (p_rxreq_readunique,      true.B),
+    (p_rxreq_makeunique,      true.B)
   ))
 
   // Field 'ExpCompAck':
@@ -573,9 +585,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  ReadShared          ReadNotSharedDirty    1
   //  -  ReadUnique          ReadUnique            1
   //                         MakeReadUnique        1
+  //  -  MakeUnique          MakeUnique            1
   val txreq_expcompack = ParallelMux(Seq(
     (p_rxreq_readshared,      true.B),
-    (p_rxreq_readunique,      true.B)
+    (p_rxreq_readunique,      true.B),
+    (p_rxreq_makeunique,      true.B)
   ))
 
   io.DnTXREQ.valid := s_dn_txreq
@@ -623,6 +637,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val dn_rxrsp_respsepdata = dn_rxrsp_opcode.is(CHI_RespSepData)
   val dn_rxrsp_compdbidresp = dn_rxrsp_opcode.is(CHI_CompDBIDResp)
 
+  // ReadShared/ReadUnique expects a downstream Comp or CompData / DataSepResp + RespSepData
   val expect_dn_rd_comp_and_data = rxreq_unsatisfied_readshared ||
                                    rxreq_unsatisfied_readunique
 
@@ -821,9 +836,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val up_rxrsp_compack = up_rxrsp_opcode.is(CCHIOpcode.CompAck)
 
   val expect_up_rd_compack_sat = rxreq_satisfied_readunique ||
-                                 rxreq_satisfied_readshared
+                                 rxreq_satisfied_readshared ||
+                                 rxreq_satisfied_makeunique
 
-  val expect_up_rd_compack_unsat = (p_rxreq_readunique || p_rxreq_readshared) &&
+  val expect_up_rd_compack_unsat = (p_rxreq_readunique || p_rxreq_readshared || p_rxreq_makeunique) &&
                                    (dn_rxrsp_comp || dn_rxdat_compdata_first || dn_rxrsp_respsepdata)
 
   val expect_up_rd_compack = expect_up_rd_compack_sat || expect_up_rd_compack_unsat
@@ -842,6 +858,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // ----------------------------------------------------------------
 
   // -- Interactions with TSHR local meta
+  val dn_rxrsp_comp_UD_PD = dn_rxrsp_comp && io.DnRXRSP.bits.Resp.get === CHIFieldResp.Comp_UD_PD.U
+
   val dn_rxdat_compdata_first_UC = dn_rxdat_compdata_first && io.DnRXDAT.bits.Resp.get === CHIFieldResp.CompData_UC.U
   val dn_rxdat_compdata_first_UD_PD = dn_rxdat_compdata_first && io.DnRXDAT.bits.Resp.get === CHIFieldResp.CompData_UD_PD.U
   val dn_rxdat_compdata_first_SC = dn_rxdat_compdata_first && io.DnRXDAT.bits.Resp.get === CHIFieldResp.CompData_SC.U
@@ -849,6 +867,25 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val dn_rxdat_datasepresp_first_UC = dn_rxdat_datasepresp_first && io.DnRXDAT.bits.Resp.get === CHIFieldResp.DataSepResp_UC.U
   val dn_rxdat_datasepresp_first_UD_PD = dn_rxdat_datasepresp_first && io.DnRXDAT.bits.Resp.get === CHIFieldResp.DataSepResp_UD_PD.U
   val dn_rxdat_datasepresp_first_SC = dn_rxdat_datasepresp_first && io.DnRXDAT.bits.Resp.get === CHIFieldResp.DataSepResp_SC.U
+
+  // - MakeUnique related meta/tag updates
+  val meta_wr_state_makeunique_UU_sat = active && p_rxreq_makeunique &&
+                                        sa_resp_decision &&
+                                        dirResult.state === MetaState.US
+
+  val meta_wr_state_makeunique_UU_unsat = active && p_rxreq_makeunique &&
+                                          dn_rxrsp_comp
+
+  val meta_wr_state_makeunique_UU = meta_wr_state_makeunique_UU_sat || meta_wr_state_makeunique_UU_unsat
+
+  val meta_wr_dirty_makeunique_set = active && p_rxreq_makeunique &&
+                                     dn_rxrsp_comp
+
+  val meta_wr_client_makeunique_set = active && p_rxreq_makeunique &&
+                                      up_rxrsp_compack
+
+  val tag_wr_makeunique = rxreq_makeunique && !dirResult.hit
+  // --------------------------------
 
   // - ReadUnique related meta/tag updates
   val meta_wr_state_readunique_UU_sat = active && p_rxreq_readunique &&
@@ -862,7 +899,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                             dn_rxdat_compdata_first_UD_PD ||
                                             dn_rxdat_datasepresp_first_UC ||
                                             dn_rxdat_datasepresp_first_UD_PD
-                                          ) && */ (dn_rxdat_compdata_first || dn_rxdat_datasepresp_first)
+                                          ) && */ (dn_rxdat_compdata_first || dn_rxdat_datasepresp_first || dn_rxrsp_comp)
 
   assert(!(meta_wr_state_readunique_UU_unsat && dn_rxdat_compdata_first && !dn_rxdat_compdata_first_UC && !dn_rxdat_compdata_first_UD_PD),
     "The subsequent of upstream ReadUnique received CompData with unexpected Resp from downstream (expecting UC, UD_PD)")
@@ -872,7 +909,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val meta_wr_state_readunique_UU = meta_wr_state_readunique_UU_sat || meta_wr_state_readunique_UU_unsat
 
   val meta_wr_dirty_readunique_set = active && p_rxreq_readunique &&
-                                     (dn_rxdat_compdata_first_UD_PD || dn_rxdat_datasepresp_first_UD_PD)
+                                     (dn_rxdat_compdata_first_UD_PD || dn_rxdat_datasepresp_first_UD_PD || dn_rxrsp_comp_UD_PD)
 
   val meta_wr_client_readunique_set = active && p_rxreq_readunique &&
                                       up_rxrsp_compack
@@ -942,7 +979,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // --------------------------------
 
   val meta_wr_state_UU = meta_wr_state_readunique_UU ||
-                         meta_wr_state_readshared_UU
+                         meta_wr_state_readshared_UU ||
+                         meta_wr_state_makeunique_UU
 
   val meta_wr_state_US = meta_wr_state_readshared_US
 
@@ -953,21 +991,25 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val meta_wr_state = meta_wr_state_UU || meta_wr_state_US || meta_wr_state_S || meta_wr_state_I
 
   val meta_wr_dirty_set = meta_wr_dirty_sa_set ||
-                          meta_wr_dirty_readunique_set
+                          meta_wr_dirty_readunique_set ||
+                          meta_wr_dirty_readshared_set ||
+                          meta_wr_dirty_makeunique_set
 
   val meta_wr_dirty_clr = meta_wr_dirty_evictback_clr
 
   val meta_wr_dirty = meta_wr_dirty_set || meta_wr_dirty_clr
 
   val meta_wr_client_set = meta_wr_client_readunique_set ||
-                           meta_wr_client_readshared_set
+                           meta_wr_client_readshared_set ||
+                           meta_wr_client_makeunique_set
 
   val meta_wr_client_clr = false.B
 
   val meta_wr_client = meta_wr_client_set || meta_wr_client_clr
 
   val tag_wr = tag_wr_readunique ||
-               tag_wr_readshared
+               tag_wr_readshared ||
+               tag_wr_makeunique
 
   io.tshr_tag_write_en := tag_wr
 
@@ -1193,7 +1235,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val expect_replace = !dirResult.hit && (
                            rxreq_readunique ||
-                           rxreq_readshared)
+                           rxreq_readshared ||
+                           rxreq_makeunique)
 
   val trigger_replace = w_s_repl &&
                         (dn_rxdat_compdata_first || dn_rxdat_datasepresp_first)
