@@ -90,6 +90,8 @@ object XSCache extends HasChisel with $file.common.XSCacheModule {
 
   override def millSourcePath = millOuterCtx.millSourcePath
 
+  override def moduleDeps = super.moduleDeps ++ Seq(zhujiangCompat)
+
   def rocketModule: ScalaModule = rocketchip
 
   def utilityModule: ScalaModule = utility
