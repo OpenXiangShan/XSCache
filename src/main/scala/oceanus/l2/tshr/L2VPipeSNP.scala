@@ -33,7 +33,10 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
     val fromSA = Input(new L2SnoopAgent.PathFromSnoopAgent)
 
     val ds_read_en = Output(Bool())
-    val ds_read_done = Input(Bool()) 
+    val ds_read_done = Input(Bool())
+    val tbuf_modified = Input(Bool()) // TSHR buffer holds data written by a non-DS source (RXDAT)
+    val tbuf_half0_ready = Input(Bool()) // TSHR buffer half (DataID 0) holds valid data
+    val tbuf_half2_ready = Input(Bool()) // TSHR buffer half (DataID 2) holds valid data
 
     val blockRBE = Output(new L2RBE.PathVPipeBlock)
     val free = Output(Bool())
@@ -237,9 +240,11 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
   // we can decide rxsnp_need_local_ds_read at enter because:
   // io.tshr_dirResult.dirty 0->1: dirty data come from upstream and stay in tshr buffer
   // io.tshr_dirResult.dirty 1->0: impossible
+  // io.tbuf_modified: TSHR buffer was modified by a non-DS source (RXDAT); the DS slot is
+  // stale until the pending DSBufWb commits, so no DS read may be issued in this window
   val enter_need_local_ds_read = io.DnRXSNP.fire && !io.ds_read_done && io.tshr_dirResult.state =/= L2Directory.MetaState.I &&
                                  (rxsnp_fwd || (!rxsnp_fwd && (io.DnRXSNP.bits.RetToSrc.get.asBool || io.tshr_dirResult.dirty))) && 
-                                 !rxsnp_do_not_read_ds
+                                 !rxsnp_do_not_read_ds && !io.tbuf_modified
   val enter_need_meta_write = io.DnRXSNP.fire && (meta_write_shared || meta_write_invalid || rxsnp_snpCleanShared)
   val need_home_txdat = io.tshr_dirResult.state =/= L2Directory.MetaState.I && !rxsnp_do_not_send_home_data && 
                         (p_rxsnp.RetToSrc.get.asBool || dirty_or_passdirty)
@@ -424,7 +429,10 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
   io.DnTXRSP.bits.TagOp.foreach(_ := 0.U)
   io.DnTXRSP.bits.TraceTag.get := p_rxsnp.TraceTag.get
 
-  io.DnTXDAT.valid := p_home_txdat_valid || p_dct_txdat_valid
+  // When the TSHR buffer is the data source (buffer modified by RXDAT, DS read
+  // suppressed), each SNP data beat is blocked until its buffer half is ready.
+  val txdat_beat_ready = Mux(p_txdat_dataID === 0.U, io.tbuf_half0_ready, io.tbuf_half2_ready)
+  io.DnTXDAT.valid := (p_home_txdat_valid || p_dct_txdat_valid) && (!io.tbuf_modified || txdat_beat_ready)
   io.DnTXDAT.bits := DontCare
   io.DnTXDAT.bits.QoS.get := p_rxsnp.QoS.get
   io.DnTXDAT.bits.TgtID.get := Mux(p_dct_txdat_valid, p_rxsnp.FwdNID.get, p_rxsnp.SrcID.get)
@@ -761,6 +769,8 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: 
            !rxsnp_do_not_read_ds,
       "TSHR @ %m SNP vPipe issued an unnecessary or already-completed DS read")
   }
+  assert(!(io.ds_read_en && io.tbuf_modified),
+    "TSHR @ %m SNP vPipe issued DS read while TSHR buffer holds non-DS-source (RXDAT) data")
   assert(!(io.DnTXRSP.valid || io.DnTXDAT.valid) || io.blockRBE.EVT,
     "TSHR @ %m SNP vPipe did not block EVT while owning a downstream response")
   assert(!(io.EVT_active && io.blockRBE.EVT),
