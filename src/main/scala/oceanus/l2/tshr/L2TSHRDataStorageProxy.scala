@@ -59,6 +59,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
     val toDS = Output(new L2DataStorage.PathTSHRToDataStorage)
     val fromDS = Input(new L2DataStorage.PathDataStorageToTSHR)
 
+    val tshr_valid = Input(Bool())
     val tshr_paddr = Input(UInt(48.W)) // TODO: parameterize with L2 physical address width
 
     val meta_valid = Input(Bool())
@@ -471,7 +472,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
     }.elsewhen (tbuf_valid_wen_last) {
       // 2. [] -> DSWrite_PreArb
       state_dsWrite_next.PreArb := true.B
-    }.elsewhen (tshr_inactive && !tbuf_valid_modified) {
+    }.elsewhen (io.tshr_valid && tshr_inactive && !tbuf_valid_modified) {
       // 3. [] -> DSWrite_Done
       state_dsWrite_next.Done := true.B
     }

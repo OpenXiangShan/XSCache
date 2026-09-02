@@ -353,7 +353,8 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   rbeSNP.io.directoryReadNeed := true.B
   rbeREQ.io.directoryReadNeed := true.B
 
-  tshr_inactive_rbe := !rbeEVT.io.valid && !rbeSNP.io.valid && !rbeREQ.io.valid
+  tshr_inactive_rbe := !rbeEVT.io.valid && !rbeSNP.io.valid && !rbeREQ.io.valid &&
+                       !rbeEVT.io.in.valid && !rbeSNP.io.in.valid && !rbeREQ.io.in.valid
 
 
   // Post RBE Data Storage Read Decision
@@ -499,6 +500,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   io.toDir := proxyDir.io.toDir
   proxyDir.io.fromDir := io.fromDir
 
+  proxyDir.io.tshr_valid := tshr_valid
   proxyDir.io.tshr_paddr := tshr_paddr
 
   proxyDir.io.tshr_alloc := tshr_alloc
@@ -539,6 +541,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   io.toDS := proxyDS.io.toDS
   proxyDS.io.fromDS := io.fromDS
 
+  proxyDS.io.tshr_valid := tshr_valid
   proxyDS.io.tshr_paddr := tshr_paddr
 
   proxyDS.io.meta_valid := meta_valid

@@ -57,6 +57,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
     val toDir = Output(new L2Directory.PathToDirectory)
     val fromDir = Input(new L2Directory.PathFromDirectory)
 
+    val tshr_valid = Input(Bool())
     val tshr_paddr = Input(UInt(paramL2.physicalAddrWidth.W))
 
     val tshr_alloc = Input(Bool())
@@ -285,7 +286,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       }.elsewhen (io.meta_modified.any || io.tag_modified || io.wb_aux) {
         // 2. [] -> DirWrite_PreArb
         state_dirWrite_next.PreArb := true.B
-      }.elsewhen (tshr_inactive) {
+      }.elsewhen (io.tshr_valid && tshr_inactive) {
         // 3. [] -> DirWrite_Done
         state_dirWrite_next.Done := true.B
       }
@@ -328,7 +329,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       when (io.wb_cancel) {
         // 1. [] -> DirWrite_Done
         state_dirWrite_next.Done := true.B
-      }.elsewhen (tshr_inactive || io.wb_aux) {
+      }.elsewhen (io.tshr_valid && (tshr_inactive || io.wb_aux)) {
         when (io.meta_modified.any || io.tag_modified || io.wb_aux) {
         // 2. [] -> DirWrite_PreArb
         state_dirWrite_next.PreArb := true.B
