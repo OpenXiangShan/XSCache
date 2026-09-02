@@ -270,7 +270,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val w_s_repl = RegInit(false.B) // Waiting to schedule Directory Replacer Read
   val s_repl = RegInit(false.B) // Scheduling Directory Replacer Read
 
-  val s_evict = RegInit(false.B) // Scheduling local eviction RXREQ EvictBack
+  val w_s_evict_up_evict = RegInit(false.B) // Waiting to schedule local eviction RXREQ EvictBack
+  val s_evict_up_evict = RegInit(false.B) // Scheduling local eviction RXREQ EvictBack
 
   val w_evict_s_dn_txreq = RegInit(false.B) // Waiting to schedule downstream TXREQ of EvictBack subsequence
 
@@ -302,7 +303,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                w_s_rd_up_compdata0 || s_rd_up_compdata0 || w_s_rd_up_compdata2 || s_rd_up_compdata2 ||
                w_s_rd_up_comp || s_rd_up_comp ||
                w_unlock_dir || w_unlock_ds ||
-               w_s_repl || s_repl || s_evict ||
+               w_s_repl || s_repl || w_s_evict_up_evict || s_evict_up_evict ||
                w_evict_s_dn_txreq ||
                w_evict_dn_comp || w_evict_dn_compdbid ||
                w_s_evict_dn_cbwrdata0 || w_s_evict_dn_cbwrdata2 ||
@@ -1098,6 +1099,14 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                          dn_rd_decided && 
                          !w_rd_dn_comp
 
+  val sched_up_rd_comp_makeunique_sat = rxreq_satisfied_makeunique
+
+  val sched_up_rd_comp_makeunique_unsat = p_rxreq_makeunique &&
+                                          dn_rxrsp_comp
+
+  val sched_up_rd_comp_makeunique = sched_up_rd_comp_makeunique_sat ||
+                                    sched_up_rd_comp_makeunique_unsat
+
   val sched_up_rd_comp_readunique_sat = rxreq_satisfied_readunique &&
                                         rxreq_client_present && !rxreq.ExpCompData
 
@@ -1108,7 +1117,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val sched_up_rd_comp_readunique = sched_up_rd_comp_readunique_sat ||
                                     sched_up_rd_comp_readunique_unsat
 
-  val sched_up_rd_comp = sched_up_rd_comp_readunique
+  val sched_up_rd_comp = sched_up_rd_comp_readunique ||
+                         sched_up_rd_comp_makeunique
 
   when (sched_up_rd_comp) {
     w_s_rd_up_comp := true.B
@@ -1239,10 +1249,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                            rxreq_makeunique)
 
   val trigger_replace = w_s_repl &&
-                        (dn_rxdat_compdata_first || dn_rxdat_datasepresp_first)
+                        (dn_rxrsp_comp || dn_rxdat_compdata_first || dn_rxdat_datasepresp_first)
 
   when (expect_replace) {
     w_s_repl := true.B
+    w_s_evict_up_evict := true.B
   }
 
   when (trigger_replace) {
@@ -1252,11 +1263,14 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   when (io.repl_done) {
     s_repl := false.B
-    s_evict := true.B
+    when (w_s_evict_up_evict) {
+      w_s_evict_up_evict := false.B
+      s_evict_up_evict := true.B
+    }
   }
 
   when (txreq_evictback_peer) {
-    s_evict := false.B
+    s_evict_up_evict := false.B
   }
 
   val lock_dir = expect_replace || rxreq_unsatisfied_evictback
@@ -1296,7 +1310,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // Activate Directory write-back immediately on replacement Directory lock released by eviction
   // to clear the replacer reading lock in Directory
   io.dir_wb_aux := unlock_dir
-  io.UpTXREQ.valid := s_evict
+  io.UpTXREQ.valid := s_evict_up_evict
   io.UpTXREQ.bits.TxnID := getUpTxnID
   io.UpTXREQ.bits.SrcID := sliceNID.U
   io.UpTXREQ.bits.TgtID := nodeId.U
