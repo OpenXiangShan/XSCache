@@ -1264,11 +1264,20 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     s_repl := true.B
   }
 
+  // If the replacer picked an INVALID way whose stale tag aliases this very request (the line
+  // was filled earlier, then invalidated leaving its tag behind), the looped-back EvictBack
+  // would paddr-hit this originator entry itself: alloc is blocked (!paddr_hit_any), the
+  // EvictBack is forced onto the reuse path of THIS busy vPipe, never enters, and the dir/ds
+  // unlocks never fire -- a circular wait inside one entry. The aliasing itself proves the
+  // victim way is invalid (a valid way holding this tag would have hit the directory), so no
+  // eviction is needed: skip the upstream EvictBack and unlock dir/ds locally.
+  val evict_self_alias = io.repl_resp.paddr === io.tshr_paddr
+
   when (io.repl_done) {
     s_repl := false.B
     when (w_s_evict_up_evict) {
       w_s_evict_up_evict := false.B
-      s_evict_up_evict := true.B
+      s_evict_up_evict := !evict_self_alias
     }
   }
 
@@ -1280,9 +1289,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val lock_ds = expect_replace || rxreq_unsatisfied_evictback
 
   val unlock_self_evictback = RegNext(meta_wr_state_evictback_I) && !meta_wr_state_evictback_I
+  val unlock_self_alias = io.repl_done && w_s_evict_up_evict && evict_self_alias
 
-  val unlock_dir = io.self_unlock_dir || unlock_self_evictback
-  val unlock_ds = io.self_unlock_ds || unlock_self_evictback
+  val unlock_dir = io.self_unlock_dir || unlock_self_evictback || unlock_self_alias
+  val unlock_ds = io.self_unlock_ds || unlock_self_evictback || unlock_self_alias
 
   when (lock_dir) {
     w_unlock_dir := true.B
