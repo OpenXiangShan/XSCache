@@ -101,7 +101,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val dirResult = io.tshr_dirResult
   
-  val configEnableMakeReadUnique = true
+  val configEnableMakeReadUnique = false
   val configInclusiveReadOnce = true
 
   // Whether, for a L1 ReadShared, the returning permission was promoted from Shared to Unique
@@ -626,6 +626,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val expect_dn_rd_comp_and_data = rxreq_unsatisfied_readshared ||
                                    rxreq_unsatisfied_readunique
 
+  // MakeUnique expects a dataless downstream Comp only (no data beats will follow)
+  val expect_dn_rd_comp_only = rxreq_unsatisfied_makeunique
+
   val expect_dn_evict_comp = fire_txreq_evict
   val expect_dn_evict_compdbid = fire_txreq_writebackfull ||
                                  fire_txreq_writeevictfull ||
@@ -639,6 +642,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   when (expect_dn_rd_comp_and_data) {
     w_rd_dn_data0 := true.B
     w_rd_dn_data2 := true.B
+    w_rd_dn_comp := true.B
+  }
+
+  when (expect_dn_rd_comp_only) {
     w_rd_dn_comp := true.B
   }
 
@@ -830,6 +837,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   }
 
   assert(!(up_rxrsp_compack && !w_rd_up_compack), "Receiving upstream RXRSP CompAck on non-valid 'w_up_rd_compack' in TSHR @ %m REQ vPipe")
+  assert(!(dn_rxrsp_comp && !(w_rd_dn_comp || w_evict_dn_comp || w_evict_dn_compdbid)),
+    "TSHR @ %m REQ vPipe received downstream Comp on non-valid expectation")
   // ----------------------------------------------------------------
 
   // -- Interactions with TSHR local meta
