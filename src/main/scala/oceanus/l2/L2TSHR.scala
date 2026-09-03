@@ -142,7 +142,9 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
 
   val meta_drop = Wire(Bool()) // modified meta drop by REQ L2 eviction
 
+  val meta_modify = WireInit(false.B)
   val meta_modified = RegInit(L2Directory.MetaWriteMask.empty)
+  val tag_modify = WireInit(false.B)
   val tag_modified = RegInit(false.B)
 
   val meta_write_EVT_meta = Wire(new L2Directory.Meta)
@@ -157,7 +159,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
 
   val meta_commit_valid = Wire(Bool())
 
-  when (meta_commit_valid || meta_drop) {
+  when (meta_commit_valid) {
     meta_modified := L2Directory.MetaWriteMask.empty
     tag_modified := false.B
   }
@@ -177,6 +179,8 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   meta_write_SNP_mask.maskAndWrite(meta, meta_modified, meta_write_SNP_meta)
   meta_write_REQ_mask.maskAndWrite(meta, meta_modified, meta_write_REQ_meta)
 
+  meta_modify := meta_write_EVT_mask.asUInt.orR || meta_write_SNP_mask.asUInt.orR || meta_write_REQ_mask.asUInt.orR
+
   // Keep meta.hit in sync with allocating pipe writes: once any vPipe writes a
   // non-Invalid state, the directory tracks this line (committed via DirWb), so
   // meta.hit must no longer report the stale miss of the original DirRdResp.
@@ -190,7 +194,15 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   }
 
   when (tag_write_REQ_mask) {
+    tag_modify := true.B
     tag_modified := true.B
+  }
+
+  when (meta_drop) {
+    meta_modify := false.B
+    meta_modified := L2Directory.MetaWriteMask.empty
+    tag_modify := false.B
+    tag_modified := false.B
   }
 
   assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.asUInt.orR)) <= 1.U,
@@ -269,7 +281,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
       tshr_buffer_wen_last := true.B
     }.otherwise {
       tshr_buffer_halfWritten_0_q := true.B
-      tshr_buffer_fullModified_q := false.B // TODO: Add comments here
+      tshr_buffer_fullModified_q := false.B
     }
   }
 
@@ -530,7 +542,9 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
 
   proxyDir.io.meta := meta
   proxyDir.io.meta_way := meta.way
+  proxyDir.io.meta_modify := meta_modify
   proxyDir.io.meta_modified := meta_modified
+  proxyDir.io.tag_modify := tag_modify
   proxyDir.io.tag_modified := tag_modified
 
   rbeEVT.io.directoryReadDone := proxyDir.io.rd_done
