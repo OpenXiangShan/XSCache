@@ -303,11 +303,15 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       1. 
       */
       when (fromDir_DirWbArbComp) {
-        // 1. DirWrite_PreArb -> DirWrite_Done
-        state_dirWrite_next.PreArb := false.B
-        state_dirWrite_next.Done := true.B
+        when (wb_trigger) {
+          // 1. DirWrite_PreArb -> DirWrite_PreArb
+        }.otherwise {
+          // 2. DirWrite_PreArb -> DirWrite_Done
+          state_dirWrite_next.PreArb := false.B
+          state_dirWrite_next.Done := true.B
+        }
       }.elsewhen (io.wb_cancel) {
-        // 2. DirWrite_PreArb -> DirWrite_Done
+        // 3. DirWrite_PreArb -> DirWrite_Done
         state_dirWrite_next.PreArb := false.B
         state_dirWrite_next.Done := true.B
       }
@@ -354,11 +358,15 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
         // 1. DirWrite_PreArb -> []
         state_dirWrite_next.PreArb := false.B
       }.elsewhen (fromDir_DirWbArbComp) {
-        // 2. DirWrite_PreArb -> DirWrite_Done
-        state_dirWrite_next.PreArb := false.B
-        state_dirWrite_next.Done := true.B
+        when (wb_trigger) {
+          // 2. DirWrite_PreArb -> DirWrite_PreArb
+        }.otherwise {
+          // 3. DirWrite_PreArb -> DirWrite_Done
+          state_dirWrite_next.PreArb := false.B
+          state_dirWrite_next.Done := true.B
+        }
       }.elsewhen (io.wb_cancel) {
-        // 3. DirWrite_PreArb -> DirWrite_Done
+        // 4. DirWrite_PreArb -> DirWrite_Done
         state_dirWrite_next.PreArb := false.B
         state_dirWrite_next.Done := true.B
       }
