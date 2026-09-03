@@ -177,6 +177,18 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   meta_write_SNP_mask.maskAndWrite(meta, meta_modified, meta_write_SNP_meta)
   meta_write_REQ_mask.maskAndWrite(meta, meta_modified, meta_write_REQ_meta)
 
+  // Keep meta.hit in sync with allocating pipe writes: once any vPipe writes a
+  // non-Invalid state, the directory tracks this line (committed via DirWb), so
+  // meta.hit must no longer report the stale miss of the original DirRdResp.
+  val meta_write_allocates =
+    (meta_write_REQ_mask.state && meta_write_REQ_meta.state =/= L2Directory.MetaState.I) ||
+    (meta_write_SNP_mask.state && meta_write_SNP_meta.state =/= L2Directory.MetaState.I) ||
+    (meta_write_EVT_mask.state && meta_write_EVT_meta.state =/= L2Directory.MetaState.I)
+
+  when (meta_write_allocates) {
+    meta.hit := true.B
+  }
+
   when (tag_write_REQ_mask) {
     tag_modified := true.B
   }
@@ -193,6 +205,9 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
     "TSHR @ %m multiple active write on meta")
 
   assert(!(tshr_dealloc && meta_modified.asUInt.orR), "TSHR @ %m deallocated with un-committed modified meta")
+
+  assert(!(meta.state =/= L2Directory.MetaState.I && !meta.hit),
+    "TSHR @ %m tracked state with stale miss hit-flag")
 
   
   // TSHR Buffer
