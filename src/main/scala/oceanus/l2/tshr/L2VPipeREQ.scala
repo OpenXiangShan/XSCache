@@ -59,6 +59,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     val tshr_meta_write_en = Output(new L2Directory.MetaWriteMask)
     val tshr_meta_write_meta = Output(new L2Directory.Meta)
 
+    val tbuf_modified = Input(Bool())
+    val tbuf_data0_valid = Input(Bool())
+    val tbuf_data2_valid = Input(Bool())
+
     val toSA = Output(new L2SnoopAgent.PathToSnoopAgent)
     val fromSA = Input(new L2SnoopAgent.PathFromSnoopAgent)
 
@@ -774,8 +778,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val dn_txdat_cbwrdata0 = io.DnTXDAT.fire && io.DnTXDAT.bits.Opcode.get === CHI_CopyBackWrData.U && io.DnTXDAT.bits.DataID.get === 0.U
   val dn_txdat_cbwrdata2 = io.DnTXDAT.fire && io.DnTXDAT.bits.Opcode.get === CHI_CopyBackWrData.U && io.DnTXDAT.bits.DataID.get === 2.U
 
-  val allow_dn_evict_cbwrdata0 = !w_snpresp0 && !w_ds_resp
-  val allow_dn_evict_cbwrdata2 = !w_snpresp2 && !w_ds_resp
+  val allow_dn_evict_cbwrdata0 = !w_snpresp0 && !w_ds_resp && io.tbuf_data0_valid
+  val allow_dn_evict_cbwrdata2 = !w_snpresp2 && !w_ds_resp && io.tbuf_data2_valid
 
   val sched_dn_evict_cbwrdata = w_evict_dn_compdbid && dn_rxrsp_compdbidresp
 
@@ -1167,8 +1171,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val up_txdat_compdata0 = io.UpTXDAT.fire && io.UpTXDAT.bits.Opcode === CCHIOpcode.CompData.U && io.UpTXDAT.bits.DataID === 0.U
   val up_txdat_compdata2 = io.UpTXDAT.fire && io.UpTXDAT.bits.Opcode === CCHIOpcode.CompData.U && io.UpTXDAT.bits.DataID === 1.U
 
-  val allow_up_rd_compdata0 = !w_ds_resp && !w_snpresp0 && !w_rd_dn_data0 && !io.L1EVT_active
-  val allow_up_rd_compdata2 = !w_ds_resp && !w_snpresp2 && !w_rd_dn_data2 && !io.L1EVT_active
+  val allow_up_rd_compdata0 = !w_ds_resp && !w_snpresp0 && !w_rd_dn_data0 && !io.L1EVT_active && io.tbuf_data0_valid
+  val allow_up_rd_compdata2 = !w_ds_resp && !w_snpresp2 && !w_rd_dn_data2 && !io.L1EVT_active && io.tbuf_data2_valid
 
   val sched_up_rd_compdata_sat_readunique = rxreq_satisfied_readunique && 
                                             (!rxreq_client_present || rxreq.ExpCompData)
