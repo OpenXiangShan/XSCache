@@ -1321,8 +1321,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // Clean local Meta (to Directory) and TSHR Buffer (to Data Storage) modified state and 
   // cancel all non-arbitered Directory & Data Storage write back for L2 Eviction
-  io.dir_wb_cancel := meta_wr_state_evictback_I
-  io.ds_wb_cancel := s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2 || s_evict_dn_compack
+  io.dir_wb_cancel := rxreq_satisfied_evictback || 
+                      meta_wr_state_evictback_I
+
+  io.ds_wb_cancel := rxreq_satisfied_evictback || 
+                     w_evict_dn_comp || w_evict_dn_compdbid ||
+                     s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2 || s_evict_dn_compack
 
   // Activate Directory write-back immediately on replacement Directory lock released by eviction
   // to clear the replacer reading lock in Directory
