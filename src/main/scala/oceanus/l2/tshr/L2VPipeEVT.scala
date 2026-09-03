@@ -13,15 +13,16 @@ import org.chipsalliance.cde.config.Parameters
 class L2VPipeEVT(
     clientComponents: Seq[CCHIComponent],
     val sliceNum: Int = 0,
-    val sliceId: Int = 0,
-    val tshrId: Int = 0,
-    nodeId: Int = 0
+    val sliceIdx: Int = 0,
+    val sliceNID: Int = 0,
+    val tshrId: Int = 0
 )(implicit val p: Parameters)
     extends Module
     with HasL2Params
     with CHIRNFOpcodesREQ
     with CHIRNFOpcodesRSP
-    with CHIRNFOpcodesDAT {
+    with CHIRNFOpcodesDAT
+    with L2TSHRLocatable {
 
   val io = IO(new Bundle {
     val UpRXEVT = Flipped(Valid(new FlitEVT))
@@ -52,18 +53,18 @@ class L2VPipeEVT(
   val state = RegInit(sIdle)
 
   val pIsWbFull = RegInit(false.B)
+  val pSrcId = Reg(UInt(8.W))
   val pTxnId = Reg(UInt(8.W))
   val pTraceTag = Reg(UInt(1.W))
   val pReqWay = Reg(UInt(4.W))
   val pMissMeta = Reg(new L2Directory.MetaReadResult)
-  val pDbid = Reg(UInt(8.W))
   val dataArmed = RegInit(false.B)
   val dirHit = RegInit(false.B)
   val inflightEvict = RegInit(false.B)
 
   io.EVT_active := inflightEvict
   io.evtDataReadyOut := RegNext(io.UpRXDAT.valid &&
-    io.UpRXDAT.bits.TxnID === pDbid &&
+    io.UpRXDAT.bits.TxnID === getUpTxnID &&
     io.UpRXDAT.bits.Opcode === CCHIOpcode.CopyBackWrData.U &&
     io.UpRXDAT.bits.DataID === 1.U, false.B) // upstream DataID: packed beat index {0,1}
 
@@ -82,7 +83,7 @@ class L2VPipeEVT(
   val copyBackWrDataMatch =
     dataArmed &&
       io.UpRXDAT.valid &&
-      io.UpRXDAT.bits.TxnID === pDbid &&
+      io.UpRXDAT.bits.TxnID === getUpTxnID &&
       io.UpRXDAT.bits.Opcode === CCHIOpcode.CopyBackWrData.U
   val isBeat0 = copyBackWrDataMatch && io.UpRXDAT.bits.DataID === 0.U
   val isBeat2 = copyBackWrDataMatch && io.UpRXDAT.bits.DataID === 1.U // upstream DataID: packed beat index {0,1}
@@ -91,8 +92,8 @@ class L2VPipeEVT(
   when (state === sIdle && io.UpRXEVT.valid) {
     pIsWbFull := isWbFull
     pTxnId := io.UpRXEVT.bits.TxnID
+    pSrcId := io.UpRXEVT.bits.SrcID
     pTraceTag := io.UpRXEVT.bits.TraceTag
-    pDbid := tshrId.U
     pReqWay := dirResult.way
     pMissMeta := dirResult
     dirHit := dirResult.hit
@@ -132,9 +133,10 @@ class L2VPipeEVT(
   }
 
   io.UpTXRSP.valid := state === sSendCompDBIDResp || state === sSendComp
-  io.UpTXRSP.bits := 0.U.asTypeOf(new FlitDnRSP)
   io.UpTXRSP.bits.TxnID := pTxnId
-  io.UpTXRSP.bits.DBID := pDbid
+  io.UpTXRSP.bits.SrcID := sliceNID.U
+  io.UpTXRSP.bits.TgtID := pSrcId
+  io.UpTXRSP.bits.DBID := getUpTxnID
   io.UpTXRSP.bits.Opcode := Mux(state === sSendCompDBIDResp, CCHIOpcode.CompDBIDResp.U, CCHIOpcode.Comp.U)
   io.UpTXRSP.bits.RespErr := 0.U
   io.UpTXRSP.bits.Resp := 0.U

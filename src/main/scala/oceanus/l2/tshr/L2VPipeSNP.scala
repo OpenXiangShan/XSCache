@@ -9,13 +9,14 @@ import oceanus.chi.bundle._
 import oceanus.chi.opcode._
 import org.chipsalliance.cde.config.Parameters
 
-class L2VPipeSNP(clientComponents: Seq[CCHIComponent], tshrId: Int = 0, nodeId: Int = 0)(implicit val p: Parameters)
+class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId: Int, val nodeId: Int)(implicit val p: Parameters)
     extends Module
     with CHIRNFOpcodesSNP
     with CHIRNFOpcodesRSP
     with CHIRNFOpcodesDAT
     with CHIRNFOpcodesREQ
-    with HasL2Params {
+    with HasL2Params
+    with L2TSHRLocatable {
 
   val io = IO(new Bundle {
     val DnRXSNP = Flipped(Valid(new CHIBundleSNP))

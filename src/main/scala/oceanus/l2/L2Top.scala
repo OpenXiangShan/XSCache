@@ -18,6 +18,7 @@ import oceanus.chi.intf.CHIRNFRawInterface
 
 
 class L2Configuration(
+  val nodeId: Int,
   val eSAM: Boolean,
   val slices: Seq[Int]
 ) {
@@ -99,7 +100,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   // ----------------------------------------------------------------
 
   //
-  val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i))))
+  val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId)))
 
   // - Upstream RXEVT routing
   val postSAM_UpEVTs = Seq(postSAM_t1p0.UpEVT)

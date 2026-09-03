@@ -26,7 +26,7 @@ trait L2TSHRLocatable extends L2SliceLocatable {
   def getUpTxnID = tshrId.U
 }
 
-class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId: Int)(implicit val p: Parameters) extends Module 
+class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId: Int, val nodeId: Int)(implicit val p: Parameters) extends Module 
     with HasL2Params 
     with L2SliceLocatable {
 
@@ -397,9 +397,9 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
 
 
   // -- vPipes and TSHR local modules
-  val vPipeEVT = Module(new L2VPipeEVT(Seq(/*TODO: client devices*/), sliceNum, sliceIdx, tshrId, 0)) // TODO: nodeId
-  val vPipeSNP = Module(new L2VPipeSNP(Seq(/*TODO: client devices*/), tshrId, 0)) // TODO: nodeId
-  val vPipeREQ = Module(new L2VPipeREQ(Seq(/*TODO: client devices*/), sliceNum, sliceIdx, sliceNID, tshrId, 0)) // TODO: nodeId
+  val vPipeEVT = Module(new L2VPipeEVT(Seq(/*TODO: client devices*/), sliceNum, sliceIdx, sliceNID, tshrId))
+  val vPipeSNP = Module(new L2VPipeSNP(Seq(/*TODO: client devices*/), sliceNum, sliceIdx, sliceNID, tshrId, nodeId))
+  val vPipeREQ = Module(new L2VPipeREQ(Seq(/*TODO: client devices*/), sliceNum, sliceIdx, sliceNID, tshrId, nodeId))
   val snoopAgent = Module(new L2SnoopAgent(tshrId, sliceNID))
 
   tshr_inactive_vpipe := vPipeEVT.io.free && vPipeSNP.io.free && vPipeREQ.io.free
