@@ -125,6 +125,67 @@ class PrefetchDbEntry(implicit p: Parameters) extends L2Bundle {
   val reqSource = UInt(MemReqSource.reqSourceBits.W)
 }
 
+// One row captures the complete replacement-relevant state of a set before a
+// request hit or a successful refill/replacement updates it.
+class DRRIPTraceDbEntry(implicit p: Parameters) extends L2Bundle {
+  // req address info
+  val reqAddr = UInt(fullAddressBits.W)
+  val reqSet = UInt(setBits.W)
+  val reqTag = UInt(tagBits.W)
+
+  // req type info
+  val isReplacement = Bool()
+  val isPrefetch = Bool()
+  val isRelease = Bool()
+  val isRefill = Bool()
+  val channel = UInt(3.W)
+  val opcode = UInt(4.W)
+
+  // req set meta info
+  val originBits = UInt(cacheParams.ways.W)
+  val invalidWays = UInt(cacheParams.ways.W)
+  val prefetchedWays = UInt(cacheParams.ways.W)
+  val accessedWays = UInt(cacheParams.ways.W)
+  val dirtyWays = UInt(cacheParams.ways.W)
+  val clientWays = UInt(cacheParams.ways.W)
+  val rrpvStateRead = UInt((2 * cacheParams.ways).W)
+
+  // req hit info
+  val isHit = Bool()
+  val hitTag = UInt(tagBits.W)
+  val hitAddr = UInt(fullAddressBits.W)
+  val hitPrefetch = Bool()
+  val hitAccessed = Bool()
+  val hitDirty = Bool()
+  val hitClients = UInt(clientBits.W)
+
+  // req replacer info
+  val hitWay = UInt(wayBits.W)
+  val finalReplWay = UInt(wayBits.W)
+  val useInvalidWay = Bool()
+  val invalidWay = UInt(wayBits.W)
+  val invalidWayMask = UInt(cacheParams.ways.W)
+  val useReplWay = Bool()
+  val replWay = UInt(wayBits.W)
+  val replWayMask = UInt(cacheParams.ways.W)
+  val useFreeWay = Bool()
+  val freeWay = UInt(wayBits.W)
+  val freeWayMask = UInt(cacheParams.ways.W)
+  val replReqType = UInt(4.W)
+  val rrpvStateWrite = UInt((2 * cacheParams.ways).W)
+  val isSDMSRRIP = Bool()
+  val isSDMBRRIP = Bool()
+  val useSRRIP = Bool()
+
+  // victim information, sampled before the SRAM update
+  val victimTag = UInt(tagBits.W)
+  val victimAddr = UInt(fullAddressBits.W)
+  val victimPrefetch = Bool()
+  val victimAccessed = Bool()
+  val victimDirty = Bool()
+  val victimClients = UInt(clientBits.W)
+  val victimState = UInt(stateBits.W)
+}
 
 class Directory(implicit p: Parameters) extends L2Module {
 
@@ -450,10 +511,73 @@ class Directory(implicit p: Parameters) extends L2Module {
     XSPerfAccumulate("drrip_victim_rrpv1", refillReqValid_s3 && selectedVictimRrpv === 1.U)
     XSPerfAccumulate("drrip_victim_rrpv2", refillReqValid_s3 && selectedVictimRrpv === 2.U)
     XSPerfAccumulate("drrip_victim_rrpv3", refillReqValid_s3 && selectedVictimRrpv === 3.U)
-    XSPerfAccumulate("drrip_prefetch_refill", refillReqValid_s3 && rrip_req_type(1) && rrip_req_type(0))
-    XSPerfAccumulate("drrip_demand_refill", refillReqValid_s3 && !rrip_req_type(1) && rrip_req_type(0))
 
     val next_state_s3 = repl.get_next_state(repl_state_s3, wayOH_s3, hit_s3, inv, repl_type, rrip_req_type)
+
+    if (cacheParams.enableMonitor && !cacheParams.FPGAPlatform) {
+      val hartId = cacheParams.hartId
+      // basicDB=true enables this table when ChiselDB is enabled at runtime.
+      val traceTable = ChiselDB.createTable(
+        s"L2_Slice${p(SliceIdKey)}_DRRIP_Trace_hart$hartId", new DRRIPTraceDbEntry, basicDB = true)
+      val trace = Wire(new DRRIPTraceDbEntry)
+      val traceReplacement = refillReqValid_s3 && !refillRetry
+      val traceWayOH = Mux(traceReplacement, finalReplOH, hitOH)
+      val hitMeta = Mux1H(hitOH, metaAll_s3)
+      val victimMeta = Mux1H(finalReplOH, metaAll_s3)
+      val hitTag = Mux1H(hitOH, tagAll_s3)
+      val victimTag = Mux1H(finalReplOH, tagAll_s3)
+      val clientWayBits = VecInit(metaAll_s3.map(_.clients.orR)).asUInt
+
+      trace.reqAddr := restoreAddressUInt(
+        Cat(req_s3.tag, req_s3.set, 0.U(offsetBits.W)), p(SliceIdKey).U)
+      trace.reqSet := req_s3.set
+      trace.reqTag := req_s3.tag
+      trace.isReplacement := traceReplacement
+      trace.isPrefetch := rrip_req_type(1)
+      trace.isRelease := req_s3.replacerInfo.channel(2) &&
+        (req_s3.replacerInfo.opcode === Release || req_s3.replacerInfo.opcode === ReleaseData)
+      trace.isRefill := req_s3.refill
+      trace.channel := req_s3.replacerInfo.channel
+      trace.opcode := req_s3.replacerInfo.opcode
+      trace.originBits := origin_bits_hold.asUInt
+      trace.invalidWays := VecInit(metaAll_s3.map(_.state === MetaData.INVALID)).asUInt
+      trace.prefetchedWays := VecInit(metaAll_s3.map(_.prefetch.getOrElse(false.B))).asUInt
+      trace.accessedWays := VecInit(metaAll_s3.map(_.accessed)).asUInt
+      trace.clientWays := clientWayBits
+      trace.dirtyWays := VecInit(metaAll_s3.map(_.dirty)).asUInt
+      trace.rrpvStateRead := repl_state_s3
+      trace.isHit := hit_s3
+      trace.hitWay := OHToUInt(hitOH)
+      trace.hitTag := hitTag
+      trace.hitAddr := restoreAddressUInt(Cat(hitTag, req_s3.set, 0.U(offsetBits.W)), p(SliceIdKey).U)
+      trace.hitPrefetch := hitMeta.prefetch.getOrElse(false.B)
+      trace.hitAccessed := hitMeta.accessed
+      trace.hitDirty := hitMeta.dirty
+      trace.hitClients := hitMeta.clients
+      trace.finalReplWay := OHToUInt(finalReplOH)
+      trace.useInvalidWay := inv
+      trace.invalidWay := invalidWay
+      trace.invalidWayMask := invOH
+      trace.useReplWay := !inv
+      trace.replWay := replaceWay
+      trace.replWayMask := replaceOH
+      trace.useFreeWay := !Mux1H(chosenOH, freeWayMask_s3)
+      trace.freeWay := OHToUInt(MaskToOH(freeWayMask_s3))
+      trace.freeWayMask := freeWayMask_s3
+      trace.replReqType := rrip_req_type
+      trace.rrpvStateWrite := next_state_s3
+      trace.isSDMSRRIP := match_a
+      trace.isSDMBRRIP := match_b
+      trace.useSRRIP := !repl_type
+      trace.victimTag := victimTag
+      trace.victimAddr := restoreAddressUInt(Cat(victimTag, req_s3.set, 0.U(offsetBits.W)), p(SliceIdKey).U)
+      trace.victimPrefetch := victimMeta.prefetch.getOrElse(false.B)
+      trace.victimAccessed := victimMeta.accessed
+      trace.victimDirty := victimMeta.dirty
+      trace.victimClients := victimMeta.clients
+      trace.victimState := victimMeta.state
+      traceTable.log(trace, replacerWen, s"L2${hartId}_${p(SliceIdKey)}", clock, reset)
+    }
 
     val repl_init = Wire(Vec(ways, UInt(2.W)))
     repl_init.foreach(_ := 2.U(2.W))
