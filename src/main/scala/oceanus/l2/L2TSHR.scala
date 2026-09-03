@@ -246,7 +246,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
 
   val tshr_buffer_commit = WireInit(false.B)
 
-  val tshr_buffer_drop = WireInit(false.B) // ! working on this
+  val tshr_buffer_drop = WireInit(false.B)
 
   val tshr_buffer_halfWritten_0_q = RegInit(false.B)
   val tshr_buffer_halfWritten_2_q = RegInit(false.B)
@@ -489,13 +489,16 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   // connections between TSHR local and REQ vPipe
   vPipeREQ.io.tshr_paddr := tshr_paddr
   vPipeREQ.io.tshr_dirResult := dirResult
+  vPipeREQ.io.tbuf_modified := tshr_buffer_modified
+  vPipeREQ.io.tbuf_data0_valid := tshr_buffer_halfWritten_0_q || tshr_buffer_fullModified_q
+  vPipeREQ.io.tbuf_data2_valid := tshr_buffer_halfWritten_2_q || tshr_buffer_fullModified_q
 
   meta_write_REQ_mask := vPipeREQ.io.tshr_meta_write_en
   meta_write_REQ_meta := vPipeREQ.io.tshr_meta_write_meta
   tag_write_REQ_mask := vPipeREQ.io.tshr_tag_write_en
 
   meta_drop := vPipeREQ.io.dir_wb_cancel
-  tshr_buffer_drop := vPipeREQ.io.ds_wb_cancel
+  tshr_buffer_drop := vPipeREQ.io.ds_wb_cancel || vPipeSNP.io.ds_wb_cancel
 
   io.toPCreditPool := vPipeREQ.io.toPCreditPool
   vPipeREQ.io.fromPCreditPool := io.fromPCreditPool

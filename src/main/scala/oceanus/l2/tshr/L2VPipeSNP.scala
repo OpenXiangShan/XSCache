@@ -35,6 +35,9 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sl
 
     val ds_read_en = Output(Bool())
     val ds_read_done = Input(Bool())
+
+    val ds_wb_cancel = Output(Bool())
+
     val tbuf_modified = Input(Bool()) // TSHR buffer holds data written by a non-DS source (RXDAT)
     val tbuf_half0_ready = Input(Bool()) // TSHR buffer half (DataID 0) holds valid data
     val tbuf_half2_ready = Input(Bool()) // TSHR buffer half (DataID 2) holds valid data
@@ -465,7 +468,10 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sl
   // -- Other IO signals -------------------------------------
   io.tshr_meta_write_en := Mux(do_meta_write, rxsnp_meta_write_en, 0.U.asTypeOf(new L2Directory.MetaWriteMask))
   io.tshr_meta_write_meta := rxsnp_meta_write_meta
+
   io.ds_read_en := enter_need_local_ds_read && !io.ds_read_done
+
+  io.ds_wb_cancel := meta_write_invalid
 
   io.blockRBE.EVT := block_vpipe_evt
   io.blockRBE.SNP := active 
