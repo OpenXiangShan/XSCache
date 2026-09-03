@@ -353,6 +353,11 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
     state_dsRead_next.PreArb := false.B
     state_dsRead_next.AheadPreArb_S1 := false.B
     state_dsRead_next.AheadPreArb_S2 := false.B
+    state_dsRead_next.AheadDone := false.B
+
+    when (!state_dsRead.AheadPostArb && !state_dsRead.PostArb) {
+      state_dsRead_next.Done := true.B
+    }
   }
 
   when (io.tshr_dealloc) {
