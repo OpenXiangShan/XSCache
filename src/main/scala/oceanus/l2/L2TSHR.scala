@@ -590,7 +590,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   proxyDS.io.meta_state := meta.state
 
   proxyDS.io.tbuf_wen_last := tshr_buffer_wen_last
-  proxyDS.io.tbuf_modified := tshr_buffer_fullModified_q
+  proxyDS.io.tbuf_modified := tshr_buffer_modified
   proxyDS.io.tbuf_data_0 := tshr_buffer_0
   proxyDS.io.tbuf_data_2 := tshr_buffer_2
 
