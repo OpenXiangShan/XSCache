@@ -1065,9 +1065,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                          fire_txreq_writeevictorevict ||
                          fire_txreq_writebackfull)
 
-  val ds_rd = ds_rd_readunique ||
-              ds_rd_readshared ||
-              ds_rd_evictback
+  val ds_rd = !io.tbuf_modified && (ds_rd_readunique ||
+                                    ds_rd_readshared ||
+                                    ds_rd_evictback)
 
   val ds_cancel_readunique = p_rxreq_readunique &&
                              (sa_respdata_first ||
