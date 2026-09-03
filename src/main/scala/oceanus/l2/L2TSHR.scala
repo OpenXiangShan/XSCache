@@ -189,8 +189,17 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
     (meta_write_SNP_mask.state && meta_write_SNP_meta.state =/= L2Directory.MetaState.I) ||
     (meta_write_EVT_mask.state && meta_write_EVT_meta.state =/= L2Directory.MetaState.I)
 
+  val meta_write_invalidates = 
+    (meta_write_REQ_mask.state && meta_write_REQ_meta.state === L2Directory.MetaState.I) ||
+    (meta_write_SNP_mask.state && meta_write_SNP_meta.state === L2Directory.MetaState.I) ||
+    (meta_write_EVT_mask.state && meta_write_EVT_meta.state === L2Directory.MetaState.I)
+
   when (meta_write_allocates) {
     meta.hit := true.B
+  }
+
+  when (meta_write_invalidates) {
+    meta.hit := false.B
   }
 
   when (tag_write_REQ_mask) {
