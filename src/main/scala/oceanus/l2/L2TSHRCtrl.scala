@@ -33,7 +33,7 @@ trait L2SliceLocatable {
   def getTxnIDFromTSHRId(tshrId: Int) = (tshrId.U << log2Ceil(sliceNum)) | sliceIdx.U(log2Ceil(sliceNum).W)
 }
 
-class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int)(implicit val p: Parameters) extends Module 
+class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val nodeId: Int)(implicit val p: Parameters) extends Module 
     with HasL2Params 
     with L2SliceLocatable {
 
@@ -69,7 +69,7 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int)(implic
   })
 
   // -- RX channel connections
-  val tshrs = Seq.tabulate(paramL2.mshrSize)(i => Module(new L2TSHR(sliceNum, sliceIdx, sliceNID, i)))
+  val tshrs = Seq.tabulate(paramL2.mshrSize)(i => Module(new L2TSHR(sliceNum, sliceIdx, sliceNID, i, nodeId)))
 
   tshrs.foreach { case t => 
     t.io.UpRXEVT := io.UpRXEVT.bits

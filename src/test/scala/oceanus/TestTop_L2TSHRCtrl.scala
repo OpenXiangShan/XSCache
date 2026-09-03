@@ -11,7 +11,7 @@ import oceanus.chi._
 
 class TestTop_L2TSHRCtrl(implicit val p: Parameters) extends Module with HasL2Params {
 
-  val module = Module(new L2TSHRCtrl(1, 0, 0)) // single-slice configuration
+  val module = Module(new L2TSHRCtrl(1, 0, 0, 0)) // single-slice configuration
 
   val io = IO(module.io.cloneType)
 

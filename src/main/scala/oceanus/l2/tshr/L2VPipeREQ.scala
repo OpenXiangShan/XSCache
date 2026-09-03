@@ -23,8 +23,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                  val sliceNum: Int, 
                  val sliceIdx: Int, 
                  val sliceNID: Int, 
-                 val tshrId: Int, 
-                 nodeId: Int)(implicit val p: Parameters) 
+                 val tshrId: Int,
+                 val nodeId: Int)(implicit val p: Parameters) 
     extends Module 
     with CHIRNFOpcodesREQ 
     with CHIRNFOpcodesRSP
@@ -1323,10 +1323,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // Activate Directory write-back immediately on replacement Directory lock released by eviction
   // to clear the replacer reading lock in Directory
   io.dir_wb_aux := unlock_dir
+
   io.UpTXREQ.valid := s_evict_up_evict
   io.UpTXREQ.bits.TxnID := getUpTxnID
   io.UpTXREQ.bits.SrcID := sliceNID.U
-  io.UpTXREQ.bits.TgtID := nodeId.U
+  io.UpTXREQ.bits.TgtID := sliceNID.U
   io.UpTXREQ.bits.Opcode := CCHIOpcode.EvictBack.U
   io.UpTXREQ.bits.Size := CCHISize.B64.U
   io.UpTXREQ.bits.Addr := io.repl_resp.paddr

@@ -75,6 +75,7 @@ Usage: TestTop_L2Top [<--option> <values>]
   require(numSlices >= 1 && numSlices <= 4, s"Unsupported slice count $numSlices under eSAM")
 
   val l2cfg = new L2Configuration(
+    nodeId = 0,
     eSAM = true,
     slices = 0 until numSlices
   )

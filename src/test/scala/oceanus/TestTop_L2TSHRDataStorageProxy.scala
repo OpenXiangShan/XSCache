@@ -7,6 +7,7 @@ import org.chipsalliance.cde.config._
 import chisel3.stage.ChiselGeneratorAnnotation
 import utility._
 import oceanus.l2._
+import oceanus.l2.tshr._
 import oceanus.chi._
 
 class TestTop_L2TSHRDataStorageProxy(implicit val p: Parameters) extends Module with HasL2Params {

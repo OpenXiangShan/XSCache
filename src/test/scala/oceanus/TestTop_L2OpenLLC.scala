@@ -72,7 +72,7 @@ class TestTop_L2OpenLLC(val numL2: Int, val numSlices: Int)(implicit p: Paramete
 
   lazy val module = new LazyModuleImp(this) {
 
-    val l2cfg = new L2Configuration(eSAM = true, slices = 0 until numSlices)
+    val l2cfg = new L2Configuration(nodeId = 0, eSAM = true, slices = 0 until numSlices)
 
     val l2s = Seq.fill(numL2)(Module(new L2Top(l2cfg)))
     val l3 = Module(new OpenLLC())
@@ -268,7 +268,9 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
   val config = new Config((_, _, _) => {
     case L2ParamsKey => L2Params (
       physicalAddrWidth = 48,
-      mshrSize = 8
+      mshrSize = 16,
+      ways = 4,
+      sets = 32
     )
     case CHIParametersKey => CHIParameters (
       issue = EnumCHIIssue.E,
@@ -285,10 +287,10 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
     // CHIAddrWidthKey / CHIDataCheckKey / CHIPoisonKey defaults (48 / oddparity / true)
     // already match the oceanus CHIParameters above.
     case OpenLLCParamKey => OpenLLCParam(
-      ways = 2,
-      sets = 2,
+      ways = 4,
+      sets = 64,
       banks = 1,
-      clientCaches = Seq.fill(numL2)(L2Param(ways = 2, sets = 2)),
+      clientCaches = Seq.fill(numL2)(L2Param(ways = 4, sets = 32)),
       fullAddressBits = 48,
       hartIds = 0 until numL2,
       enableRollingDB = false,
