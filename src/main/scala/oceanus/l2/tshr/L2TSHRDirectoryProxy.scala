@@ -72,7 +72,10 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
 
     val meta = Input(new L2Directory.Meta)
     val meta_way = Input(UInt(4.W)) // TODO: parameterize with l2 way count
+
+    val meta_modify = Input(Bool())
     val meta_modified = Input(new L2Directory.MetaWriteMask)
+    val tag_modify = Input(Bool())
     val tag_modified = Input(Bool())
 
     val rd_idle = Output(Bool())
@@ -273,6 +276,8 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
 
   state_dirWrite := state_dirWrite_next
 
+  val wb_trigger = (io.meta_modify || io.meta_modified.any || io.tag_modify || io.tag_modified || io.wb_aux) && !io.wb_cancel
+
   if (configAggressiveWrite) {
 
     when (state_dirWrite.NotYet) {
@@ -283,7 +288,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       when (io.wb_cancel) {
         // 1. [] -> DirWrite_Done
         state_dirWrite_next.Done := true.B
-      }.elsewhen (io.meta_modified.any || io.tag_modified || io.wb_aux) {
+      }.elsewhen (wb_trigger) {
         // 2. [] -> DirWrite_PreArb
         state_dirWrite_next.PreArb := true.B
       }.elsewhen (io.tshr_valid && tshr_inactive) {
@@ -313,7 +318,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       /*
       1. 
       */
-      when ((io.meta_modified.any || io.tag_modified) && !io.wb_cancel) {
+      when (wb_trigger) {
         // 1. DirWrite_Done -> DirWrite_PreArb
         state_dirWrite_next.Done := false.B
         state_dirWrite_next.PreArb := true.B
@@ -330,7 +335,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
         // 1. [] -> DirWrite_Done
         state_dirWrite_next.Done := true.B
       }.elsewhen (io.tshr_valid && (tshr_inactive || io.wb_aux)) {
-        when (io.meta_modified.any || io.tag_modified || io.wb_aux) {
+        when (wb_trigger) {
         // 2. [] -> DirWrite_PreArb
         state_dirWrite_next.PreArb := true.B
         }.otherwise {
@@ -364,7 +369,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       /*
       1.
       */
-      when ((io.meta_modified.any || io.tag_modified) && !io.wb_cancel) {
+      when (wb_trigger) {
         // 1. DirWrite_Done -> []
         state_dirWrite_next.Done := false.B
       }
