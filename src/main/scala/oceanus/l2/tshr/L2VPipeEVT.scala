@@ -115,7 +115,14 @@ class L2VPipeEVT(
   }
 
   when (state === sWaitCommit) {
-    state := sSendComp
+    when (pIsWbFull) {
+      // WriteBackFull: CompDBIDResp is the complete CCHI response; a trailing Comp is illegal
+      state := sIdle
+      dataArmed := false.B
+      inflightEvict := false.B
+    }.otherwise {
+      state := sSendComp
+    }
   }
 
   when (state === sSendComp && io.UpTXRSP.fire) {
