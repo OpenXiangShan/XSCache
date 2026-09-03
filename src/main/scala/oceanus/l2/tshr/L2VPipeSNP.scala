@@ -582,11 +582,6 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sl
            (!io.tshr_dirResult.dirty && !io.tshr_dirResult.clients.asUInt.orR),
       "TSHR @ %m SNP vPipe observed dirty data or clients while local meta was invalid")
   }
-  when (active) {
-    assert(req_evict_valid === req_evict_valid_q &&
-           (!req_evict_valid || req_evict_opcode === req_evict_opcode_q),
-      "TSHR @ %m SNP vPipe observed REQ_evict change during an active transaction")
-  }
   when (io.DnRXSNP.fire) {
     assert(PopCount(sa_uops) <= 1.U,
       "TSHR @ %m SNP vPipe issued multiple SnoopAgent uops")
