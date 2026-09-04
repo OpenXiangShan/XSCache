@@ -551,6 +551,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   proxyDir.io.read_arbed := false.B // TODO: S0 Directory Arbitration from L2TSHRCtrl
   proxyDir.io.read_en := tshr_enter_dirRead
   proxyDir.io.repl_en := vPipeREQ.io.repl_en
+  proxyDir.io.repl_reset := vPipeREQ.io.repl_reset
 
   proxyDir.io.meta := meta
   proxyDir.io.meta_way := meta.way

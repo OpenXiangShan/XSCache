@@ -74,6 +74,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     val ds_rd_done = Input(Bool())
 
     val repl_en = Output(Bool())
+    val repl_reset = Output(Bool())
     val repl_retry = Input(Bool())
     val repl_done = Input(Bool())
     val repl_resp = Input(new L2Directory.ReplReadResult)
@@ -1315,6 +1316,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   }
 
   io.repl_en := s_repl
+  io.repl_reset := expect_replace
 
   io.dir_wb_locked := w_unlock_dir
   io.ds_wb_locked := w_unlock_ds
