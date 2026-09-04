@@ -69,6 +69,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
     val read_arbed = Input(Bool())
     val read_en = Input(Bool())
     val repl_en = Input(Bool())
+    val repl_reset = Input(Bool())
 
     val meta = Input(new L2Directory.Meta)
     val meta_way = Input(UInt(4.W)) // TODO: parameterize with l2 way count
@@ -234,6 +235,18 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
     }
   }
 
+  when (state_dirRead.ReplDone) {
+
+    /*
+    1.
+    */
+    when (io.repl_reset) {
+      // 1. DirRead_ReplDone -> DirRead_Done
+      state_dirRead_next.ReplDone := false.B
+      state_dirRead_next.Done := true.B
+    }
+  }
+
   when (io.tshr_dealloc) {
     state_dirRead_next := DirReadFSM.init
   }
@@ -257,6 +270,8 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   assert(!(fromDir_ReplRdResp && fromDir_ReplRdRetryAck), "ReplRdResp and ReplRdRetryAck must be exclusive to each other")
 
   assert(PopCount(state_dirRead.asUInt) <= 1.U, "multiple active states in DirReadFSM")
+
+  assert (!(io.repl_reset && !state_dirRead.Done && !state_dirRead.ReplDone), "replace read state reset on inter-states")
 
   FSMPerfHistogram(s"L2TSHR_${id}_DirReadFSM_PreArb", state_dirRead.PreArb, state_dirRead_next.PreArb)
   FSMPerfHistogram(s"L2TSHR_${id}_DirReadFSM_PostArb", state_dirRead.PostArb, state_dirRead_next.PostArb)
