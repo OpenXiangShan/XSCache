@@ -477,8 +477,8 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   vPipeSNP.io.tshr_paddr := tshr_paddr
   vPipeSNP.io.tshr_dirResult := dirResult
   vPipeSNP.io.tbuf_modified := tshr_buffer_modified
-  vPipeSNP.io.tbuf_half0_ready := tshr_buffer_halfWritten_0_q || tshr_buffer_fullModified_q
-  vPipeSNP.io.tbuf_half2_ready := tshr_buffer_halfWritten_2_q || tshr_buffer_fullModified_q
+  vPipeSNP.io.tbuf_half0_ready := tshr_buffer_halfWritten_0_q || tshr_buffer_fullModified_q || vPipeSNP.io.ds_read_done
+  vPipeSNP.io.tbuf_half2_ready := tshr_buffer_halfWritten_2_q || tshr_buffer_fullModified_q || vPipeSNP.io.ds_read_done
 
   meta_write_SNP_mask := vPipeSNP.io.tshr_meta_write_en
   meta_write_SNP_meta := vPipeSNP.io.tshr_meta_write_meta
@@ -490,8 +490,8 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   vPipeREQ.io.tshr_paddr := tshr_paddr
   vPipeREQ.io.tshr_dirResult := dirResult
   vPipeREQ.io.tbuf_modified := tshr_buffer_modified
-  vPipeREQ.io.tbuf_data0_valid := tshr_buffer_halfWritten_0_q || tshr_buffer_fullModified_q
-  vPipeREQ.io.tbuf_data2_valid := tshr_buffer_halfWritten_2_q || tshr_buffer_fullModified_q
+  vPipeREQ.io.tbuf_data0_valid := tshr_buffer_halfWritten_0_q || tshr_buffer_fullModified_q || vPipeREQ.io.ds_rd_done
+  vPipeREQ.io.tbuf_data2_valid := tshr_buffer_halfWritten_2_q || tshr_buffer_fullModified_q || vPipeREQ.io.ds_rd_done
 
   meta_write_REQ_mask := vPipeREQ.io.tshr_meta_write_en
   meta_write_REQ_meta := vPipeREQ.io.tshr_meta_write_meta
