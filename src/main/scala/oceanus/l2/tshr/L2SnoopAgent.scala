@@ -205,17 +205,24 @@ class L2SnoopAgent(tshrId: Int, sliceNID: Int)(implicit val p: Parameters) exten
   val doneForREQ = serviceFromREQ
   val directForSNP = directDone && startFromSNP
   val directForREQ = directDone && startFromREQ
-  val passDirty = Mux(rspMatch, io.UpRXRSP.bits.Resp(2), Mux(datBeat2, passDirtyReg || io.UpRXDAT.bits.Resp(2), false.B))
+  val dataPassDirty = io.UpRXDAT.bits.Resp(2)
+  val pdValid = rspMatch || datBeat0 || datBeat2
+
+  val passDirty = Mux(
+    rspMatch,
+    io.UpRXRSP.bits.Resp(2),
+    Mux(datBeat0 || datBeat2, dataPassDirty, false.B)
+  )
 
   io.fromSAForSNP.SnpResp := (rspMatch && doneForSNP) || directForSNP
   io.fromSAForSNP.SnpRespData0 := datBeat0 && serviceFromSNP
   io.fromSAForSNP.SnpRespData2 := datBeat2 && serviceFromSNP
-  io.fromSAForSNP.PASSDIRTY := Mux(doneForSNP, passDirty, false.B)
+  io.fromSAForSNP.PASSDIRTY := doneForSNP && pdValid && passDirty
 
   io.fromSAForREQ.SnpResp := (rspMatch && doneForREQ) || directForREQ
   io.fromSAForREQ.SnpRespData0 := datBeat0 && serviceFromREQ
   io.fromSAForREQ.SnpRespData2 := datBeat2 && serviceFromREQ
-  io.fromSAForREQ.PASSDIRTY := Mux(doneForREQ, passDirty, false.B)
+  io.fromSAForREQ.PASSDIRTY := doneForREQ && pdValid && passDirty
 
   io.fromSA.SnpResp := io.fromSAForSNP.SnpResp || io.fromSAForREQ.SnpResp
   io.fromSA.SnpRespData0 := io.fromSAForSNP.SnpRespData0 || io.fromSAForREQ.SnpRespData0
@@ -336,6 +343,8 @@ class L2SnoopAgent(tshrId: Int, sliceNID: Int)(implicit val p: Parameters) exten
     s"L2SnoopAgent @ %m: service did not retain its source")
   assert(!(datBeat2 && !seenData0),
     s"L2SnoopAgent @ %m: SnpRespData DataID 2 arrived before DataID 0")
+  assert(!(datBeat2 && passDirtyReg =/= io.UpRXDAT.bits.Resp(2)),
+    "L2SnoopAgent: SnpRespData PassDirty changed between data beats")
   assert(!(io.uopFromSNP.valid && !armedSNP && holdCountSNP >= 4.U),
     s"L2SnoopAgent @ %m: SNP uop input valid stayed high after acceptance; deassert before reusing the request")
   assert(!(io.uopFromREQ.valid && !armedREQ && holdCountREQ >= 4.U),
