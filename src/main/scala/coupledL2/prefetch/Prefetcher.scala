@@ -291,6 +291,9 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   // =================== Prefetchers =====================
   // TODO: consider separate VBOP and PBOP in prefetch param
+  val bopCqfEnabled = prefetchers.collectFirst {
+    case bop: BOPParameters => bop.enableCQF
+  }.getOrElse(false)
   val pbop = if (hasBOP) Some(
     Module(new PBestOffsetPrefetch()(p.alterPartial({
       case L2ParamKey =>
@@ -301,6 +304,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
             crossPage = false,
             useDelayOut = false,
             enableStudentCover = true,
+            enableCQF = bopCqfEnabled,
             studentPoolSize = 8,
             studentFilterTableBits = 2048,
             studentHashMode = "bop_rr",
@@ -327,6 +331,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
             crossPage = true,
             useDelayOut = true,
             enableStudentCover = true,
+            enableCQF = bopCqfEnabled,
             studentPoolSize = 4,
             studentFilterTableBits = 4096,
             studentHashMode = "pairs_low9",
@@ -350,6 +355,10 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     })))
   ) else None
 
+  // VBOP (Large) and PBOP (Small) share one CQF instance and therefore one
+  // Quality/Feedback budget, matching the GEM5 compact profile.
+  val cqf = if (hasBOP && bopCqfEnabled) Some(Module(new CompactQualityFeedback)) else None
+
   val tp = if (hasTPPrefetcher) Some(Module(new TemporalPrefetch())) else None
   // define Next-Line Prefetcher
   val nl = if (hasNLPrefetcher) Some(Module(new NextLinePrefetch())) else None
@@ -371,6 +380,15 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   // Rcv > NL > VBOP > PBOP > TP > CDP
   train.ready := true.B
   if (hasBOP) {
+    val bopTrainOtherInput = train.fire && train.bits.is_other_train.getOrElse(true.B)
+    XSPerfAccumulate("bop_train_other_input", bopTrainOtherInput)
+    if (bopCqfEnabled) {
+      cqf.get.io.enable := vbop_en || pbop_en
+      cqf.get.io.demand.valid := bopTrainOtherInput
+      cqf.get.io.demand.bits := train.bits.vaddr.getOrElse(0.U)
+        .pad(CqfParameters.LineBits)(CqfParameters.LineBits - 1, 0)
+    }
+
     val vbop_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
     vbop_train_buf.io.enq.valid := train.valid && train.bits.is_other_train.getOrElse(true.B)
     vbop_train_buf.io.enq.bits  := train.bits
@@ -384,6 +402,14 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     vbop.get.io.resp <> resp
     vbop.get.io.resp.valid := resp.valid && resp.bits.isBOP
     vbop.get.io.tlb_req <> bop_tlb_req
+    if (bopCqfEnabled) {
+      cqf.get.io.candidate(0) <> vbop.get.io.cqfCandidate
+      vbop.get.io.cqfDecision <> cqf.get.io.decision(0)
+    } else {
+      vbop.get.io.cqfCandidate.ready := false.B
+      vbop.get.io.cqfDecision.valid := false.B
+      vbop.get.io.cqfDecision.bits := DontCare
+    }
 
     val pbop_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
     pbop_train_buf.io.enq.valid := train.valid && train.bits.is_other_train.getOrElse(true.B)
@@ -397,6 +423,19 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     pbop.get.io.train <> pbop_train_buf.io.deq
     pbop.get.io.resp <> resp
     pbop.get.io.resp.valid := resp.valid && resp.bits.isPBOP
+    if (bopCqfEnabled) {
+      cqf.get.io.candidate(1) <> pbop.get.io.cqfCandidate
+      pbop.get.io.cqfDecision <> cqf.get.io.decision(1)
+    } else {
+      pbop.get.io.cqfCandidate.ready := false.B
+      pbop.get.io.cqfDecision.valid := false.B
+      pbop.get.io.cqfDecision.bits := DontCare
+    }
+
+    assert(!vbop.get.io.cqfCandidate.valid || vbop.get.io.cqfCandidate.bits.kind,
+      "VBOP candidates must use CQF Large kind")
+    assert(!pbop.get.io.cqfCandidate.valid || !pbop.get.io.cqfCandidate.bits.kind,
+      "PBOP candidates must use CQF Small kind")
   }
   if (hasReceiver) {
     pfRcv.get.io.enable := pfRcv_en

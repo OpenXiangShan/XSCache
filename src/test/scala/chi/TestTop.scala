@@ -33,6 +33,7 @@ class TestTop_CHIL2(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, ext
   val cacheParams = p(L2ParamKey)
 
   val clogId = "l2top"
+  val l1Params = cacheParams.clientCaches.head
 
   println(s"CLog.b shared handle Id: ${clogId}")
   println(s"eTime: ${extTime}")
@@ -51,7 +52,10 @@ class TestTop_CHIL2(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, ext
         channelBytes = TLChannelBeatBytes(cacheParams.blockBytes),
         minLatency = 1,
         echoFields = Nil,
-        requestFields = Seq(AliasField(2), VaddrField(36), PrefetchField()),
+        requestFields = Seq(PrefetchField(), ReqSourceField()) ++
+          l1Params.aliasBitsOpt.map(AliasField).toSeq ++
+          l1Params.vaddrBitsOpt.map(VaddrField).toSeq ++
+          l1Params.pcBitOpt.map(PCField).toSeq,
         responseKeys = cacheParams.respKey
       )
     ))
