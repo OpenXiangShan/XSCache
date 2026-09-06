@@ -77,6 +77,11 @@ trait HasCoupledL2Parameters {
 
   def releaseBufWPorts = 3 // sinkC & mainPipe s5 & mainPipe s3 (nested)
 
+  // Intra-slice SRAM banking.  This is independent of the outer Slice/bank
+  // selection encoded in the address and used by CoupledL2.
+  // Use the low bit of the local set index to select one of two SRAM banks.
+  def intraSliceBankCount = 2
+
   def mmioBridgeSize = cacheParams.mmioBridgeSize
 
   // ECC
