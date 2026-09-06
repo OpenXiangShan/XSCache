@@ -70,6 +70,7 @@ class DataStorage(implicit p: Parameters) extends L2Module {
     gen = new DSECCBankBlock,
     set = blocks,
     way = 1,
+    setSplit = intraSliceBankCount,
     dataSplit = dataSRAMSplit,
     singlePort = true,
     readMCP2 = true,
