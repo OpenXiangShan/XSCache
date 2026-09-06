@@ -158,6 +158,9 @@ class Directory(implicit p: Parameters) extends L2Module {
 
   val sets = cacheParams.sets
   val ways = cacheParams.ways
+  private val setBankCount = intraSliceBankCount
+  private val setBankBits = log2Ceil(setBankCount)
+  require(sets % setBankCount == 0, "sets must be divisible by intra-slice bank count")
 
   val tagWen  = io.tagWReq.valid
   val metaWen = io.metaWReq.valid
@@ -171,6 +174,7 @@ class Directory(implicit p: Parameters) extends L2Module {
       gen = UInt((tagBankSplit * encTagBankBits).W),
       set = sets,
       way = ways,
+      setSplit = setBankCount,
       waySplit = 2,
       dataSplit = if (enableTagSRAMSplit) {
         tagSRAMSplit
@@ -187,6 +191,7 @@ class Directory(implicit p: Parameters) extends L2Module {
       gen = UInt(tagBits.W),
       set = sets,
       way = ways,
+      setSplit = setBankCount,
       waySplit = 2,
       singlePort = true,
       readMCP2 = false,
@@ -195,7 +200,16 @@ class Directory(implicit p: Parameters) extends L2Module {
     ))
   }
 
-  val metaArray = Module(new SRAMTemplate(new MetaEntry, sets, ways, singlePort = true, hasMbist = mbist, hasSramCtl = hasSramCtl))
+  val metaArray = Module(new SplittedSRAM(
+    gen = new MetaEntry,
+    set = sets,
+    way = ways,
+    setSplit = setBankCount,
+    singlePort = true,
+    readMCP2 = false,
+    hasMbist = mbist,
+    hasSramCtl = hasSramCtl
+  ))
 
   val metaRead = Wire(Vec(ways, new MetaEntry()))
 
@@ -203,7 +217,17 @@ class Directory(implicit p: Parameters) extends L2Module {
   val repl = ReplacementPolicy.fromString(cacheParams.replacement, ways)
   val random_repl = cacheParams.replacement == "random"
   val replacer_sram_opt = if(random_repl) None else
-    Some(Module(new SRAMTemplate(UInt(repl.nBits.W), sets, 1, singlePort = true, shouldReset = true, hasMbist = mbist, hasSramCtl = hasSramCtl)))
+    Some(Module(new SplittedSRAM(
+      gen = UInt(repl.nBits.W),
+      set = sets,
+      way = 1,
+      setSplit = setBankCount,
+      singlePort = true,
+      shouldReset = true,
+      readMCP2 = false,
+      hasMbist = mbist,
+      hasSramCtl = hasSramCtl
+    )))
 
   /* ====== Generate response signals ====== */
   // hit/way calculation in stage 3, Cuz SRAM latency is high under high frequency
@@ -340,7 +364,16 @@ class Directory(implicit p: Parameters) extends L2Module {
   dontTouch(metaArray.io)
   dontTouch(tagArray.io)
 
-  io.read.ready := !io.metaWReq.valid && !io.tagWReq.valid && !replacerWen
+  // Tag/Meta/replacer arrays are split by the local Set bit.  A read can
+  // overlap a write to another physical bank, but not a write to its own
+  // bank.  The old implementation blocked every read whenever any write
+  // was present, which created a global bubble.
+  def bankOf(set: UInt): UInt = set(setBankBits - 1, 0)
+  val readBank = bankOf(io.read.bits.set)
+  val metaWriteConflict = io.metaWReq.valid && readBank === bankOf(io.metaWReq.bits.set)
+  val tagWriteConflict = io.tagWReq.valid && readBank === bankOf(io.tagWReq.bits.set)
+  val replacerWriteConflict = replacerWen && readBank === bankOf(req_s3.set)
+  io.read.ready := !metaWriteConflict && !tagWriteConflict && !replacerWriteConflict
 
   /* ======!! Replacement logic !!====== */
   /* ====== Read, choose replaceWay ====== */
@@ -392,7 +425,17 @@ class Directory(implicit p: Parameters) extends L2Module {
   // hit-Promotion, miss-Insertion for RRIP
   // origin-bit marks whether the data_block is reused
   val origin_bit_opt = if(random_repl) None else
-    Some(Module(new SRAMTemplate(Bool(), sets, ways, singlePort = true, shouldReset = true, hasMbist = mbist, hasSramCtl = hasSramCtl)))
+    Some(Module(new SplittedSRAM(
+      gen = Bool(),
+      set = sets,
+      way = ways,
+      setSplit = setBankCount,
+      singlePort = true,
+      shouldReset = true,
+      readMCP2 = false,
+      hasMbist = mbist,
+      hasSramCtl = hasSramCtl
+    )))
   val origin_bits_r = origin_bit_opt.get.io.r(io.read.fire, io.read.bits.set).resp.data
   val origin_bits_hold = Wire(Vec(ways, Bool()))
   origin_bits_hold := RegEnable(origin_bits_r, reqValid_s2)
