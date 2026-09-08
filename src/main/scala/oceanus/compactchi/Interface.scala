@@ -24,12 +24,27 @@ class CCHIInterfaceType1 extends Bundle {
   }
 }
 
+class CCHIInterfaceType3 extends Bundle {
+  val UpREQ = Flipped(Decoupled(new FlitREQ))
+  val UpRSP = Flipped(Decoupled(new FlitUpRSP))
+  val UpDAT = Flipped(Decoupled(new FlitUpDAT))
+  val DnRSP = Decoupled(new FlitDnRSP)
+  val DnDAT = Decoupled(new FlitDnDAT)
+
+  def <>(other: CCHIInterfaceType3) = {
+    other.UpREQ <> UpREQ
+    other.UpRSP <> UpRSP
+    other.UpDAT <> UpDAT
+    other.DnRSP <> DnRSP
+    other.DnDAT <> DnDAT
+  }
+}
+
 class CCHIInterfaceType4 extends Bundle {
-  // TODO: also applicable for Link Credit, but sanity check required here in future
   val UpREQ = Flipped(Decoupled(new FlitREQ))
   val DnDAT = Decoupled(new FlitDnDAT)
 
-  def <>(other: CCHIInterfaceType1) = {
+  def <>(other: CCHIInterfaceType4) = {
     other.UpREQ <> UpREQ
     other.DnDAT <> DnDAT
   }
