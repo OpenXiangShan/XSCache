@@ -13,11 +13,11 @@ import xscache.coupledL2.prefetch._
 import xscache.coupledL2._
 import utility._
 import utility.chiron._
-import xscache.common.{AliasField, BankBitsKey, PrefetchField}
+import xscache.common.{AliasField, BankBitsKey, DirtyField, PrefetchField}
 import scala.collection.mutable.ArrayBuffer
 import xscache.chi._
 
-class TestTop_CHIL2(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, extTime: Boolean = false, vTime: Boolean = false)(implicit p: Parameters) extends LazyModule
+class TestTop_CHIL2(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, extTime: Boolean = false, vTime: Boolean = false, xsDefault: Boolean = true)(implicit p: Parameters) extends LazyModule
   with HasCHIMsgParameters {
 
   /*   L1D(L1I)* L1D(L1I)* ... L1D(L1I)*
@@ -51,7 +51,12 @@ class TestTop_CHIL2(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, ext
         channelBytes = TLChannelBeatBytes(cacheParams.blockBytes),
         minLatency = 1,
         echoFields = Nil,
-        requestFields = Seq(AliasField(2), VaddrField(36), PrefetchField()),
+        requestFields = if (xsDefault) Seq(
+          AliasField(2),
+          VaddrField(44),
+          PrefetchField(),
+          utility.ReqSourceField()
+        ) else Seq(AliasField(2), VaddrField(36), PrefetchField()),
         responseKeys = cacheParams.respKey
       )
     ))
@@ -213,38 +218,63 @@ object TestTopCHIHelper {
           onFPGAPlatform: Boolean,
           enableChiselDB: Boolean,
           enableTLLog: Boolean,
-          enableCHILog: Boolean)(args: Array[String]) = {
+          enableCHILog: Boolean,
+          xsDefault: Boolean = true)(args: Array[String]) = {
 
     val config = new Config((_, _, _) => {
-      case L2ParamKey => L2Param(
-        ways                = 4,
-        sets                = 128,
-        clientCaches        = Seq(L1Param(aliasBitsOpt = Some(2), vaddrBitsOpt = Some(36))),
-        // echoField        = Seq(DirtyField),
-        enablePerf          = false,
-        enableRollingDB     = !onFPGAPlatform && enableChiselDB,
-        enableMonitor       = !onFPGAPlatform && enableChiselDB,
-        enableTLLog         = !onFPGAPlatform && enableChiselDB && enableTLLog,
-        enableCHILog        = !onFPGAPlatform && enableCHILog,
-        elaboratedTopDown   = false,
-        FPGAPlatform        = onFPGAPlatform,
+      case L2ParamKey => {
+        // Match XiangShan DefaultConfig: 2 MiB L2 / 4 slices / 8 ways / 64 B lines.
+        // L2Param describes one slice, so each slice contains 1024 sets x 8 ways.
+        val xsDefaultParam = L2Param(
+          ways                = 8,
+          sets                = 1024,
+          clientCaches        = Seq(L1Param(
+            name              = "dcache",
+            sets              = 128,
+            ways              = 6,
+            blockBytes        = 64,
+            aliasBitsOpt      = Some(2),
+            vaddrBitsOpt      = Some(44),
+            isKeywordBitsOpt  = Some(true)
+          )),
+          echoField           = Seq(DirtyField()),
+          reqField            = Seq(utility.ReqSourceField()),
 
-        // prefetch
-        prefetch            = Seq(BOPParameters()),
+          enablePerf          = false,
+          enableRollingDB     = !onFPGAPlatform && enableChiselDB,
+          enableMonitor       = !onFPGAPlatform && enableChiselDB,
+          enableTLLog         = !onFPGAPlatform && enableChiselDB && enableTLLog,
+          enableCHILog        = !onFPGAPlatform && enableCHILog,
+          elaboratedTopDown   = false,
+          FPGAPlatform        = onFPGAPlatform,
 
-        // data check
-        dataCheck           = Some("oddparity"),
-        enablePoison        = true,
+          // prefetch
+          prefetch            = Seq(BOPParameters()),
 
-        // internal ECC
-        tagECC              = Some("secded"),
-        dataECC             = Some("secded"),
-        enableTagECC        = true,
-        enableDataECC       = true,
+          // data check
+          dataCheck           = Some("oddparity"),
+          enablePoison        = true,
 
-        // using external RN-F SAM
-        sam                 = Seq(AddressSet.everything -> 0)
-      )
+          // internal ECC
+          tagECC              = Some("secded"),
+          dataECC             = Some("secded"),
+          enableTagECC        = true,
+          enableDataECC       = true,
+
+          // using external RN-F SAM
+          sam                 = Seq(AddressSet.everything -> 0)
+        )
+        // Small functional-test config. DRRIP set dueling splits the set index into
+        // two equal halves, so log2(sets) must be even: use 256 instead of 128.
+        val functionalParam = xsDefaultParam.copy(
+          ways                = 4,
+          sets                = 256,
+          clientCaches        = Seq(L1Param(aliasBitsOpt = Some(2), vaddrBitsOpt = Some(36))),
+          echoField           = Nil,
+          reqField            = Nil
+        )
+        if (xsDefault) xsDefaultParam else functionalParam
+      }
       case CHIIssue => issue
     })
 
@@ -281,6 +311,9 @@ Usage: TestTop_CHIL2 [<--option> <values>]
       --chilog <1>              enable CHILogger under ChiselDB
       --etime <1>               enable external world time for CHI logging
       --vtime <1>               enable verilog world time for CHI logging
+      --xs-default <1>          use L2 params matching XiangShan DefaultConfig
+                                (8 ways, 1024 sets, dcache client with 44-bit vaddr);
+                                0 for small functional-test params (4 ways, 256 sets)
   """
 
   if (args.contains("--help"))
@@ -302,6 +335,7 @@ Usage: TestTop_CHIL2 [<--option> <values>]
   var enableCHILog: Boolean = false
   var eTime: Boolean = false
   var vTime: Boolean = false
+  var xsDefault: Boolean = true
 
   val varArgsToDrop = args.sliding(2, 1).zipWithIndex.collect {
     case (Array("--issue", value), i) => (issue = value, i)
@@ -314,6 +348,7 @@ Usage: TestTop_CHIL2 [<--option> <values>]
     case (Array("--chilog", value), i) => (enableCHILog = value.toInt != 0, i)
     case (Array("--etime", value), i) => (eTime = value.toInt != 0, i)
     case (Array("--vtime", value), i) => (vTime = value.toInt != 0, i)
+    case (Array("--xs-default", value), i) => (xsDefault = value.toInt != 0, i)
   }
 
   varArgsToDrop.map(_._2).foreach(i => {
@@ -328,11 +363,13 @@ Usage: TestTop_CHIL2 [<--option> <values>]
       numULAgents,
       numBanks,
       eTime,
-      vTime)(p), 
+      vTime,
+      xsDefault)(p),
     issue,
     onFPGAPlatform,
     enableChiselDB,
     enableTLLog,
-    enableCHILog
+    enableCHILog,
+    xsDefault
   )(varArgs.toArray)
 }
