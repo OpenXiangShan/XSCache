@@ -8,6 +8,7 @@ WITH_CHILOG ?= 1
 BY_ETIME ?= 1
 BY_VTIME ?= 0
 FPGA ?= 0
+XS_DEFAULT ?= 1
 
 init:
 	git submodule update --init
@@ -19,13 +20,13 @@ compile:
 CHI_PASS_ARGS = ISSUE=$(ISSUE) NUM_CORE=$(NUM_CORE) NUM_TL_UL=$(NUM_TL_UL) NUM_SLICE=$(NUM_SLICE) \
 			    WITH_CHISELDB=$(WITH_CHISELDB) WITH_TLLOG=$(WITH_TLLOG) WITH_CHILOG=$(WITH_CHILOG) \
 				BY_ETIME=$(BY_ETIME) BY_VTIME=$(BY_VTIME) \
-			    FPGA=$(FPGA)
+			    FPGA=$(FPGA) XS_DEFAULT=$(XS_DEFAULT)
 
 TOP = TestTop
 CHI_TOP_ARGS = --issue $(ISSUE) --core $(NUM_CORE) --tl-ul $(NUM_TL_UL) --bank $(NUM_SLICE) \
 		   	   --chiseldb $(WITH_CHISELDB) --tllog $(WITH_TLLOG) --chilog $(WITH_CHILOG) \
 			   --etime $(BY_ETIME) --vtime $(BY_VTIME) \
-		       --fpga $(FPGA)
+		       --fpga $(FPGA) --xs-default $(XS_DEFAULT)
 BUILD_DIR_L2 = ./build/coupledl2
 BUILD_DIR_LLC = ./build/openllc
 TOP_V_L2 = $(BUILD_DIR_L2)/$(TOP).sv
