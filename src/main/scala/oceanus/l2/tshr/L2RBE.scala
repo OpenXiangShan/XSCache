@@ -13,6 +13,7 @@ object L2RBE {
   class PathVPipeBlock extends Bundle {
     val EVT = Bool()
     val SNP = Bool()
+    val EVB = Bool()
     val REQ = Bool()
   }
 }
@@ -26,6 +27,7 @@ class L2RBE[T <: Bundle](
 
   val io = IO(new Bundle {
 
+    val blockFromTSHR = Input(Bool())
     val blockFromVPipe = Input(new PathVPipeBlock)
         
     val directoryReadDone = Input(Bool())
@@ -38,10 +40,11 @@ class L2RBE[T <: Bundle](
   })
 
   // blocking conditions
+  val blockByTSHR = io.blockFromTSHR
   val blockByVPipe = io.blockFromVPipe.asUInt.orR
   val blockByDirectory = !io.directoryReadDone && io.directoryReadNeed
 
-  val block = blockByVPipe || blockByDirectory
+  val block = blockByTSHR || blockByVPipe || blockByDirectory
 
   // auxiliary
   val _is_stalling = Wire(Bool())
@@ -86,6 +89,7 @@ class L2RBE[T <: Bundle](
   val perf_stallCycleCnt_byEVT = RegInit(0.U(32.W))
   val perf_stallCycleCnt_bySNP = RegInit(0.U(32.W))
   val perf_stallCycleCnt_byREQ = RegInit(0.U(32.W))
+  val perf_stallCycleCnt_byTSHR = RegInit(0.U(32.W))
   when (io.out.fire) {
     perf_stallCycleCnt := 0.U
     perf_stallCycleCnt_byDirectory := 0.U
@@ -98,6 +102,7 @@ class L2RBE[T <: Bundle](
     when (io.blockFromVPipe.EVT) { perf_stallCycleCnt_byEVT := perf_stallCycleCnt_byEVT + 1.U }
     when (io.blockFromVPipe.SNP) { perf_stallCycleCnt_bySNP := perf_stallCycleCnt_bySNP + 1.U }
     when (io.blockFromVPipe.REQ) { perf_stallCycleCnt_byREQ := perf_stallCycleCnt_byREQ + 1.U }
+    when (io.blockFromTSHR) { perf_stallCycleCnt_byTSHR := perf_stallCycleCnt_byTSHR + 1.U }
   }
 
   XSPerfAccumulate(s"L2RBE_${gen.className}_stallCycleCnt_total", _is_stalling)
@@ -107,6 +112,7 @@ class L2RBE[T <: Bundle](
   XSPerfAccumulate(s"L2RBE_${gen.className}_stallCycleCnt_byEVT_total", _is_stalling && io.blockFromVPipe.EVT)
   XSPerfAccumulate(s"L2RBE_${gen.className}_stallCycleCnt_bySNP_total", _is_stalling && io.blockFromVPipe.SNP)
   XSPerfAccumulate(s"L2RBE_${gen.className}_stallCycleCnt_byREQ_total", _is_stalling && io.blockFromVPipe.REQ)
+  XSPerfAccumulate(s"L2RBE_${gen.className}_stallCycleCnt_byTSHR_total", _is_stalling && io.blockFromTSHR)
   XSPerfHistogram(s"L2RBE_${gen.className}_stallCycleCnt_byDirectory", perf_stallCycleCnt_byDirectory, io.out.fire, 0, 40, 2, right_strict = true)
   XSPerfHistogram(s"L2RBE_${gen.className}_stallCycleCnt_byDirectory", perf_stallCycleCnt_byDirectory, io.out.fire, 40, 800, 40, left_strict = true)
   XSPerfHistogram(s"L2RBE_${gen.className}_stallCycleCnt_byEVT", perf_stallCycleCnt_byEVT, io.out.fire, 0, 40, 2, right_strict = true)
@@ -115,5 +121,7 @@ class L2RBE[T <: Bundle](
   XSPerfHistogram(s"L2RBE_${gen.className}_stallCycleCnt_bySNP", perf_stallCycleCnt_bySNP, io.out.fire, 40, 800, 40, left_strict = true)
   XSPerfHistogram(s"L2RBE_${gen.className}_stallCycleCnt_byREQ", perf_stallCycleCnt_byREQ, io.out.fire, 0, 40, 2, right_strict = true)
   XSPerfHistogram(s"L2RBE_${gen.className}_stallCycleCnt_byREQ", perf_stallCycleCnt_byREQ, io.out.fire, 40, 800, 40, left_strict = true)
+  XSPerfHistogram(s"L2RBE_${gen.className}_stallCycleCnt_byTSHR", perf_stallCycleCnt_byTSHR, io.out.fire, 0, 40, 2, right_strict = true)
+  XSPerfHistogram(s"L2RBE_${gen.className}_stallCycleCnt_byTSHR", perf_stallCycleCnt_byTSHR, io.out.fire, 40, 800, 40, left_strict = true)
   XSPerfAccumulate(s"L2RBE_${gen.className}_issueCnt", io.out.fire)
 }

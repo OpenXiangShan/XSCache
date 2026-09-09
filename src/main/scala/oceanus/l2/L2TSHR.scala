@@ -43,13 +43,14 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
 
     val UpRXEVT = Input(new FlitEVT)                    // L1 EVT
     val DnRXSNP = Input(new CHIBundleSNP)               // HN SNP
+    val UpRXEVB = Input(new L2VPipeREQ.FlitEVB)         // L2 EVB
     val UpRXREQ = Input(new FlitREQ)                    // L1/L2 REQ
 
     val DnTXREQ = Decoupled(new CHIBundleREQ)           // HN REQ
 
     val UpTXSNP = Decoupled(new FlitSNP)                // SNP to L1
 
-    val UpTXREQ = Decoupled(new FlitREQ)              // REQ from L2 to L2
+    val UpTXEVB = Decoupled(new L2VPipeREQ.FlitEVB)   // EVB from L2 to L2
 
     val UpRXRSP = Flipped(Valid(new FlitUpRSP))       // RSP from L1
     val UpRXDAT = Flipped(Valid(new FlitUpDAT))       // DAT from L1
@@ -74,6 +75,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
     val peer_unlock_ds = Output(Vec(paramL2.mshrSize, Bool()))
 
     val self_unlock_dir = Input(Bool())
+    val self_unlock_dir_tshrId = Input(UInt(mshrIndexWidth.W))
     val self_unlock_ds = Input(Bool())
 
     val valid = Output(Bool())
@@ -86,6 +88,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
 
   val tshr_enter_EVT = io.fromAlloc.alloc.EVT || io.fromAlloc.reuse.EVT
   val tshr_enter_SNP = io.fromAlloc.alloc.SNP || io.fromAlloc.reuse.SNP
+  val tshr_enter_EVB = io.fromAlloc.alloc.EVB || io.fromAlloc.reuse.EVB
   val tshr_enter_REQ = io.fromAlloc.alloc.REQ || io.fromAlloc.reuse.REQ
 
   val tshr_enter_EVT_WayValid_Evict = tshr_enter_EVT && io.UpRXEVT.WayValid && io.UpRXEVT.Opcode === Evict.U
@@ -371,26 +374,43 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   // RBEs
   val rbeEVT = Module(new L2RBE(new FlitEVT /*TODO: strip PA here*/))
   val rbeSNP = Module(new L2RBE(new CHIBundleSNP /*TODO: strip PA here*/))
+  val rbeEVB = Module(new L2RBE(new L2VPipeREQ.FlitEVB))
   val rbeREQ = Module(new L2RBE(new FlitREQStripped))
 
   io.toAlloc.busy.EVT := !rbeEVT.io.in.ready
   io.toAlloc.busy.SNP := !rbeSNP.io.in.ready
+  io.toAlloc.busy.EVB := !rbeEVB.io.in.ready
   io.toAlloc.busy.REQ := !rbeREQ.io.in.ready
+
+  // RBE drain priority chain: EVT > SNP > EVB > REQ.
+  // NOTE: keyed on io.valid (queue occupancy, registered) rather than io.out.valid
+  // (drain fire) — the latter closes a combinational cycle through vPipeSNP.blockRBE.EVT
+  rbeEVT.io.blockFromTSHR := false.B
+  rbeSNP.io.blockFromTSHR := rbeEVT.io.valid
+  rbeEVB.io.blockFromTSHR := rbeEVT.io.valid || rbeSNP.io.valid
+  rbeREQ.io.blockFromTSHR := rbeEVT.io.valid || rbeSNP.io.valid || rbeEVB.io.valid
+
+  // PathVPipeBlock.EVB is only meaningful on the vPipe (blockRBE) side;
+  // there is no EVB vPipe to block an RBE, so tie it off here
+  Seq(rbeEVT, rbeSNP, rbeEVB, rbeREQ).foreach(_.io.blockFromVPipe.EVB := false.B)
 
   rbeEVT.io.in.bits := io.UpRXEVT
   rbeSNP.io.in.bits := io.DnRXSNP
+  rbeEVB.io.in.bits := io.UpRXEVB
   rbeREQ.io.in.bits := io.UpRXREQ
 
   rbeEVT.io.in.valid := tshr_enter_EVT
   rbeSNP.io.in.valid := tshr_enter_SNP
+  rbeEVB.io.in.valid := tshr_enter_EVB
   rbeREQ.io.in.valid := tshr_enter_REQ
 
   rbeEVT.io.directoryReadNeed := !((rbeEVT.io.out.bits.Opcode === Evict.U || rbeEVT.io.out.bits.Opcode === WriteBackFull.U) && rbeEVT.io.out.bits.WayValid)
   rbeSNP.io.directoryReadNeed := true.B
+  rbeEVB.io.directoryReadNeed := true.B
   rbeREQ.io.directoryReadNeed := true.B
 
-  tshr_inactive_rbe := !rbeEVT.io.valid && !rbeSNP.io.valid && !rbeREQ.io.valid &&
-                       !rbeEVT.io.in.valid && !rbeSNP.io.in.valid && !rbeREQ.io.in.valid
+  tshr_inactive_rbe := !rbeEVT.io.valid && !rbeSNP.io.valid && !rbeEVB.io.valid && !rbeREQ.io.valid &&
+                       !rbeEVT.io.in.valid && !rbeSNP.io.in.valid && !rbeEVB.io.in.valid && !rbeREQ.io.in.valid
 
 
   // Post RBE Data Storage Read Decision
@@ -438,6 +458,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   // connections between RBEs / RX and EVT vPipe
   rbeEVT.io.blockFromVPipe.EVT := vPipeEVT.io.blockRBE.EVT
   rbeSNP.io.blockFromVPipe.EVT := vPipeEVT.io.blockRBE.SNP
+  rbeEVB.io.blockFromVPipe.EVT := vPipeEVT.io.blockRBE.EVB
   rbeREQ.io.blockFromVPipe.EVT := vPipeEVT.io.blockRBE.REQ
 
   vPipeEVT.io.UpRXEVT := rbeEVT.io.out
@@ -447,6 +468,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   // connections between RBEs / RX and SNP vPipe
   rbeEVT.io.blockFromVPipe.SNP := vPipeSNP.io.blockRBE.EVT
   rbeSNP.io.blockFromVPipe.SNP := vPipeSNP.io.blockRBE.SNP
+  rbeEVB.io.blockFromVPipe.SNP := vPipeSNP.io.blockRBE.EVB
   rbeREQ.io.blockFromVPipe.SNP := vPipeSNP.io.blockRBE.REQ
 
   vPipeSNP.io.DnRXSNP := rbeSNP.io.out
@@ -454,9 +476,11 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   // connections between RBEs / RX and REQ vPipe
   rbeEVT.io.blockFromVPipe.REQ := vPipeREQ.io.blockRBE.EVT
   rbeSNP.io.blockFromVPipe.REQ := vPipeREQ.io.blockRBE.SNP
+  rbeEVB.io.blockFromVPipe.REQ := vPipeREQ.io.blockRBE.EVB
   rbeREQ.io.blockFromVPipe.REQ := vPipeREQ.io.blockRBE.REQ
 
   vPipeREQ.io.UpRXREQ := rbeREQ.io.out
+  vPipeREQ.io.UpRXEVB := rbeEVB.io.out
 
   vPipeREQ.io.DnRXRSP := io.DnRXRSP
   vPipeREQ.io.DnRXDAT := io.DnRXDAT
@@ -489,6 +513,8 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   // connections between TSHR local and REQ vPipe
   vPipeREQ.io.tshr_paddr := tshr_paddr
   vPipeREQ.io.tshr_dirResult := dirResult
+  vPipeREQ.io.tshr_meta_modified := meta_modified.asUInt.orR
+  vPipeREQ.io.tshr_tag_modified := tag_modified
   vPipeREQ.io.tbuf_modified := tshr_buffer_modified
   vPipeREQ.io.tbuf_data0_valid := tshr_buffer_halfWritten_0_q || tshr_buffer_fullModified_q || vPipeREQ.io.ds_rd_done
   vPipeREQ.io.tbuf_data2_valid := tshr_buffer_halfWritten_2_q || tshr_buffer_fullModified_q || vPipeREQ.io.ds_rd_done
@@ -510,6 +536,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   io.peer_unlock_ds := vPipeREQ.io.peer_unlock_ds
 
   vPipeREQ.io.self_unlock_dir := io.self_unlock_dir
+  vPipeREQ.io.self_unlock_dir_tshrId := io.self_unlock_dir_tshrId
   vPipeREQ.io.self_unlock_ds := io.self_unlock_ds
 
   vPipeREQ.io.L1EVT_active := vPipeEVT.io.EVT_active
@@ -529,7 +556,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   fastArb(Seq(vPipeSNP.io.DnTXDAT, vPipeREQ.io.DnTXDAT), io.DnTXDAT, Some("DnTXDAT"))
   io.DnTXDAT.bits.Data.get := Mux(io.DnTXDAT.bits.DataID.get === 0.U, tshr_buffer_0, tshr_buffer_2)
 
-  io.UpTXREQ <> vPipeREQ.io.UpTXREQ
+  io.UpTXEVB <> vPipeREQ.io.UpTXEVB
 
   // ----------------------------------------------------------------
 
@@ -562,6 +589,7 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
 
   rbeEVT.io.directoryReadDone := proxyDir.io.rd_done
   rbeSNP.io.directoryReadDone := proxyDir.io.rd_done
+  rbeEVB.io.directoryReadDone := proxyDir.io.rd_done
   rbeREQ.io.directoryReadDone := proxyDir.io.rd_done
 
   vPipeREQ.io.repl_retry := proxyDir.io.repl_retry
@@ -630,7 +658,10 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   // 'wb_cancel' drops non-arbiterated Directory Write & Data Storage write
   proxyDir.io.wb_locked := vPipeREQ.io.dir_wb_locked
   proxyDS.io.wb_locked := vPipeREQ.io.ds_wb_locked
+  vPipeREQ.io.dir_wb_done := proxyDir.io.wb_done
 
   proxyDir.io.wb_cancel := vPipeREQ.io.dir_wb_cancel
   proxyDS.io.wb_cancel := vPipeREQ.io.ds_wb_cancel
+  
+  proxyDS.io.wb_aux := vPipeREQ.io.ds_wb_aux
 }

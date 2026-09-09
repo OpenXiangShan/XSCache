@@ -72,6 +72,7 @@ class L2VPipeEVT(
 
   io.blockRBE.EVT := !io.free
   io.blockRBE.SNP := io.EVT_active
+  io.blockRBE.EVB := io.EVT_active
   io.blockRBE.REQ := io.EVT_active
 
   val dirResult = io.tshr_dirResult

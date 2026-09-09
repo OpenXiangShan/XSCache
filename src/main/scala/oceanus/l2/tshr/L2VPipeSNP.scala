@@ -475,6 +475,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sl
 
   io.blockRBE.EVT := block_vpipe_evt
   io.blockRBE.SNP := active 
+  io.blockRBE.EVB := active
   io.blockRBE.REQ := active
   io.free := !active
   // ---------------------------------------------------------
