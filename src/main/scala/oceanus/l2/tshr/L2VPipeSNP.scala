@@ -9,16 +9,17 @@ import oceanus.chi.bundle._
 import oceanus.chi.opcode._
 import org.chipsalliance.cde.config.Parameters
 
-class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId: Int, val nodeId: Int)(implicit val p: Parameters)
+class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implicit val p: Parameters)
     extends Module
     with CHIRNFOpcodesSNP
     with CHIRNFOpcodesRSP
     with CHIRNFOpcodesDAT
     with CHIRNFOpcodesREQ
-    with HasL2Params
-    with L2TSHRLocatable {
+    with HasL2Params {
 
   val io = IO(new Bundle {
+    val consts = Input(new L2TSHRConsts(sliceNum))
+
     val DnRXSNP = Flipped(Valid(new CHIBundleSNP))
 
     val DnTXRSP = Decoupled(new CHIBundleRSP)
@@ -420,7 +421,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sl
   io.DnTXRSP.bits := DontCare
   io.DnTXRSP.bits.QoS.get := p_rxsnp.QoS.get
   io.DnTXRSP.bits.TgtID.get := p_rxsnp.SrcID.get
-  io.DnTXRSP.bits.SrcID.get := nodeId.U
+  io.DnTXRSP.bits.SrcID.get := io.consts.nodeId
   io.DnTXRSP.bits.TxnID.get := p_rxsnp.TxnID.get
   io.DnTXRSP.bits.Opcode.get := Mux(need_dct_txdat, CHI_SnpRespFwded.U, CHI_SnpResp.U)
   io.DnTXRSP.bits.RespErr.get := 0.U
@@ -440,7 +441,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sl
   io.DnTXDAT.bits := DontCare
   io.DnTXDAT.bits.QoS.get := p_rxsnp.QoS.get
   io.DnTXDAT.bits.TgtID.get := Mux(p_dct_txdat_valid, p_rxsnp.FwdNID.get, p_rxsnp.SrcID.get)
-  io.DnTXDAT.bits.SrcID.get := nodeId.U
+  io.DnTXDAT.bits.SrcID.get := io.consts.nodeId
   io.DnTXDAT.bits.TxnID.get := Mux(p_dct_txdat_valid, p_rxsnp.FwdTxnID.get, p_rxsnp.TxnID.get)
   io.DnTXDAT.bits.HomeNID.get := p_rxsnp.SrcID.get
   io.DnTXDAT.bits.Opcode.get := Mux(p_dct_txdat_valid, CHI_CompData.U, Mux(need_dct_txdat, CHI_SnpRespDataFwded.U, CHI_SnpRespData.U))
@@ -683,7 +684,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sl
       "TSHR @ %m SNP vPipe emitted an incorrect Home TXRSP opcode")
     assert(io.DnTXRSP.bits.QoS.get === p_rxsnp.QoS.get &&
            io.DnTXRSP.bits.TgtID.get === p_rxsnp.SrcID.get &&
-           io.DnTXRSP.bits.SrcID.get === nodeId.U &&
+           io.DnTXRSP.bits.SrcID.get === io.consts.nodeId &&
            io.DnTXRSP.bits.TxnID.get === p_rxsnp.TxnID.get &&
            io.DnTXRSP.bits.RespErr.get === 0.U &&
            io.DnTXRSP.bits.TraceTag.get === p_rxsnp.TraceTag.get,
@@ -693,7 +694,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int, val sl
   }
   when (io.DnTXDAT.valid) {
     assert(io.DnTXDAT.bits.QoS.get === p_rxsnp.QoS.get &&
-           io.DnTXDAT.bits.SrcID.get === nodeId.U &&
+           io.DnTXDAT.bits.SrcID.get === io.consts.nodeId &&
            io.DnTXDAT.bits.HomeNID.get === p_rxsnp.SrcID.get &&
            io.DnTXDAT.bits.DBID.get === p_rxsnp.TxnID.get &&
            io.DnTXDAT.bits.RespErr.get === 0.U &&

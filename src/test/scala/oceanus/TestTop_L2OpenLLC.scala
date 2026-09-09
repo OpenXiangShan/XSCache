@@ -237,6 +237,8 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       --l2 <l2_num>             specify the number of Oceanus L2 instances, 1 by default
       --slices <slice_num>      specify the number of slices per L2, 2 by default;
                                 external SAM supports 1 to 4 slices
+      --noperf                  disable all DUT performance counters (drops the
+                                LogPerfEndpoint bulk; much faster firtool/verilation)
   """
 
   if (args.contains("--help"))
@@ -245,21 +247,20 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
     System.exit(0)
   }
 
-  var varArgs = ArrayBuffer(args.toIndexedSeq:_*)
-  var varArgsDropped = 0
-
   var numL2 = 1
   var numSlices = 2
+  var noPerf = false
 
-  val varArgsToDrop = args.sliding(2, 1).zipWithIndex.collect {
-    case (Array("--l2", value), i) => (numL2 = value.toInt, i)
-    case (Array("--slices", value), i) => (numSlices = value.toInt, i)
+  val varArgs = ArrayBuffer[String]()
+  var i = 0
+  while (i < args.length) {
+    args(i) match {
+      case "--l2"     => numL2 = args(i + 1).toInt; i += 2
+      case "--slices" => numSlices = args(i + 1).toInt; i += 2
+      case "--noperf" => noPerf = true; i += 1
+      case other      => varArgs += other; i += 1
+    }
   }
-
-  varArgsToDrop.map(_._2).foreach(i => {
-    varArgs.remove(i - varArgsDropped, 2)
-    varArgsDropped = varArgsDropped + 2
-  })
   varArgs.trimToSize()
 
   require(numL2 >= 1, s"Unsupported L2 count $numL2")
@@ -306,13 +307,13 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
     )
     case LogUtilsOptionsKey => LogUtilsOptions(
       enableDebug = false,
-      enablePerf = true,
+      enablePerf = !noPerf,
       fpgaPlatform = false
     )
     case PerfCounterOptionsKey => PerfCounterOptions (
-      enablePerfPrint = true,
+      enablePerfPrint = !noPerf,
       enablePerfDB = false,
-      perfLevel = XSPerfLevel.VERBOSE,
+      perfLevel = if (noPerf) XSPerfLevel.NORMAL else XSPerfLevel.VERBOSE,
       0
     )
   })

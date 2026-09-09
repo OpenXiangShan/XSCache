@@ -102,6 +102,12 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   //
   val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId)))
 
+  slices.zipWithIndex.foreach { case (slice, i) =>
+    slice.io.consts.sliceIdx := i.U
+    slice.io.consts.sliceNID := config.slices(i).U
+    slice.io.consts.nodeId := config.nodeId.U
+  }
+
   // - Upstream RXEVT routing
   val postSAM_UpEVTs = Seq(postSAM_t1p0.UpEVT)
   val preArb_UpEVTs = Wire(Vec(config.sliceNum, Vec(postSAM_UpEVTs.size, Decoupled(new FlitEVT))))

@@ -12,19 +12,17 @@ import org.chipsalliance.cde.config.Parameters
 
 class L2VPipeEVT(
     clientComponents: Seq[CCHIComponent],
-    val sliceNum: Int = 0,
-    val sliceIdx: Int = 0,
-    val sliceNID: Int = 0,
-    val tshrId: Int = 0
+    val sliceNum: Int
 )(implicit val p: Parameters)
     extends Module
     with HasL2Params
     with CHIRNFOpcodesREQ
     with CHIRNFOpcodesRSP
-    with CHIRNFOpcodesDAT
-    with L2TSHRLocatable {
+    with CHIRNFOpcodesDAT {
 
   val io = IO(new Bundle {
+    val consts = Input(new L2TSHRConsts(sliceNum))
+
     val UpRXEVT = Flipped(Valid(new FlitEVT))
     val UpTXRSP = Decoupled(new FlitDnRSP)
     val UpRXDAT = Flipped(Valid(new FlitUpDAT))
@@ -64,7 +62,7 @@ class L2VPipeEVT(
 
   io.EVT_active := inflightEvict
   io.evtDataReadyOut := RegNext(io.UpRXDAT.valid &&
-    io.UpRXDAT.bits.TxnID === getUpTxnID &&
+    io.UpRXDAT.bits.TxnID === io.consts.tshrId &&
     io.UpRXDAT.bits.Opcode === CCHIOpcode.CopyBackWrData.U &&
     io.UpRXDAT.bits.DataID === 1.U, false.B) // upstream DataID: packed beat index {0,1}
 
@@ -84,7 +82,7 @@ class L2VPipeEVT(
   val copyBackWrDataMatch =
     dataArmed &&
       io.UpRXDAT.valid &&
-      io.UpRXDAT.bits.TxnID === getUpTxnID &&
+      io.UpRXDAT.bits.TxnID === io.consts.tshrId &&
       io.UpRXDAT.bits.Opcode === CCHIOpcode.CopyBackWrData.U
   val isBeat0 = copyBackWrDataMatch && io.UpRXDAT.bits.DataID === 0.U
   val isBeat2 = copyBackWrDataMatch && io.UpRXDAT.bits.DataID === 1.U // upstream DataID: packed beat index {0,1}
@@ -135,9 +133,9 @@ class L2VPipeEVT(
 
   io.UpTXRSP.valid := state === sSendCompDBIDResp || state === sSendComp
   io.UpTXRSP.bits.TxnID := pTxnId
-  io.UpTXRSP.bits.SrcID := sliceNID.U
+  io.UpTXRSP.bits.SrcID := io.consts.sliceNID
   io.UpTXRSP.bits.TgtID := pSrcId
-  io.UpTXRSP.bits.DBID := getUpTxnID
+  io.UpTXRSP.bits.DBID := io.consts.tshrId
   io.UpTXRSP.bits.Opcode := Mux(state === sSendCompDBIDResp, CCHIOpcode.CompDBIDResp.U, CCHIOpcode.Comp.U)
   io.UpTXRSP.bits.RespErr := 0.U
   io.UpTXRSP.bits.Resp := 0.U

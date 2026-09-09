@@ -54,6 +54,8 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
 
   val io = IO(new Bundle {
 
+    val tshrId = Input(UInt(mshrIndexWidth.W))
+
     val fromDir = Input(new L2Directory.PathFromDirectory)
 
     val toDS = Output(new L2DataStorage.PathTSHRToDataStorage)
@@ -137,12 +139,12 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
   val ds_read_cancel = io.ds_read_EVT_cancel || io.ds_read_SNP_cancel || io.ds_read_REQ_cancel
 
   //
-  val fromDir_en = io.fromDir.TSHRID === id.U
+  val fromDir_en = io.fromDir.TSHRID === io.tshrId
 
   val fromDir_DirRdResp = fromDir_en && io.fromDir.DirRdResp
 
   //
-  val fromDS_en = io.fromDS.TSHRID === id.U
+  val fromDS_en = io.fromDS.TSHRID === io.tshrId
 
   val fromDS_DSBufAheadRdArbComp = fromDS_en && io.fromDS.DSBufAheadRdArbComp
   val fromDS_DSBufAheadRdResp = fromDS_en && io.fromDS.DSBufAheadRdResp
@@ -601,7 +603,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
   XSPerfAccumulate(s"L2TSHR_${id}_DSWrite_Done_cycleCnt", state_dsWrite.Done)
 
   // interactions with Data Storage
-  io.toDS.TSHRID := id.U
+  io.toDS.TSHRID := io.tshrId
   // *NOTICE: The AheadPreArb_S1 and AheadPreArb_S2 state should never overlap with any DSWrite states.
   //          It is assumed that no Data could be fast enough to be returned to TSHR Buffer in S0, S1, S2 from L1 and L3,
   //          otherwise consider clear all AheadPreArb on any RXDAT fire.
