@@ -498,7 +498,10 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
 
   when(grantDirWb) {
     val entry = blockRefill(reqSet)(winReq.WAY(wayBits - 1, 0))
-    when(entry.locked) {
+    // Release only on the lock owner's own fill-commit (tag+meta write):
+    // an eviction invalidate (meta-only) or any non-owner write to the same
+    // way must not drop the lock while the owner's fill commit is pending.
+    when(entry.locked && entry.owner === winReq.TSHRID && winReq.TAG_WEN) {
       entry.dirWbDone := true.B
     }
   }

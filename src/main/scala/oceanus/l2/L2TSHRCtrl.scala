@@ -42,8 +42,6 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
     val DnRXSNP = Flipped(Decoupled(new CHIBundleSNP))
     val UpRXREQ = Flipped(Decoupled(new FlitREQ))
 
-    val UpTXREQ = Decoupled(new FlitREQ)
-
     val UpTXSNP = Decoupled(new FlitSNP)
 
     val DnTXREQ = Decoupled(new CHIBundleREQ)
@@ -68,12 +66,16 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
     val fromClientTableEVT = Input(Vec(paramL2.mshrSize, Vec(1, Bool()))) // TODO: parameterize with coherent l2 client count
   })
 
+  //
+  val EVB = Wire(Decoupled(new L2VPipeREQ.FlitEVB))
+
   // -- RX channel connections
   val tshrs = Seq.tabulate(paramL2.mshrSize)(i => Module(new L2TSHR(sliceNum, sliceIdx, sliceNID, i, nodeId)))
 
   tshrs.foreach { case t => 
     t.io.UpRXEVT := io.UpRXEVT.bits
     t.io.DnRXSNP := io.DnRXSNP.bits
+    t.io.UpRXEVB := EVB.bits
     t.io.UpRXREQ := io.UpRXREQ.bits
 
     t.io.UpRXRSP.valid := io.UpRXRSP.valid && getTSHRIdFromUpTxnID(io.UpRXRSP.bits.TxnID) === t.tshrId.U 
@@ -97,15 +99,16 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
 
   // -- TSHR Allocation connections
   val tshrAlloc = Module(new L2TSHRAlloc(new L2TSHRAllocConfig(
-    cluster = Seq(Seq(L2TSHRAllocTarget.EVT), Seq(L2TSHRAllocTarget.SNP, L2TSHRAllocTarget.REQ)), // TODO: parameterize clustering
+    cluster = Seq(Seq(L2TSHRAllocTarget.EVT), Seq(L2TSHRAllocTarget.SNP, L2TSHRAllocTarget.EVB, L2TSHRAllocTarget.REQ)), // TODO: parameterize clustering
     resv = Seq(
-      (paramL2.mshrSize - 1, L2TSHRResvTarget.L2EVT),
+      (paramL2.mshrSize - 1, L2TSHRResvTarget.L2EVB),
       (paramL2.mshrSize - 2, L2TSHRResvTarget.L1EVT),
       (paramL2.mshrSize - 3, L2TSHRResvTarget.L3SNP)) // TODO: parameterize reservation
   )))
 
   tshrAlloc.io.fromTSHRCtrl.RXEVT <> io.UpRXEVT
   tshrAlloc.io.fromTSHRCtrl.RXSNP <> io.DnRXSNP
+  tshrAlloc.io.fromTSHRCtrl.RXEVB <> EVB
   tshrAlloc.io.fromTSHRCtrl.RXREQ <> io.UpRXREQ
 
   tshrs.foreach { case t => 
@@ -116,7 +119,7 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   // ----------------------------------------------------------------
 
   // -- TX channel connections
-  fastArb(tshrs.map(_.io.UpTXREQ), io.UpTXREQ, Some("TSHRsToUpTXREQ"))
+  fastArb(tshrs.map(_.io.UpTXEVB), EVB, Some("TSHRsToUpTXEVB"))
 
   fastArb(tshrs.map(_.io.UpTXSNP), io.UpTXSNP, Some("TSHRsToUpTXSNP"))
 
@@ -158,6 +161,10 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   // -- TSHR Inter-Unlocking connections
   tshrs.map(_.io.self_unlock_dir).zipWithIndex.foreach { case (sink, i) => {
     sink := tshrs.map(_.io.peer_unlock_dir(i)).orR
+  }}
+
+  tshrs.map(_.io.self_unlock_dir_tshrId).zipWithIndex.foreach { case (sink, i) => {
+    sink := ParallelMux(tshrs.map(_.io.peer_unlock_dir(i)), tshrs.map(_.tshrId.U))
   }}
 
   tshrs.map(_.io.self_unlock_ds).zipWithIndex.foreach { case (sink, i) => {

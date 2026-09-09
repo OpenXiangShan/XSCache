@@ -98,6 +98,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
 
     val wb_locked = Input(Bool())
     val wb_cancel = Input(Bool())
+    val wb_aux = Input(Bool())
     val wb_accept = Output(Bool())
     val wb_done = Output(Bool())
 
@@ -169,12 +170,10 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
   val hit_after_fromDS_dirRdResp = fromDir_DirRdResp && (io.fromDir.META.state =/= MetaState.I && io.fromDir.META.way === ds_read_ahead_way_q)
   val hit_after_fromDS_metaValid = io.meta_valid && (io.meta_state =/= MetaState.I && io.meta_way === ds_read_ahead_way_q)
   
-  // *NOTICE: State predication here prevents unnecessary DS write.
-  //          This predication could be removed (io.meta_state =/= MetaState.I) if causing any problem.
-  //          Especially for situations that cannot update local meta immediately after first TSHR Buffer 
-  //          update by upstream/downstream, if any.
+  // *NOTICE: State predication here prevents unnecessary and stale DS write.
   val tbuf_valid_modified = io.tbuf_modified && (io.meta_state =/= MetaState.I)
   val tbuf_valid_wen_last = io.tbuf_wen_last && (io.meta_state =/= MetaState.I)
+  val tbuf_valid_wb_aux = io.wb_aux && io.tbuf_modified && (io.meta_state =/= MetaState.I)
 
 
   // Data Storage read states
@@ -355,7 +354,8 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
     state_dsRead_next.AheadPreArb_S2 := false.B
     state_dsRead_next.AheadDone := false.B
 
-    when (!state_dsRead.AheadPostArb && !state_dsRead.PostArb) {
+    when (!state_dsRead.AheadPostArb && !state_dsRead.PostArb &&
+          !state_dsRead_next.AheadPostArb && !state_dsRead_next.PostArb) {
       state_dsRead_next.Done := true.B
     }
   }
@@ -474,7 +474,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
     when (io.wb_cancel) {
       // 1. [] -> DSWrite_Done
       state_dsWrite_next.Done := true.B
-    }.elsewhen (tbuf_valid_wen_last) {
+    }.elsewhen (tbuf_valid_wen_last || tbuf_valid_wb_aux) {
       // 2. [] -> DSWrite_PreArb
       state_dsWrite_next.PreArb := true.B
     }.elsewhen (io.tshr_valid && tshr_inactive && !tbuf_valid_modified) {
@@ -488,7 +488,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
     /*
     1. 
     */
-    when (tbuf_valid_wen_last && !io.wb_cancel) {
+    when ((tbuf_valid_wen_last || tbuf_valid_wb_aux) && !io.wb_cancel) {
       when (fromDS_DSBufWbArbComp && fromDS_DSBufWbComp) {
         // 1.1. DSWrite_PreArb -> DSWrite_PreArb
       }.elsewhen (fromDS_DSBufWbArbComp) {
@@ -518,7 +518,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
     /*
     1. 
     */
-    when (tbuf_valid_wen_last) {
+    when ((tbuf_valid_wen_last || tbuf_valid_wb_aux) && !io.wb_cancel) {
       when (fromDS_DSBufWbComp) {
         // 1. DSWrite_PostArb -> DSWrite_PreArb
         state_dsWrite_next.PostArb := false.B
@@ -559,7 +559,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
       // 4. DSWrite_PreArb_PostArb -> DSWrite_PostArb
       state_dsWrite_next.PreArb_PostArb := false.B
       state_dsWrite_next.PostArb := true.B
-    }.elsewhen (tbuf_valid_wen_last) {
+    }.elsewhen (tbuf_valid_wen_last || tbuf_valid_wb_aux) {
       // 5. DSWrite_PreArb_PostArb -> DSWrite_PreArb_PostArb
     }
   }
@@ -569,7 +569,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
     /*
     1.
     */
-    when (tbuf_valid_wen_last && !io.wb_cancel) {
+    when ((tbuf_valid_wen_last || tbuf_valid_wb_aux) && !io.wb_cancel) {
       // . DSWrite_Done -> DSWrite_PreArb
       state_dsWrite_next.Done := false.B
       state_dsWrite_next.PreArb := true.B

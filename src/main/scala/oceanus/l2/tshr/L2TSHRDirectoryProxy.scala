@@ -258,7 +258,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   io.repl_idle := !state_dirRead.ReplPreArb && !state_dirRead.ReplPostArb
   io.repl_ready := state_dirRead.Done || state_dirRead.ReplRetry
   io.repl_accept := io.toDir.ReplRd && fromDir_ReplRdArbComp
-  io.repl_done := state_dirRead.ReplDone
+  io.repl_done := state_dirRead.ReplDone && !io.repl_reset
   io.repl_retry := state_dirRead.ReplRetry
 
   assert(!(fromDir_DirRdArbComp && !state_dirRead.PreArb), "receiving DirRdArbComp on unexpected state (expecting PreArb)")
@@ -292,6 +292,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   state_dirWrite := state_dirWrite_next
 
   val wb_trigger = (io.meta_modify || io.meta_modified.any || io.tag_modify || io.tag_modified || io.wb_aux) && !io.wb_cancel
+  val wb_trigger_now = (io.meta_modify || io.tag_modify || io.wb_aux) && !io.wb_cancel
 
   if (configAggressiveWrite) {
 
@@ -318,7 +319,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       1. 
       */
       when (fromDir_DirWbArbComp) {
-        when (wb_trigger) {
+        when (wb_trigger_now) {
           // 1. DirWrite_PreArb -> DirWrite_PreArb
         }.otherwise {
           // 2. DirWrite_PreArb -> DirWrite_Done
@@ -369,19 +370,16 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       /*
       1.
       */
-      when (io.tshr_reuse) {
-        // 1. DirWrite_PreArb -> []
-        state_dirWrite_next.PreArb := false.B
-      }.elsewhen (fromDir_DirWbArbComp) {
-        when (wb_trigger) {
-          // 2. DirWrite_PreArb -> DirWrite_PreArb
+      when (fromDir_DirWbArbComp) {
+        when (wb_trigger_now) {
+          // 1. DirWrite_PreArb -> DirWrite_PreArb
         }.otherwise {
-          // 3. DirWrite_PreArb -> DirWrite_Done
+          // 2. DirWrite_PreArb -> DirWrite_Done
           state_dirWrite_next.PreArb := false.B
           state_dirWrite_next.Done := true.B
         }
       }.elsewhen (io.wb_cancel) {
-        // 4. DirWrite_PreArb -> DirWrite_Done
+        // 3. DirWrite_PreArb -> DirWrite_Done
         state_dirWrite_next.PreArb := false.B
         state_dirWrite_next.Done := true.B
       }
@@ -393,8 +391,14 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
       1.
       */
       when (wb_trigger) {
-        // 1. DirWrite_Done -> []
-        state_dirWrite_next.Done := false.B
+        when (io.wb_aux) {
+          // 1. DirWrite_Done -> DirWrite_PreArb
+          state_dirWrite_next.Done := false.B
+          state_dirWrite_next.PreArb := true.B
+        }.otherwise {
+          // 2. DirWrite_Done -> []
+          state_dirWrite_next.Done := false.B
+        }
       }
     }
   }

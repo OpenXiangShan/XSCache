@@ -132,9 +132,8 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       preArb_UpREQs(i)(j).valid := postSAM_UpREQ.valid && postSAM_UpREQ.bits.TgtID === config.slices(i).U
     }}
     val slice_io_UpRXREQ_remote = Wire(Decoupled(new FlitREQ))
-    val slice_io_UpRXREQ_local = slice.io.UpTXREQ
     fastArb(preArb_UpREQs(i), slice_io_UpRXREQ_remote, Some(s"UpRXREQ_remote_$i"))
-    arb(Seq(slice_io_UpRXREQ_local, slice_io_UpRXREQ_remote), slice.io.UpRXREQ, Some(s"UpRXREQ_$i"))
+    arb(Seq(slice_io_UpRXREQ_remote), slice.io.UpRXREQ, Some(s"UpRXREQ_$i"))
   }}
 
   // - Upstream RXRSP routing
