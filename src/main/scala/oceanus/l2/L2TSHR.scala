@@ -17,20 +17,25 @@ import freechips.rocketchip.util.SeqToAugmentedSeq
 import oceanus.l2.tshr.L2TSHRDirectoryProxy
 
 
-trait L2TSHRLocatable extends L2SliceLocatable {
-
-  val tshrId: Int
-
-  def getDnTxnID = getTxnIDFromTSHRId(tshrId)
-
-  def getUpTxnID = tshrId.U
+/* Per-instance identities routed as ports instead of constructor constants,
+   so that all TSHR/slice instances elaborate to identical modules and
+   firtool can deduplicate them into a single definition. */
+class L2SliceConsts(val sliceNum: Int)(implicit val p: Parameters) extends Bundle with HasL2Params {
+  val sliceIdx = UInt(log2Ceil(math.max(sliceNum, 2)).W)
+  val sliceNID = UInt(8.W) // CCHI flit SrcID width, see oceanus.compactchi Flit bundles
+  val nodeId = UInt(paramCHI.nodeIdWidth.W)
 }
 
-class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId: Int, val nodeId: Int)(implicit val p: Parameters) extends Module 
-    with HasL2Params 
-    with L2SliceLocatable {
+class L2TSHRConsts(sliceNum: Int)(implicit p: Parameters) extends L2SliceConsts(sliceNum) {
+  val tshrId = UInt(mshrIndexWidth.W)
+}
+
+class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) extends Module 
+    with HasL2Params {
 
   val io = IO(new Bundle {
+
+    val consts = Input(new L2TSHRConsts(sliceNum))
 
     val toDir = Output(new L2Directory.PathToDirectory)
     val fromDir = Input(new L2Directory.PathFromDirectory)
@@ -167,13 +172,13 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
     tag_modified := false.B
   }
 
-  when (io.fromDir.DirRdResp && io.fromDir.TSHRID === tshrId.U) {
+  when (io.fromDir.DirRdResp && io.fromDir.TSHRID === io.consts.tshrId) {
     meta_modified.unmaskAndWrite(meta, io.fromDir.META)
     meta.way := io.fromDir.META.way
     meta.hit := io.fromDir.META.hit
   }
   
-  when (io.fromDir.ReplRdResp && io.fromDir.TSHRID === tshrId.U) {
+  when (io.fromDir.ReplRdResp && io.fromDir.TSHRID === io.consts.tshrId) {
     replResult := io.fromDir.REPL
     meta.way := io.fromDir.REPL.way
   }
@@ -426,10 +431,15 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
 
 
   // -- vPipes and TSHR local modules
-  val vPipeEVT = Module(new L2VPipeEVT(Seq(/*TODO: client devices*/), sliceNum, sliceIdx, sliceNID, tshrId))
-  val vPipeSNP = Module(new L2VPipeSNP(Seq(/*TODO: client devices*/), sliceNum, sliceIdx, sliceNID, tshrId, nodeId))
-  val vPipeREQ = Module(new L2VPipeREQ(Seq(/*TODO: client devices*/), sliceNum, sliceIdx, sliceNID, tshrId, nodeId))
-  val snoopAgent = Module(new L2SnoopAgent(tshrId, sliceNID))
+  val vPipeEVT = Module(new L2VPipeEVT(Seq(/*TODO: client devices*/), sliceNum))
+  val vPipeSNP = Module(new L2VPipeSNP(Seq(/*TODO: client devices*/), sliceNum))
+  val vPipeREQ = Module(new L2VPipeREQ(Seq(/*TODO: client devices*/), sliceNum))
+  val snoopAgent = Module(new L2SnoopAgent(sliceNum))
+
+  vPipeEVT.io.consts := io.consts
+  vPipeSNP.io.consts := io.consts
+  vPipeREQ.io.consts := io.consts
+  snoopAgent.io.consts := io.consts
 
   tshr_inactive_vpipe := vPipeEVT.io.free && vPipeSNP.io.free && vPipeREQ.io.free
 
@@ -563,6 +573,8 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
   // Directory Proxy
   val proxyDir = Module(new L2TSHRDirectoryProxy(tshrId))
 
+  proxyDir.io.tshrId := io.consts.tshrId
+
   io.toDir := proxyDir.io.toDir
   proxyDir.io.fromDir := io.fromDir
 
@@ -605,6 +617,8 @@ class L2TSHR(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val tshrId
 
   // Data Storage Proxy
   val proxyDS = Module(new L2TSHRDataStorageProxy(tshrId))
+
+  proxyDS.io.tshrId := io.consts.tshrId
 
   proxyDS.io.fromDir := io.fromDir
 

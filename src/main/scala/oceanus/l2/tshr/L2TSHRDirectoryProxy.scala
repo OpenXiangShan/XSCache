@@ -54,6 +54,8 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
 
   val io = IO(new Bundle {
 
+    val tshrId = Input(UInt(mshrIndexWidth.W))
+
     val toDir = Output(new L2Directory.PathToDirectory)
     val fromDir = Input(new L2Directory.PathFromDirectory)
 
@@ -105,7 +107,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   //  - When set to 'false', the "rd_done" and "repl_ready" signals might not behave as expected.
   val configReplReadAfterReadOnly = true
 
-  val fromDir_en = io.fromDir.TSHRID === id.U
+  val fromDir_en = io.fromDir.TSHRID === io.tshrId
 
   val fromDir_DirRdArbComp = fromDir_en && io.fromDir.DirRdArbComp
   val fromDir_DirRdResp = fromDir_en && io.fromDir.DirRdResp
@@ -414,7 +416,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   assert(PopCount(state_dirWrite.asUInt) <= 1.U, "multiple active states in DirWriteFSM")
 
   // interactions with Directory
-  io.toDir.TSHRID := id.U
+  io.toDir.TSHRID := io.tshrId
   io.toDir.PADDR := io.tshr_paddr
   io.toDir.WAY := io.meta_way
   io.toDir.META := io.meta

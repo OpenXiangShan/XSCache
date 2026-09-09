@@ -38,7 +38,7 @@ class TestTop_L2TSHRAlloc(val ccfg: Int)(implicit val p: Parameters) extends Mod
   val config = new L2TSHRAllocConfig(
     cluster = clusterConfigs(ccfg),
     resv = Seq(
-      (paramL2.mshrSize - 1, L2TSHRResvTarget.L2EVT),
+      (paramL2.mshrSize - 1, L2TSHRResvTarget.L2EVB),
       (paramL2.mshrSize - 2, L2TSHRResvTarget.L1EVT),
       (paramL2.mshrSize - 3, L2TSHRResvTarget.L3SNP))
   )

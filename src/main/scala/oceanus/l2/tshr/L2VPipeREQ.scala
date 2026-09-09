@@ -25,19 +25,16 @@ object L2VPipeREQ {
 }
 
 class L2VPipeREQ(clientComponents: Seq[CCHIComponent], 
-                 val sliceNum: Int, 
-                 val sliceIdx: Int, 
-                 val sliceNID: Int, 
-                 val tshrId: Int,
-                 val nodeId: Int)(implicit val p: Parameters) 
+                 val sliceNum: Int)(implicit val p: Parameters) 
     extends Module 
     with CHIRNFOpcodesREQ 
     with CHIRNFOpcodesRSP
     with CHIRNFOpcodesDAT
-    with HasL2Params
-    with L2TSHRLocatable {
+    with HasL2Params {
 
   val io = IO(new Bundle {
+    val consts = Input(new L2TSHRConsts(sliceNum))
+
     val UpRXREQ = Flipped(Valid(new FlitREQStripped))
     val UpRXEVB = Flipped(Valid(new L2VPipeREQ.FlitEVB))
 
@@ -118,6 +115,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   })
 
   val dirResult = io.tshr_dirResult
+
+  val dnTxnID = (io.consts.tshrId << log2Ceil(sliceNum)) | io.consts.sliceIdx
 
   val configNonAgedDirArb = false
   
@@ -649,8 +648,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.DnTXREQ.valid := s_dn_txreq
   io.DnTXREQ.bits.QoS.get := 14.U // Default at 14, (**DOT NOT use 15**, maybe better policy in future)
   io.DnTXREQ.bits.TgtID.get := 0.U // Support E-SAM only currently
-  io.DnTXREQ.bits.SrcID.get := nodeId.U
-  io.DnTXREQ.bits.TxnID.get := getDnTxnID
+  io.DnTXREQ.bits.SrcID.get := io.consts.nodeId
+  io.DnTXREQ.bits.TxnID.get := dnTxnID
   io.DnTXREQ.bits.ReturnNID_StashNID_SLCRepHint.get := 0.U // Not providing SLCRepHint/StashNID, default to 0
   io.DnTXREQ.bits.StashNIDValid_Endian_Deep.get := 0.U
   io.DnTXREQ.bits.ReturnTxnID_StashLPIDValid_StashLPID.get := 0.U
@@ -808,7 +807,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.DnTXRSP.valid := s_rd_dn_compack || s_evict_dn_compack
   io.DnTXRSP.bits.QoS.get := 14.U // Default at 14, (**DOT NOT use 15**, maybe better policy in future)
   io.DnTXRSP.bits.TgtID.get := p_homenid
-  io.DnTXRSP.bits.SrcID.get := nodeId.U
+  io.DnTXRSP.bits.SrcID.get := io.consts.nodeId
   io.DnTXRSP.bits.TxnID.get := p_dbid
   io.DnTXRSP.bits.Opcode.get := CHI_CompAck.U
   io.DnTXRSP.bits.RespErr.get := 0.U
@@ -860,7 +859,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.DnTXDAT.valid := s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2
   io.DnTXDAT.bits.QoS.get := 14.U // Default at 14, (**DOT NOT use 15**, maybe better policy in future)
   io.DnTXDAT.bits.TgtID.get := p_homenid
-  io.DnTXDAT.bits.SrcID.get := nodeId.U
+  io.DnTXDAT.bits.SrcID.get := io.consts.nodeId
   io.DnTXDAT.bits.TxnID.get := p_dbid
   io.DnTXDAT.bits.HomeNID.get := 0.U
   io.DnTXDAT.bits.Opcode.get := CHI_CopyBackWrData.U
@@ -1279,9 +1278,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   io.UpTXRSP.valid := s_rd_up_comp
   io.UpTXRSP.bits.TxnID := p_rxreq.TxnID
-  io.UpTXRSP.bits.SrcID := sliceNID.U
+  io.UpTXRSP.bits.SrcID := io.consts.sliceNID
   io.UpTXRSP.bits.TgtID := p_rxreq.SrcID
-  io.UpTXRSP.bits.DBID := getUpTxnID
+  io.UpTXRSP.bits.DBID := io.consts.tshrId
   io.UpTXRSP.bits.Opcode := up_txrsp_opcode
   io.UpTXRSP.bits.RespErr := 0.U // TODO: RespErr
   io.UpTXRSP.bits.Resp := up_txrsp_resp
@@ -1357,9 +1356,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   io.UpTXDAT.valid := s_rd_up_compdata0 || s_rd_up_compdata2
   io.UpTXDAT.bits.TxnID := p_rxreq.TxnID
-  io.UpTXDAT.bits.SrcID := sliceNID.U
+  io.UpTXDAT.bits.SrcID := io.consts.sliceNID
   io.UpTXDAT.bits.TgtID := p_rxreq.SrcID
-  io.UpTXDAT.bits.DBID := getUpTxnID
+  io.UpTXDAT.bits.DBID := io.consts.tshrId
   io.UpTXDAT.bits.Opcode := CCHIOpcode.CompData.U
   io.UpTXDAT.bits.RespErr := 0.U // TODO: RespErr
   io.UpTXDAT.bits.Resp := up_txdat_resp
@@ -1480,7 +1479,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.ds_wb_aux := unlock_ds
   
   io.UpTXEVB.valid := s_evict_up_evict
-  io.UpTXEVB.bits.TshrId := tshrId.U
+  io.UpTXEVB.bits.TshrId := io.consts.tshrId
   io.UpTXEVB.bits.Addr := io.repl_resp.paddr
   io.UpTXEVB.bits.Way := io.repl_resp.way
   // ----------------------------------------------------------------

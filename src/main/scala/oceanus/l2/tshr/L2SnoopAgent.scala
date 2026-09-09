@@ -82,9 +82,11 @@ object L2SnoopAgent {
   }
 }
 
-class L2SnoopAgent(tshrId: Int, sliceNID: Int)(implicit val p: Parameters) extends Module with HasL2Params {
+class L2SnoopAgent(val sliceNum: Int)(implicit val p: Parameters) extends Module with HasL2Params {
 
   val io = IO(new Bundle {
+    val consts = Input(new L2TSHRConsts(sliceNum))
+
     val uopFromSNP = Flipped(Valid(new L2SnoopAgent.PathToSnoopAgent))
     val uopFromREQ = Flipped(Valid(new L2SnoopAgent.PathToSnoopAgent))
 
@@ -186,13 +188,13 @@ class L2SnoopAgent(tshrId: Int, sliceNID: Int)(implicit val p: Parameters) exten
   val rspMatch =
     state === sWaitCore &&
       io.UpRXRSP.valid &&
-      io.UpRXRSP.bits.TxnID === tshrId.U &&
+      io.UpRXRSP.bits.TxnID === io.consts.tshrId &&
       io.UpRXRSP.bits.Opcode === CCHIOpcode.SnpResp.U
 
   val datMatch =
     state === sWaitCore &&
       io.UpRXDAT.valid &&
-      io.UpRXDAT.bits.TxnID === tshrId.U &&
+      io.UpRXDAT.bits.TxnID === io.consts.tshrId &&
       io.UpRXDAT.bits.Opcode === CCHIOpcode.SnpRespData.U
 
   val datBeat0 = datMatch && io.UpRXDAT.bits.DataID === 0.U
@@ -246,8 +248,8 @@ class L2SnoopAgent(tshrId: Int, sliceNID: Int)(implicit val p: Parameters) exten
 
   io.txSnp.valid := state === sSnpReq
   io.txSnp.bits := 0.U.asTypeOf(new FlitSNP)
-  io.txSnp.bits.SrcID := sliceNID.U // RN echoes SrcID into SnpResp.TgtID; must be our slice NID for L2Top demux
-  io.txSnp.bits.TxnID := tshrId.U
+  io.txSnp.bits.SrcID := io.consts.sliceNID // RN echoes SrcID into SnpResp.TgtID; must be our slice NID for L2Top demux
+  io.txSnp.bits.TxnID := io.consts.tshrId
   io.txSnp.bits.Opcode := serviceOpcode
   io.txSnp.bits.Addr := servicePaddr >> 3
   io.txSnp.bits.alias := serviceAlias

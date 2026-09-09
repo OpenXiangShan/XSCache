@@ -38,6 +38,8 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
     with L2SliceLocatable {
 
   val io = IO(new Bundle {
+    val consts = Input(new L2SliceConsts(sliceNum))
+
     val UpRXEVT = Flipped(Decoupled(new FlitEVT))
     val DnRXSNP = Flipped(Decoupled(new CHIBundleSNP))
     val UpRXREQ = Flipped(Decoupled(new FlitREQ))
@@ -70,7 +72,14 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   val EVB = Wire(Decoupled(new L2VPipeREQ.FlitEVB))
 
   // -- RX channel connections
-  val tshrs = Seq.tabulate(paramL2.mshrSize)(i => Module(new L2TSHR(sliceNum, sliceIdx, sliceNID, i, nodeId)))
+  val tshrs = Seq.tabulate(paramL2.mshrSize)(i => Module(new L2TSHR(sliceNum, i)))
+
+  tshrs.zipWithIndex.foreach { case (t, i) =>
+    t.io.consts.tshrId := i.U
+    t.io.consts.sliceIdx := io.consts.sliceIdx
+    t.io.consts.sliceNID := io.consts.sliceNID
+    t.io.consts.nodeId := io.consts.nodeId
+  }
 
   tshrs.foreach { case t => 
     t.io.UpRXEVT := io.UpRXEVT.bits
