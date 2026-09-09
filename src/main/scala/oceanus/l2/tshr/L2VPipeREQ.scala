@@ -20,6 +20,7 @@ object L2VPipeREQ {
   class FlitEVB(implicit val p: Parameters) extends Bundle with HasL2Params {
      val TshrId = UInt(mshrIndexWidth.W)
      val Addr = UInt(paramL2.physicalAddrWidth.W)
+     val Way = UInt(wayBits.W)
   }
 }
 
@@ -191,10 +192,14 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val p_prefill = RegInit(false.B)
 
   val rxevb_unsatisfied_evictback = rxevb_evictback &&
-                                    dirResult.state > MetaState.I && dirResult.hit && !p_prefill
+                                    dirResult.state > MetaState.I && dirResult.hit &&
+                                    dirResult.way === rxevb.Way &&
+                                    !p_prefill
 
   val rxevb_satisfied_evictback = rxevb_evictback &&
-                                  (dirResult.state === MetaState.I || !dirResult.hit || p_prefill)
+                                  (dirResult.state === MetaState.I || !dirResult.hit || 
+                                   dirResult.way =/= rxevb.Way ||
+                                   p_prefill)
   // ----------------------------------------------------------------
 
   // -- Enchantment modules and signals of downstream RX channels
@@ -1477,6 +1482,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.UpTXEVB.valid := s_evict_up_evict
   io.UpTXEVB.bits.TshrId := tshrId.U
   io.UpTXEVB.bits.Addr := io.repl_resp.paddr
+  io.UpTXEVB.bits.Way := io.repl_resp.way
   // ----------------------------------------------------------------
 
   // -- Interactions with peer Refill unlock
