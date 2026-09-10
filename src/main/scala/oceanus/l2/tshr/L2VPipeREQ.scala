@@ -1559,7 +1559,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // ----------------------------------------------------------------
 
   // -- Blocking same-PA RXSNP, on waiting of L1 CompAck
-  io.blockRBE.EVT := false.B
+  io.blockRBE.EVT := p_prefill
   io.blockRBE.SNP := w_rd_up_compack
   io.blockRBE.EVB := (active && dirResult.state > MetaState.I && dirResult.hit && !p_prefill) ||
                      w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds ||
