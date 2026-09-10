@@ -1489,7 +1489,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // -- Interactions with peer Refill unlock
   val evictback_peer_unlock_dir_immediate = rxevb_unsatisfied_evictback || 
-                                            (rxevb_satisfied_evictback && (p_prefill || (!io.tshr_meta_modified && !io.tshr_tag_modified)))
+                                            (rxevb_satisfied_evictback && (p_prefill || dirResult.way =/= rxevb.Way ||
+                                                                           (!io.tshr_meta_modified && !io.tshr_tag_modified)))
 
   val sched_evictback_peer_unlock_dir = rxevb_evictback &&
                                         !evictback_peer_unlock_dir_immediate
