@@ -215,12 +215,9 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
   val alloc_vec = Wire(Vec(clusterCount, Vec(io.fromTSHR.length, Bool())))
   val reuse_vec = Wire(Vec(clusterCount, Vec(io.fromTSHR.length, Bool())))
 
-  // Allocation candidate vector conditions:
-  //  - TSHR non-active
-  //  - Request type matches on reservation TSHR
-  //  - No previous cluster allocating on candidate TSHR with different PA in current cycle (see 'conflict mask')
-  val can_alloc_vec = (0 until clusterCount).map(cIdx => io.fromTSHR.zipWithIndex.map { case (t, tIdx) => 
-    !t.valid && (config.resv.find(_._1 == tIdx) match {
+  // Reservation rule: whether TSHR tIdx accepts cluster cIdx's allocation target
+  val resv_allow = (0 until clusterCount).map(cIdx => io.fromTSHR.zipWithIndex.map { case (_, tIdx) =>
+    config.resv.find(_._1 == tIdx) match {
       case Some((_, L2TSHRResvTarget.L1EVT)) => postcluster_isL1EVT(cIdx)
       case Some((_, L2TSHRResvTarget.L2EVB)) => postcluster_isL2EVB(cIdx)
       case Some((_, L2TSHRResvTarget.L3SNP)) => postcluster_isL3SNP(cIdx)
@@ -229,7 +226,15 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
         false.B // unused
       }
       case None => true.B
-    }) && /* conflict mask from other clusters */ !{
+    }
+  })
+
+  // Allocation candidate vector conditions:
+  //  - TSHR non-active
+  //  - Request type matches on reservation TSHR
+  //  - No previous cluster allocating on candidate TSHR with different PA in current cycle (see 'conflict mask')
+  val can_alloc_vec = (0 until clusterCount).map(cIdx => io.fromTSHR.zipWithIndex.map { case (t, tIdx) =>
+    !t.valid && resv_allow(cIdx)(tIdx) && /* conflict mask from other clusters */ !{
       if (cIdx == 0)
         false.B
       else
@@ -239,7 +244,7 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
   })
 
   val alloc_vec_mask = Wire(Vec(clusterCount, Vec(io.fromTSHR.length, Bool())))
-  alloc_vec_mask.zipWithIndex.foreach { case (mask, cIdx) => 
+  alloc_vec_mask.zipWithIndex.foreach { case (mask, cIdx) =>
     mask.head := false.B
     mask.zipWithIndex.tail.foreach { case (m, tIdx) => m := mask(tIdx - 1) || can_alloc_vec(cIdx)(tIdx - 1) }
   }
@@ -247,7 +252,7 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
   // Reuse candidate vector conditions:
   //  - PA hit on the active TSHR
   //  - Channel receivable (non-busy) by the active TSHR
-  val can_reuse_vec = (0 until clusterCount).map(cIdx => io.fromTSHR.zipWithIndex.map { case (t, tIdx) => 
+  val can_reuse_vec = (0 until clusterCount).map(cIdx => io.fromTSHR.zipWithIndex.map { case (t, tIdx) =>
     paddr_hit_vec(cIdx)(tIdx) && (
       !t.bits.busy.EVT && postcluster(cIdx).bits.target.EVT ||
       !t.bits.busy.SNP && postcluster(cIdx).bits.target.SNP ||
@@ -263,13 +268,39 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
     mask.zipWithIndex.tail.foreach { case (m, tIdx) => m := mask(tIdx - 1) || can_reuse_vec(cIdx)(tIdx - 1) }
   }
 
+  // Cross-cluster same-PA merge: when an earlier (higher-priority) cluster allocates a TSHR
+  // for the same PA in the same cycle, the later cluster either merges into the SAME TSHR
+  // (when the reservation rule admits the later cluster's target on that TSHR) or is blocked
+  // for this cycle; a blocked cluster retries next cycle and nests into the sibling TSHR
+  // through the reuse path (reuse is reservation-exempt).
+  val xcluster_merge_valid = Wire(Vec(clusterCount, Bool()))
+  val xcluster_merge_oh    = Wire(Vec(clusterCount, Vec(io.fromTSHR.length, Bool())))
+  val xcluster_merge_legal = Wire(Vec(clusterCount, Bool()))
+  (0 until clusterCount).foreach { cIdx =>
+    if (cIdx == 0) {
+      xcluster_merge_valid(cIdx) := false.B
+      xcluster_merge_oh(cIdx)    := VecInit(Seq.fill(io.fromTSHR.length)(false.B))
+      xcluster_merge_legal(cIdx) := false.B
+    } else {
+      val earlierHits = (0 until cIdx).map(c2Idx =>
+        postcluster(c2Idx).valid && postcluster_paddr_match_mat(cIdx)(c2Idx) && alloc_vec(c2Idx).asUInt.orR)
+      xcluster_merge_valid(cIdx) := postcluster(cIdx).valid && ParallelOR(earlierHits)
+      xcluster_merge_oh(cIdx)    := PriorityMux(earlierHits, (0 until cIdx).map(c2Idx => alloc_vec(c2Idx)))
+      xcluster_merge_legal(cIdx) := ParallelOR((0 until io.fromTSHR.length).map(tIdx =>
+                                      xcluster_merge_oh(cIdx)(tIdx) && resv_allow(cIdx)(tIdx)))
+    }
+  }
+
   // Allocation vector conditions:
-  //  - The TSHR was the candidate
+  //  - Same-PA earlier cluster allocated: merge into the same TSHR when reservation-legal, else blocked
+  //  - Otherwise: the TSHR was the candidate
   //  - Not masked by other better allocation candidate
   //  - No any PA hit on active TSHR (might be the reuse candidate)
   alloc_vec.zipWithIndex.foreach { case (alloc_vec, cIdx) =>
     alloc_vec.zipWithIndex.foreach { case (alloc, tIdx) =>
-      alloc := can_alloc_vec(cIdx)(tIdx) && !alloc_vec_mask(cIdx)(tIdx) && !paddr_hit_any(cIdx) && postcluster(cIdx).valid }
+      alloc := Mux(xcluster_merge_valid(cIdx),
+                   xcluster_merge_legal(cIdx) && xcluster_merge_oh(cIdx)(tIdx),
+                   can_alloc_vec(cIdx)(tIdx) && !alloc_vec_mask(cIdx)(tIdx) && !paddr_hit_any(cIdx) && postcluster(cIdx).valid) }
     assert(PopCount(alloc_vec) <= 1.U, s"Multiple TSHR allocation on ${clusterName(cIdx)}")
   }
 
