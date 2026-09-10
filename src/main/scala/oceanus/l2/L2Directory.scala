@@ -489,7 +489,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     plruRegs(s3_set) := PLRU4.getNextState(s3_plru, way_s3)
   }
 
-  when(s3_valid && s3_isRepl && !hit_s3) {
+  when(s3_valid && s3_isRepl && !hit_s3 && !replRetry) {
     blockRefill(s3_set)(way_s3).locked := true.B
     blockRefill(s3_set)(way_s3).dirWbDone := false.B
     blockRefill(s3_set)(way_s3).owner := s3_tshr
