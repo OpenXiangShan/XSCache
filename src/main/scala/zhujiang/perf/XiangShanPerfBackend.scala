@@ -1,7 +1,19 @@
-package zhujiang.perf
+package chisel3.internal {
+  import chisel3.experimental.BaseModule
+
+  // Expose parent/seed so Definition-relative collector names can be rebuilt
+  // before the parent circuit has finished naming.
+  object ZJPerfModuleInfo {
+    def parent(module: BaseModule): Option[BaseModule] = module._parent
+    def seedName(module: BaseModule): Option[String] = module.seedOpt
+  }
+}
+
+package zhujiang.perf {
 
 import chisel3._
 import chisel3.experimental.BaseModule
+import chisel3.internal.ZJPerfModuleInfo
 import chisel3.reflect.DataMirror.isVisible
 import chisel3.util.experimental.BoringUtils.{bore, tapAndRead}
 import org.chipsalliance.cde.config.Parameters
@@ -79,6 +91,50 @@ object XiangShanUtilityPerfBackend extends ZJPerfBackend {
     val output = Wire(new ZJPerfExport(Seq.empty))
     output := DontCare
     output
+  }
+
+  private def legalizeName(raw: String): String = {
+    val cleaned = raw.map {
+      case ch if ch.isLetterOrDigit || ch == '_' => ch
+      case _                                     => '_'
+    }.mkString
+    val collapsed = cleaned.replaceAll("_+", "_").stripPrefix("_").stripSuffix("_")
+    if (collapsed.isEmpty) "mod"
+    else if (collapsed.head.isLetter) collapsed
+    else s"mod_$collapsed"
+  }
+
+  private def ownerInstanceName(module: BaseModule, ownerId: Int): String = {
+    ZJPerfModuleInfo.seedName(module).filter(_.nonEmpty).map(legalizeName).getOrElse {
+      legalizeName(s"${module.desiredName}_$ownerId")
+    }
+  }
+
+  private def ownerRelativePath(module: BaseModule, ownerId: Int, root: Option[BaseModule]): String = {
+    val names = ListBuffer.empty[String]
+    var current = Option(module)
+    var depth = 0
+    while (current.exists(mod => !root.exists(_ eq mod)) && depth < 64) {
+      val owner = current.get
+      names += ownerInstanceName(owner, ownerId)
+      current = ZJPerfModuleInfo.parent(owner)
+      depth += 1
+    }
+    val path = names.reverse.mkString("__")
+    if (path.nonEmpty) path else s"mod_$ownerId"
+  }
+
+  private def withOwnerPath(spec: ZJPerfEventSpec, ownerPath: String): ZJPerfEventSpec = spec match {
+    case event: ZJPerfAccumulateSpec   => event.copy(ownerPath = ownerPath)
+    case event: ZJPerfMaxSpec          => event.copy(ownerPath = ownerPath)
+    case event: ZJPerfDistributionSpec => event.copy(ownerPath = ownerPath)
+    case event: ZJPerfHistogramSpec    => event.copy(ownerPath = ownerPath)
+  }
+
+  private def collectorName(instanceName: String, spec: ZJPerfEventSpec): String = {
+    val relative = if (spec.ownerPath.nonEmpty) spec.ownerPath else s"mod_${spec.ownerId}"
+    val prefix = legalizeName(instanceName)
+    if (relative.isEmpty) prefix else s"${prefix}__$relative"
   }
 
   override def newScope(kind: ZJPerfScopeKind.Value): ZJPerfBackendScope = new ZJPerfBackendScope {
@@ -173,7 +229,13 @@ object XiangShanUtilityPerfBackend extends ZJPerfBackend {
       if (kind == ZJPerfScopeKind.Normal || !enabled) {
         emptyExport
       } else {
-        val entries = pending.toSeq
+        val root = chisel3.XSCompatibility.currentModule
+        val ownerPaths = owners.zipWithIndex.map { case (owner, ownerId) =>
+          ownerId -> ownerRelativePath(owner, ownerId, root)
+        }.toMap
+        val entries = pending.toSeq.map { entry =>
+          entry.copy(spec = withOwnerPath(entry.spec, ownerPaths(entry.spec.ownerId)))
+        }
         val output  = IO(Output(new ZJPerfExport(entries.map(_.spec))))
         entries.zip(output.events).foreach { case (entry, event) =>
           event.value  := tapOrGet(entry.value)
@@ -186,17 +248,18 @@ object XiangShanUtilityPerfBackend extends ZJPerfBackend {
     }
   }
 
-  override def consume(exports: Seq[ZJPerfExport])(implicit p: Parameters): Unit = {
-    exports.foreach { output =>
-      output.specs.zipWithIndex.groupBy(_._1.ownerId).toSeq.sortBy(_._1).foreach { case (ownerId, entries) =>
+  override def consume(exports: Seq[(String, ZJPerfExport)])(implicit p: Parameters): Unit = {
+    exports.foreach { case (instanceName, output) =>
+      output.specs.zipWithIndex.groupBy(_._1.ownerId).toSeq.sortBy(_._1).foreach { case (_, entries) =>
         val specs     = entries.map(_._1)
         val eventIds  = entries.map(_._2)
         val collector = Module(new XiangShanPerfCollector(specs))
-        collector.suggestName(s"zhujiang_perf_collector_$ownerId")
+        collector.suggestName(collectorName(instanceName, specs.head))
         collector.events.events.zip(eventIds).foreach { case (sink, eventId) =>
           sink := output.events(eventId)
         }
       }
     }
   }
+}
 }
