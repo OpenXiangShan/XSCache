@@ -675,7 +675,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   vPipeREQ.io.dir_wb_done := proxyDir.io.wb_done
 
   proxyDir.io.wb_cancel := vPipeREQ.io.dir_wb_cancel
-  proxyDS.io.wb_cancel := vPipeREQ.io.ds_wb_cancel
+  proxyDS.io.wb_cancel := vPipeREQ.io.ds_wb_cancel || vPipeSNP.io.ds_wb_cancel
   
   proxyDS.io.wb_aux := vPipeREQ.io.ds_wb_aux
 }
