@@ -65,6 +65,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
                s_meta_write || w_ds_read || w_snpresp0 || w_snpresp2 || s_snpcompack
 
   val p_rxsnp = RegInit(0.U.asTypeOf(new CHIBundleSNP))
+  val p_rxsnp_to_invalid = RegInit(false.B)
   val p_fwd_state = RegInit(0.U(CHICohResps.WIDTH.W))
   val p_txdat_dataID = RegInit(0.U(paramCHI.datDataIDWidth.W))
   val p_home_txrsp_valid = RegInit(false.B)
@@ -282,6 +283,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
   // State update
   when (io.DnRXSNP.fire) {
     p_rxsnp := io.DnRXSNP.bits
+    p_rxsnp_to_invalid := meta_write_invalid
     p_rxsnp_need_dct_txdat := enter_need_dct_txdat
     p_sa_passdirty := false.B
 
@@ -474,7 +476,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
 
   io.ds_read_en := enter_need_local_ds_read && !io.ds_read_done
 
-  io.ds_wb_cancel := meta_write_invalid
+  io.ds_wb_cancel := active && p_rxsnp_to_invalid
 
   io.blockRBE.EVT := block_vpipe_evt
   io.blockRBE.SNP := active 
