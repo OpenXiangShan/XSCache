@@ -250,7 +250,9 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
   val enter_need_local_ds_read = io.DnRXSNP.fire && !io.ds_read_done && io.tshr_dirResult.state =/= L2Directory.MetaState.I &&
                                  (rxsnp_fwd || (!rxsnp_fwd && (io.DnRXSNP.bits.RetToSrc.get.asBool || io.tshr_dirResult.dirty))) && 
                                  !rxsnp_do_not_read_ds && !io.tbuf_modified
-  val enter_need_meta_write = io.DnRXSNP.fire && (meta_write_shared || meta_write_invalid || rxsnp_snpCleanShared)
+  val enter_noop_meta_write = io.tshr_dirResult.state === L2Directory.MetaState.I
+  val enter_need_meta_write = io.DnRXSNP.fire && (meta_write_shared || meta_write_invalid || rxsnp_snpCleanShared) &&
+                              !enter_noop_meta_write
   val need_home_txdat = io.tshr_dirResult.state =/= L2Directory.MetaState.I && !rxsnp_do_not_send_home_data && 
                         (p_rxsnp.RetToSrc.get.asBool || dirty_or_passdirty)
   val enter_need_dct_txdat = io.DnRXSNP.fire && rxsnp_fwd && io.tshr_dirResult.state =/= L2Directory.MetaState.I
