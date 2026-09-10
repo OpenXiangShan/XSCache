@@ -1456,9 +1456,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.dir_wb_locked := w_unlock_dir
   io.ds_wb_locked := w_unlock_ds
 
-  // Clean local Meta (to Directory) and TSHR Buffer (to Data Storage) modified state and 
-  // cancel all non-arbitered Directory & Data Storage write back for L2 Eviction
-  io.dir_wb_cancel := meta_wr_state_evictback_I
+  // 1. Clean local Meta (to Directory) and TSHR Buffer (to Data Storage) modified state and 
+  //    cancel all non-arbitered Directory & Data Storage write back for L2 Eviction
+  // 2. Cancel same way unfinished meta commiting on satisfied EvictBack since we're unlocking
+  //    peer Directory commit immediately
+  io.dir_wb_cancel := meta_wr_state_evictback_I ||
+                      rxevb_satisfied_evictback && dirResult.way === rxevb.Way
 
   io.ds_wb_cancel := w_evict_dn_comp || w_evict_dn_compdbid ||
                      s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2 || s_evict_dn_compack
@@ -1560,7 +1563,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // -- Blocking same-PA RXSNP, on waiting of L1 CompAck
   io.blockRBE.EVT := p_prefill
-  io.blockRBE.SNP := w_rd_up_compack
+  io.blockRBE.SNP := w_rd_up_compack || s_repl
   io.blockRBE.EVB := (active && dirResult.state > MetaState.I && dirResult.hit && !p_prefill) ||
                      w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds ||
                      evict_active
