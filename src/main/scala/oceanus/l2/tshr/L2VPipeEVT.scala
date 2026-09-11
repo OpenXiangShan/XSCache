@@ -189,5 +189,5 @@ class L2VPipeEVT(
   // copyback data would be absorbed into a dead Data Storage entry while the meta write
   // would clobber whatever line occupies 'dirResult.way' (hardcoded to 0 on a miss).
   assert(!(state === sWaitCommit && pIsWbFull && !dirHit),
-    "EVT: WriteBackFull missed the directory — L1 copyback data would be silently dropped (inclusion broken)")
+    "EVT: WriteBackFull missed the directory - L1 copyback data would be silently dropped (inclusion broken)")
 }
