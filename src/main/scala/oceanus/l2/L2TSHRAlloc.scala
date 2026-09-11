@@ -251,9 +251,13 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
 
   // Reuse candidate vector conditions:
   //  - PA hit on the active TSHR
+  //  - For the REQ target only: admitted by the reservation rule on that TSHR, so a
+  //    reservation-reserved TSHR is never converted into a long-lived refiller
+  //    (SNP/EVT/EVB reuse stays reservation-exempt: snoops must never be blocked,
+  //    and their nesting adds only bounded host work)
   //  - Channel receivable (non-busy) by the active TSHR
   val can_reuse_vec = (0 until clusterCount).map(cIdx => io.fromTSHR.zipWithIndex.map { case (t, tIdx) =>
-    paddr_hit_vec(cIdx)(tIdx) && (
+    paddr_hit_vec(cIdx)(tIdx) && (resv_allow(cIdx)(tIdx) || !postcluster(cIdx).bits.target.REQ) && (
       !t.bits.busy.EVT && postcluster(cIdx).bits.target.EVT ||
       !t.bits.busy.SNP && postcluster(cIdx).bits.target.SNP ||
       !t.bits.busy.REQ && postcluster(cIdx).bits.target.REQ ||
@@ -271,8 +275,10 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
   // Cross-cluster same-PA merge: when an earlier (higher-priority) cluster allocates a TSHR
   // for the same PA in the same cycle, the later cluster either merges into the SAME TSHR
   // (when the reservation rule admits the later cluster's target on that TSHR) or is blocked
-  // for this cycle; a blocked cluster retries next cycle and nests into the sibling TSHR
-  // through the reuse path (reuse is reservation-exempt).
+  // for this cycle; a blocked cluster retries and nests into the sibling TSHR through the
+  // reuse path. Reuse is reservation-exempt for SNP/EVT/EVB targets; a blocked REQ cluster
+  // instead waits for the sibling TSHR to drain, then allocates its own
+  // reservation-admitted TSHR.
   val xcluster_merge_valid = Wire(Vec(clusterCount, Bool()))
   val xcluster_merge_oh    = Wire(Vec(clusterCount, Vec(io.fromTSHR.length, Bool())))
   val xcluster_merge_legal = Wire(Vec(clusterCount, Bool()))
