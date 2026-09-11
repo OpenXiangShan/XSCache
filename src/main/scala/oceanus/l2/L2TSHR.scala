@@ -83,6 +83,10 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
     val self_unlock_dir_tshrId = Input(UInt(mshrIndexWidth.W))
     val self_unlock_ds = Input(Bool())
 
+    val peer_unlock_ack = Output(Bool())
+    val peer_unlock_ack_tshrId = Output(UInt(mshrIndexWidth.W))
+    val self_unlock_dir_ack = Input(Bool())
+
     val valid = Output(Bool())
   })
 
@@ -548,6 +552,10 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   vPipeREQ.io.self_unlock_dir := io.self_unlock_dir
   vPipeREQ.io.self_unlock_dir_tshrId := io.self_unlock_dir_tshrId
   vPipeREQ.io.self_unlock_ds := io.self_unlock_ds
+
+  io.peer_unlock_ack := vPipeREQ.io.peer_unlock_ack
+  io.peer_unlock_ack_tshrId := vPipeREQ.io.peer_unlock_ack_tshrId
+  vPipeREQ.io.self_unlock_dir_ack := io.self_unlock_dir_ack
 
   vPipeREQ.io.L1EVT_active := vPipeEVT.io.EVT_active
 

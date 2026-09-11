@@ -109,6 +109,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     val peer_unlock_ack = Output(Bool())
     val peer_unlock_ack_tshrId = Output(UInt(mshrIndexWidth.W))
 
+    val self_unlock_dir_ack = Input(Bool()) // the peer refiller's Directory commit landed
+
     val L1EVT_active = Input(Bool())
 
     val L2EVT_opcode = Valid(UInt(paramCHI.reqOpcodeWidth.W))
@@ -118,7 +120,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val dnTxnID = (io.consts.tshrId << log2Ceil(sliceNum)) | io.consts.sliceIdx
 
-  val configNonAgedDirArb = false
+  val configNonAgedDirArb = true
   
   val configEnableMakeReadUnique = false
   val configInclusiveReadOnce = true
@@ -270,6 +272,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val p_cbwrdata_meta = Reg(new L2Directory.Meta) 
 
   val p_unlock_source = Reg(UInt(mshrIndexWidth.W))
+  val p_dir_commit_pending = RegInit(false.B) // peer-unlocked refill commit pending Directory landing
 
   val p_prefill_meta = Reg(new L2Directory.Meta)
 
@@ -340,6 +343,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val w_s_evict_peer_unlock_dir = RegInit(false.B) // Waiting to schedule peer TSHR unlocking Directory Write-Back of EvictBack subsequence
   val w_s_evict_peer_unlock_ds = RegInit(false.B) // Waiting to schedule peer TSHR unlocking Data Storage Write-Back of EvictBack subsequence
 
+  val w_evict_peer_commit_dir = RegInit(false.B) // Waiting for the refilling peer TSHR's Directory commit ack of EvictBack subsequence
+
   // TODO: more state bits here
 
   assert(!(rxreq_fire && w_snpresp0), "RXREQ fired on valid 'w_snpresp0' in TSHR @ %m REQ vPipe")
@@ -362,7 +367,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                w_s_evict_dn_cbwrdata0 || w_s_evict_dn_cbwrdata2 ||
                s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2 ||
                s_evict_dn_compack ||
-               w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds
+               w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds ||
+               w_evict_peer_commit_dir
 
   io.free := !active
 
@@ -1441,9 +1447,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   when (unlock_dir) {
     w_unlock_dir := false.B
-    if (configNonAgedDirArb) {
-      p_unlock_source := io.self_unlock_dir_tshrId
-    }
   }
 
   when (unlock_ds) {
@@ -1543,11 +1546,36 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                  evictback_peer_unlock_ds_late && p_rxevb.TshrId === i.U
   }}
 
-  if (!configNonAgedDirArb) {
+  if (configNonAgedDirArb) {
+    // -- EVB Directory commit acknowledgement (non-aged Directory arbitration)
+    // Host side: keep the EVB active until the refilling peer's Directory commit lands,
+    // so no same-PA request can observe the victim entry between its (possibly cancelled)
+    // invalidation and the refiller's replacement commit.
+    // Self-alias EVBs skip the wait: the same TSHR's proxies already serialize the commit.
+    when ((evictback_peer_unlock_dir_immediate && rxevb.TshrId =/= io.consts.tshrId) ||
+          (evictback_peer_unlock_dir_late && p_rxevb.TshrId =/= io.consts.tshrId)) {
+      w_evict_peer_commit_dir := true.B
+    }
+    when (io.self_unlock_dir_ack) {
+      w_evict_peer_commit_dir := false.B
+    }
+    assert(!(io.self_unlock_dir_ack && !w_evict_peer_commit_dir),
+      "TSHR @ %m REQ vPipe received Directory commit ack while no EVB was waiting for it")
+
+    // Refiller side: a peer EVB host unlocked our refill commit; acknowledge once the
+    // tag+meta commit lands in the Directory.
+    when (io.self_unlock_dir && w_unlock_dir) {
+      p_unlock_source := io.self_unlock_dir_tshrId
+      p_dir_commit_pending := true.B
+    }
+    when (io.dir_wb_done) {
+      p_dir_commit_pending := false.B
+    }
+    io.peer_unlock_ack := p_dir_commit_pending && io.dir_wb_done
+    io.peer_unlock_ack_tshrId := p_unlock_source
+  } else {
     io.peer_unlock_ack := false.B
     io.peer_unlock_ack_tshrId := 0.U
-  } else {
-    require(false, "Non-aged directory arbiter is not supported in TSHR for now")
   }
   // ----------------------------------------------------------------
 
@@ -1564,9 +1592,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // -- Blocking same-PA RXSNP, on waiting of L1 CompAck
   io.blockRBE.EVT := p_prefill
-  io.blockRBE.SNP := w_rd_up_compack || s_repl
+  io.blockRBE.SNP := w_rd_up_compack || s_repl || w_evict_peer_commit_dir
   io.blockRBE.EVB := (active && dirResult.state > MetaState.I && dirResult.hit && !p_prefill) ||
                      w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds ||
+                     w_evict_peer_commit_dir ||
                      evict_active
   io.blockRBE.REQ := active
 

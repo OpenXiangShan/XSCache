@@ -173,11 +173,15 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   }}
 
   tshrs.map(_.io.self_unlock_dir_tshrId).zipWithIndex.foreach { case (sink, i) => {
-    sink := ParallelMux(tshrs.map(_.io.peer_unlock_dir(i)), tshrs.map(_.tshrId.U))
+    sink := Mux1H(tshrs.map(_.io.peer_unlock_dir(i)), tshrs.map(_.tshrId.U))
   }}
 
   tshrs.map(_.io.self_unlock_ds).zipWithIndex.foreach { case (sink, i) => {
     sink := tshrs.map(_.io.peer_unlock_ds(i)).orR
+  }}
+
+  tshrs.map(_.io.self_unlock_dir_ack).zipWithIndex.foreach { case (sink, i) => {
+    sink := tshrs.map(t => t.io.peer_unlock_ack && t.io.peer_unlock_ack_tshrId === i.U).orR
   }}
   // ----------------------------------------------------------------
 
