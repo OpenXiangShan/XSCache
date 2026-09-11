@@ -1491,15 +1491,28 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // ----------------------------------------------------------------
 
   // -- Interactions with peer Refill unlock
-  val evictback_peer_unlock_dir_immediate = rxevb_unsatisfied_evictback || 
+  // For an unsatisfied EvictBack, the peer refiller's Directory commit is what makes the victim
+  // slot re-selectable by unrelated refills. Release it only after this EvictBack's Data Storage
+  // read has landed -- otherwise a third-party refill can re-select the slot and overwrite the
+  // victim data before this EvictBack has read it. (Previously released immediately.)
+  val evictback_peer_unlock_dir_immediate = rxevb_unsatisfied_evictback && io.ds_rd_done ||
                                             (rxevb_satisfied_evictback && (p_prefill || dirResult.way =/= rxevb.Way ||
                                                                            (!io.tshr_meta_modified && !io.tshr_tag_modified)))
 
   val sched_evictback_peer_unlock_dir = rxevb_evictback &&
                                         !evictback_peer_unlock_dir_immediate
 
+  // Satisfied/unsatisfied qualification of the accepted EvictBack, registered for the
+  // scheduled (late) peer Directory unlock path.
+  val p_rxevb_unsatisfied = RegInit(false.B)
+  when (rxevb_evictback) {
+    p_rxevb_unsatisfied := rxevb_unsatisfied_evictback
+  }
+
   val allow_evictback_peer_unlock_dir = w_s_evict_peer_unlock_dir &&
-                                        io.dir_wb_done
+                                        Mux(p_rxevb_unsatisfied,
+                                            io.ds_rd_done || ds_cancel_evictback || fire_txreq_evict,
+                                            io.dir_wb_done)
 
   val evictback_peer_unlock_dir_late = allow_evictback_peer_unlock_dir
 
