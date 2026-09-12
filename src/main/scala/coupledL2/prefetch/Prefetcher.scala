@@ -209,6 +209,8 @@ class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
   val req = Vec(banks, DecoupledIO(new PrefetchReq))
   val stash_txreq = DecoupledIO(new CHIREQ)
   val stash_rxrsp = Flipped(DecoupledIO(new CHIRSP))
+  val hnCBusy = Input(UInt(3.W))
+  val txreqHardStall = Input(Bool())
   val resp = Vec(banks, Flipped(DecoupledIO(new PrefetchResp)))
   val recv_addr = Flipped(ValidIO(new Bundle() {
     val addr = UInt(64.W)
@@ -285,7 +287,18 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   io.tlb_req.resp.ready := true.B
 
   val stashPrefetcher = Module(new StashPrefetcher)
+  // CHI E.b CBusy uses the same 4-level occupancy encoding as HN PoS.
+  // Stop L3 stash issue on HN/SN hint (>=75%) or a sustained TXREQ backpressure.
+  val hnHint = io.hnCBusy >= 2.U
+  val l2HardCnt = RegInit(0.U(3.W))
+  when(io.txreqHardStall) {
+    l2HardCnt := Mux(l2HardCnt === 7.U, l2HardCnt, l2HardCnt + 1.U)
+  }.otherwise {
+    l2HardCnt := 0.U
+  }
+  val l2Hard = l2HardCnt >= 2.U
   stashPrefetcher.io.recv := io.l3_recv
+  stashPrefetcher.io.allow := !hnHint && !l2Hard
   io.stash_txreq <> stashPrefetcher.io.txreq
   stashPrefetcher.io.rxrsp <> io.stash_rxrsp
 

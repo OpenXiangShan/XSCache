@@ -771,6 +771,7 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     rxsnp.ready := Cat(slices.zipWithIndex.map { case (s, i) => s.io.out.rx.snp.ready && rxsnpSliceID === i.U }).orR
 
     val rxrsp = Wire(DecoupledIO(new CHIRSP))
+    val hnCBusy = RegInit(0.U(3.W))
     val rxrspIsStashPrefetch = isStashPrefetchID(rxrsp.bits.txnID)
     val rxrspIsMMIO = rxrsp.bits.txnID.head(1).asBool && !rxrspIsStashPrefetch
     val isPCrdGrant = rxrsp.valid && rxrsp.bits.opcode === PCrdGrant
@@ -827,6 +828,8 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     val rxrspSliceID = getSliceID(rxrsp.bits.txnID)
     val stashRxRspReady = WireInit(false.B)
     prefetcher.foreach { p =>
+      p.io.hnCBusy := hnCBusy
+      p.io.txreqHardStall := txreq.valid && !txreq.ready
       p.io.stash_rxrsp.valid := rxrsp.valid && rxrspIsStashPrefetch && !isPCrdGrant
       p.io.stash_rxrsp.bits := rxrsp.bits
       p.io.stash_rxrsp.bits.txnID := restoreStashPrefetchID(rxrsp.bits.txnID)
@@ -901,6 +904,12 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       linkMonitor.io.exitco.foreach { _ :=
         Cat(slices.zipWithIndex.map { case (s, i) => s.io.l2FlushDone.getOrElse(false.B)}).andR && io.cpu_wfi.getOrElse(false.B)
       }
+    }
+
+    when(rxrsp.fire || rxdat.fire) {
+      val rspCBusy = Mux(rxrsp.fire, rxrsp.bits.cBusy.getOrElse(0.U(3.W)), 0.U)
+      val datCBusy = Mux(rxdat.fire, rxdat.bits.cBusy.getOrElse(0.U(3.W)), 0.U)
+      hnCBusy := Mux(rspCBusy > datCBusy, rspCBusy, datCBusy)
     }
 
     XSPerfAccumulate("pcrd_count", pCrdQueue_s2.io.enq.fire)
