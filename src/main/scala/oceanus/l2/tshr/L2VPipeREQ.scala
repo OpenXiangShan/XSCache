@@ -87,6 +87,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     val dir_wb_locked = Output(Bool())
     val dir_wb_cancel = Output(Bool())
     val dir_wb_aux = Output(Bool())
+    val dir_wb_accept = Input(Bool())
     val dir_wb_done = Input(Bool())
 
     val ds_wb_locked = Output(Bool())
@@ -1475,8 +1476,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //    I state into Directory on reuse.
   // 3. Trigger Directory write-back immediately on EvictBack to commit the un-commited meta.
   io.dir_wb_aux := unlock_dir || 
-                   ((io.tshr_meta_modified || io.tshr_tag_modified) && expect_replace) ||
-                   ((io.tshr_meta_modified || io.tshr_tag_modified) && rxevb_satisfied_evictback)
+                   ((io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept && expect_replace) ||
+                   ((io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept && rxevb_satisfied_evictback)
 
   // 1. Activate Data Storage write-back immediately on replacement Data Storage lock released by eviction
   //    since the TSHR local meta state was not updated till replacer response, and the data always return
