@@ -273,7 +273,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val p_cbwrdata_meta = Reg(new L2Directory.Meta) 
 
   val p_unlock_source = Reg(UInt(mshrIndexWidth.W))
-  val p_dir_commit_pending = RegInit(false.B) // peer-unlocked refill commit pending Directory landing
 
   val p_prefill_meta = Reg(new L2Directory.Meta)
 
@@ -323,6 +322,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val w_unlock_dir = RegInit(false.B) // Waiting for unlocking Directory Write-Back
   val w_unlock_ds = RegInit(false.B) // Waiting for unlocking Data Storage Write-Back
 
+  val w_s_unlock_ack = RegInit(false.B) // Waiting to schedule peer unlocking ack
+
   val w_s_repl = RegInit(false.B) // Waiting to schedule Directory Replacer Read
   val s_repl = RegInit(false.B) // Scheduling Directory Replacer Read
 
@@ -361,7 +362,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                w_rd_up_compack ||
                w_s_rd_up_compdata0 || s_rd_up_compdata0 || w_s_rd_up_compdata2 || s_rd_up_compdata2 ||
                w_s_rd_up_comp || s_rd_up_comp ||
-               w_unlock_dir || w_unlock_ds ||
+               w_unlock_dir || w_unlock_ds || w_s_unlock_ack ||
                w_s_repl || s_repl || w_s_evict_up_evict || s_evict_up_evict ||
                w_evict_s_dn_txreq ||
                w_evict_dn_comp || w_evict_dn_compdbid ||
@@ -1580,12 +1581,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     // tag+meta commit lands in the Directory.
     when (io.self_unlock_dir && w_unlock_dir) {
       p_unlock_source := io.self_unlock_dir_tshrId
-      p_dir_commit_pending := true.B
+      w_s_unlock_ack := true.B
     }
     when (io.dir_wb_done) {
-      p_dir_commit_pending := false.B
+      w_s_unlock_ack := false.B
     }
-    io.peer_unlock_ack := p_dir_commit_pending && io.dir_wb_done
+    io.peer_unlock_ack := w_s_unlock_ack && io.dir_wb_done
     io.peer_unlock_ack_tshrId := p_unlock_source
   } else {
     io.peer_unlock_ack := false.B
