@@ -36,6 +36,7 @@ class StashPrefetchEntry(implicit p: Parameters) extends PrefetchModule with Has
     val txreq = DecoupledIO(new CHIREQ)
     val rxrsp = Flipped(ValidIO(new CHIRSP))
     val id = Input(UInt(TXNID_WIDTH.W))
+    val allow = Input(Bool())
     val waitResp = Output(Bool())
   })
 
@@ -59,7 +60,7 @@ class StashPrefetchEntry(implicit p: Parameters) extends PrefetchModule with Has
     val timer = RegInit(0.U(16.W))
     when(state === s_invalid) {
       timer := 0.U
-    }.otherwise {
+    }.elsewhen(!(state === s_sendReq && !io.allow)) {
       timer := timer + 1.U
     }
     assert(state === s_invalid || timer < 20000.U, "StashPrefetchEntry Leak(id: %d)", io.id)
@@ -107,6 +108,7 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
     val recv = Input(new PrefetchRecv)
     val txreq = DecoupledIO(new CHIREQ)
     val rxrsp = Flipped(DecoupledIO(new CHIRSP))
+    val allow = Input(Bool())
   })
 
   val l3PftQueue = Module(new OverwriteQueue(
@@ -114,21 +116,22 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
     entries = stashPrefetchEntryCount,
     hasFlow = true
   ))
-  l3PftQueue.io.enq.valid := io.recv.addr_valid && io.recv.pf_en
+  l3PftQueue.io.enq.valid := io.allow && io.recv.addr_valid && io.recv.pf_en
   l3PftQueue.io.enq.bits.addr := io.recv.addr(fullAddressBits - 1, 0)
   l3PftQueue.io.enq.bits.pfSource := io.recv.pf_source
 
   val stashPrefetchEntries = Seq.tabulate(stashPrefetchEntryCount) { i =>
     val entry = Module(new StashPrefetchEntry)
     entry.io.id := i.U
+    entry.io.allow := io.allow
     entry
   }
 
   val allocReadys = VecInit(stashPrefetchEntries.map(_.io.alloc.ready))
   val allocOH = PriorityEncoderOH(allocReadys)
-  l3PftQueue.io.deq.ready := allocReadys.asUInt.orR
+  l3PftQueue.io.deq.ready := io.allow && allocReadys.asUInt.orR
   stashPrefetchEntries.zipWithIndex.foreach { case (entry, i) =>
-    entry.io.alloc.valid := l3PftQueue.io.deq.valid && allocOH(i)
+    entry.io.alloc.valid := io.allow && l3PftQueue.io.deq.valid && allocOH(i)
     entry.io.alloc.bits := l3PftQueue.io.deq.bits
     entry.io.rxrsp.valid := io.rxrsp.valid && entry.io.waitResp && io.rxrsp.bits.txnID === i.U
     entry.io.rxrsp.bits := io.rxrsp.bits
@@ -141,10 +144,15 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
 
   val txreqArb = Module(new TwoLevelRRArbiter(chiselTypeOf(io.txreq.bits), stashPrefetchEntries.size))
   txreqArb.suggestName("stash_prefetch_txreq_arb")
-  stashPrefetchEntries.map(_.io.txreq).zip(txreqArb.io.in).foreach { case (req, in) => in <> req }
+  stashPrefetchEntries.map(_.io.txreq).zip(txreqArb.io.in).foreach { case (req, in) =>
+    in.valid := req.valid && io.allow
+    in.bits := req.bits
+    req.ready := in.ready && io.allow
+  }
   io.txreq <> txreqArb.io.out
 
   XSPerfAccumulate("l3_prefetch_recv", io.recv.addr_valid && io.recv.pf_en)
+  XSPerfAccumulate("l3_prefetch_throttled", !io.allow)
   XSPerfAccumulate("l3_prefetch_queue_fire", l3PftQueue.io.deq.fire)
   XSPerfAccumulate("l3_prefetch_txreq_valid", io.txreq.valid)
   XSPerfAccumulate("l3_prefetch_txreq_blocked", io.txreq.valid && !io.txreq.ready)
