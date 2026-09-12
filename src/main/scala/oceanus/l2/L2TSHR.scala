@@ -680,6 +680,8 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   // 'wb_cancel' drops non-arbiterated Directory Write & Data Storage write
   proxyDir.io.wb_locked := vPipeREQ.io.dir_wb_locked
   proxyDS.io.wb_locked := vPipeREQ.io.ds_wb_locked
+
+  vPipeREQ.io.dir_wb_accept := proxyDir.io.wb_accept
   vPipeREQ.io.dir_wb_done := proxyDir.io.wb_done
 
   proxyDir.io.wb_cancel := vPipeREQ.io.dir_wb_cancel
