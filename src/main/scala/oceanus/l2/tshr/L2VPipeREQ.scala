@@ -1473,12 +1473,21 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // 1. Activate Directory write-back immediately on replacement Directory lock released by eviction
   //    to clear the replacer reading lock in Directory.
+  //    NOTE: 'unlock_self_evictback' is intentionally excluded here — its pulse is the falling edge
+  //    of 'meta_wr_state_evictback_I', which is itself a 'dir_wb_cancel' source, so the EVB host's
+  //    pending invalidate is cancelled and there is never committed work left for the aux to trigger;
+  //    re-arming on it manufactured a phantom (empty) DirWb that collided with a nested refill's
+  //    ReplRd (seed 3019). 'unlock_self_alias' is kept: its pulse always has the refill's locked
+  //    commit pending, and it is the only prompt trigger once 'expect_replace' has cleared.
   // 2. Trigger Directory write-back immediately on refill transactions to commit the un-committed 
   //    I state into Directory on reuse.
   // 3. Trigger Directory write-back immediately on EvictBack to commit the un-commited meta.
-  io.dir_wb_aux := unlock_dir || 
+  io.dir_wb_aux := io.self_unlock_dir || unlock_self_alias ||
                    ((io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept && expect_replace) ||
                    ((io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept && rxevb_satisfied_evictback)
+
+  assert(!(unlock_self_evictback && (io.tshr_meta_modified || io.tshr_tag_modified)),
+    "EvictBack self-unlock with un-committed meta/tag: aux drop would strand a commit")
 
   // 1. Activate Data Storage write-back immediately on replacement Data Storage lock released by eviction
   //    since the TSHR local meta state was not updated till replacer response, and the data always return
