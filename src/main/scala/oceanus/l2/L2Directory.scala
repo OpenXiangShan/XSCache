@@ -20,6 +20,7 @@ object L2Directory {
     val locked = Bool()
     val dirWbDone = Bool()
     val owner = UInt(mshrIndexWidth.W)
+    val reqTag = UInt(tagWidth.W) // refill (requestor) tag of the in-flight refill owning this lock
   }
 
   object MetaState {
@@ -476,8 +477,19 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val invalidWay = PriorityEncoder(invalidVec)
   val plruWay    = PLRU4.getReplaceWay(s3_plru)
   val chosenWay  = Mux(hasInvalid, invalidWay, plruWay)
-  val victimWay  = Mux(freeWayMask_s3(chosenWay), chosenWay, PriorityEncoder(freeWayMask_s3))
-  val replRetry  = s3_valid && s3_isRepl && !freeWayMask_s3.orR
+
+  // A way whose (stale) tag equals another in-flight refill's requestor tag must not be
+  // victimized: the resulting EvictBack would be forced to nest into that refill's TSHR,
+  // which cannot drain it before its own commit (blockRBE.EVB Clause A) — the Class-B
+  // circular wait. The requestor's own PA is never recorded at its pick (single-TSHR-per-PA
+  // + record written only at this S3 edge), so self-alias picks stay available.
+  val refillTagBlockVec = VecInit((0 until ways).map { w =>
+    VecInit(blockRefill(s3_set).map(e => e.locked && (e.reqTag === dirData_s3(w).tag))).asUInt.orR
+  })
+  val victimMask_s3 = freeWayMask_s3 & (~refillTagBlockVec.asUInt)(ways - 1, 0)
+
+  val victimWay  = Mux(victimMask_s3(chosenWay), chosenWay, PriorityEncoder(victimMask_s3))
+  val replRetry  = s3_valid && s3_isRepl && !victimMask_s3.orR
 
   val way_s3   = Mux(s3_isRepl, victimWay, Mux(hit_s3, hitWay, 0.U))
   val entry_s3 = dirData_s3(way_s3)
@@ -493,7 +505,12 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     blockRefill(s3_set)(way_s3).locked := true.B
     blockRefill(s3_set)(way_s3).dirWbDone := false.B
     blockRefill(s3_set)(way_s3).owner := s3_tshr
+    blockRefill(s3_set)(way_s3).reqTag := s3_tag
     blockRefillAge(s3_set)(way_s3) := 0.U
+    assert(!VecInit(blockRefill(s3_set).zipWithIndex.map { case (e, w) =>
+      w.U =/= way_s3 && e.locked && e.reqTag === dirData_s3(way_s3).tag
+    }).asUInt.orR,
+      "Directory: ReplRd victimized a way whose tag aliases an in-flight refill PA")
   }
 
   when(grantDirWb) {
@@ -649,6 +666,8 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   XSPerfAccumulate("grant_dirWb",   grantDirWb)
   XSPerfAccumulate("replStall",     replStall)
   XSPerfAccumulate("replRetry",     replRetry)
+  XSPerfAccumulate("replRetry_refillTag", s3_valid && s3_isRepl && freeWayMask_s3.orR && !victimMask_s3.orR)
+  XSPerfAccumulate("replDivert_refillTag", s3_valid && s3_isRepl && !replRetry && !victimMask_s3(chosenWay))
   XSPerfAccumulate("blockRefill_locked", PopCount(blockRefill.flatten.map(_.locked)))
   XSPerfAccumulate("dirRd_hit",     s3_valid && s3_isDirRd && hit_s3)
   XSPerfAccumulate("dirRd_miss",    s3_valid && s3_isDirRd && !hit_s3)
