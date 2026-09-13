@@ -22,8 +22,8 @@ object L2Common {
     out <> arb.io.out
   }
 
-  def fastArb[T <: Bundle](in: Seq[DecoupledIO[T]], out: DecoupledIO[T], name: Option[String] = None): Unit = {
-    val arb = Module(new FastArbiter[T](chiselTypeOf(out.bits), in.size))
+  def fastArb[T <: Bundle](in: Seq[DecoupledIO[T]], out: DecoupledIO[T], name: Option[String] = None, rotateOnBlock: Boolean = false): Unit = {
+    val arb = Module(new FastArbiter[T](chiselTypeOf(out.bits), in.size, rotateOnBlock))
     if (name.nonEmpty) { arb.suggestName(s"${name.get}_arb") }
     for ((a, req) <- arb.io.in.zip(in)) { a <> req }
     out <> arb.io.out

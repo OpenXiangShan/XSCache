@@ -128,7 +128,25 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   // ----------------------------------------------------------------
 
   // -- TX channel connections
-  fastArb(tshrs.map(_.io.UpTXEVB), EVB, Some("TSHRsToUpTXEVB"))
+  // rotateOnBlock: a head EVB rejected by the allocator (nest target's rbeEVB
+  // full, or Clause-A drain refusal mid-refill) must not seal this channel —
+  // the refill TSHRs whose commits would unblock it may hold EVBs queued behind
+  // that head (s5011 deadlock: T1/T2/T10 circular wait). Rotate past the blocked
+  // head so deliverable EVBs drain; the blocked one re-participates next rotation.
+  fastArb(tshrs.map(_.io.UpTXEVB), EVB, Some("TSHRsToUpTXEVB"), rotateOnBlock = true)
+
+  // rotateOnBlock observability: every blocked (valid && !ready) cycle rotates the
+  // RR base once; the histogram records the consecutive-rotation length of each
+  // blocked episode, so a pathological spin shows up as a long tail.
+  XSPerfAccumulate("TSHRsToUpTXEVB_rotateOnBlock", EVB.valid && !EVB.ready)
+  val evbRotateLen = RegInit(0.U(32.W))
+  when (EVB.fire) {
+    evbRotateLen := 0.U
+  }.elsewhen (EVB.valid && !EVB.ready) {
+    evbRotateLen := evbRotateLen + 1.U
+  }
+  XSPerfHistogram("TSHRsToUpTXEVB_rotateOnBlock_len", evbRotateLen, EVB.fire, 0, 40, 2, right_strict = true)
+  XSPerfHistogram("TSHRsToUpTXEVB_rotateOnBlock_len", evbRotateLen, EVB.fire, 40, 800, 40, left_strict = true)
 
   fastArb(tshrs.map(_.io.UpTXSNP), io.UpTXSNP, Some("TSHRsToUpTXSNP"))
 
