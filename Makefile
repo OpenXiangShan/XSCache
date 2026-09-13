@@ -90,11 +90,16 @@ test-top-l2top:
 
 BUILD_DIR_L2OPENLLC = ./build/l2openllc
 
+# set NO_PERF=1 to strip all DUT performance counters from the generated RTL
+# (removes the LogPerfEndpoint bulk: much faster firtool/verilation/compile)
+NO_PERF ?= 0
+PERF_ARGS = $(if $(filter 1,$(NO_PERF)),--noperf,)
+
 # defaults to 1 L2 x 2 slices; override with NUM_L2=<n> / NUM_SLICE=<1-4>
 NUM_L2 ?= 1
 test-top-l2openllc: NUM_SLICE = 2
 test-top-l2openllc:
-	mill -i XSCache.test.runMain oceanus.TestTop_L2OpenLLC -td $(BUILD_DIR_L2OPENLLC) --l2 $(NUM_L2) --slices $(NUM_SLICE) --target systemverilog --split-verilog
+	mill -i XSCache.test.runMain oceanus.TestTop_L2OpenLLC -td $(BUILD_DIR_L2OPENLLC) --l2 $(NUM_L2) --slices $(NUM_SLICE) $(PERF_ARGS) --target systemverilog --split-verilog
 	if [ -f "$(BUILD_DIR_L2OPENLLC)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2OPENLLC)/TestTop.sv.conf" "$(BUILD_DIR_L2OPENLLC)"; fi
 
 clean:
