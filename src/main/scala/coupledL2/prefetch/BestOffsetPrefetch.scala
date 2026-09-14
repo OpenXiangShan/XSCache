@@ -767,11 +767,19 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
 }
 
 class BopReqBundle(implicit p: Parameters) extends BOPBundle{
+  // Virtual byte address of the candidate prefetch line. The original
+  // trigger is represented by CQF metadata together with issueOffset.
   val full_vaddr = UInt(fullVAddrBits.W)
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
+  val pc = UInt(pcBitOpt.getOrElse(fullVAddrBits).W)
+  val pcValid = Bool()
+  val reqSource = UInt(MemReqSource.reqSourceBits.W)
   val isBOP = Bool()
   val issueOffset = SInt(offsetWidth.W)
+  // Snapshot native degree admission before CQF latency. Degree remains a
+  // downstream BOP control and must not change the CQF candidate population.
+  val degreePass = Bool()
   val samePagePaddrValid = Bool()
   val samePagePaddr = UInt(fullAddressBits.W)
 }
@@ -786,6 +794,9 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
   // for pf req
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
+  val pc = UInt(pcBitOpt.getOrElse(fullVAddrBits).W)
+  val pcValid = Bool()
+  val reqSource = UInt(MemReqSource.reqSourceBits.W)
   val issueOffset = SInt(offsetWidth.W)
 
   def fromBopReqBundle(req: BopReqBundle) = {
@@ -799,6 +810,9 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
     )
     needT := req.needT
     source := req.source
+    pc := req.pc
+    pcValid := req.pcValid
+    reqSource := req.reqSource
     issueOffset := req.issueOffset
   }
 
@@ -812,6 +826,21 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
     req.pfSource := MemReqSource.Prefetch2L2BOP.id.U
     req.cdpPfDepth.foreach(_ := 0.U)
     req
+  }
+
+  def toCqfMeta(): CqfCandidate = {
+    val meta = Wire(new CqfCandidate)
+    // vaddrNoOffset is the candidate virtual line retained by the request
+    // buffer. Recover the original trigger by subtracting the selected offset.
+    val candidateLine = vaddrNoOffset.pad(CqfParameters.LineBits)(CqfParameters.LineBits - 1, 0)
+    val triggerLine = CqfParameters.subtractLineOffset(candidateLine, issueOffset)
+    meta.pc := pc
+    meta.pcValid := pcValid
+    meta.reqSource := reqSource
+    meta.kind := true.B // VBOP is CQF Large
+    meta.triggerLine := triggerLine
+    meta.candidateLine := candidateLine
+    meta
   }
 
   def get_pf_paddr(): UInt = {
@@ -836,6 +865,7 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
     val in_req = Flipped(DecoupledIO(new BopReqBundle))
     val tlb_req = new L2ToL1TlbIO(nRespDups = 1)
     val out_req = DecoupledIO(new PrefetchReq)
+    val out_cqfMeta = Output(Valid(new CqfCandidate))
     val out_issueOffset = Output(SInt(offsetWidth.W))
   })
 
@@ -845,7 +875,12 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
   val entries = Seq.fill(REQ_FILTER_SIZE)(Reg(new BopReqBufferEntry))
   //val replacement = ReplacementPolicy.fromString("plru", REQ_FILTER_SIZE)
   val tlb_req_arb = Module(new TwoLevelRRArbiter(new L2TlbReq, REQ_FILTER_SIZE))
-  val pf_req_arb = Module(new TwoLevelRRArbiter(new PrefetchReq, REQ_FILTER_SIZE))
+  class BopPrefetchReq extends Bundle {
+    val req = new PrefetchReq
+    val cqfMeta = new CqfCandidate
+    val issueOffset = SInt(offsetWidth.W)
+  }
+  val pf_req_arb = Module(new TwoLevelRRArbiter(new BopPrefetchReq, REQ_FILTER_SIZE))
   ArbPerf(tlb_req_arb, "bop_tlb_req_arb")
   ArbPerf(pf_req_arb, "bop_pf_req_arb")
 
@@ -892,11 +927,13 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
   io.tlb_req.req.bits.isPrefetch := true.B
   io.tlb_req.req_kill := false.B
   io.tlb_req.resp.ready := true.B
-  io.out_req <> pf_req_arb.io.out
+  io.out_req.valid := pf_req_arb.io.out.valid
+  io.out_req.bits := pf_req_arb.io.out.bits.req
+  pf_req_arb.io.out.ready := io.out_req.ready
   io.out_req.bits.pfSource := MemReqSource.Prefetch2L2BOP.id.U
-  io.out_issueOffset := Mux1H(entries.indices.map(i =>
-    pf_req_arb.io.in(i).fire -> entries(i).issueOffset.asUInt
-  )).asSInt
+  io.out_cqfMeta.valid := pf_req_arb.io.out.valid
+  io.out_cqfMeta.bits := pf_req_arb.io.out.bits.cqfMeta
+  io.out_issueOffset := pf_req_arb.io.out.bits.issueOffset
 
   /* s0: entries look up */
   val prev_in_valid = RegNext(io.in_req.valid, false.B)
@@ -995,7 +1032,10 @@ class PrefetchReqBuffer(name: String = "vbop")(implicit p: Parameters) extends B
     tlb_req_arb.io.in(i).bits.vaddr := e.get_tlb_vaddr()
 
     pf_req_arb.io.in(i).valid := can_send_pf(i)
-    pf_req_arb.io.in(i).bits := e.toPrefetchReq()
+    pf_req_arb.io.in(i).bits.req := e.toPrefetchReq()
+    pf_req_arb.io.in(i).bits.req.pfSource := MemReqSource.Prefetch2L2BOP.id.U
+    pf_req_arb.io.in(i).bits.cqfMeta := e.toCqfMeta()
+    pf_req_arb.io.in(i).bits.issueOffset := e.issueOffset
   }
 
   XSPerfAccumulate("tlb_req", io.tlb_req.req.valid)
@@ -1108,12 +1148,16 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     val train = Flipped(DecoupledIO(new PrefetchTrain))
     val tlb_req = new L2ToL1TlbIO(nRespDups= 1)
     val req = DecoupledIO(new PrefetchReq)
-    val resp = Flipped(DecoupledIO(new PrefetchResp))
-    // Raw candidate/decision pair for the shared Compact Quality Feedback
-    // controller.  Candidate valid is a one-cycle, non-retryable pulse: a
-    // full CQF ingress slot is an intentional drop, not train backpressure.
+    val cqfEnable = Input(Bool())
     val cqfCandidate = DecoupledIO(new CqfCandidate)
     val cqfDecision = Flipped(DecoupledIO(new CqfDecision))
+    val cqfCandidateEligible = Output(Bool())
+    val cqfCandidateAdmit = Output(Bool())
+    val cqfCandidateCapacityBypass = Output(Bool())
+    val cqfMeta = Output(Valid(new CqfCandidate))
+    val nativeReqFire = Output(Bool())
+    val postCqfReqFire = Output(Bool())
+    val resp = Flipped(DecoupledIO(new PrefetchResp))
   })
 
   // 0 / 1: whether to enable
@@ -1124,11 +1168,11 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val rrTable = Module(new RecentRequestTable("vbop"))
   val scoreTable = Module(new OffsetScoreTable("vbop"))
   val reqFilter = Module(new PrefetchReqBuffer)
+  val cqfGate = if (enableCQF) Some(Module(new CqfRequestGate("vbop"))) else None
   val student = if (enableStudentCover) Some(Module(new StudentCoverageLearner("vbop"))) else None
   val studentTrainReady = student.map(_.io.train.ready).getOrElse(true.B)
 
   val s1_req_valid = RegInit(false.B)
-  val s1_cqf_waiting = RegInit(false.B)
   val s0_ready, s1_ready = WireInit(false.B)
   val s0_fire = s0_ready && io.train.valid
   val s1_fire = s1_ready && s1_req_valid
@@ -1141,23 +1185,18 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
   val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, teacherOffset)
   val issueGate = if (issueGateEnable) issueConf(phaseEnd, teacherDisable) else true.B
-  val nativeIssueEnable = (studentSelectedEnable || !teacherDisable) && issueGate
-  // CQF observes the raw teacher/student choice before the native confidence
-  // gate.  Once CQF is enabled, its decision is the admission decision and
-  // the native gate is intentionally bypassed.
-  val cqfRawEnable = enable && (studentSelectedEnable || !teacherDisable) &&
-    issueOffset =/= 0.U
-  val issueEnable = if (enableCQF) enable && (studentSelectedEnable || !teacherDisable)
-    else nativeIssueEnable
+  val issueEnable = (studentSelectedEnable || !teacherDisable) && issueGate
   // NOTE: vaddr from l1 to l2 has no offset bits
   val s0_oldFullAddr = Cat(io.train.bits.vaddr.getOrElse(0.U), 0.U(offsetBits.W))
   val s0_oldFullAddrNoOff = s0_oldFullAddr(s0_oldFullAddr.getWidth-1, offsetBits)
   val s0_newFullAddr = s0_oldFullAddr + signedExtend((issueOffset << offsetBits), fullAddrBits)
   val s0_newPaddr = io.train.bits.addr + signedExtend((issueOffset << offsetBits), fullAddressBits)
   val s0_crossPage = getPPN(s0_newFullAddr) =/= getPPN(s0_oldFullAddr) // unequal tags
-  val s0_oldCqfLine = s0_oldFullAddrNoOff.pad(CqfParameters.LineBits)(CqfParameters.LineBits - 1, 0)
-  val s0_newCqfLine = s0_newFullAddr(s0_newFullAddr.getWidth - 1, offsetBits)
-    .pad(CqfParameters.LineBits)(CqfParameters.LineBits - 1, 0)
+  val trainPcValid = if (io.train.bits.pc.isDefined) {
+    CqfParameters.pcSourceValid(io.train.bits.reqsource)
+  } else {
+    false.B
+  }
 
   rrTable.io.r <> scoreTable.io.test
   rrTable.io.w <> delayQueue.io.out
@@ -1183,59 +1222,89 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val s1_newPaddr = RegEnable(s0_newPaddr, s0_fire)
   val s1_issueOffset = RegEnable(issueOffset.asSInt, s0_fire)
   val s1_samePagePaddrValid = RegEnable(!s0_crossPage, s0_fire)
+  val s1_pc = RegEnable(io.train.bits.pc.getOrElse(0.U), s0_fire)
+  val s1_pcValid = RegEnable(trainPcValid, s0_fire)
+  val s1_reqSource = RegEnable(io.train.bits.reqsource, s0_fire)
+  val s1_triggerLine = RegEnable(
+    s0_oldFullAddrNoOff.pad(CqfParameters.LineBits)(CqfParameters.LineBits - 1, 0),
+    s0_fire
+  )
+
+  // This is the raw request at the BOP algorithm boundary.  It contains the
+  // selected student/teacher offset and issueGate result, but has not entered
+  // the duplicate filter or TLB pipeline yet.
+  val cqfRawReq = Wire(DecoupledIO(new BopReqBundle))
+  cqfRawReq.valid := enable && s1_req_valid
+  cqfRawReq.bits.full_vaddr := s1_newFullAddr
+  cqfRawReq.bits.needT := s1_needT
+  cqfRawReq.bits.source := s1_source
+  cqfRawReq.bits.pc := s1_pc
+  cqfRawReq.bits.pcValid := s1_pcValid
+  cqfRawReq.bits.reqSource := s1_reqSource
+  cqfRawReq.bits.isBOP := true.B
+  cqfRawReq.bits.issueOffset := s1_issueOffset
+  cqfRawReq.bits.degreePass := io.fdbkDegree > 0.U
+  cqfRawReq.bits.samePagePaddrValid := s1_samePagePaddrValid
+  cqfRawReq.bits.samePagePaddr := s1_newPaddr
+
+  val cqfRawMeta = Wire(new CqfCandidate)
+  cqfRawMeta.pc := s1_pc
+  cqfRawMeta.pcValid := s1_pcValid
+  cqfRawMeta.reqSource := s1_reqSource
+  cqfRawMeta.kind := true.B
+  cqfRawMeta.triggerLine := s1_triggerLine
+  cqfRawMeta.candidateLine := (s1_triggerLine.asSInt + s1_issueOffset).asUInt
+    .pad(CqfParameters.LineBits)(CqfParameters.LineBits - 1, 0)
+
+  val reqFilterIn = Wire(DecoupledIO(new BopReqBundle))
+  if (enableCQF) {
+    cqfGate.get.io.enable := io.cqfEnable
+    cqfGate.get.io.in <> cqfRawReq
+    cqfGate.get.io.inMeta.valid := cqfRawReq.valid
+    cqfGate.get.io.inMeta.bits := cqfRawMeta
+    io.cqfCandidate <> cqfGate.get.io.candidate
+    cqfGate.get.io.decision <> io.cqfDecision
+    io.cqfCandidateEligible := cqfGate.get.io.candidateEligible
+    io.cqfCandidateAdmit := cqfGate.get.io.candidateAdmit
+    io.cqfCandidateCapacityBypass := cqfGate.get.io.capacityBypass
+    reqFilterIn <> cqfGate.get.io.out
+  } else {
+    reqFilterIn <> cqfRawReq
+    io.cqfCandidate.valid := false.B
+    io.cqfCandidate.bits := 0.U.asTypeOf(new CqfCandidate)
+    io.cqfDecision.ready := false.B
+    io.cqfCandidateEligible := false.B
+    io.cqfCandidateAdmit := false.B
+    io.cqfCandidateCapacityBypass := false.B
+  }
 
   s0_ready := delayQueue.io.in.ready && scoreTable.io.req.ready && studentTrainReady && s1_ready
-  s1_ready := !s1_cqf_waiting && (reqFilter.io.in_req.ready || !s1_req_valid)
-
-  val trainPcValid = if (io.train.bits.pc.isDefined) {
-    CqfParameters.pcSourceValid(io.train.bits.reqsource)
-  } else {
-    false.B
-  }
-  val cqfCandidateFire = if (enableCQF) io.cqfCandidate.fire else false.B
-  val cqfDecisionFire = if (enableCQF) io.cqfDecision.fire else false.B
-
-  io.cqfCandidate.valid := (if (enableCQF) s0_fire && cqfRawEnable && trainPcValid else false.B)
-  io.cqfCandidate.bits.pc := io.train.bits.pc.getOrElse(0.U)
-  io.cqfCandidate.bits.pcValid := trainPcValid
-  io.cqfCandidate.bits.kind := true.B // VBOP is CQF Large
-  io.cqfCandidate.bits.triggerLine := s0_oldCqfLine
-  io.cqfCandidate.bits.candidateLine := s0_newCqfLine
-  io.cqfDecision.ready := (if (enableCQF) s1_cqf_waiting else false.B)
+  s1_ready := cqfRawReq.ready || !s1_req_valid
+  io.nativeReqFire := cqfRawReq.fire
+  io.postCqfReqFire := reqFilterIn.fire
 
   when(s0_fire) {
-    if (enableCQF) {
-      // A candidate that CQF cannot capture is dropped here.  The local
-      // training event has already fired and is never replayed.
-      s1_cqf_waiting := cqfCandidateFire
-      s1_req_valid := cqfRawEnable && !trainPcValid
-    } else {
-      s1_cqf_waiting := false.B
-      s1_req_valid := enable && issueEnable && issueOffset =/= 0.U
-    }
+    s1_req_valid := enable && issueEnable && issueOffset =/= 0.U
   }.elsewhen(s1_fire){
     s1_req_valid := false.B
-  }.elsewhen(cqfDecisionFire) {
-    s1_cqf_waiting := false.B
-    s1_req_valid := enable && io.cqfDecision.bits.allow
   }
 
   io.train.ready := s0_ready
   io.resp.ready := true.B
   io.tlb_req.resp.ready := true.B
 
-  reqFilter.io.in_req.valid := enable && s1_req_valid && io.fdbkDegree > 0.U
-  reqFilter.io.in_req.bits.full_vaddr := s1_newFullAddr
-  reqFilter.io.in_req.bits.needT := s1_needT
-  reqFilter.io.in_req.bits.source := s1_source
-  reqFilter.io.in_req.bits.isBOP := true.B
-  reqFilter.io.in_req.bits.issueOffset := s1_issueOffset
-  reqFilter.io.in_req.bits.samePagePaddrValid := s1_samePagePaddrValid
-  reqFilter.io.in_req.bits.samePagePaddr := s1_newPaddr
+  // CQF observes the post-issueGate native candidate. Native degree control is
+  // applied only after the CQF gate using the value captured with that request.
+  private val degreeDropAfterCqf = reqFilterIn.valid && !reqFilterIn.bits.degreePass
+  reqFilter.io.in_req.valid := reqFilterIn.valid && reqFilterIn.bits.degreePass
+  reqFilter.io.in_req.bits := reqFilterIn.bits
+  reqFilterIn.ready := Mux(reqFilterIn.bits.degreePass, reqFilter.io.in_req.ready, true.B)
 
   io.tlb_req <> reqFilter.io.tlb_req
   io.req <> reqFilter.io.out_req
   io.req.valid := reqFilter.io.out_req.valid
+  io.cqfMeta.valid := io.req.valid
+  io.cqfMeta.bits := reqFilter.io.out_cqfMeta.bits
 
   XSPerfAccumulate("bop_req", io.req.fire)
   emitOffsetDistCounters("prefetch_sent_issue_offset", reqFilter.io.out_issueOffset, io.req.fire)
@@ -1248,27 +1317,8 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && !issueEnable)
   XSPerfAccumulate("bop_phase_auto_disable", phaseEnd && !issueEnable)
   XSPerfAccumulate("bop_student_takeover", scoreTable.io.req.fire && studentSelectedEnable)
-  XSPerfAccumulate("bop_l2_feedback_control_drop", enable && s1_req_valid && io.fdbkDegree === 0.U)
-  XSPerfAccumulate("bop_cqf_candidate", io.cqfCandidate.valid)
-  XSPerfAccumulate("bop_cqf_candidate_accept", io.cqfCandidate.fire)
-  XSPerfAccumulate("bop_cqf_candidate_drop", io.cqfCandidate.valid && !io.cqfCandidate.ready)
-  XSPerfAccumulate("bop_cqf_suppressed", io.cqfDecision.fire && !io.cqfDecision.bits.allow)
-  val cqfInvalidPcBypass = if (enableCQF) {
-    s0_fire && cqfRawEnable && !trainPcValid
-  } else {
-    false.B
-  }
-  XSPerfAccumulate("bop_cqf_invalid_pc_bypass", cqfInvalidPcBypass)
-  XSPerfAccumulate("bop_cqf_invalid_pc_store_bypass", cqfInvalidPcBypass &&
-    io.train.bits.reqsource === MemReqSource.CPUStoreData.id.U)
-  XSPerfAccumulate("bop_cqf_invalid_pc_atomic_bypass", cqfInvalidPcBypass &&
-    io.train.bits.reqsource === MemReqSource.CPUAtomicData.id.U)
-  XSPerfAccumulate("bop_cqf_invalid_pc_l1_prefetch_bypass", cqfInvalidPcBypass &&
-    MemReqSource.isL1Prefetch(io.train.bits.reqsource))
-  XSPerfAccumulate("bop_cqf_invalid_pc_other_bypass", cqfInvalidPcBypass &&
-    io.train.bits.reqsource =/= MemReqSource.CPUStoreData.id.U &&
-    io.train.bits.reqsource =/= MemReqSource.CPUAtomicData.id.U &&
-    !MemReqSource.isL1Prefetch(io.train.bits.reqsource))
+  XSPerfAccumulate("bop_l2_feedback_control_drop", degreeDropAfterCqf)
+  XSPerfAccumulate("bop_degree_drop_after_cqf", degreeDropAfterCqf)
 }
 
 class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
@@ -1278,9 +1328,16 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     val fdbkDegree = Input(UInt(degreeBits.W))
     val train = Flipped(DecoupledIO(new PrefetchTrain))
     val req = DecoupledIO(new PrefetchReq)
-    val resp = Flipped(DecoupledIO(new PrefetchResp))
+    val cqfEnable = Input(Bool())
     val cqfCandidate = DecoupledIO(new CqfCandidate)
     val cqfDecision = Flipped(DecoupledIO(new CqfDecision))
+    val cqfCandidateEligible = Output(Bool())
+    val cqfCandidateAdmit = Output(Bool())
+    val cqfCandidateCapacityBypass = Output(Bool())
+    val cqfMeta = Output(Valid(new CqfCandidate))
+    val nativeReqFire = Output(Bool())
+    val postCqfReqFire = Output(Bool())
+    val resp = Flipped(DecoupledIO(new PrefetchResp))
   })
 
   // 0 / 1: whether to enable
@@ -1290,11 +1347,11 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val delayQueue = Module(new DelayQueue("pbop"))
   val rrTable = Module(new RecentRequestTable("pbop"))
   val scoreTable = Module(new OffsetScoreTable("pbop"))
+  val cqfGate = if (enableCQF) Some(Module(new CqfRequestGate("pbop"))) else None
   val student = if (enableStudentCover) Some(Module(new StudentCoverageLearner("pbop"))) else None
   val studentTrainReady = student.map(_.io.train.ready).getOrElse(true.B)
 
   val s1_req_valid = RegInit(false.B)
-  val s1_cqf_waiting = RegInit(false.B)
   val s0_ready, s1_ready = WireInit(false.B)
   val s0_fire = s0_ready && io.train.valid
   val s1_fire = s1_ready && s1_req_valid
@@ -1307,18 +1364,22 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
   val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, teacherOffset)
   val issueGate = if (issueGateEnable) issueConf(phaseEnd, teacherDisable) else true.B
-  val nativeIssueEnable = (studentSelectedEnable || !teacherDisable) && issueGate
-  val cqfRawEnable = enable && (studentSelectedEnable || !teacherDisable) &&
-    issueOffset =/= 0.U
-  val issueEnable = if (enableCQF) enable && (studentSelectedEnable || !teacherDisable)
-    else nativeIssueEnable
+  val issueEnable = (studentSelectedEnable || !teacherDisable) && issueGate
   val s0_oldAddr = io.train.bits.addr
   val s0_oldAddrNoOff = s0_oldAddr(s0_oldAddr.getWidth-1, offsetBits)
   val s0_newAddr = s0_oldAddr + signedExtend((issueOffset << offsetBits), fullAddressBits)
   val s0_crossPage = getPPN(s0_newAddr) =/= getPPN(s0_oldAddr) // unequal tags
-  val s0_oldCqfLine = io.train.bits.vaddr.getOrElse(0.U)
-    .pad(CqfParameters.LineBits)(CqfParameters.LineBits - 1, 0)
-  val s0_newCqfLine = s0_oldCqfLine + signedExtend(issueOffset, CqfParameters.LineBits)
+  val s0_oldFullVaddr = Cat(io.train.bits.vaddr.getOrElse(0.U), 0.U(offsetBits.W))
+  // Keep the complete candidate virtual address with the request. The
+  // trigger line is reconstructed at the CQF boundary from this address and
+  // the request's signed issue offset.
+  val s0_newFullVaddr = s0_oldFullVaddr +
+    signedExtend((issueOffset << offsetBits), fullVAddrBits)
+  val trainPcValid = if (io.train.bits.pc.isDefined) {
+    CqfParameters.pcSourceValid(io.train.bits.reqsource)
+  } else {
+    false.B
+  }
 
   rrTable.io.r <> scoreTable.io.test
   rrTable.io.w <> delayQueue.io.out
@@ -1338,65 +1399,106 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   }
 
   /* s1 send req */
-  class PBestOffsetReq extends Bundle {
-    val req = new PrefetchReq
-    val issueOffset = SInt(offsetWidth.W)
-  }
-  val s1_req = Reg(new PrefetchReq)
-  val s1_issueOffset = RegInit(0.S(offsetWidth.W))
-  val s1_crossPage = RegInit(false.B)
+  val s1_req = Reg(new BopReqBundle)
   // Flow through while empty, but do not propagate downstream ready back to s1.
-  val reqSkidBuffer = Module(new Queue(new PBestOffsetReq, entries = 1, pipe = false, flow = true))
+  val reqSkidBuffer = Module(new Queue(new BopReqBundle, entries = 1, pipe = false, flow = true))
 
   s0_ready := delayQueue.io.in.ready && scoreTable.io.req.ready && studentTrainReady && s1_ready
-  s1_ready := !s1_cqf_waiting && (reqSkidBuffer.io.enq.ready || !s1_req_valid)
-
-  val trainPcValid = if (io.train.bits.pc.isDefined) {
-    CqfParameters.pcSourceValid(io.train.bits.reqsource)
-  } else {
-    false.B
-  }
-  val cqfCandidateFire = if (enableCQF) io.cqfCandidate.fire else false.B
-  val cqfDecisionFire = if (enableCQF) io.cqfDecision.fire else false.B
-
-  io.cqfCandidate.valid := (if (enableCQF) s0_fire && cqfRawEnable && trainPcValid else false.B)
-  io.cqfCandidate.bits.pc := io.train.bits.pc.getOrElse(0.U)
-  io.cqfCandidate.bits.pcValid := trainPcValid
-  io.cqfCandidate.bits.kind := false.B // PBOP is CQF Small
-  io.cqfCandidate.bits.triggerLine := s0_oldCqfLine
-  io.cqfCandidate.bits.candidateLine := s0_newCqfLine
-  io.cqfDecision.ready := (if (enableCQF) s1_cqf_waiting else false.B)
+  s1_ready := reqSkidBuffer.io.enq.ready || !s1_req_valid
 
   when(s0_fire) {
-    s1_req.tag := parseFullAddress(s0_newAddr)._1
-    s1_req.set := parseFullAddress(s0_newAddr)._2
+    s1_req.full_vaddr := s0_newFullVaddr
     s1_req.needT := io.train.bits.needT
     s1_req.source := io.train.bits.source
-    s1_issueOffset := issueOffset.asSInt
-    s1_crossPage := s0_crossPage
-    if (enableCQF) {
-      s1_cqf_waiting := cqfCandidateFire
-      // Invalid-PC candidates fail open but still pass through the existing
-      // PBOP page-crossing rule.
-      s1_req_valid := cqfRawEnable && !trainPcValid && !s0_crossPage
-    } else {
-      s1_cqf_waiting := false.B
-      s1_req_valid := enable && !s0_crossPage && issueEnable && issueOffset =/= 0.U
-    }
+    s1_req.pc := io.train.bits.pc.getOrElse(0.U)
+    s1_req.pcValid := trainPcValid
+    s1_req.reqSource := io.train.bits.reqsource
+    s1_req.isBOP := true.B
+    s1_req.issueOffset := issueOffset.asSInt
+    s1_req.degreePass := false.B
+    s1_req.samePagePaddrValid := !s0_crossPage
+    s1_req.samePagePaddr := s0_newAddr
+    s1_req_valid := enable && issueEnable && issueOffset =/= 0.U
   }.elsewhen(s1_fire) {
     s1_req_valid := false.B
-  }.elsewhen(cqfDecisionFire) {
-    s1_cqf_waiting := false.B
-    s1_req_valid := enable && io.cqfDecision.bits.allow && !s1_crossPage
   }
 
   reqSkidBuffer.io.enq.valid := s1_req_valid
-  reqSkidBuffer.io.enq.bits.req := s1_req
-  reqSkidBuffer.io.enq.bits.req.pfSource := MemReqSource.Prefetch2L2PBOP.id.U
-  reqSkidBuffer.io.enq.bits.issueOffset := s1_issueOffset
-  io.req.valid := enable && reqSkidBuffer.io.deq.valid && io.fdbkDegree > 0.U
-  io.req.bits := reqSkidBuffer.io.deq.bits.req
-  reqSkidBuffer.io.deq.ready := io.req.ready
+  reqSkidBuffer.io.enq.bits := s1_req
+  reqSkidBuffer.io.enq.bits.degreePass := io.fdbkDegree > 0.U
+
+  val cqfRawReq = Wire(DecoupledIO(new BopReqBundle))
+  cqfRawReq <> reqSkidBuffer.io.deq
+  val cqfRawMeta = Wire(new CqfCandidate)
+  cqfRawMeta.pc := cqfRawReq.bits.pc
+  cqfRawMeta.pcValid := cqfRawReq.bits.pcValid
+  cqfRawMeta.reqSource := cqfRawReq.bits.reqSource
+  cqfRawMeta.kind := false.B
+  // full_vaddr is the candidate byte address. Recover the trigger line from
+  // the candidate line and the signed BOP offset.
+  val cqfCandidateLine = CqfParameters.lineFromByteAddress(
+    cqfRawReq.bits.full_vaddr,
+    offsetBits
+  )
+  cqfRawMeta.candidateLine := cqfCandidateLine
+  cqfRawMeta.triggerLine := CqfParameters.subtractLineOffset(
+    cqfCandidateLine,
+    cqfRawReq.bits.issueOffset
+  )
+
+  val cqfOutReq = Wire(DecoupledIO(new BopReqBundle))
+  if (enableCQF) {
+    cqfGate.get.io.enable := io.cqfEnable
+    cqfGate.get.io.in <> cqfRawReq
+    cqfGate.get.io.inMeta.valid := cqfRawReq.valid
+    cqfGate.get.io.inMeta.bits := cqfRawMeta
+    io.cqfCandidate <> cqfGate.get.io.candidate
+    cqfGate.get.io.decision <> io.cqfDecision
+    io.cqfCandidateEligible := cqfGate.get.io.candidateEligible
+    io.cqfCandidateAdmit := cqfGate.get.io.candidateAdmit
+    io.cqfCandidateCapacityBypass := cqfGate.get.io.capacityBypass
+    cqfOutReq <> cqfGate.get.io.out
+  } else {
+    cqfOutReq <> cqfRawReq
+    io.cqfCandidate.valid := false.B
+    io.cqfCandidate.bits := 0.U.asTypeOf(new CqfCandidate)
+    io.cqfDecision.ready := false.B
+    io.cqfCandidateEligible := false.B
+    io.cqfCandidateAdmit := false.B
+    io.cqfCandidateCapacityBypass := false.B
+  }
+
+  private val degreeDropAfterCqf = cqfOutReq.valid && !cqfOutReq.bits.degreePass
+  private val crossPageDropAfterCqf = cqfOutReq.valid && cqfOutReq.bits.degreePass &&
+    !cqfOutReq.bits.samePagePaddrValid
+  private val nativeFilterPass = cqfOutReq.bits.degreePass && cqfOutReq.bits.samePagePaddrValid
+  cqfOutReq.ready := Mux(nativeFilterPass, io.req.ready, true.B)
+  io.nativeReqFire := cqfRawReq.fire
+  io.postCqfReqFire := cqfOutReq.fire
+  io.req.valid := enable && cqfOutReq.valid && nativeFilterPass
+  io.req.bits.tag := parseFullAddress(cqfOutReq.bits.samePagePaddr)._1
+  io.req.bits.set := parseFullAddress(cqfOutReq.bits.samePagePaddr)._2
+  // full_vaddr is the candidate virtual address, so it now matches the
+  // physical tag/set carried by this PrefetchReq.
+  io.req.bits.vaddr.foreach(_ := get_block_addr(cqfOutReq.bits.full_vaddr))
+  io.req.bits.needT := cqfOutReq.bits.needT
+  io.req.bits.source := cqfOutReq.bits.source
+  io.req.bits.pfSource := MemReqSource.Prefetch2L2PBOP.id.U
+  io.req.bits.cdpPfDepth.foreach(_ := 0.U)
+  io.cqfMeta.valid := io.req.valid
+  io.cqfMeta.bits.pc := cqfOutReq.bits.pc
+  io.cqfMeta.bits.pcValid := cqfOutReq.bits.pcValid
+  io.cqfMeta.bits.reqSource := cqfOutReq.bits.reqSource
+  io.cqfMeta.bits.kind := false.B
+  val finalCandidateLine = CqfParameters.lineFromByteAddress(
+    cqfOutReq.bits.full_vaddr,
+    offsetBits
+  )
+  io.cqfMeta.bits.candidateLine := finalCandidateLine
+  io.cqfMeta.bits.triggerLine := CqfParameters.subtractLineOffset(
+    finalCandidateLine,
+    cqfOutReq.bits.issueOffset
+  )
   io.train.ready := s0_ready
   io.resp.ready := true.B
 
@@ -1406,30 +1508,12 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   XSPerfAccumulate("bop_resp", io.resp.fire)
   XSPerfAccumulate("bop_train_stall_for_st_not_ready", io.train.valid && !scoreTable.io.req.ready)
   XSPerfAccumulate("bop_train_stall_for_stu_not_ready", io.train.valid && !studentTrainReady)
-  XSPerfAccumulate("bop_drop_for_cross_page", scoreTable.io.req.fire && s0_crossPage)
+  XSPerfAccumulate("bop_drop_for_cross_page", crossPageDropAfterCqf)
+  XSPerfAccumulate("bop_cross_page_drop_after_cqf", crossPageDropAfterCqf)
   XSPerfAccumulate("bop_drop_for_external_disable", scoreTable.io.req.fire && !enable)
   XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && enable && !issueEnable)
   XSPerfAccumulate("bop_phase_auto_disable", phaseEnd && !issueEnable)
   XSPerfAccumulate("bop_student_takeover", scoreTable.io.req.fire && studentSelectedEnable)
-  XSPerfAccumulate("bop_l2_feedback_control_drop", enable && s1_req_valid && io.fdbkDegree === 0.U)
-  XSPerfAccumulate("bop_cqf_candidate", io.cqfCandidate.valid)
-  XSPerfAccumulate("bop_cqf_candidate_accept", io.cqfCandidate.fire)
-  XSPerfAccumulate("bop_cqf_candidate_drop", io.cqfCandidate.valid && !io.cqfCandidate.ready)
-  XSPerfAccumulate("bop_cqf_suppressed", io.cqfDecision.fire && !io.cqfDecision.bits.allow)
-  val cqfInvalidPcBypass = if (enableCQF) {
-    s0_fire && cqfRawEnable && !trainPcValid
-  } else {
-    false.B
-  }
-  XSPerfAccumulate("bop_cqf_invalid_pc_bypass", cqfInvalidPcBypass)
-  XSPerfAccumulate("bop_cqf_invalid_pc_store_bypass", cqfInvalidPcBypass &&
-    io.train.bits.reqsource === MemReqSource.CPUStoreData.id.U)
-  XSPerfAccumulate("bop_cqf_invalid_pc_atomic_bypass", cqfInvalidPcBypass &&
-    io.train.bits.reqsource === MemReqSource.CPUAtomicData.id.U)
-  XSPerfAccumulate("bop_cqf_invalid_pc_l1_prefetch_bypass", cqfInvalidPcBypass &&
-    MemReqSource.isL1Prefetch(io.train.bits.reqsource))
-  XSPerfAccumulate("bop_cqf_invalid_pc_other_bypass", cqfInvalidPcBypass &&
-    io.train.bits.reqsource =/= MemReqSource.CPUStoreData.id.U &&
-    io.train.bits.reqsource =/= MemReqSource.CPUAtomicData.id.U &&
-    !MemReqSource.isL1Prefetch(io.train.bits.reqsource))
+  XSPerfAccumulate("bop_l2_feedback_control_drop", degreeDropAfterCqf)
+  XSPerfAccumulate("bop_degree_drop_after_cqf", degreeDropAfterCqf)
 }

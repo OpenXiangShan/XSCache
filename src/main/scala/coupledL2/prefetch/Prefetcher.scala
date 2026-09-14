@@ -403,12 +403,14 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     vbop.get.io.resp.valid := resp.valid && resp.bits.isBOP
     vbop.get.io.tlb_req <> bop_tlb_req
     if (bopCqfEnabled) {
+      vbop.get.io.cqfEnable := cqf.get.io.enable
       cqf.get.io.candidate(0) <> vbop.get.io.cqfCandidate
       vbop.get.io.cqfDecision <> cqf.get.io.decision(0)
     } else {
-      vbop.get.io.cqfCandidate.ready := false.B
+      vbop.get.io.cqfEnable := false.B
+      vbop.get.io.cqfCandidate.ready := true.B
       vbop.get.io.cqfDecision.valid := false.B
-      vbop.get.io.cqfDecision.bits := DontCare
+      vbop.get.io.cqfDecision.bits := 0.U.asTypeOf(new CqfDecision)
     }
 
     val pbop_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
@@ -424,17 +426,19 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     pbop.get.io.resp <> resp
     pbop.get.io.resp.valid := resp.valid && resp.bits.isPBOP
     if (bopCqfEnabled) {
+      pbop.get.io.cqfEnable := cqf.get.io.enable
       cqf.get.io.candidate(1) <> pbop.get.io.cqfCandidate
       pbop.get.io.cqfDecision <> cqf.get.io.decision(1)
     } else {
-      pbop.get.io.cqfCandidate.ready := false.B
+      pbop.get.io.cqfEnable := false.B
+      pbop.get.io.cqfCandidate.ready := true.B
       pbop.get.io.cqfDecision.valid := false.B
-      pbop.get.io.cqfDecision.bits := DontCare
+      pbop.get.io.cqfDecision.bits := 0.U.asTypeOf(new CqfDecision)
     }
 
-    assert(!vbop.get.io.cqfCandidate.valid || vbop.get.io.cqfCandidate.bits.kind,
+    assert(!vbop.get.io.cqfMeta.valid || vbop.get.io.cqfMeta.bits.kind,
       "VBOP candidates must use CQF Large kind")
-    assert(!pbop.get.io.cqfCandidate.valid || !pbop.get.io.cqfCandidate.bits.kind,
+    assert(!pbop.get.io.cqfMeta.valid || !pbop.get.io.cqfMeta.bits.kind,
       "PBOP candidates must use CQF Small kind")
   }
   if (hasReceiver) {
@@ -547,6 +551,39 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   }
 
   val reqsFire = reqs.map(_.map(_.fire).getOrElse(false.B))
+
+  if (hasBOP) {
+    XSPerfAccumulate("bop_req_native",
+      PopCount(Seq(vbop.get.io.nativeReqFire, pbop.get.io.nativeReqFire)))
+    if (bopCqfEnabled) {
+      val bopCqfEligible = PopCount(Seq(
+        vbop.get.io.cqfCandidateEligible,
+        pbop.get.io.cqfCandidateEligible
+      ))
+      val bopCqfAdmit = PopCount(Seq(
+        vbop.get.io.cqfCandidateAdmit,
+        pbop.get.io.cqfCandidateAdmit
+      ))
+      val bopCqfCapacityBypass = PopCount(Seq(
+        vbop.get.io.cqfCandidateCapacityBypass,
+        pbop.get.io.cqfCandidateCapacityBypass
+      ))
+      XSPerfAccumulate("bop_cqf_candidate_eligible", bopCqfEligible)
+      XSPerfAccumulate("bop_cqf_candidate_admit", bopCqfAdmit)
+      XSPerfAccumulate("bop_cqf_candidate_capacity_bypass",
+        bopCqfCapacityBypass)
+      XSPerfAccumulate("bop_req_cqf_allow",
+        PopCount(Seq(vbop.get.io.postCqfReqFire, pbop.get.io.postCqfReqFire)))
+      // Includes policy allows and all fail-open classes. Keep the legacy
+      // cqf_allow name above for result-parser compatibility.
+      XSPerfAccumulate("bop_req_after_cqf",
+        PopCount(Seq(vbop.get.io.postCqfReqFire, pbop.get.io.postCqfReqFire)))
+    }
+  }
+
+  XSPerfAccumulate("bop_req_physical", PopCount(io.req.map { req =>
+    req.fire && (req.bits.isBOP || req.bits.isPBOP)
+  }))
 
   XSPerfAccumulate("prefetch_train_valid", train.valid)
   XSPerfAccumulate("prefetch_train_in_valid", PopCount(io.train.map(_.valid)))
