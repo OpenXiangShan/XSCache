@@ -498,6 +498,13 @@ class Directory(implicit p: Parameters) extends L2Module {
 
   XSPerfAccumulate("dirRead_cnt", io.read.fire)
   XSPerfAccumulate("choose_busy_way", reqValid_s3 && !Mux1H(chosenOH, req_s3.wayMask))
+  // read/write sharing stats for the set-banked tag/meta/replacer SRAMs:
+  // dir_rw_conflict_any counts cycles where a read request coexists with any
+  // directory write (all serialized before set banking); dir_read_blocked counts
+  // reads actually stalled (only same-bank writes after set banking).
+  XSPerfAccumulate("dir_read_attempt", io.read.valid)
+  XSPerfAccumulate("dir_rw_conflict_any", io.read.valid && (io.metaWReq.valid || io.tagWReq.valid || replacerWen))
+  XSPerfAccumulate("dir_read_blocked", io.read.valid && !io.read.ready)
 
   /* ====== ChiselDB logging for  prefetcher lifecycle ====== */
   if (cacheParams.enableMonitor && !cacheParams.FPGAPlatform) {
