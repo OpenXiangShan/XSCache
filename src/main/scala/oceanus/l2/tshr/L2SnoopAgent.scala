@@ -26,9 +26,18 @@ object SnoopOpcodeDerive {
     val hasClient = clients.orR
     val invalidate = isInvalidate(intent) || aliasMismatch
     val needSnoop = hit && hasClient && (invalidate || state === L2Directory.MetaState.UU)
+    // A true SnpMakeInvalid intent (L3 SnpMakeInvalid / CMO MakeInvalid) must keep
+    // the CCHI SnpMakeInvalid opcode even on a UU line: the dirty data is
+    // contractually dead (full-line overwrite flow) and the SNP vPipe forbids any
+    // data return for MakeInvalid. Only the other invalidate paths use the UU ->
+    // SnpToInvalid substitution to pull dirty data back from L1.
     val opcode = Mux(
       invalidate,
-      Mux(state === L2Directory.MetaState.UU, CCHIOpcode.SnpToInvalid.U, CCHIOpcode.SnpMakeInvalid.U),
+      Mux(
+        intent === Intent.SnpMakeInvalid,
+        CCHIOpcode.SnpMakeInvalid.U,
+        Mux(state === L2Directory.MetaState.UU, CCHIOpcode.SnpToInvalid.U, CCHIOpcode.SnpMakeInvalid.U)
+      ),
       CCHIOpcode.SnpToShared.U
     )
 
@@ -41,7 +50,10 @@ object SnoopOpcodeDerive {
     val needSnoop = hit && hasClient && (invalidate || state == L2Directory.MetaState.UU.litValue.toInt)
     val opcode =
       if (invalidate) {
-        if (state == L2Directory.MetaState.UU.litValue.toInt) {
+        if (intent == Intent.SnpMakeInvalid.litValue.toInt) {
+          // MakeInvalid contract: data is dead, never substitute SnpToInvalid
+          CCHIOpcode.SnpMakeInvalid.opcode
+        } else if (state == L2Directory.MetaState.UU.litValue.toInt) {
           CCHIOpcode.SnpToInvalid.opcode
         } else {
           CCHIOpcode.SnpMakeInvalid.opcode
