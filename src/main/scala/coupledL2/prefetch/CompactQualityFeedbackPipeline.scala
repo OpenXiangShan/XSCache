@@ -908,12 +908,19 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
     CqfPipelineFeedbackPhase.DemandMatchRead -> feedbackDemandKey(5, 0),
     CqfPipelineFeedbackPhase.DemandSweepRead -> feedbackSelectContext.demandSweepIndex(7, 2)
   ))
+  // Demand match/sweep operations share one match-row scratch register. Once
+  // either read is issued, keep younger Feedback operations out until its
+  // registered response is consumed. This also protects a saved match row
+  // from being made stale by a younger candidate update before demand clear.
+  private val feedbackDemandReadInFlight = feedbackMemoryResponseValid && (
+    feedbackMemoryPhase === CqfPipelineFeedbackPhase.DemandMatchRead ||
+      feedbackMemoryPhase === CqfPipelineFeedbackPhase.DemandSweepRead)
   private val feedbackReadSetHazard =
     (feedbackMemoryResponseValid && feedbackMemorySet === feedbackReadIssueSet) ||
       (feedbackReadResponseValid && feedbackReadSet === feedbackReadIssueSet)
   private val feedbackReadIssueValid = tablesReady && !feedbackWriteValid &&
     !feedbackResponseContinues && feedbackSelectReady && !feedbackPendingWrite &&
-    !feedbackReadSetHazard
+    !feedbackDemandReadInFlight && !feedbackReadSetHazard
 
   feedbackTable.io.r.req.valid := feedbackReadIssueValid
   feedbackTable.io.r.req.bits.setIdx := feedbackReadIssueSet
@@ -1165,6 +1172,8 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
       "CQF pipeline Quality 1RW SRAM accessed twice")
     assert(!(feedbackReadFire && feedbackWriteFire),
       "CQF pipeline Feedback 1RW SRAM accessed twice")
+    assert(!(feedbackReadFire && feedbackDemandReadInFlight),
+      "CQF pipeline overlapped a Feedback read behind an in-flight demand read")
     assert(!qualityWriteValid || qualityWriteFire,
       "CQF pipeline Quality write unexpectedly backpressured")
     assert(!feedbackWriteValid || feedbackWriteFire,
