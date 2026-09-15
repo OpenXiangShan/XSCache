@@ -93,8 +93,15 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
   private val feedbackWays = 4
   private val feedbackSets = 64
   private val lineBits = CqfParameters.LineBits
+  private val contextEntryBits = (new CqfPipelineContext).getWidth
+  private val qualityEntryBits = (new CqfPipelineQualityEntry).getWidth
+  private val feedbackEntryBits = (new CqfPipelineFeedbackEntry).getWidth
 
   require(isPow2(contextEntries) && contextEntries >= 3)
+  require(qualityEntryBits == 32,
+    s"CQF Quality entry packing expects 32 bits, got $qualityEntryBits")
+  require(feedbackEntryBits == 36,
+    s"CQF Feedback entry packing expects 36 bits, got $feedbackEntryBits")
   require(offsetBits == 6,
     s"CQF's Sv48 line fingerprint requires 64-byte blocks, got ${1 << offsetBits} bytes")
 
@@ -105,28 +112,33 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
   private val stateBlock = 3.U(2.W)
 
   private val qualityTable = Module(new SRAMTemplate(
-    new CqfPipelineQualityEntry,
+    UInt((qualityEntryBits * qualityWays).W),
     set = qualitySets,
-    way = qualityWays,
+    way = 1,
     singlePort = true,
     shouldReset = true,
     hasMbist = cacheParams.hasMbist,
     hasSramCtl = cacheParams.hasSramCtl
   ))
   private val feedbackTable = Module(new SRAMTemplate(
-    new CqfPipelineFeedbackEntry,
+    UInt((feedbackEntryBits * feedbackWays).W),
     set = feedbackSets,
-    way = feedbackWays,
+    way = 1,
     singlePort = true,
     shouldReset = true,
     hasMbist = cacheParams.hasMbist,
     hasSramCtl = cacheParams.hasSramCtl
   ))
 
-  private val contexts = RegInit(VecInit(Seq.fill(contextEntries)(
-    0.U.asTypeOf(new CqfPipelineContext))))
-  private val qPlru = RegInit(VecInit(Seq.fill(qualitySets)(0.U(3.W))))
-  private val fVictim = RegInit(VecInit(Seq.fill(feedbackSets)(0.U(2.W))))
+  private val contextRegisters = Seq.fill(contextEntries)(
+    RegInit(0.U(contextEntryBits.W)))
+  private val contexts = contextRegisters.map(_.asTypeOf(new CqfPipelineContext))
+  private val contextNext = contexts.map(WireInit(_))
+  for (i <- 0 until contextEntries) {
+    contextRegisters(i) := contextNext(i).asUInt
+  }
+  private val qPlru = Seq.fill(qualitySets)(RegInit(0.U(3.W)))
+  private val fVictim = Seq.fill(feedbackSets)(RegInit(0.U(2.W)))
   private val feedbackOccupancy = RegInit(0.U(9.W))
   private val demandAge = RegInit(0.U(12.W))
   private val sweepPtr = RegInit(0.U(8.W))
@@ -196,31 +208,75 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
   private def plruVictim(state: UInt): UInt =
     Mux(!state(0), Mux(!state(1), 0.U, 1.U), Mux(!state(2), 2.U, 3.U))
 
+  private def selectUInt(entries: Seq[UInt], index: UInt): UInt =
+    MuxLookup(index, entries.head)(entries.indices.map(i => i.U -> entries(i)))
+
+  private def selectContext(index: UInt): CqfPipelineContext =
+    MuxLookup(index, contexts.head.asUInt)(
+      contexts.indices.map(i => i.U -> contexts(i).asUInt))
+      .asTypeOf(new CqfPipelineContext)
+
+  // Table entries are kept packed at the SRAM boundary.  Besides matching a
+  // conventional single-word SRAM interface, this avoids nested aggregate
+  // arrays that older gsim versions cannot reliably split.
+  private def qValid(entry: UInt): Bool = entry(31)
+  private def qKind(entry: UInt): Bool = entry(30)
+  private def qTag(entry: UInt): UInt = entry(29, 22)
+  private def qState(entry: UInt): UInt = entry(21, 20)
+  private def qUseful(entry: UInt): UInt = entry(19, 13)
+  private def qUnused(entry: UInt): UInt = entry(12, 6)
+  private def qResolved(entry: UInt): UInt = entry(5, 0)
+  private def packQualityEntry(
+    valid: Bool, kind: Bool, tag: UInt, state: UInt,
+    useful: UInt, unused: UInt, resolved: UInt
+  ): UInt = Cat(valid, kind, tag.pad(8)(7, 0), state.pad(2)(1, 0),
+    useful.pad(7)(6, 0), unused.pad(7)(6, 0), resolved.pad(6)(5, 0))
+
+  private def fValid(entry: UInt): Bool = entry(35)
+  private def fTag(entry: UInt): UInt = entry(34, 21)
+  private def fOwnerSet(entry: UInt): UInt = entry(20, 15)
+  private def fOwnerTag(entry: UInt): UInt = entry(14, 7)
+  private def fOwnerKind(entry: UInt): Bool = entry(6)
+  private def fIssueEpoch(entry: UInt): UInt = entry(5, 0)
+  private def packFeedbackEntry(
+    valid: Bool, tag: UInt, ownerSet: UInt, ownerTag: UInt,
+    ownerKind: Bool, issueEpoch: UInt
+  ): UInt = Cat(valid, tag.pad(14)(13, 0), ownerSet.pad(6)(5, 0),
+    ownerTag.pad(8)(7, 0), ownerKind, issueEpoch.pad(6)(5, 0))
+
   private def findQualityWay(
-    row: Vec[CqfPipelineQualityEntry],
+    row: Seq[UInt],
     tag: UInt,
     kind: Bool
   ): UInt = {
-    val hits = VecInit(row.map(e => e.valid && e.tag === tag && e.kind === kind))
+    val hits = VecInit(row.map(e => qValid(e) && qTag(e) === tag && qKind(e) === kind))
     Mux(hits.asUInt.orR, OHToUInt(PriorityEncoderOH(hits.asUInt)), qualityWays.U)
   }
 
   private def selectQualityWay(
-    row: Vec[CqfPipelineQualityEntry],
+    row: Seq[UInt],
     tag: UInt,
     kind: Bool,
     plru: UInt
   ): UInt = {
     val hitWay = findQualityWay(row, tag, kind)
-    val invalid = VecInit(row.map(e => !e.valid))
+    val invalid = VecInit(row.map(e => !qValid(e)))
     Mux(hitWay =/= qualityWays.U, hitWay,
       Mux(invalid.asUInt.orR, OHToUInt(PriorityEncoderOH(invalid.asUInt)), plruVictim(plru)))
   }
 
-  private def findFeedbackWay(row: Vec[CqfPipelineFeedbackEntry], tag: UInt): UInt = {
-    val hits = VecInit(row.map(e => e.valid && e.tag === tag))
+  private def findFeedbackWay(row: Seq[UInt], tag: UInt): UInt = {
+    val hits = VecInit(row.map(e => fValid(e) && fTag(e) === tag))
     Mux(hits.asUInt.orR, OHToUInt(PriorityEncoderOH(hits.asUInt)), feedbackWays.U)
   }
+
+  private def selectQualityEntry(
+    row: Seq[UInt], way: UInt
+  ): UInt = MuxLookup(way, row.head)(row.indices.map(i => i.U -> row(i)))
+
+  private def selectFeedbackEntry(
+    row: Seq[UInt], way: UInt
+  ): UInt = MuxLookup(way, row.head)(row.indices.map(i => i.U -> row(i)))
 
   private def stateAfterEvidence(state: UInt, useful: UInt, unused: UInt): UInt = {
     val samples = useful +& unused
@@ -234,12 +290,12 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
         Mux(shouldBlock, stateBlock, stateOpen)))
   }
 
-  private def applyOutcome(entry: CqfPipelineQualityEntry, isUseful: Bool):
+  private def applyOutcome(entry: UInt, isUseful: Bool):
       (UInt, UInt, UInt, UInt, UInt, Bool) = {
-    val usefulNext = entry.useful + Mux(isUseful, 1.U, 0.U)
-    val unusedNext = entry.unused + Mux(isUseful, 0.U, 1.U)
-    val resolvedNext = entry.resolved +& 1.U
-    val stateBeforeDecay = stateAfterEvidence(entry.state, usefulNext, unusedNext)
+    val usefulNext = qUseful(entry) + Mux(isUseful, 1.U, 0.U)
+    val unusedNext = qUnused(entry) + Mux(isUseful, 0.U, 1.U)
+    val resolvedNext = qResolved(entry) +& 1.U
+    val stateBeforeDecay = stateAfterEvidence(qState(entry), usefulNext, unusedNext)
     val decay = resolvedNext >= 64.U
     val usefulAfterDecay = (usefulNext >> 1).pad(7)
     val unusedAfterDecay = (unusedNext >> 1).pad(7)
@@ -254,14 +310,20 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
 
   private def oldestOH(valid: Seq[Bool], sequence: Seq[UInt]): UInt = {
     require(valid.length == sequence.length && valid.nonEmpty)
-    VecInit(valid.indices.map { i =>
-      val olderExists = valid.indices.filter(_ != i).map { j =>
-        // Modular comparison is safe because at most 16 sequences are live;
-        // their distance is always far below half of the 32-bit number space.
-        valid(j) && (sequence(j) - sequence(i))(31)
-      }.reduce(_ || _)
-      valid(i) && !olderExists
-    }).asUInt
+    // Modular comparison is safe because at most 16 sequences are live; their
+    // distance is always far below half of the 32-bit number space.  A linear
+    // reduction is equivalent to the all-pairs formulation and produces a
+    // much smaller oldest-first selector.
+    var found = valid.head
+    var oldestIndex = 0.U(log2Ceil(valid.length).W)
+    var oldestSequence = sequence.head
+    for (i <- 1 until valid.length) {
+      val take = valid(i) && (!found || (sequence(i) - oldestSequence)(31))
+      oldestIndex = Mux(take, i.U, oldestIndex)
+      oldestSequence = Mux(take, sequence(i), oldestSequence)
+      found = found || valid(i)
+    }
+    UIntToOH(oldestIndex, valid.length) & Fill(valid.length, found)
   }
 
   private val tablesReady = qualityTable.io.resetDone && feedbackTable.io.resetDone
@@ -292,13 +354,14 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
     oldestOH(candidateActive(port), contexts.map(_.sequence))
   }
   private val decisionIndex = decisionOH.map(OHToUInt(_))
+  private val decisionContext = decisionIndex.map(selectContext)
 
   for (port <- 0 until 2) {
     io.decision(port).valid := decisionOH(port).orR &&
       candidateComplete(port)(decisionIndex(port))
-    io.decision(port).bits.allow := contexts(decisionIndex(port)).allow
-    io.decision(port).bits.sampled := contexts(decisionIndex(port)).sampled
-    io.decision(port).bits.feedbackInserted := contexts(decisionIndex(port)).feedbackInserted
+    io.decision(port).bits.allow := decisionContext(port).allow
+    io.decision(port).bits.sampled := decisionContext(port).sampled
+    io.decision(port).bits.feedbackInserted := decisionContext(port).feedbackInserted
   }
 
   private val decisionFire = VecInit(io.decision.map(_.fire))
@@ -310,7 +373,7 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
   })
   for (i <- 0 until contextEntries) {
     when (contextRetire(i)) {
-      contexts(i).active := false.B
+      contextNext(i).active := false.B
     }
   }
 
@@ -326,11 +389,10 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
   private val firstValid = Mux(firstPort === 0.U, candidateInputs(0), candidateInputs(1))
   private val secondValid = bothCandidates
 
-  // A completed demand or handshaken decision can be replaced in the same
-  // cycle. Allocation assignments appear after retirement assignments and
-  // therefore own the reused entry's complete next state.
-  private val initiallyFree = ((~activeVec.asUInt) | contextRetire.asUInt)(
-    contextEntries - 1, 0)
+  // Retired contexts become allocatable on the following cycle. Keeping
+  // admission independent of decision.ready cuts the combinational path
+  // through CqfRequestGate's output queue while preserving fail-open policy.
+  private val initiallyFree = (~activeVec.asUInt)(contextEntries - 1, 0)
   private val demandAllocOH = PriorityEncoderOH(initiallyFree)
   private val freeAfterDemand = initiallyFree & ~Mux(demandInput, demandAllocOH, 0.U)
   private val firstAllocOH = PriorityEncoderOH(freeAfterDemand)
@@ -384,14 +446,16 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
   secondContext.feedbackPhase := CqfPipelineFeedbackPhase.Waiting
   secondContext.allow := true.B
 
-  when (io.demandAccept) {
-    contexts(OHToUInt(demandAllocOH)) := demandContext
-  }
-  when (firstAccepted) {
-    contexts(OHToUInt(firstAllocOH)) := firstContext
-  }
-  when (secondAccepted) {
-    contexts(OHToUInt(secondAllocOH)) := secondContext
+  for (i <- 0 until contextEntries) {
+    when (io.demandAccept && demandAllocOH(i)) {
+      contextNext(i) := demandContext
+    }
+    when (firstAccepted && firstAllocOH(i)) {
+      contextNext(i) := firstContext
+    }
+    when (secondAccepted && secondAllocOH(i)) {
+      contextNext(i) := secondContext
+    }
   }
   when (admittedCount =/= 0.U) {
     nextSequence := nextSequence + admittedCount
@@ -403,15 +467,21 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
   // --------------------------------------------------------------------------
   // Quality 1RW pipeline
   // --------------------------------------------------------------------------
-  private val qualityReadResponseValid = RegInit(false.B)
-  private val qualityReadContext = Reg(UInt(contextBits.W))
-  private val qualityReadPhase = Reg(UInt(CqfPipelineQualityPhase.Width.W))
-  qualityReadResponseValid := false.B
+  private val qualityMemoryResponseValid = RegInit(false.B)
+  private val qualityMemoryContext = Reg(UInt(contextBits.W))
+  private val qualityMemoryPhase = Reg(UInt(CqfPipelineQualityPhase.Width.W))
+  private val qualityMemorySet = Reg(UInt(6.W))
+  qualityMemoryResponseValid := false.B
+  private val qualityReadResponseValid = RegNext(qualityMemoryResponseValid, false.B)
+  private val qualityReadContext = RegEnable(qualityMemoryContext, qualityMemoryResponseValid)
+  private val qualityReadPhase = RegEnable(qualityMemoryPhase, qualityMemoryResponseValid)
+  private val qualityReadSet = RegEnable(qualityMemorySet, qualityMemoryResponseValid)
+  private val qualityResponseData = RegEnable(
+    qualityTable.io.r.resp.data(0), qualityMemoryResponseValid)
 
   private val qualityWriteValid = WireDefault(false.B)
   private val qualityWriteSet = WireDefault(0.U(6.W))
-  private val qualityWriteRow = Wire(Vec(qualityWays, new CqfPipelineQualityEntry))
-  qualityWriteRow := 0.U.asTypeOf(qualityWriteRow)
+  private val qualityWriteRow = Seq.fill(qualityWays)(WireDefault(0.U(qualityEntryBits.W)))
   private val qualityHitPulse = WireDefault(false.B)
   private val qualityAllocatePulse = WireDefault(false.B)
   private val qualityReplacePulse = WireDefault(false.B)
@@ -426,8 +496,11 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
   private val qualityToFeedbackValid = WireDefault(false.B)
   private val qualityToFeedbackContext = WireDefault(0.U(contextBits.W))
 
-  private val qResponseContext = contexts(qualityReadContext)
-  private val qResponseRow = qualityTable.io.r.resp.data
+  private val qResponseContext = selectContext(qualityReadContext)
+  private val qResponsePacked = qualityResponseData
+  private val qResponseRow = (0 until qualityWays).map { way =>
+    qResponsePacked((way + 1) * qualityEntryBits - 1, way * qualityEntryBits)
+  }
   private val qResponseUsefulThenUnused = qualityReadResponseValid &&
     qualityReadPhase === CqfPipelineQualityPhase.UsefulRead &&
     qResponseContext.unusedPending
@@ -440,11 +513,11 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
       val hitWay = findQualityWay(qResponseRow, tag, qResponseContext.candidate.kind)
       val hit = qResponseContext.candidate.pcValid && hitWay =/= qualityWays.U
       val selectedWay = selectQualityWay(
-        qResponseRow, tag, qResponseContext.candidate.kind, qPlru(set))
-      val oldEntry = qResponseRow(selectedWay(1, 0))
-      val oldState = Mux(hit, oldEntry.state, stateObserve)
-      val useful = Mux(hit, oldEntry.useful, 0.U)
-      val unused = Mux(hit, oldEntry.unused, 0.U)
+        qResponseRow, tag, qResponseContext.candidate.kind, selectUInt(qPlru, set))
+      val oldEntry = selectQualityEntry(qResponseRow, selectedWay)
+      val oldState = Mux(hit, qState(oldEntry), stateObserve)
+      val useful = Mux(hit, qUseful(oldEntry), 0.U)
+      val unused = Mux(hit, qUnused(oldEntry), 0.U)
       val strict = unused >= useful * 20.U + 4.U
       val observeSample = samplingHash(
         qResponseContext.candidate.pc, qResponseContext.candidate.kind,
@@ -464,32 +537,36 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
       val allowed = !qResponseContext.candidate.pcValid || !hit ||
         oldState =/= stateBlock || sampled
 
-      contexts(qualityReadContext).allow := allowed
-      contexts(qualityReadContext).sampled := sampled
-      contexts(qualityReadContext).qualityPhase := CqfPipelineQualityPhase.Done
-      contexts(qualityReadContext).feedbackPhase := Mux(sampled,
-        CqfPipelineFeedbackPhase.CandidateRead,
-        CqfPipelineFeedbackPhase.Done)
+      for (i <- 0 until contextEntries) {
+        when (qualityReadContext === i.U) {
+          contextNext(i).allow := allowed
+          contextNext(i).sampled := sampled
+          contextNext(i).qualityPhase := CqfPipelineQualityPhase.Done
+          contextNext(i).feedbackPhase := Mux(sampled,
+            CqfPipelineFeedbackPhase.CandidateRead,
+            CqfPipelineFeedbackPhase.Done)
+        }
+      }
       qualityToFeedbackValid := sampled
       qualityToFeedbackContext := qualityReadContext
-
       when (qResponseContext.candidate.pcValid) {
-        val updatedRow = WireInit(qResponseRow)
         qualityHitPulse := hit
         qualityAllocatePulse := !hit
-        qualityReplacePulse := !hit && oldEntry.valid
-        qPlru(set) := plruNext(qPlru(set), selectedWay)
+        qualityReplacePulse := !hit && qValid(oldEntry)
+        for (s <- 0 until qualitySets) {
+          when (set === s.U) {
+            qPlru(s) := plruNext(qPlru(s), selectedWay)
+          }
+        }
         when (!hit) {
-          updatedRow(selectedWay(1, 0)).valid := true.B
-          updatedRow(selectedWay(1, 0)).kind := qResponseContext.candidate.kind
-          updatedRow(selectedWay(1, 0)).tag := tag
-          updatedRow(selectedWay(1, 0)).state := stateObserve
-          updatedRow(selectedWay(1, 0)).useful := 0.U
-          updatedRow(selectedWay(1, 0)).unused := 0.U
-          updatedRow(selectedWay(1, 0)).resolved := 0.U
+          for (way <- 0 until qualityWays) {
+            qualityWriteRow(way) := Mux(selectedWay === way.U,
+              packQualityEntry(true.B, qResponseContext.candidate.kind, tag,
+                stateObserve, 0.U, 0.U, 0.U),
+              qResponseRow(way))
+          }
           qualityWriteValid := true.B
           qualityWriteSet := set
-          qualityWriteRow := updatedRow
         }
       }
     }.otherwise {
@@ -500,13 +577,8 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
         qResponseContext.usefulOwnerKind, qResponseContext.unusedOwnerKind)
       val hitWay = findQualityWay(qResponseRow, ownerTag, ownerKind)
       val ownerHit = hitWay =/= qualityWays.U
-      val oldEntry = qResponseRow(hitWay(1, 0))
+      val oldEntry = selectQualityEntry(qResponseRow, hitWay)
       val outcome = applyOutcome(oldEntry, usefulOutcome)
-      val updatedRow = WireInit(qResponseRow)
-      updatedRow(hitWay(1, 0)).useful := outcome._1
-      updatedRow(hitWay(1, 0)).unused := outcome._2
-      updatedRow(hitWay(1, 0)).resolved := outcome._3
-      updatedRow(hitWay(1, 0)).state := outcome._4
 
       feedbackUsefulPulse := ownerHit && usefulOutcome
       feedbackUnusedPulse := ownerHit && !usefulOutcome
@@ -515,81 +587,103 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
         qualityWriteValid := true.B
         qualityWriteSet := Mux(usefulOutcome,
           qResponseContext.usefulOwnerSet, qResponseContext.unusedOwnerSet)
-        qualityWriteRow := updatedRow
+        for (way <- 0 until qualityWays) {
+          qualityWriteRow(way) := Mux(hitWay === way.U,
+            packQualityEntry(qValid(qResponseRow(way)), qKind(qResponseRow(way)),
+              qTag(qResponseRow(way)), outcome._4, outcome._1, outcome._2, outcome._3),
+            qResponseRow(way))
+        }
         qualityStateTransitionCount := PopCount(VecInit(Seq(
-          oldEntry.state =/= outcome._5,
+          qState(oldEntry) =/= outcome._5,
           outcome._6 && outcome._5 =/= outcome._4)))
         observeToOpenCount := PopCount(VecInit(Seq(
-          oldEntry.state === stateObserve && outcome._5 === stateOpen,
+          qState(oldEntry) === stateObserve && outcome._5 === stateOpen,
           outcome._6 && outcome._5 === stateObserve && outcome._4 === stateOpen)))
         observeToBlockCount := PopCount(VecInit(Seq(
-          oldEntry.state === stateObserve && outcome._5 === stateBlock,
+          qState(oldEntry) === stateObserve && outcome._5 === stateBlock,
           outcome._6 && outcome._5 === stateObserve && outcome._4 === stateBlock)))
         openToBlockCount := PopCount(VecInit(Seq(
-          oldEntry.state === stateOpen && outcome._5 === stateBlock,
+          qState(oldEntry) === stateOpen && outcome._5 === stateBlock,
           outcome._6 && outcome._5 === stateOpen && outcome._4 === stateBlock)))
         blockToOpenCount := PopCount(VecInit(Seq(
-          oldEntry.state === stateBlock && outcome._5 === stateOpen,
+          qState(oldEntry) === stateBlock && outcome._5 === stateOpen,
           outcome._6 && outcome._5 === stateBlock && outcome._4 === stateOpen)))
       }
-      contexts(qualityReadContext).qualityPhase := Mux(
-        usefulOutcome && qResponseContext.unusedPending,
-        CqfPipelineQualityPhase.UnusedRead,
-        CqfPipelineQualityPhase.Done)
+      for (i <- 0 until contextEntries) {
+        when (qualityReadContext === i.U) {
+          contextNext(i).qualityPhase := Mux(
+            usefulOutcome && qResponseContext.unusedPending,
+            CqfPipelineQualityPhase.UnusedRead,
+            CqfPipelineQualityPhase.Done)
+        }
+      }
     }
   }
 
   private val qualityPotential = contexts.indices.map { i =>
     contexts(i).active && contexts(i).qualityPhase =/= CqfPipelineQualityPhase.Done &&
+      !(qualityMemoryResponseValid && qualityMemoryContext === i.U) &&
       !(qualityReadResponseValid && qualityReadContext === i.U)
   }
   private val qualitySelectOH = oldestOH(qualityPotential, contexts.map(_.sequence))
   private val qualitySelectIndex = OHToUInt(qualitySelectOH)
-  private val qualitySelectPhase = contexts(qualitySelectIndex).qualityPhase
+  private val qualitySelectContext = selectContext(qualitySelectIndex)
+  private val qualitySelectPhase = qualitySelectContext.qualityPhase
   private val qualitySelectReady = qualitySelectOH.orR &&
     qualitySelectPhase =/= CqfPipelineQualityPhase.Waiting
-  private val qualityReadIssueValid = tablesReady && !qualityWriteValid &&
-    !qResponseUsefulThenUnused && qualitySelectReady
   private val qualityReadIssueSet = MuxLookup(qualitySelectPhase, 0.U)(Seq(
     CqfPipelineQualityPhase.CandidateRead ->
-      qualityHash(contexts(qualitySelectIndex).candidate.pc,
-        contexts(qualitySelectIndex).candidate.kind)(5, 0),
-    CqfPipelineQualityPhase.UsefulRead -> contexts(qualitySelectIndex).usefulOwnerSet,
-    CqfPipelineQualityPhase.UnusedRead -> contexts(qualitySelectIndex).unusedOwnerSet
+      qualityHash(qualitySelectContext.candidate.pc,
+        qualitySelectContext.candidate.kind)(5, 0),
+    CqfPipelineQualityPhase.UsefulRead -> qualitySelectContext.usefulOwnerSet,
+    CqfPipelineQualityPhase.UnusedRead -> qualitySelectContext.unusedOwnerSet
   ))
+  private val qualityReadSetHazard =
+    (qualityMemoryResponseValid && qualityMemorySet === qualityReadIssueSet) ||
+      (qualityReadResponseValid && qualityReadSet === qualityReadIssueSet)
+  private val qualityReadIssueValid = tablesReady && !qualityWriteValid &&
+    !qResponseUsefulThenUnused && qualitySelectReady && !qualityReadSetHazard
 
   qualityTable.io.r.req.valid := qualityReadIssueValid
   qualityTable.io.r.req.bits.setIdx := qualityReadIssueSet
   qualityTable.io.w.req.valid := qualityWriteValid
   qualityTable.io.w.req.bits.setIdx := qualityWriteSet
-  qualityTable.io.w.req.bits.data := qualityWriteRow
-  qualityTable.io.w.req.bits.waymask.foreach(_ := Fill(qualityWays, 1.U(1.W)))
+  qualityTable.io.w.req.bits.data(0) := Cat(qualityWriteRow.reverse)
+  qualityTable.io.w.req.bits.waymask.foreach(_ := 1.U)
   private val qualityReadFire = qualityTable.io.r.req.fire
   private val qualityWriteFire = qualityTable.io.w.req.fire
   when (qualityReadFire) {
-    qualityReadResponseValid := true.B
-    qualityReadContext := qualitySelectIndex
-    qualityReadPhase := qualitySelectPhase
+    qualityMemoryResponseValid := true.B
+    qualityMemoryContext := qualitySelectIndex
+    qualityMemoryPhase := qualitySelectPhase
+    qualityMemorySet := qualityReadIssueSet
   }
 
   // --------------------------------------------------------------------------
   // Feedback 1RW pipeline
   // --------------------------------------------------------------------------
-  private val feedbackReadResponseValid = RegInit(false.B)
-  private val feedbackReadContext = Reg(UInt(contextBits.W))
-  private val feedbackReadPhase = Reg(UInt(CqfPipelineFeedbackPhase.Width.W))
+  private val feedbackMemoryResponseValid = RegInit(false.B)
+  private val feedbackMemoryContext = Reg(UInt(contextBits.W))
+  private val feedbackMemoryPhase = Reg(UInt(CqfPipelineFeedbackPhase.Width.W))
+  private val feedbackMemorySet = Reg(UInt(6.W))
+  feedbackMemoryResponseValid := false.B
+  private val feedbackReadResponseValid = RegNext(feedbackMemoryResponseValid, false.B)
+  private val feedbackReadContext = RegEnable(feedbackMemoryContext, feedbackMemoryResponseValid)
+  private val feedbackReadPhase = RegEnable(feedbackMemoryPhase, feedbackMemoryResponseValid)
+  private val feedbackReadSet = RegEnable(feedbackMemorySet, feedbackMemoryResponseValid)
+  private val feedbackResponseData = RegEnable(
+    feedbackTable.io.r.resp.data(0), feedbackMemoryResponseValid)
   // Strict Feedback ordering guarantees that only the oldest demand can be
   // between match/sweep or waiting for write1. Keep these wide rows in the
   // table pipeline instead of replicating them in all 16 contexts.
-  private val feedbackMatchScratch = Reg(Vec(feedbackWays, new CqfPipelineFeedbackEntry))
+  private val feedbackMatchScratch = Seq.fill(feedbackWays)(Reg(UInt(feedbackEntryBits.W)))
   private val feedbackWrite1Set = Reg(UInt(6.W))
-  private val feedbackWrite1Row = Reg(Vec(feedbackWays, new CqfPipelineFeedbackEntry))
-  feedbackReadResponseValid := false.B
+  private val feedbackWrite1Row = Seq.fill(feedbackWays)(Reg(UInt(feedbackEntryBits.W)))
 
   private val feedbackResponseWriteValid = WireDefault(false.B)
   private val feedbackResponseWriteSet = WireDefault(0.U(6.W))
-  private val feedbackResponseWriteRow = Wire(Vec(feedbackWays, new CqfPipelineFeedbackEntry))
-  feedbackResponseWriteRow := 0.U.asTypeOf(feedbackResponseWriteRow)
+  private val feedbackResponseWriteRow = Seq.fill(feedbackWays)(
+    WireDefault(0.U(feedbackEntryBits.W)))
   private val feedbackSelectedPulse = WireDefault(false.B)
   private val feedbackInsertPulse = WireDefault(false.B)
   private val feedbackCoalescePulse = WireDefault(false.B)
@@ -598,8 +692,11 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
   private val feedbackExpiryPulse = WireDefault(false.B)
   private val feedbackOccupancyIncrement = WireDefault(false.B)
 
-  private val fResponseContext = contexts(feedbackReadContext)
-  private val fResponseRow = feedbackTable.io.r.resp.data
+  private val fResponseContext = selectContext(feedbackReadContext)
+  private val fResponsePacked = feedbackResponseData
+  private val fResponseRow = (0 until feedbackWays).map { way =>
+    fResponsePacked((way + 1) * feedbackEntryBits - 1, way * feedbackEntryBits)
+  }
   private val feedbackResponseContinues = feedbackReadResponseValid &&
     feedbackReadPhase === CqfPipelineFeedbackPhase.DemandMatchRead &&
     fResponseContext.demandMatchSet =/= fResponseContext.demandSweepIndex(7, 2)
@@ -613,114 +710,171 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
       val tag = key(19, 6)
       val hitWay = findFeedbackWay(fResponseRow, tag)
       val hit = hitWay =/= feedbackWays.U
-      val invalid = VecInit(fResponseRow.map(e => !e.valid))
+      val invalid = VecInit(fResponseRow.map(e => !fValid(e)))
       val hasInvalid = invalid.asUInt.orR
       val victim = Mux(hasInvalid,
-        OHToUInt(PriorityEncoderOH(invalid.asUInt)), fVictim(set))
-      val updatedRow = WireInit(fResponseRow)
+        OHToUInt(PriorityEncoderOH(invalid.asUInt)), selectUInt(fVictim, set))
 
       feedbackSelectedPulse := true.B
       feedbackCoalescePulse := hit
-      contexts(feedbackReadContext).feedbackPhase := CqfPipelineFeedbackPhase.Done
+      for (i <- 0 until contextEntries) {
+        when (feedbackReadContext === i.U) {
+          contextNext(i).feedbackPhase := CqfPipelineFeedbackPhase.Done
+        }
+      }
       when (!hit) {
-        updatedRow(victim).valid := true.B
-        updatedRow(victim).tag := tag
-        updatedRow(victim).ownerSet := qualityKey(5, 0)
-        updatedRow(victim).ownerTag := qualityKey(13, 6)
-        updatedRow(victim).ownerKind := fResponseContext.candidate.kind
-        updatedRow(victim).issueEpoch := demandAge(11, 6)
+        for (way <- 0 until feedbackWays) {
+          feedbackResponseWriteRow(way) := Mux(victim === way.U,
+            packFeedbackEntry(true.B, tag, qualityKey(5, 0), qualityKey(13, 6),
+              fResponseContext.candidate.kind, demandAge(11, 6)),
+            fResponseRow(way))
+        }
         feedbackResponseWriteValid := true.B
         feedbackResponseWriteSet := set
-        feedbackResponseWriteRow := updatedRow
         feedbackInsertPulse := true.B
         feedbackReplacePulse := !hasInvalid
         feedbackOccupancyIncrement := hasInvalid
-        contexts(feedbackReadContext).feedbackInserted := true.B
+        for (i <- 0 until contextEntries) {
+          when (feedbackReadContext === i.U) {
+            contextNext(i).feedbackInserted := true.B
+          }
+        }
         when (!hasInvalid) {
-          fVictim(set) := fVictim(set) + 1.U
+          for (s <- 0 until feedbackSets) {
+            when (set === s.U) {
+              fVictim(s) := fVictim(s) + 1.U
+            }
+          }
         }
       }
     }.otherwise {
       val matchResponse = feedbackReadPhase === CqfPipelineFeedbackPhase.DemandMatchRead
-      val matchRow = Wire(Vec(feedbackWays, new CqfPipelineFeedbackEntry))
-      matchRow := Mux(matchResponse, fResponseRow, feedbackMatchScratch)
+      val matchRowPacked = (0 until feedbackWays).map { way =>
+        Mux(matchResponse, fResponseRow(way), feedbackMatchScratch(way))
+      }
+      val matchRow = matchRowPacked
       val sameSet = fResponseContext.demandMatchSet === fResponseContext.demandSweepIndex(7, 2)
       when (matchResponse && !sameSet) {
-        feedbackMatchScratch := fResponseRow
-        contexts(feedbackReadContext).feedbackPhase :=
-          CqfPipelineFeedbackPhase.DemandSweepRead
+        for (way <- 0 until feedbackWays) {
+          feedbackMatchScratch(way) := fResponseRow(way)
+        }
+        for (i <- 0 until contextEntries) {
+          when (feedbackReadContext === i.U) {
+            contextNext(i).feedbackPhase :=
+              CqfPipelineFeedbackPhase.DemandSweepRead
+          }
+        }
       }.otherwise {
         val sweepRow = fResponseRow
         val hitWay = findFeedbackWay(matchRow, fResponseContext.demandMatchTag)
         val useful = hitWay =/= feedbackWays.U
-        val usefulEntry = matchRow(hitWay(1, 0))
+        val usefulEntry = selectFeedbackEntry(matchRow, hitWay)
         val sweepWay = fResponseContext.demandSweepIndex(1, 0)
-        val sweepEntry = sweepRow(sweepWay)
-        val expired = sweepEntry.valid &&
-          (fResponseContext.demandNextEpoch - sweepEntry.issueEpoch) >= 30.U
+        val sweepEntry = selectFeedbackEntry(sweepRow, sweepWay)
+        val expired = fValid(sweepEntry) &&
+          (fResponseContext.demandNextEpoch - fIssueEpoch(sweepEntry)) >= 30.U
         val usefulWinsSweep = useful && sameSet && hitWay(1, 0) === sweepWay
         val unused = expired && !usefulWinsSweep
-        val matchCleared = WireInit(matchRow)
-        val sweepCleared = WireInit(sweepRow)
-        val combinedCleared = WireInit(matchRow)
-        when (useful) {
-          matchCleared(hitWay(1, 0)).valid := false.B
-          combinedCleared(hitWay(1, 0)).valid := false.B
-        }
-        when (unused) {
-          sweepCleared(sweepWay).valid := false.B
-          combinedCleared(sweepWay).valid := false.B
+        val matchCleared = Seq.fill(feedbackWays)(Wire(UInt(feedbackEntryBits.W)))
+        val sweepCleared = Seq.fill(feedbackWays)(Wire(UInt(feedbackEntryBits.W)))
+        val combinedCleared = Seq.fill(feedbackWays)(Wire(UInt(feedbackEntryBits.W)))
+        for (way <- 0 until feedbackWays) {
+          matchCleared(way) := Cat(
+            fValid(matchRow(way)) && !(useful && hitWay === way.U),
+            matchRow(way)(feedbackEntryBits - 2, 0))
+          sweepCleared(way) := Cat(
+            fValid(sweepRow(way)) && !(unused && sweepWay === way.U),
+            sweepRow(way)(feedbackEntryBits - 2, 0))
+          combinedCleared(way) := Cat(
+            fValid(matchRow(way)) &&
+              !(useful && hitWay === way.U) &&
+              !(unused && sweepWay === way.U),
+            matchRow(way)(feedbackEntryBits - 2, 0))
         }
 
-        contexts(feedbackReadContext).usefulPending := useful
-        contexts(feedbackReadContext).usefulOwnerSet := usefulEntry.ownerSet
-        contexts(feedbackReadContext).usefulOwnerTag := usefulEntry.ownerTag
-        contexts(feedbackReadContext).usefulOwnerKind := usefulEntry.ownerKind
-        contexts(feedbackReadContext).unusedPending := unused
-        contexts(feedbackReadContext).unusedOwnerSet := sweepEntry.ownerSet
-        contexts(feedbackReadContext).unusedOwnerTag := sweepEntry.ownerTag
-        contexts(feedbackReadContext).unusedOwnerKind := sweepEntry.ownerKind
-        contexts(feedbackReadContext).qualityPhase := Mux(useful,
-          CqfPipelineQualityPhase.UsefulRead,
-          Mux(unused, CqfPipelineQualityPhase.UnusedRead,
-            CqfPipelineQualityPhase.Done))
+        for (i <- 0 until contextEntries) {
+          when (feedbackReadContext === i.U) {
+            contextNext(i).usefulPending := useful
+            contextNext(i).usefulOwnerSet := fOwnerSet(usefulEntry)
+            contextNext(i).usefulOwnerTag := fOwnerTag(usefulEntry)
+            contextNext(i).usefulOwnerKind := fOwnerKind(usefulEntry)
+            contextNext(i).unusedPending := unused
+            contextNext(i).unusedOwnerSet := fOwnerSet(sweepEntry)
+            contextNext(i).unusedOwnerTag := fOwnerTag(sweepEntry)
+            contextNext(i).unusedOwnerKind := fOwnerKind(sweepEntry)
+            contextNext(i).qualityPhase := Mux(useful,
+              CqfPipelineQualityPhase.UsefulRead,
+              Mux(unused, CqfPipelineQualityPhase.UnusedRead,
+                CqfPipelineQualityPhase.Done))
+          }
+        }
 
         feedbackRetireCount := PopCount(VecInit(Seq(useful, unused)))
         feedbackExpiryPulse := unused
         when (sameSet && (useful || unused)) {
           feedbackResponseWriteValid := true.B
           feedbackResponseWriteSet := fResponseContext.demandMatchSet
-          feedbackResponseWriteRow := combinedCleared
-          contexts(feedbackReadContext).feedbackPhase := CqfPipelineFeedbackPhase.Done
+          for (way <- 0 until feedbackWays) {
+            feedbackResponseWriteRow(way) := combinedCleared(way)
+          }
+          for (i <- 0 until contextEntries) {
+            when (feedbackReadContext === i.U) {
+              contextNext(i).feedbackPhase := CqfPipelineFeedbackPhase.Done
+            }
+          }
         }.elsewhen (!sameSet && useful) {
           feedbackResponseWriteValid := true.B
           feedbackResponseWriteSet := fResponseContext.demandMatchSet
-          feedbackResponseWriteRow := matchCleared
+          for (way <- 0 until feedbackWays) {
+            feedbackResponseWriteRow(way) := matchCleared(way)
+          }
           when (unused) {
             feedbackWrite1Set := fResponseContext.demandSweepIndex(7, 2)
-            feedbackWrite1Row := sweepCleared
-            contexts(feedbackReadContext).feedbackPhase :=
-              CqfPipelineFeedbackPhase.DemandWrite1
+            for (way <- 0 until feedbackWays) {
+              feedbackWrite1Row(way) := sweepCleared(way)
+            }
+            for (i <- 0 until contextEntries) {
+              when (feedbackReadContext === i.U) {
+                contextNext(i).feedbackPhase :=
+                  CqfPipelineFeedbackPhase.DemandWrite1
+              }
+            }
           }.otherwise {
-            contexts(feedbackReadContext).feedbackPhase := CqfPipelineFeedbackPhase.Done
+            for (i <- 0 until contextEntries) {
+              when (feedbackReadContext === i.U) {
+                contextNext(i).feedbackPhase := CqfPipelineFeedbackPhase.Done
+              }
+            }
           }
         }.elsewhen (!sameSet && unused) {
           feedbackResponseWriteValid := true.B
           feedbackResponseWriteSet := fResponseContext.demandSweepIndex(7, 2)
-          feedbackResponseWriteRow := sweepCleared
-          contexts(feedbackReadContext).feedbackPhase := CqfPipelineFeedbackPhase.Done
+          for (way <- 0 until feedbackWays) {
+            feedbackResponseWriteRow(way) := sweepCleared(way)
+          }
+          for (i <- 0 until contextEntries) {
+            when (feedbackReadContext === i.U) {
+              contextNext(i).feedbackPhase := CqfPipelineFeedbackPhase.Done
+            }
+          }
         }.otherwise {
-          contexts(feedbackReadContext).feedbackPhase := CqfPipelineFeedbackPhase.Done
+          for (i <- 0 until contextEntries) {
+            when (feedbackReadContext === i.U) {
+              contextNext(i).feedbackPhase := CqfPipelineFeedbackPhase.Done
+            }
+          }
         }
       }
     }
   }
 
-  // Build a post-response view for scheduling. A sampled candidate discovered
-  // by the Quality response can launch its Feedback lookup in this same cycle.
+  // Build a post-response view for scheduling. The Quality response data is
+  // explicitly registered, so this same-cycle handoff does not cross an SRAM
+  // output combinationally.
   private val feedbackPotential = contexts.indices.map { i =>
     val existing = contexts(i).active &&
       contexts(i).feedbackPhase =/= CqfPipelineFeedbackPhase.Done &&
+      !(feedbackMemoryResponseValid && feedbackMemoryContext === i.U) &&
       !(feedbackReadResponseValid && feedbackReadContext === i.U)
     val qualityHandoff = qualityToFeedbackValid && qualityToFeedbackContext === i.U
     existing || qualityHandoff
@@ -734,7 +888,7 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
   private val feedbackSelectPhase = Mux1H(feedbackSelectOH, feedbackPhaseView)
   private val feedbackSelectReady = feedbackSelectOH.orR &&
     feedbackSelectPhase =/= CqfPipelineFeedbackPhase.Waiting
-  private val feedbackSelectContext = contexts(feedbackSelectIndex)
+  private val feedbackSelectContext = selectContext(feedbackSelectIndex)
   private val feedbackPendingWrite = feedbackSelectReady &&
     feedbackSelectPhase === CqfPipelineFeedbackPhase.DemandWrite1
   private val feedbackPendingWriteGranted = tablesReady &&
@@ -742,11 +896,11 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
   private val feedbackWriteValid = feedbackResponseWriteValid || feedbackPendingWriteGranted
   private val feedbackWriteSet = Mux(feedbackResponseWriteValid,
     feedbackResponseWriteSet, feedbackWrite1Set)
-  private val feedbackWriteRow = Mux(feedbackResponseWriteValid,
-    feedbackResponseWriteRow, feedbackWrite1Row)
+  private val feedbackWriteRow = (0 until feedbackWays).map { way =>
+    Mux(feedbackResponseWriteValid,
+      feedbackResponseWriteRow(way), feedbackWrite1Row(way))
+  }
 
-  private val feedbackReadIssueValid = tablesReady && !feedbackWriteValid &&
-    !feedbackResponseContinues && feedbackSelectReady && !feedbackPendingWrite
   private val feedbackCandidateKey = feedbackHash(feedbackSelectContext.candidate.candidateLine)
   private val feedbackDemandKey = feedbackHash(feedbackSelectContext.demandLine)
   private val feedbackReadIssueSet = MuxLookup(feedbackSelectPhase, 0.U)(Seq(
@@ -754,32 +908,47 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
     CqfPipelineFeedbackPhase.DemandMatchRead -> feedbackDemandKey(5, 0),
     CqfPipelineFeedbackPhase.DemandSweepRead -> feedbackSelectContext.demandSweepIndex(7, 2)
   ))
+  private val feedbackReadSetHazard =
+    (feedbackMemoryResponseValid && feedbackMemorySet === feedbackReadIssueSet) ||
+      (feedbackReadResponseValid && feedbackReadSet === feedbackReadIssueSet)
+  private val feedbackReadIssueValid = tablesReady && !feedbackWriteValid &&
+    !feedbackResponseContinues && feedbackSelectReady && !feedbackPendingWrite &&
+    !feedbackReadSetHazard
 
   feedbackTable.io.r.req.valid := feedbackReadIssueValid
   feedbackTable.io.r.req.bits.setIdx := feedbackReadIssueSet
   feedbackTable.io.w.req.valid := feedbackWriteValid
   feedbackTable.io.w.req.bits.setIdx := feedbackWriteSet
-  feedbackTable.io.w.req.bits.data := feedbackWriteRow
-  feedbackTable.io.w.req.bits.waymask.foreach(_ := Fill(feedbackWays, 1.U(1.W)))
+  feedbackTable.io.w.req.bits.data(0) := Cat(feedbackWriteRow.reverse)
+  feedbackTable.io.w.req.bits.waymask.foreach(_ := 1.U)
   private val feedbackReadFire = feedbackTable.io.r.req.fire
   private val feedbackWriteFire = feedbackTable.io.w.req.fire
 
   when (feedbackReadFire) {
-    feedbackReadResponseValid := true.B
-    feedbackReadContext := feedbackSelectIndex
-    feedbackReadPhase := feedbackSelectPhase
+    feedbackMemoryResponseValid := true.B
+    feedbackMemoryContext := feedbackSelectIndex
+    feedbackMemoryPhase := feedbackSelectPhase
+    feedbackMemorySet := feedbackReadIssueSet
     when (feedbackSelectPhase === CqfPipelineFeedbackPhase.DemandMatchRead) {
       val nextAge = demandAge + 1.U
       demandAge := nextAge
       sweepPtr := sweepPtr + 1.U
-      contexts(feedbackSelectIndex).demandMatchSet := feedbackDemandKey(5, 0)
-      contexts(feedbackSelectIndex).demandMatchTag := feedbackDemandKey(19, 6)
-      contexts(feedbackSelectIndex).demandSweepIndex := sweepPtr
-      contexts(feedbackSelectIndex).demandNextEpoch := nextAge(11, 6)
+      for (i <- 0 until contextEntries) {
+        when (feedbackSelectIndex === i.U) {
+          contextNext(i).demandMatchSet := feedbackDemandKey(5, 0)
+          contextNext(i).demandMatchTag := feedbackDemandKey(19, 6)
+          contextNext(i).demandSweepIndex := sweepPtr
+          contextNext(i).demandNextEpoch := nextAge(11, 6)
+        }
+      }
     }
   }
   when (feedbackWriteFire && feedbackPendingWriteGranted) {
-    contexts(feedbackSelectIndex).feedbackPhase := CqfPipelineFeedbackPhase.Done
+    for (i <- 0 until contextEntries) {
+      when (feedbackSelectIndex === i.U) {
+        contextNext(i).feedbackPhase := CqfPipelineFeedbackPhase.Done
+      }
+    }
   }
 
   when (feedbackOccupancyIncrement || feedbackRetireCount.orR) {
@@ -880,20 +1049,20 @@ class CompactQualityFeedbackPipeline(implicit p: Parameters) extends PrefetchMod
   private val demandCompleteCount = PopCount(demandComplete)
   private val candidateLatencySum = (0 until 2).map { port =>
     Mux(decisionFire(port),
-      cycleCounter(31, 0) - contexts(decisionIndex(port)).allocatedCycle, 0.U)
+      cycleCounter(31, 0) - decisionContext(port).allocatedCycle, 0.U)
   }.reduce(_ +& _)
   private val demandLatencySum = contexts.indices.map { i =>
     Mux(demandComplete(i), cycleCounter(31, 0) - contexts(i).allocatedCycle, 0.U)
   }.reduce(_ +& _)
   private val maxCandidateLatency = Mux(decisionFire.asUInt.orR,
     Mux(decisionFire.asUInt.andR,
-      Mux(cycleCounter(31, 0) - contexts(decisionIndex(0)).allocatedCycle >=
-        cycleCounter(31, 0) - contexts(decisionIndex(1)).allocatedCycle,
-        cycleCounter(31, 0) - contexts(decisionIndex(0)).allocatedCycle,
-        cycleCounter(31, 0) - contexts(decisionIndex(1)).allocatedCycle),
+      Mux(cycleCounter(31, 0) - decisionContext(0).allocatedCycle >=
+        cycleCounter(31, 0) - decisionContext(1).allocatedCycle,
+        cycleCounter(31, 0) - decisionContext(0).allocatedCycle,
+        cycleCounter(31, 0) - decisionContext(1).allocatedCycle),
       Mux(decisionFire(0),
-        cycleCounter(31, 0) - contexts(decisionIndex(0)).allocatedCycle,
-        cycleCounter(31, 0) - contexts(decisionIndex(1)).allocatedCycle)), 0.U)
+        cycleCounter(31, 0) - decisionContext(0).allocatedCycle,
+        cycleCounter(31, 0) - decisionContext(1).allocatedCycle)), 0.U)
   private val maxDemandLatency = contexts.indices.map { i =>
     Mux(demandComplete(i), cycleCounter(31, 0) - contexts(i).allocatedCycle, 0.U)
   }.reduce((a, b) => Mux(a >= b, a, b))
