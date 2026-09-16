@@ -159,6 +159,9 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   val tag_modify = WireInit(false.B)
   val tag_modified = RegInit(false.B)
 
+  val meta_write_SA_meta = Wire(new L2Directory.Meta)
+  val meta_write_SA_mask = Wire(new L2Directory.MetaWriteMask)
+
   val meta_write_EVT_meta = Wire(new L2Directory.Meta)
   val meta_write_EVT_mask = Wire(new L2Directory.MetaWriteMask)
 
@@ -187,21 +190,27 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
     meta.way := io.fromDir.REPL.way
   }
 
+  meta_write_SA_mask.maskAndWrite(meta, meta_modified, meta_write_SA_meta)
   meta_write_EVT_mask.maskAndWrite(meta, meta_modified, meta_write_EVT_meta)
   meta_write_SNP_mask.maskAndWrite(meta, meta_modified, meta_write_SNP_meta)
   meta_write_REQ_mask.maskAndWrite(meta, meta_modified, meta_write_REQ_meta)
 
-  meta_modify := meta_write_EVT_mask.asUInt.orR || meta_write_SNP_mask.asUInt.orR || meta_write_REQ_mask.asUInt.orR
+  meta_modify := meta_write_SA_mask.asUInt.orR ||
+                 meta_write_EVT_mask.asUInt.orR || 
+                 meta_write_SNP_mask.asUInt.orR || 
+                 meta_write_REQ_mask.asUInt.orR
 
   // Keep meta.hit in sync with allocating pipe writes: once any vPipe writes a
   // non-Invalid state, the directory tracks this line (committed via DirWb), so
   // meta.hit must no longer report the stale miss of the original DirRdResp.
   val meta_write_allocates =
+    (meta_write_SA_mask.state  && meta_write_SA_meta.state  =/= L2Directory.MetaState.I) ||
     (meta_write_REQ_mask.state && meta_write_REQ_meta.state =/= L2Directory.MetaState.I) ||
     (meta_write_SNP_mask.state && meta_write_SNP_meta.state =/= L2Directory.MetaState.I) ||
     (meta_write_EVT_mask.state && meta_write_EVT_meta.state =/= L2Directory.MetaState.I)
 
   val meta_write_invalidates = 
+    (meta_write_SA_mask.state  && meta_write_SA_meta.state  === L2Directory.MetaState.I) ||
     (meta_write_REQ_mask.state && meta_write_REQ_meta.state === L2Directory.MetaState.I) ||
     (meta_write_SNP_mask.state && meta_write_SNP_meta.state === L2Directory.MetaState.I) ||
     (meta_write_EVT_mask.state && meta_write_EVT_meta.state === L2Directory.MetaState.I)
@@ -226,16 +235,12 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
     tag_modified := false.B
   }
 
-  assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.asUInt.orR)) <= 1.U,
-    "TSHR @ %m multiple active meta writes on one cycle")
-  assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.state)) <= 1.U, 
+  assert(PopCount(Seq(meta_write_SA_mask, meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.state)) <= 1.U, 
     "TSHR @ %m multiple active write on meta.state")
-  assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.dirty)) <= 1.U, 
+  assert(PopCount(Seq(meta_write_SA_mask, meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.dirty)) <= 1.U, 
     "TSHR @ %m multiple active write on meta.dirty")
-  assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.clients.asUInt.orR)) <= 1.U, 
+  assert(PopCount(Seq(meta_write_SA_mask, meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.clients.asUInt.orR)) <= 1.U, 
     "TSHR @ %m multiple active write on meta.clients")
-  assert(PopCount(Seq(meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.asUInt.orR)) <= 1.U, 
-    "TSHR @ %m multiple active write on meta")
 
   assert(!(tshr_dealloc && meta_modified.asUInt.orR), "TSHR @ %m deallocated with un-committed modified meta")
 
@@ -501,6 +506,10 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   vPipeREQ.io.UpRXRSP := io.UpRXRSP
   vPipeREQ.io.UpRXDAT := io.UpRXDAT
+
+  // connections between TSHR local and Snoop Agent
+  meta_write_SA_mask := snoopAgent.io.tshr_meta_write_en
+  meta_write_SA_meta := snoopAgent.io.tshr_meta_write_meta
 
   // connections between TSHR local and EVT vPipe
   vPipeEVT.io.tshr_paddr := tshr_paddr
