@@ -11,6 +11,7 @@ import scala.collection.mutable.ArrayBuffer
 import utility._
 import oceanus.l2.{L2Configuration, L2Params, L2ParamsKey, L2Top}
 import oceanus.chi.{CHIParameters, CHIParametersKey, EnumCHIChannel, EnumCHIIssue}
+import xscache.oceanus.compactchi.{CCHIParameters, CCHIParametersKey}
 import oceanus.chi.bundle.{CHIBundleDAT, CHIBundleREQ, CHIBundleRSP, CHIBundleSNP}
 import oceanus.chi.link.OceanusChannelAdapter
 import xscache.chi.{ChannelIO, CHIIssue, HasCHIMsgParameters, Issue}
@@ -72,9 +73,11 @@ class TestTop_L2OpenLLC(val numL2: Int, val numSlices: Int)(implicit p: Paramete
 
   lazy val module = new LazyModuleImp(this) {
 
-    val l2cfg = new L2Configuration(nodeId = 0, eSAM = true, slices = 0 until numSlices)
-
-    val l2s = Seq.fill(numL2)(Module(new L2Top(l2cfg)))
+    // Each L2 instance takes its own CHI node ID (0 until numL2) as SrcID on
+    // the RN-F link toward OpenLLC; OpenLLC itself is node numL2 (l3.io.nodeID)
+    // and learns each RN's ID per port (rnID), so IDs must be distinct per L2.
+    val l2s = Seq.tabulate(numL2)(i => Module(new L2Top(
+      new L2Configuration(nodeId = i, eSAM = true, slices = 0 until numSlices))))
     val l3 = Module(new OpenLLC())
 
     // -- Cohestra V3 pin-level export ------------------------------------------
@@ -285,6 +288,7 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       mpamPresent = true
     )
     case CHIIssue => Issue.Eb
+    case CCHIParametersKey => CCHIParameters()
     // CHIAddrWidthKey / CHIDataCheckKey / CHIPoisonKey defaults (48 / oddparity / true)
     // already match the oceanus CHIParameters above.
     case OpenLLCParamKey => OpenLLCParam(
