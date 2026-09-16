@@ -28,8 +28,8 @@ object L2DataStorage {
   class PathTSHRToDataStorage(implicit val p: Parameters)
       extends PathTSHRToDataStorageUOPs with HasL2Params {
     val TSHRID = UInt(mshrIndexWidth.W)
-    val WAY      = UInt(32.W)   // TODO: replace with actual way index width
-    val SET      = UInt(32.W)   // TODO: replace with actual set index width
+    val WAY      = UInt(wayBits.W)
+    val SET      = UInt(setBits.W)
     val DATA     = UInt(512.W)
   }
 

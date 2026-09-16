@@ -2,8 +2,10 @@ package oceanus.compactchi
 
 import chisel3._
 import chisel3.util._
+import org.chipsalliance.cde.config.Parameters
+import xscache.oceanus.compactchi.HasCCHIParameters
 
-class CCHIInterfaceType1 extends Bundle {
+class CCHIInterfaceType1(implicit val p: Parameters) extends Bundle with HasCCHIParameters {
   // TODO: also applicable for Link Credit, but sanity check required here in future
   val UpEVT = Flipped(Decoupled(new FlitEVT))
   val UpREQ = Flipped(Decoupled(new FlitREQ))
@@ -24,7 +26,7 @@ class CCHIInterfaceType1 extends Bundle {
   }
 }
 
-class CCHIInterfaceType3 extends Bundle {
+class CCHIInterfaceType3(implicit val p: Parameters) extends Bundle with HasCCHIParameters {
   val UpREQ = Flipped(Decoupled(new FlitREQ))
   val UpRSP = Flipped(Decoupled(new FlitUpRSP))
   val UpDAT = Flipped(Decoupled(new FlitUpDAT))
@@ -40,7 +42,7 @@ class CCHIInterfaceType3 extends Bundle {
   }
 }
 
-class CCHIInterfaceType4 extends Bundle {
+class CCHIInterfaceType4(implicit val p: Parameters) extends Bundle with HasCCHIParameters {
   val UpREQ = Flipped(Decoupled(new FlitREQ))
   val DnDAT = Decoupled(new FlitDnDAT)
 

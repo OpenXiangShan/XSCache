@@ -2,29 +2,31 @@ package oceanus.compactchi
 
 import chisel3._
 import chisel3.util._
+import org.chipsalliance.cde.config.Parameters
+import xscache.oceanus.compactchi.HasCCHIParameters
 
-class FlitEVTStripped extends Bundle {
-  val TxnID = UInt(8.W) // TODO: configured by L1 parameter
-  val SrcID = UInt(8.W) // TODO: configured by UpstreamNodeID_Width
-  val TgtID = UInt(8.W) // TODO: configured by DownstreamNodeID_Width
+class FlitEVTStripped(implicit val p: Parameters) extends Bundle with HasCCHIParameters {
+  val TxnID = UInt(paramCCHI.TxnID_Width.W)
+  val SrcID = UInt(paramCCHI.UpstreamNodeID_Width.W)
+  val TgtID = UInt(paramCCHI.DownstreamNodeID_Width.W)
   val Opcode = UInt(1.W)
   val NS = Bool()
   val MemAttr = Bool() // allocate hint per CCHI spec; currently not consumed by L2
   val WayValid = Bool()
-  val Way = UInt(2.W) // TODO: configured by L2 way count
+  val Way = UInt(paramCCHI.WayIndex_Width.W)
   val TraceTag = UInt(1.W)
 }
 
-class FlitEVT extends FlitEVTStripped {
-  val Addr = UInt(48.W)
+class FlitEVT(implicit p: Parameters) extends FlitEVTStripped {
+  val Addr = UInt(48.W) // TODO: configured by Addr_Width
 }
 
-class FlitREQStripped extends Bundle {
-  val TxnID = UInt(8.W) // TODO: configured by L1 parameter
-  val SrcID = UInt(8.W) // TODO: configured by UpstreamNodeID_Width
-  val TgtID = UInt(8.W) // TODO: configured by DownstreamNodeID_Width
+class FlitREQStripped(implicit val p: Parameters) extends Bundle with HasCCHIParameters {
+  val TxnID = UInt(paramCCHI.TxnID_Width.W)
+  val SrcID = UInt(paramCCHI.UpstreamNodeID_Width.W)
+  val TgtID = UInt(paramCCHI.DownstreamNodeID_Width.W)
   val Opcode = UInt(6.W) // TODO: variable width between different types of components
-  val TagAlias = UInt(2.W) //  TODO: configurable by TagAlias_Width
+  val TagAlias = UInt(paramCCHI.TagAlias_Width.W)
   val Size = UInt(3.W)
   val NS = Bool()
   val Order = UInt(2.W)
@@ -33,57 +35,57 @@ class FlitREQStripped extends Bundle {
   val ExpCompData = Bool()
   def ExpCompStash = ExpCompData
   val WayValid = Bool()
-  val Way = UInt(2.W) // TODO: configured by L2 way count
+  val Way = UInt(paramCCHI.WayIndex_Width.W)
   val TraceTag = UInt(1.W)
 }
 
-class FlitREQ extends FlitREQStripped {
-  val Addr = UInt(48.W)
+class FlitREQ(implicit p: Parameters) extends FlitREQStripped {
+  val Addr = UInt(48.W) // TODO: configured by Addr_Width
 }
 
-class FlitSNPStripped extends Bundle {
-  val TxnID = UInt(8.W) // TODO: configured by L2 parameter
-  val SrcID = UInt(8.W) // TODO: configured by DownstreamNodeID_Width
-  val TgtID = UInt(8.W) // TODO: configured by UpstreamNodeID_Width
+class FlitSNPStripped(implicit val p: Parameters) extends Bundle with HasCCHIParameters {
+  val TxnID = UInt(paramCCHI.DBID_Width.W) 
+  val SrcID = UInt(paramCCHI.DownstreamNodeID_Width.W)
+  val TgtID = UInt(paramCCHI.UpstreamNodeID_Width.W)
   val Opcode = UInt(2.W) // TODO: variable width between different types of components
   val NS = Bool()
   val TraceTag = UInt(1.W)
 }
 
-class FlitSNP extends FlitSNPStripped {
-  val Addr = UInt((48 - 3).W)
+class FlitSNP(implicit p: Parameters) extends FlitSNPStripped {
+  val Addr = UInt((48 - 3).W) // TODO: configured by Addr_Width
   val alias = UInt(2.W) // L2->L1 snoop locator; pprobe uses localMeta.alias, rprobe uses req.alias
 }
 
-class FlitDnRSP extends Bundle {
-  val TxnID = UInt(8.W) // TODO: configured by L1 parameter
-  val SrcID = UInt(8.W) // TODO: configured by DownstreamNodeID_Width
-  val TgtID = UInt(8.W) // TODO: configured by UpstreamNodeID_Width
-  val DBID = UInt(8.W) // TODO: configured by L2 parameter
+class FlitDnRSP(implicit val p: Parameters) extends Bundle with HasCCHIParameters {
+  val TxnID = UInt(paramCCHI.TxnID_Width.W)
+  val SrcID = UInt(paramCCHI.DownstreamNodeID_Width.W)
+  val TgtID = UInt(paramCCHI.UpstreamNodeID_Width.W)
+  val DBID = UInt(paramCCHI.DBID_Width.W)
   val Opcode = UInt(3.W) // TODO: variable width between different types of components
   val RespErr = UInt(2.W)
   val Resp = UInt(3.W)
   val CBusy = UInt(3.W)
   val WayValid = Bool()
-  val Way = UInt(2.W) // TODO: configured by L2 way count
+  val Way = UInt(paramCCHI.WayIndex_Width.W)
   val TraceTag = UInt(1.W)
 }
 
-class FlitUpRSP extends Bundle {
-  val TxnID = UInt(8.W) // TODO: configured by L2 parameter
-  val SrcID = UInt(8.W) // TODO: configured by UpstreamNodeID_Width
-  val TgtID = UInt(8.W) // TODO: configured by DownstreamNodeID_Width
+class FlitUpRSP(implicit val p: Parameters) extends Bundle with HasCCHIParameters {
+  val TxnID = UInt(paramCCHI.DBID_Width.W)
+  val SrcID = UInt(paramCCHI.UpstreamNodeID_Width.W)
+  val TgtID = UInt(paramCCHI.DownstreamNodeID_Width.W)
   val Opcode = UInt(1.W)
   val RespErr = UInt(2.W)
   val Resp = UInt(3.W)
   val TraceTag = UInt(1.W)
 }
 
-class FlitDnDATWithoutData extends Bundle {
-  val TxnID = UInt(8.W) // TODO: configured by L1 parameter
-  val SrcID = UInt(8.W) // TODO: configured by DownstreamNodeID_Width
-  val TgtID = UInt(8.W) // TODO: configured by UpstreamNodeID_Width
-  val DBID = UInt(8.W) // TODO: configured by L2 parameter
+class FlitDnDATWithoutData(implicit val p: Parameters) extends Bundle with HasCCHIParameters {
+  val TxnID = UInt(paramCCHI.TxnID_Width.W)
+  val SrcID = UInt(paramCCHI.DownstreamNodeID_Width.W)
+  val TgtID = UInt(paramCCHI.UpstreamNodeID_Width.W)
+  val DBID = UInt(paramCCHI.DBID_Width.W)
   val Opcode = UInt(1.W)
   val RespErr = UInt(2.W)
   val Resp = UInt(3.W)
@@ -91,18 +93,18 @@ class FlitDnDATWithoutData extends Bundle {
   val DataSource = UInt(5.W)
   val CBusy = UInt(3.W)
   val WayValid = Bool()
-  val Way = UInt(2.W) // TODO: configured by L2 way count
+  val Way = UInt(paramCCHI.WayIndex_Width.W)
   val TraceTag = UInt(1.W)
 }
 
-class FlitDnDAT extends FlitDnDATWithoutData {
-  val Data = UInt(256.W)
+class FlitDnDAT(implicit p: Parameters) extends FlitDnDATWithoutData {
+  val Data = UInt(paramCCHI.Data_Width.W)
 }
 
-class FlitUpDATWithoutData extends Bundle {
-  val TxnID = UInt(8.W) // TODO: configured by maximum value of L1 parameter and L2 parameter
-  val SrcID = UInt(8.W) // TODO: configured by UpstreamNodeID_Width
-  val TgtID = UInt(8.W) // TODO: configured by DownstreamNodeID_Width
+class FlitUpDATWithoutData(implicit val p: Parameters) extends Bundle with HasCCHIParameters {
+  val TxnID = UInt(paramCCHI.DBID_Width.W)
+  val SrcID = UInt(paramCCHI.UpstreamNodeID_Width.W)
+  val TgtID = UInt(paramCCHI.DownstreamNodeID_Width.W)
   val Opcode = UInt(2.W)
   val RespErr = UInt(2.W)
   val Resp = UInt(3.W)
@@ -110,7 +112,7 @@ class FlitUpDATWithoutData extends Bundle {
   val TraceTag = UInt(1.W)
 }
 
-class FlitUpDAT extends FlitUpDATWithoutData {
-  val Data = UInt(256.W)
-  val BE = UInt(32.W)
+class FlitUpDAT(implicit p: Parameters) extends FlitUpDATWithoutData {
+  val Data = UInt(paramCCHI.Data_Width.W)
+  val BE = UInt((paramCCHI.Data_Width / 8).W)
 }

@@ -14,6 +14,7 @@ import oceanus.chi.field.CHIFieldSize._
 import oceanus.chi.field.CHIFieldOrder._
 import oceanus.chi.field.CHIFieldMemAttr._
 import oceanus.chi.field.CHIFieldResp
+import xscache.oceanus.compactchi.HasCCHIParameters
 
 object L2VPipeREQ {
 
@@ -30,7 +31,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     with CHIRNFOpcodesREQ 
     with CHIRNFOpcodesRSP
     with CHIRNFOpcodesDAT
-    with HasL2Params {
+    with HasL2Params
+    with HasCCHIParameters {
 
   val io = IO(new Bundle {
     val consts = Input(new L2TSHRConsts(sliceNum))
@@ -97,7 +99,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     val toPCreditPool = Valid(new L2PCreditPool.Entry)
     val fromPCreditPool = Input(Bool())
 
-    val toClientTable = Output(UInt(8.W)) // TODO: configurable with upstream nodeId width
+    val toClientTable = Output(UInt(paramCCHI.UpstreamNodeID_Width.W))
     val fromClientTable = Input(Vec(1, Bool())) // TODO: parameterize with coherent l2 client count
 
     val peer_unlock_dir = Output(Vec(paramL2.mshrSize, Bool()))

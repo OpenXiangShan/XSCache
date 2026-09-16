@@ -5,17 +5,21 @@ import chisel3.util._
 import utility._
 import oceanus.l2._
 import org.chipsalliance.cde.config.Parameters
+import xscache.oceanus.compactchi.HasCCHIParameters
 
 
-class L2ClientTable(val sliceNum: Int)(implicit val p: Parameters) extends Module with HasL2Params {
+class L2ClientTable(val sliceNum: Int)(implicit val p: Parameters) 
+    extends Module 
+    with HasL2Params
+    with HasCCHIParameters {
 
   val theOnlyDCacheNID = 0
 
   val io = IO(new Bundle {
-    val queryREQ = Input(Vec(sliceNum, Vec(paramL2.mshrSize, UInt(8.W)))) // TODO: configurable with upstream nodeId width
+    val queryREQ = Input(Vec(sliceNum, Vec(paramL2.mshrSize, UInt(paramCCHI.UpstreamNodeID_Width.W))))
     val clientsREQ = Output(Vec(sliceNum, Vec(paramL2.mshrSize, Vec(1, Bool())))) // TODO: parameterize with coherent l2 client count
 
-    val queryEVT = Input(Vec(sliceNum, Vec(paramL2.mshrSize, UInt(8.W)))) // TODO: configurable with upstream nodeId width
+    val queryEVT = Input(Vec(sliceNum, Vec(paramL2.mshrSize, UInt(paramCCHI.UpstreamNodeID_Width.W))))
     val clientsEVT = Output(Vec(sliceNum, Vec(paramL2.mshrSize, Vec(1, Bool())))) // TODO: parameterize with coherent l2 client count
   })
 

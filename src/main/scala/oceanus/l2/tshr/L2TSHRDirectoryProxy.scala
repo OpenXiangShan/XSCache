@@ -74,7 +74,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
     val repl_reset = Input(Bool())
 
     val meta = Input(new L2Directory.Meta)
-    val meta_way = Input(UInt(4.W)) // TODO: parameterize with l2 way count
+    val meta_way = Input(UInt(wayBits.W))
 
     val meta_modify = Input(Bool())
     val meta_modified = Input(new L2Directory.MetaWriteMask)

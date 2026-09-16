@@ -62,10 +62,10 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
     val fromDS = Input(new L2DataStorage.PathDataStorageToTSHR)
 
     val tshr_valid = Input(Bool())
-    val tshr_paddr = Input(UInt(48.W)) // TODO: parameterize with L2 physical address width
+    val tshr_paddr = Input(UInt(paramL2.physicalAddrWidth.W))
 
     val meta_valid = Input(Bool())
-    val meta_way = Input(UInt(4.W)) // TODO: parameterize with L2 way count
+    val meta_way = Input(UInt(wayBits.W))
     val meta_state = Input(L2Directory.MetaState())
     
     val tbuf_wen_last = Input(Bool())
@@ -78,7 +78,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
     val tshr_dealloc = Input(Bool())
 
     val ds_read_ahead_en = Input(Bool())
-    val ds_read_ahead_way = Input(UInt(4.W)) // TODO: parameterize with L2 way count
+    val ds_read_ahead_way = Input(UInt(wayBits.W))
     val ds_read_ahead_arbed = Input(Bool())
 
     val ds_read_rbeEVT_en = Input(Bool())
@@ -160,7 +160,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
   val hit_on_fromDS_dirRdResp = fromDir_DirRdResp && (io.fromDir.META.state =/= MetaState.I && io.fromDir.META.way === io.fromDS.WAY)
   val hit_on_fromDS_metaValid = io.meta_valid && (io.meta_state =/= MetaState.I && io.meta_way === io.fromDS.WAY)
 
-  val ds_read_ahead_way_q = RegInit(0.U(4.W)) // TODO: parameterize with L2 way count
+  val ds_read_ahead_way_q = RegInit(0.U(wayBits.W))
 
   when (io.ds_read_ahead_en) {
     ds_read_ahead_way_q := io.ds_read_ahead_way

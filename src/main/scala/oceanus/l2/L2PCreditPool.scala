@@ -7,12 +7,13 @@ import oceanus.l2._
 import org.chipsalliance.cde.config.Parameters
 import chisel3.experimental.BundleLiterals.AddBundleLiteralConstructor
 import oceanus.l2.L2Common.fastArb
+import oceanus.chi.HasCHIParameters
 
 object L2PCreditPool {
 
-  class Entry extends Bundle {
+  class Entry(implicit val p: Parameters) extends Bundle with HasCHIParameters {
     val pCrdType = UInt(4.W)
-    val srcId = UInt(12.W) // TODO: parameterize with CHI node id width
+    val srcId = UInt(paramCHI.nodeIdWidth.W)
   }
 }
 
