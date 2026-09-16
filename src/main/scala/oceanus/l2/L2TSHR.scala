@@ -15,6 +15,7 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.util.RotateVector.left
 import freechips.rocketchip.util.SeqToAugmentedSeq
 import oceanus.l2.tshr.L2TSHRDirectoryProxy
+import xscache.oceanus.compactchi.HasCCHIParameters
 
 
 /* Per-instance identities routed as ports instead of constructor constants,
@@ -31,7 +32,8 @@ class L2TSHRConsts(sliceNum: Int)(implicit p: Parameters) extends L2SliceConsts(
 }
 
 class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) extends Module 
-    with HasL2Params {
+    with HasL2Params
+    with HasCCHIParameters {
 
   val io = IO(new Bundle {
 
@@ -70,10 +72,10 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
     val toPCreditPool = Valid(new L2PCreditPool.Entry)
     val fromPCreditPool = Input(Bool())
 
-    val toClientTableREQ = Output(UInt(8.W)) // TODO: configurable with upstream nodeId width
+    val toClientTableREQ = Output(UInt(paramCCHI.UpstreamNodeID_Width.W))
     val fromClientTableREQ = Input(Vec(1, Bool())) // TODO: parameterize with coherent l2 client count
 
-    val toClientTableEVT = Output(UInt(8.W)) // TODO: configurable with upstream nodeId width
+    val toClientTableEVT = Output(UInt(paramCCHI.UpstreamNodeID_Width.W))
     val fromClientTableEVT = Input(Vec(1, Bool())) // TODO: parameterize with coherent l2 client count
 
     val peer_unlock_dir = Output(Vec(paramL2.mshrSize, Bool()))

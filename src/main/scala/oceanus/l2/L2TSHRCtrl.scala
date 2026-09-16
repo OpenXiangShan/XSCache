@@ -14,6 +14,7 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.util.SeqBoolBitwiseOps
 import freechips.rocketchip.util.SeqToAugmentedSeq
 import oceanus.compactchi.CCHIOpcode._
+import xscache.oceanus.compactchi.HasCCHIParameters
 
 
 trait L2SliceLocatable {
@@ -35,7 +36,8 @@ trait L2SliceLocatable {
 
 class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val nodeId: Int)(implicit val p: Parameters) extends Module 
     with HasL2Params 
-    with L2SliceLocatable {
+    with L2SliceLocatable
+    with HasCCHIParameters {
 
   val io = IO(new Bundle {
     val consts = Input(new L2SliceConsts(sliceNum))
@@ -61,10 +63,10 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
     val toPCreditPool = Vec(paramL2.mshrSize, Valid(new L2PCreditPool.Entry))
     val fromPCreditPool = Input(Vec(paramL2.mshrSize, Bool()))
 
-    val toClientTableREQ = Output(Vec(paramL2.mshrSize, UInt(8.W))) // TODO: configurable with upstream nodeId width
+    val toClientTableREQ = Output(Vec(paramL2.mshrSize, UInt(paramCCHI.UpstreamNodeID_Width.W)))
     val fromClientTableREQ = Input(Vec(paramL2.mshrSize, Vec(1, Bool()))) // TODO: parameterize with coherent l2 client count
 
-    val toClientTableEVT = Output(Vec(paramL2.mshrSize, UInt(8.W))) // TODO: configurable with upstream nodeId width
+    val toClientTableEVT = Output(Vec(paramL2.mshrSize, UInt(paramCCHI.UpstreamNodeID_Width.W)))
     val fromClientTableEVT = Input(Vec(paramL2.mshrSize, Vec(1, Bool()))) // TODO: parameterize with coherent l2 client count
   })
 

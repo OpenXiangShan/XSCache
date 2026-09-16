@@ -7,6 +7,7 @@ import utility.sram.SRAMTemplate
 import oceanus.l2._
 import oceanus.compactchi._
 import org.chipsalliance.cde.config.{Field, Parameters}
+import xscache.oceanus.compactchi.HasCCHIParameters
 
 case object L2DirectoryBlockRefillFaultModeKey extends Field[Int](0)
 
@@ -56,15 +57,15 @@ object L2Directory {
   }
 
   // Meta: coherence state (NO tag — tag is internal to Directory)
-  class Meta(implicit val p: Parameters) extends Bundle with HasL2Params {
+  class Meta(implicit val p: Parameters) extends Bundle with HasL2Params with HasCCHIParameters {
     val state = MetaState()
     val dirty = Bool()
     val clients = Vec(1, Bool()) // TODO: parameterize with coherent l2 client count
-    val alias = UInt(2.W) // TODO: parameterize with L2 alias width
+    val alias = UInt(paramCCHI.TagAlias_Width.W)
   }
 
   class MetaReadResult(implicit override val p: Parameters) extends Meta with HasL2Params {
-    val way = UInt(4.W) // TODO: parameterize with l2 way count
+    val way = UInt(wayBits.W)
     val hit = Bool() // DirRd: tag hit. ReplRd: unused.
   }
 
@@ -105,7 +106,7 @@ object L2Directory {
 
   class ReplReadResult(implicit override val p: Parameters) extends Bundle with HasL2Params {
     val paddr = UInt(paramL2.physicalAddrWidth.W) // victim PA; valid when META.state =/= I
-    val way = UInt(4.W) // TODO: parameterize with l2 way count
+    val way = UInt(wayBits.W)
   }
 
   class PathToDirectoryUOPs extends Bundle {
@@ -117,7 +118,7 @@ object L2Directory {
   class PathToDirectory(implicit val p: Parameters) extends PathToDirectoryUOPs with HasL2Params {
     val TSHRID = UInt(mshrIndexWidth.W)
     val PADDR = UInt(paramL2.physicalAddrWidth.W)
-    val WAY = UInt(4.W) // TODO: parameterize with l2 way count // only applicable for DirWb
+    val WAY = UInt(wayBits.W)
     val META = new L2Directory.Meta // only applicable for DirWb
     val META_WEN = new L2Directory.MetaWriteMask // only applicable for DirWb
     val TAG_WEN = Bool()

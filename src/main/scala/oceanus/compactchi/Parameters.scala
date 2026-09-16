@@ -1,5 +1,7 @@
 package xscache.oceanus.compactchi
 
+import org.chipsalliance.cde.config.Parameters
+import org.chipsalliance.cde.config.Field
 
 case class CCHIParameters (
 
@@ -56,3 +58,10 @@ case class CCHIParameters (
     */
     UWPredict_Enable          : Boolean         = true
 )
+
+case object CCHIParametersKey extends Field[CCHIParameters]
+
+trait HasCCHIParameters {
+    implicit val p: Parameters
+    val paramCCHI = p(CCHIParametersKey)
+}
