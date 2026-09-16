@@ -110,6 +110,9 @@ class L2SnoopAgent(val sliceNum: Int)(implicit val p: Parameters) extends Module
     val UpRXRSP = Flipped(Valid(new FlitUpRSP))
     val UpRXDAT = Flipped(Valid(new FlitUpDAT))
 
+    val tshr_meta_write_en = Output(new L2Directory.MetaWriteMask)
+    val tshr_meta_write_meta = Output(new L2Directory.Meta)
+
     val fromSA = Output(new L2SnoopAgent.PathFromSnoopAgent)
     val fromSAForSNP = Output(new L2SnoopAgent.PathFromSnoopAgent)
     val fromSAForREQ = Output(new L2SnoopAgent.PathFromSnoopAgent)
@@ -213,7 +216,14 @@ class L2SnoopAgent(val sliceNum: Int)(implicit val p: Parameters) extends Module
   // Upstream RXDAT DataID carries a packed beat index ({0,1} for the two 256-bit halves), not the CHI chunk index {0,2}
   val datBeat2 = datMatch && io.UpRXDAT.bits.DataID === 1.U
 
-  val done = rspMatch || datBeat2
+  val done = rspMatch || (datBeat2 && seenData0)
+  // SNP opcodes 0x00-0x03 place SnpToShared/SnpToClean after the client-clearing opcodes; inserting an opcode changes clear_client_en semantics.
+  val clear_client_en = done && (serviceOpcode === CCHIOpcode.SnpMakeInvalid.U || serviceOpcode === CCHIOpcode.SnpToInvalid.U)
+  // clear_client_en trusts CHI-compliant core behavior and does not inspect the final response state for I.
+  io.tshr_meta_write_en := 0.U.asTypeOf(new L2Directory.MetaWriteMask)
+  io.tshr_meta_write_en.clients(0) := clear_client_en
+  io.tshr_meta_write_meta := 0.U.asTypeOf(new L2Directory.Meta)
+  io.tshr_meta_write_meta.clients(0) := false.B
   val directDone = startService && !startNeedSnoop
   val doneForSNP = serviceFromSNP
   val doneForREQ = serviceFromREQ
