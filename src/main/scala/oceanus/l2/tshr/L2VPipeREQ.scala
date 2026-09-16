@@ -276,6 +276,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val p_prefill_meta = Reg(new L2Directory.Meta)
 
+  // --------------------------------
+  val issue_up_rd_compdata_first = Wire(Bool())
+  val issue_up_rd_comp = Wire(Bool())
+
   // ----------------------------------------------------------------
 
   // -- Interaction with Client Table
@@ -405,7 +409,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     CCHIOpcode.CleanInvalid,
     CCHIOpcode.ReadUnique,
     CCHIOpcode.MakeUnique
-  ) || rxevb_evictback
+  ) || rxevb_unsatisfied_evictback
 
   io.toSA.SnpToShared := rxreq_opcode.is(
     CCHIOpcode.ReadShared
@@ -943,7 +947,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val meta_wr_dirty_makeunique_set = active && p_rxreq_makeunique &&
                                      dn_rxrsp_comp
 
-  val meta_wr_client_makeunique_set = meta_wr_state_makeunique_UU
+  val meta_wr_client_makeunique_set = active && p_rxreq_makeunique &&
+                                      !p_rxreq_client_present &&
+                                      issue_up_rd_comp
 
   val meta_wr_alias_makeunique = meta_wr_client_makeunique_set
   // --------------------------------
@@ -972,7 +978,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val meta_wr_dirty_readunique_set = active && p_rxreq_readunique &&
                                      (dn_rxdat_compdata_first_UD_PD || dn_rxdat_datasepresp_first_UD_PD || dn_rxrsp_comp_UD_PD)
 
-  val meta_wr_client_readunique_set = meta_wr_state_readunique_UU
+  val meta_wr_client_readunique_set = active && p_rxreq_readunique &&
+                                      !p_rxreq_client_present &&
+                                      (issue_up_rd_comp || issue_up_rd_compdata_first)
 
   val meta_wr_alias_readunique = meta_wr_client_readunique_set
   // --------------------------------
@@ -1017,9 +1025,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val meta_wr_dirty_readshared_set = active && p_rxreq_readshared &&
                                      (dn_rxdat_compdata_first_UD_PD || dn_rxdat_datasepresp_first_UD_PD)
 
-  val meta_wr_client_readshared_set = meta_wr_state_readshared_UU ||
-                                      meta_wr_state_readshared_US ||
-                                      meta_wr_state_readshared_S
+  val meta_wr_client_readshared_set = active && p_rxreq_readshared &&
+                                      !p_rxreq_client_present &&
+                                      (issue_up_rd_comp || issue_up_rd_compdata_first)
 
   val meta_wr_alias_readshared = meta_wr_client_readshared_set
   // --------------------------------
@@ -1259,7 +1267,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     w_s_rd_up_comp := true.B
   }
 
-  val issue_up_rd_comp = w_s_rd_up_comp && allow_up_rd_comp
+  issue_up_rd_comp := w_s_rd_up_comp && allow_up_rd_comp
 
   when (issue_up_rd_comp) {
     w_s_rd_up_comp := false.B
@@ -1334,6 +1342,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val issue_up_rd_compdata0 = w_s_rd_up_compdata0 && allow_up_rd_compdata0
   val issue_up_rd_compdata2 = w_s_rd_up_compdata2 && allow_up_rd_compdata2
+
+  issue_up_rd_compdata_first := (issue_up_rd_compdata0 || issue_up_rd_compdata2) &&
+                                (w_s_rd_up_compdata0 && w_s_rd_up_compdata2)
 
   when (issue_up_rd_compdata0) {
     w_s_rd_up_compdata0 := false.B
