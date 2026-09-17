@@ -608,14 +608,26 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     pftQueue(i).io.enq.bits := ParallelPriorityMux(select(i).asUInt, reqsBits)
     // Re-check the tier at dequeue and discard instead of holding: a queued
     // prefetch whose tier fell below the busy bank threshold is dropped fast
-    // so it cannot keep occupying NoC/L2 resources.
-    val deqAdmit = confAdmit(pftQueue(i).io.deq.bits.pfSource, i)
-    pipe(i).io.in.valid := pftQueue(i).io.deq.valid && deqAdmit
-    pipe(i).io.in.bits := pftQueue(i).io.deq.bits
-    pftQueue(i).io.deq.ready := Mux(deqAdmit, pipe(i).io.in.ready, true.B)
+    // so it cannot keep occupying NoC/L2 resources. The head entry is staged
+    // in a register so the admit decision never feeds back into deq.ready
+    // combinationally (OverwriteQueue hasFlow makes deq.bits depend on
+    // deq.ready, so gating deq.ready with deq.bits would form a loop).
+    val headValid = RegInit(false.B)
+    val headBits = Reg(chiselTypeOf(pftQueue(i).io.deq.bits))
+    val headAdmit = confAdmit(headBits.pfSource, i)
+    val headDone = headValid && (!headAdmit || pipe(i).io.in.ready)
+    pftQueue(i).io.deq.ready := !headValid || headDone
+    pipe(i).io.in.valid := headValid && headAdmit
+    pipe(i).io.in.bits := headBits
+    when(pftQueue(i).io.deq.fire) {
+      headValid := true.B
+      headBits := pftQueue(i).io.deq.bits
+    }.elsewhen(headDone) {
+      headValid := false.B
+    }
     io.req(i) <> pipe(i).io.out
     XSPerfAccumulate(s"pftq_enq_drop_bank$i", PopCount(dropVecAll(i)))
-    XSPerfAccumulate(s"pftq_deq_drop_bank$i", pftQueue(i).io.deq.valid && !deqAdmit)
+    XSPerfAccumulate(s"pftq_deq_drop_bank$i", headValid && !headAdmit)
   }
   val pftqOverwrite = VecInit((0 until banks).map { i =>
     pftQueue(i).io.full && pftQueue(i).io.enq.fire && !pftQueue(i).io.deq.fire
