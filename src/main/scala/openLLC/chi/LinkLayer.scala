@@ -74,10 +74,6 @@ class RNLinkMonitor(implicit p: Parameters) extends LLCModule {
   val txState = RegInit(LinkStates.STOP)
   val rxState = RegInit(LinkStates.STOP)
 
-  // Record the upstream request node's ID
-  val rnID = RegEnable(rxOut.req.flit.asTypeOf(new CHIREQ()).elements.filter(_._1 == "srcID").head._2,
-    0.U(NODEID_WIDTH.W), rxOut.req.flitv)
-
   Seq(txState, rxState).zip(MixedVecInit(Seq(txOut, rxOut))).foreach { case (state, link) =>
     state := MuxLookup(Cat(link.linkactivereq, link.linkactiveack), LinkStates.STOP)(Seq(
       Cat(true.B, false.B) -> LinkStates.ACTIVATE,
@@ -90,9 +86,11 @@ class RNLinkMonitor(implicit p: Parameters) extends LLCModule {
   /* IO assignment */
   val rxreqDeact, rxrspDeact, rxdatDeact = Wire(Bool())
   val rxDeact = rxreqDeact && rxrspDeact && rxdatDeact
+  // Response TgtID comes from the transaction context (the original request's SrcID,
+  // carried in the task bundle); only SrcID is overridden with this HN's node ID.
   Decoupled2LCredit(setSrcID(txIn.snp, io.nodeID), txOut.snp, LinkState(txState), Some("txsnp"))
-  Decoupled2LCredit(setTgtID(setSrcID(txIn.rsp, io.nodeID), rnID.asUInt), txOut.rsp, LinkState(txState), Some("txrsp"))
-  Decoupled2LCredit(setTgtID(setSrcID(txIn.dat, io.nodeID), rnID.asUInt), txOut.dat, LinkState(txState), Some("txdat"))
+  Decoupled2LCredit(setSrcID(txIn.rsp, io.nodeID), txOut.rsp, LinkState(txState), Some("txrsp"))
+  Decoupled2LCredit(setSrcID(txIn.dat, io.nodeID), txOut.dat, LinkState(txState), Some("txdat"))
   LCredit2Decoupled(setSrcID(setTgtID(rxOut.req, new CHIREQ(), rxOut.req.flit.asTypeOf(new CHIREQ()).srcID),
       new CHIREQ(), io.entranceID), rxIn.req, LinkState(rxState), rxreqDeact, Some("rxreq"), maxLCreditNum)
   LCredit2Decoupled(setSrcID(rxOut.rsp, new CHIRSP(), io.entranceID), rxIn.rsp,
