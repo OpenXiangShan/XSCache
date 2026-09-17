@@ -50,6 +50,9 @@ class PrefetchControllerIO(implicit p: Parameters) extends PrefetchBundle {
   val isDemandTrain = Input(Bool())
   val pfFeedbackVec = Input(Vec(banks, new PrefetchFeedbackBundle()))
   val l2PfFbCtrl = Output(new L2PfFeedbackCtrl)
+  // Per-engine accuracy tier, 5 levels: 0 <25%, 1 <50%, 2 <75%, 3 <90%, 4 >=90%.
+  // Engines stay at the max tier until enough events settle a real ratio.
+  val confTier = Output(Vec(7, UInt(3.W)))
 }
 
 class PrefetchController(implicit p: Parameters) extends PrefetchModule {
@@ -450,6 +453,58 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
     peVec(i) := c4_peNext
     c4_statPeOverflowVec(i) := c4_DeltaSumReg(peBits - 1) === peVec(i)(peBits - 1) && c4_peNext(peBits - 1) =/= peVec(i)(peBits - 1)
   }
+
+  // ========== confidence: per-engine accuracy tier ==========
+  // Useful = the prefetched line was consumed (demand cache hit, L1 prefetch
+  // cache hit, or an MSHR hit). Useless = the prefetched line was evicted
+  // untouched. A dropped-by-tier request never enters L2, so it is counted as
+  // not served instead of useless and does not pollute the ratio.
+  // NOTE: L1 engines (Stream/Stride/Berti/SMS) are gated by L1's own accuracy
+  // at the core side; their L2-level useless accounting is biased because a
+  // line consumed by an L1 prefetch miss refill still looks evicted-unused
+  // here. The Prefetcher therefore only applies the tier gate to the L2
+  // native engines (VBOP/PBOP/TP).
+  private val confCntBits = 8
+  private val confSettle = 64
+  val confEn = Constantin.createRecord(s"l2pf_confEn$hartId", initValue = 1)
+  val confHitCnt = RegInit(VecInit(Seq.fill(PF_NUM)(0.U(confCntBits.W))))
+  val confAllCnt = RegInit(VecInit(Seq.fill(PF_NUM)(0.U(confCntBits.W))))
+  val confTierVec = RegInit(VecInit(Seq.fill(PF_NUM)(4.U(3.W))))
+  for (i <- 0 until PF_NUM) {
+    val useful = PopCount((0 until banks).map(s =>
+      c0_statMshrHitVec(i)(s) || c0_statDemandCacheHitVec(i)(s) || c0_statL1PrefetchCacheHitVec(i)(s)
+    ))
+    val useless = PopCount((0 until banks).map(s => c0_statPfUselessVec(i)(s)))
+    val hitSum = Cat(0.U(1.W), confHitCnt(i)) + useful
+    val allSum = Cat(0.U(1.W), confAllCnt(i)) + useful + useless
+    val settle = allSum >= confSettle.U
+    when(confEn === 0.U) {
+      confHitCnt(i) := 0.U
+      confAllCnt(i) := 0.U
+      confTierVec(i) := 4.U
+    }.elsewhen(settle) {
+      val tier = Wire(UInt(3.W))
+      tier := 0.U
+      when((hitSum << 2) >= allSum) { tier := 1.U }        // >= 25%
+      when((hitSum << 1) >= allSum) { tier := 2.U }        // >= 50%
+      when((hitSum << 2) >= allSum * 3.U) { tier := 3.U }  // >= 75%
+      when(hitSum * 10.U >= allSum * 9.U) { tier := 4.U }  // >= 90%
+      confTierVec(i) := tier
+      // Keep half of the counts so the ratio smooths across settle windows.
+      confHitCnt(i) := (hitSum >> 1)(confCntBits - 1, 0)
+      confAllCnt(i) := (allSum >> 1)(confCntBits - 1, 0)
+    }.otherwise {
+      confHitCnt(i) := hitSum(confCntBits - 1, 0)
+      confAllCnt(i) := allSum(confCntBits - 1, 0)
+    }
+    XSPerfAccumulate(s"conf_settle${PF_NAME_VEC(i)}", settle && confEn =/= 0.U)
+    XSPerfAccumulate(s"conf_useful${PF_NAME_VEC(i)}", useful)
+    XSPerfAccumulate(s"conf_useless${PF_NAME_VEC(i)}", useless)
+    for (t <- 0 until 5) {
+      XSPerfAccumulate(s"conf_tier${t}${PF_NAME_VEC(i)}", confTierVec(i) === t.U)
+    }
+  }
+  io.confTier := confTierVec
 
   // record for debug //
   val statVecInit = VecInit(Seq.fill(PF_NUM)(VecInit(Seq.fill(banks)(false.B))))
