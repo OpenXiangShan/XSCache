@@ -40,6 +40,7 @@ class OverwriteQueue[T <: Data](
     val enq = Flipped(DecoupledIO(gen))
     val deq = DecoupledIO(gen)
     val overwrite = Output(Bool())
+    val full = Output(Bool())
   })
   def wrapInc(ptr: UInt): UInt = Mux(ptr === (entries - 1).U, 0.U, ptr + 1.U)
   require(entries > 1, "Queue must have positive entries")
@@ -52,6 +53,7 @@ class OverwriteQueue[T <: Data](
   val tailPtr = RegInit(0.U(ptrBits.W))
   val full = headPtr === tailPtr && maybe_full
   val empty = headPtr === tailPtr && !maybe_full
+  io.full := full
   
   // Decide enq ready depending on hasOverWrite (elaboration-time constant)
   io.enq.ready := true.B 

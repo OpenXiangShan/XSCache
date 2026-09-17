@@ -147,9 +147,17 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   val memAttr = chiOpt.map(_ => new MemAttr)
   val traceTag = chiOpt.map(_ => Bool())
 
+  def chiReqQos: UInt = {
+    Mux(
+      MemReqSource.isL1Prefetch(reqSource),
+      8.U(QOS_WIDTH.W),
+      Mux(MemReqSource.isL2Prefetch(reqSource), 1.U(QOS_WIDTH.W), Fill(QOS_WIDTH, 1.U(1.W)))
+    )
+  }
+
   def toCHIREQBundle(): CHIREQ = {
     val req = WireInit(0.U.asTypeOf(new CHIREQ()))
-    req.qos := Fill(QOS_WIDTH, 1.U(1.W)) - 1.U // TODO
+    req.qos := chiReqQos
     req.tgtID := tgtID.getOrElse(0.U)
     req.srcID := srcID.getOrElse(0.U)
     req.txnID := txnID.getOrElse(0.U)

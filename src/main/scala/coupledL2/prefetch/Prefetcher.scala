@@ -209,8 +209,10 @@ class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
   val req = Vec(banks, DecoupledIO(new PrefetchReq))
   val stash_txreq = DecoupledIO(new CHIREQ)
   val stash_rxrsp = Flipped(DecoupledIO(new CHIRSP))
-  val hnCBusy = Input(UInt(3.W))
+  val hnCBusy = Input(Vec(1 << bankBits, UInt(3.W)))
+  val snCBusy = Input(UInt(3.W))
   val txreqHardStall = Input(Bool())
+  val l2PfqBusy = Output(Bool())
   val resp = Vec(banks, Flipped(DecoupledIO(new PrefetchResp)))
   val recv_addr = Flipped(ValidIO(new Bundle() {
     val addr = UInt(64.W)
@@ -247,16 +249,29 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val pbopDegree = prefetchController.io.l2PfFbCtrl.pbopDegree
   val tpDegree = prefetchController.io.l2PfFbCtrl.tpDegree
 
+  // CHI E.b CBusy[1:0]: 00 <50%, 01 >50%, 10 >75%, 11 >90%.
+  // HN hint is per-bank; SN hint is global because DMT CompData comes from SN.
+  val bankCBusy = io.hnCBusy.map(_(1, 0))
+  val bankFarOff = RegInit(VecInit(Seq.fill(banks)(false.B)))
+  val snFarOff = RegInit(false.B)
+  for (i <- 0 until banks) {
+    when(bankCBusy(i) >= 2.U) { bankFarOff(i) := true.B }.elsewhen(bankCBusy(i) <= 1.U) { bankFarOff(i) := false.B }
+  }
+  when(io.snCBusy(1, 0) >= 2.U) { snFarOff := true.B }.elsewhen(io.snCBusy(1, 0) <= 1.U) { snFarOff := false.B }
+  val pftFarOff = VecInit(bankFarOff.map(_ || snFarOff))
   l2ToL1PfCtrl.streamDegree := streamDegree
   l2ToL1PfCtrl.strideDegree := strideDegree
   l2ToL1PfCtrl.bertiDegree := bertiDegree
   l2ToL1PfCtrl.smsDegree := smsDegree
+  XSPerfAccumulate("pftq_cbusy_stall", PopCount(pftFarOff))
+  XSPerfAccumulate("pftq_hn_faroff", PopCount(bankFarOff))
+  XSPerfAccumulate("pftq_sn_faroff", snFarOff)
 
   val pfRcv_en = RegNextN(pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pf_recv_en, 2, Some(true.B))
   val pbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pbop_en
   val vbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_vbop_en
   val tp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_tp_en
-  val cdp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_cdp_en
+  val cdp_en = false.B
   val delay_latency = pfCtrlFromCore.l2_pf_delay_latency
 
   /**
@@ -287,9 +302,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   io.tlb_req.resp.ready := true.B
 
   val stashPrefetcher = Module(new StashPrefetcher)
-  // CHI E.b CBusy uses the same 4-level occupancy encoding as HN PoS.
-  // Stop L3 stash issue on HN/SN hint (>=75%) or a sustained TXREQ backpressure.
-  val hnHint = io.hnCBusy >= 2.U
+  // Stop L3 stash issue on the busy bank when CBusy[1:0] is >75% or TXREQ stays backpressured.
   val l2HardCnt = RegInit(0.U(3.W))
   when(io.txreqHardStall) {
     l2HardCnt := Mux(l2HardCnt === 7.U, l2HardCnt, l2HardCnt + 1.U)
@@ -298,7 +311,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   }
   val l2Hard = l2HardCnt >= 2.U
   stashPrefetcher.io.recv := io.l3_recv
-  stashPrefetcher.io.allow := !hnHint && !l2Hard
+  stashPrefetcher.io.allow := VecInit(pftFarOff.map(off => !off && !l2Hard))
+  XSPerfAccumulate("pftq_l2hard", l2Hard)
   io.stash_txreq <> stashPrefetcher.io.txreq
   stashPrefetcher.io.rxrsp <> io.stash_rxrsp
 
@@ -494,25 +508,49 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val pipe = Seq.tabulate(banks) { _ => Module(new Pipeline(new PrefetchReq, 1)) }
   val select = Wire(Vec(banks, Vec(SRC_NUM, Bool())))
   val selectOH = Wire(Vec(banks, Vec(SRC_NUM, Bool())))
-  val reqsAllowed = Seq(
-    true.B,
-    true.B,
-    vbopDegree.orR,
-    pbopDegree.orR,
-    tpDegree.orR,
-    true.B
-  )
+  io.l2PfqBusy := VecInit(pftQueue.map(_.io.full)).asUInt.orR
 
   for (i <- 0 until banks) {
+    // Keep enqueue enabled on CBusy so a full pftQueue can overwrite the oldest
+    // request. Only dequeue/issue is held, otherwise stale prefetch is frozen.
+    val reqsAllowed = Seq(
+      true.B,
+      true.B,
+      vbopDegree.orR,
+      pbopDegree.orR,
+      tpDegree.orR,
+      false.B
+    )
     select(i) := VecInit(reqsValid.zip(reqsSetAddr).zip(reqsAllowed).map {
       case ((valid, addr), allowed) => valid && allowed && bank_eq(addr, i, bankBits)
     })
     selectOH(i) := VecInit(PriorityEncoderOH(select(i).asUInt).asBools)
     pftQueue(i).io.enq.valid := select(i).asUInt.orR
     pftQueue(i).io.enq.bits := ParallelPriorityMux(select(i).asUInt, reqsBits)
-    pipe(i).io.in <> pftQueue(i).io.deq
+    pipe(i).io.in.valid := pftQueue(i).io.deq.valid && !pftFarOff(i)
+    pipe(i).io.in.bits := pftQueue(i).io.deq.bits
+    pftQueue(i).io.deq.ready := pipe(i).io.in.ready && !pftFarOff(i)
     io.req(i) <> pipe(i).io.out
   }
+  val pftqDeqHold = VecInit((0 until banks).map { i =>
+    pftQueue(i).io.deq.valid && pftFarOff(i)
+  })
+  val pftqOverwrite = VecInit((0 until banks).map { i =>
+    pftQueue(i).io.full && pftQueue(i).io.enq.fire && !pftQueue(i).io.deq.fire
+  })
+  val pftqIssueFire = VecInit((0 until banks).map { i =>
+    pipe(i).io.in.fire
+  })
+  val pftFarOffPrev = RegNext(pftFarOff, VecInit(Seq.fill(banks)(false.B)))
+  val pftqReleaseBurst = VecInit((0 until banks).map { i =>
+    pftFarOffPrev(i) && !pftFarOff(i) && pftQueue(i).io.deq.valid
+  })
+  XSPerfAccumulate("pftq_deq_hold", PopCount(pftqDeqHold))
+  XSPerfAccumulate("pftq_full", PopCount(VecInit(pftQueue.map(_.io.full))))
+  XSPerfAccumulate("pftq_enq_fire", PopCount(VecInit(pftQueue.map(_.io.enq.fire))))
+  XSPerfAccumulate("pftq_overwrite", PopCount(pftqOverwrite))
+  XSPerfAccumulate("pftq_issue_fire", PopCount(pftqIssueFire))
+  XSPerfAccumulate("pftq_release_burst", PopCount(pftqReleaseBurst))
 
   for ((reqOpt, j) <- reqs.zipWithIndex) {
     reqOpt.foreach { req =>
