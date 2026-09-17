@@ -565,8 +565,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   io.l2PfqBusy := VecInit(pftQueue.map(_.io.full)).asUInt.orR
 
   for (i <- 0 until banks) {
-    // Keep enqueue enabled on CBusy so a full pftQueue can overwrite the oldest
-    // request. Only dequeue/issue is held, otherwise stale prefetch is frozen.
+    // A full pftQueue still overwrites the oldest queued prefetch.
     val reqsAllowed = Seq(
       true.B,
       true.B,
