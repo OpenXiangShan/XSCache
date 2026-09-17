@@ -453,6 +453,7 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       val hartId = Input(UInt(hartIdLen.W))
       val pfCtrlFromCore = Input(new PrefetchCtrlFromCore)
       val l2_fdbk_pf_ctrl = Output(new L2ToL1PfCtrl)
+      val l2PfqBusy = Output(Bool())
       val l2_hint = Vec(hintChannelCount, ValidIO(new L2ToL1Hint()(l2ECCParams)))
       val l2_tlb_req = new L2ToL1TlbIO(nRespDups = 1)(l2TlbParams)
       val debugTopDown = new Bundle {
@@ -771,7 +772,19 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     rxsnp.ready := Cat(slices.zipWithIndex.map { case (s, i) => s.io.out.rx.snp.ready && rxsnpSliceID === i.U }).orR
 
     val rxrsp = Wire(DecoupledIO(new CHIRSP))
-    val hnCBusy = RegInit(0.U(3.W))
+    val hnCBusy = RegInit(VecInit(Seq.fill(banks)(0.U(3.W))))
+    val snCBusy = RegInit(0.U(3.W))
+    val snCBusyIdle = RegInit(0.U(10.W))
+    val hnNodeIds = cacheParams.hnNodeIds
+    val snNodeIds = cacheParams.snNodeIds
+    def cBusyFromHn(srcID: UInt): Bool = {
+      if (hnNodeIds.isEmpty) true.B
+      else VecInit(hnNodeIds.map(_.U === srcID)).asUInt.orR
+    }
+    def cBusyFromSn(srcID: UInt): Bool = {
+      if (snNodeIds.isEmpty) false.B
+      else VecInit(snNodeIds.map(_.U === srcID)).asUInt.orR
+    }
     val rxrspIsStashPrefetch = isStashPrefetchID(rxrsp.bits.txnID)
     val rxrspIsMMIO = rxrsp.bits.txnID.head(1).asBool && !rxrspIsStashPrefetch
     val isPCrdGrant = rxrsp.valid && rxrsp.bits.opcode === PCrdGrant
@@ -829,6 +842,7 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     val stashRxRspReady = WireInit(false.B)
     prefetcher.foreach { p =>
       p.io.hnCBusy := hnCBusy
+      p.io.snCBusy := snCBusy
       p.io.txreqHardStall := txreq.valid && !txreq.ready
       p.io.stash_rxrsp.valid := rxrsp.valid && rxrspIsStashPrefetch && !isPCrdGrant
       p.io.stash_rxrsp.bits := rxrsp.bits
@@ -881,6 +895,14 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
 
     XSPerfAccumulate("l2_l3_txreq_fire", txreq.fire)
     XSPerfAccumulate("l2_l3_txreq_stash", txreq.fire && txreqStash)
+    XSPerfAccumulate("l2_l3_txreq_qos15", txreq.fire && txreq.bits.qos >= 15.U)
+    XSPerfAccumulate("l2_l3_txreq_qos14", txreq.fire && txreq.bits.qos === 14.U)
+    XSPerfAccumulate("l2_l3_txreq_qos8", txreq.fire && txreq.bits.qos === 8.U)
+    XSPerfAccumulate("l2_l3_txreq_qos1", txreq.fire && txreq.bits.qos === 1.U)
+    XSPerfAccumulate("l2_l3_txreq_qos0", txreq.fire && txreq.bits.qos === 0.U)
+    XSPerfAccumulate("l2_l3_txreq_lowqos_head", txreq.valid && txreq.bits.qos < 14.U)
+    XSPerfAccumulate("l2_l3_txreq_demand_stall", txreq.valid && txreq.bits.qos >= 15.U && !txreq.ready)
+    XSPerfAccumulate("l2_l3_txreq_prefetch_stall", txreq.valid && txreq.bits.qos < 14.U && !txreq.ready)
 
     if (p(EnableL2DecoupledDownstreamCHI)) {
       io.decoupledCHI.get.tx.req <> txreq
@@ -906,13 +928,48 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       }
     }
 
-    when(rxrsp.fire || rxdat.fire) {
-      val rspCBusy = Mux(rxrsp.fire, rxrsp.bits.cBusy.getOrElse(0.U(3.W)), 0.U)
-      val datCBusy = Mux(rxdat.fire, rxdat.bits.cBusy.getOrElse(0.U(3.W)), 0.U)
-      hnCBusy := Mux(rspCBusy > datCBusy, rspCBusy, datCBusy)
+    val rspFromSn = rxrsp.fire && !rxrspIsMMIO && cBusyFromSn(rxrsp.bits.srcID)
+    val datFromSn = rxdat.fire && !rxdatIsMMIO && cBusyFromSn(rxdat.bits.srcID)
+    when(rxrsp.fire && !rxrspIsMMIO) {
+      val rspCBusy = rxrsp.bits.cBusy.getOrElse(0.U(3.W))
+      when(cBusyFromSn(rxrsp.bits.srcID)) {
+        snCBusy := rspCBusy
+      }.elsewhen(cBusyFromHn(rxrsp.bits.srcID)) {
+        hnCBusy(rxrspSliceID) := rspCBusy
+      }
+    }
+    when(rxdat.fire && !rxdatIsMMIO) {
+      val datCBusy = rxdat.bits.cBusy.getOrElse(0.U(3.W))
+      when(cBusyFromSn(rxdat.bits.srcID)) {
+        snCBusy := datCBusy
+      }.elsewhen(cBusyFromHn(rxdat.bits.srcID)) {
+        hnCBusy(rxdatSliceID) := datCBusy
+      }
+    }
+    when(rspFromSn || datFromSn) {
+      snCBusyIdle := 0.U
+    }.elsewhen(snCBusy(1, 0) =/= 0.U) {
+      // DMT CompData may never return to this RN. Decay a stale SN hint so
+      // already-accepted CHI prefetch can drain and demand cannot deadlock.
+      when(snCBusyIdle === 1023.U) {
+        snCBusy := 0.U
+        snCBusyIdle := 0.U
+      }.otherwise {
+        snCBusyIdle := snCBusyIdle + 1.U
+      }
     }
 
     XSPerfAccumulate("pcrd_count", pCrdQueue_s2.io.enq.fire)
+    XSPerfAccumulate("cbusy_from_sn", rspFromSn || datFromSn)
+    val cBusyFromHnRsp = rxrsp.fire && !rxrspIsMMIO && cBusyFromHn(rxrsp.bits.srcID)
+    val cBusyFromHnDat = rxdat.fire && !rxdatIsMMIO && cBusyFromHn(rxdat.bits.srcID)
+    XSPerfAccumulate("cbusy_from_hn", cBusyFromHnRsp || cBusyFromHnDat)
+    XSPerfAccumulate("cbusy_sn_hot", snCBusy(1, 0) >= 2.U)
+    XSPerfAccumulate("cbusy_sn_decay", snCBusyIdle === 1023.U && snCBusy(1, 0) =/= 0.U)
+    XSPerfAccumulate("cbusy_hn_hot", PopCount(VecInit(hnCBusy.map(_(1, 0) >= 2.U))))
+    val snHotPrev = RegNext(snCBusy(1, 0) >= 2.U, false.B)
+    XSPerfAccumulate("cbusy_sn_release", snHotPrev && snCBusy(1, 0) < 2.U)
+    XSPerfAccumulate("cbusy_sn_release_txreq", snHotPrev && snCBusy(1, 0) < 2.U && txreq.fire)
 
     val perfEvents = Seq(("noEvent", 0.U)) ++ slices.zipWithIndex.map {
       case (slide, slide_idx) =>
@@ -1027,6 +1084,13 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       case None => io.debugTopDown.l2MissMatch := false.B
     }
 
+    val sliceAMshrFull = slices.map(_.io.aMshrFull).reduce(_ || _)
+    // L1 issue throttle is L2-local MSHR pressure only. pftQueue.full is an L2
+    // prefetch hold/overwrite condition and must not stall timely L1 demand-side
+    // prefetch issue, otherwise late L1 prefetch explodes when SN is busy.
+    io.l2PfqBusy := sliceAMshrFull
+    XSPerfAccumulate("l2_a_mshr_full", sliceAMshrFull)
+    XSPerfAccumulate("l2_pftq_full_any", prefetcher.map(_.io.l2PfqBusy).getOrElse(false.B))
     io.l2Miss := RegNext(slices.map(_.io.l2Miss).reduce(_ || _))
 
     // ==================== XSPerf Counters ====================

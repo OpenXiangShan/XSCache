@@ -365,7 +365,11 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   val a_task = {
     val oa = io.tasks.txreq.bits
     oa := 0.U.asTypeOf(io.tasks.txreq.bits.cloneType)
-    oa.qos := Fill(QOS_WIDTH, 1.U(1.W)) - 1.U // TODO
+    oa.qos := Mux(
+      release_valid2,
+      Fill(QOS_WIDTH, 1.U(1.W)),
+      req.chiReqQos
+    )
     oa.tgtID := Mux(!state.s_reissue.getOrElse(false.B), srcid_retryack, 0.U)
     oa.srcID := 0.U
     oa.txnID := io.id

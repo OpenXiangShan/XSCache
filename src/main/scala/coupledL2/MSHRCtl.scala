@@ -91,6 +91,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
 
     /* for TopDown */
     val l2Miss = Output(Bool())
+    val aMshrFull = Output(Bool())
   })
 
   /*MSHR allocation pointer gen -> to Mainpipe*/
@@ -111,6 +112,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val mshrCount = PopCount(Cat(mshrs.map(_.io.status.valid)))
   val mshrFull = pipeReqCount + mshrCount >= mshrsAll.U
   val a_mshrFull = pipeReqCount + mshrCount >= (mshrsAll-1).U // the last idle mshr should not be allocated for channel A req
+  io.aMshrFull := a_mshrFull
   val mshrSelector = Module(new MSHRSelector())
   val selectedMSHROH = mshrSelector.io.out.bits
 

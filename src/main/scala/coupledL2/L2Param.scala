@@ -136,6 +136,9 @@ case class L2Param(
 
   // Network layer SAM
   sam: Seq[(AddressSet, Int)] = Seq(AddressSet.everything -> 0),
+  // Completer node IDs used by RN CBusy decode. Empty means treat all sources as HN.
+  hnNodeIds: Seq[Int] = Nil,
+  snNodeIds: Seq[Int] = Nil,
 
   // Map each slice to the coherent L1 client it serves.
   sliceCoherentClientMap: Option[Seq[Int]] = None,
