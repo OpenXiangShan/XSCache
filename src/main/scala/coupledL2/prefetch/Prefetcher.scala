@@ -311,11 +311,12 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   // NoC pressure tier per bank: CHI E.b CBusy[1:0] of the target bank HN
   // folded with the global SN hint (00 <50%, 01 >50%, 10 >75%, 11 >90%).
   val confTierVec = prefetchController.io.confTier
-  val confThrottleEn = Constantin.createRecord(s"l2pf_confThrottle$hartId", initValue = 1)
+  val confHartId = cacheParams.hartId
+  val confThrottleEn = Constantin.createRecord(s"l2pf_confThrottle$confHartId", initValue = 1)
   // Packed 4x3-bit minimum confidence tier per NoC tier: 0, 2, 3, 4.
-  val confMinTier = Constantin.createRecord(s"l2pf_confMinTier$hartId", initValue = 2256)
+  val confMinTier = Constantin.createRecord(s"l2pf_confMinTier$confHartId", initValue = 2256)
   // Gate only L2 native engines (VBOP/PBOP/TP); L1 engines bypass.
-  val confGateMask = Constantin.createRecord(s"l2pf_confGateMask$hartId", initValue = 112)
+  val confGateMask = Constantin.createRecord(s"l2pf_confGateMask$confHartId", initValue = 112)
   val nocTier = RegInit(VecInit(Seq.fill(banks)(0.U(2.W))))
   for (i <- 0 until banks) {
     val hnTier = io.hnCBusy(i)(1, 0)
