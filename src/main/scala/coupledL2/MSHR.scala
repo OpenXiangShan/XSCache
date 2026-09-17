@@ -1308,9 +1308,11 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     timer := timer + 1.U
   }
 
-  // Fast-drop a prefetch whose acquire was never sent: when the confidence
-  // tier of its engine falls below the busy threshold of the target bank,
-  // free the MSHR entry instead of letting a low-value prefetch occupy it.
+  // Fast-drop a prefetch whose acquire was never sent: when the decayed
+  // confidence tier of this request falls below the busy threshold of the
+  // target bank, free the MSHR entry instead of letting a low-value prefetch
+  // occupy it. Confidence decays with MSHR residence time so a stale
+  // prefetch is dropped before a fresh one of the same tier.
   // Only a prefetch with no in-flight side effect (acquire not sent, no
   // release or probe pending, replacement settled, no merged demand) may be
   // dropped; a dropped prefetch never reaches the NoC and is not useless.
