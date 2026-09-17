@@ -25,7 +25,7 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLPermissions._
 import org.chipsalliance.cde.config.Parameters
-import xscache.coupledL2.prefetch.{DemandRefillBundle, PfSource, PrefetchTrain}
+import xscache.coupledL2.prefetch.{DemandRefillBundle, PfConfidence, PfSource, PrefetchTrain}
 import xscache.coupledL2.MetaData._
 import xscache.coupledL2._
 import xscache.chi.CHICohStates._
@@ -63,6 +63,8 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     val aMergeTask = Flipped(ValidIO(new TaskBundle))
     val replResp = Flipped(ValidIO(new ReplacerResult))
     val pCrd = new PCrdQueryBundle
+    val pfTierBlocked = Input(Vec(7, Bool()))
+    val pfAbandon = Output(Bool())
   })
 
   require (chiOpt.isDefined)
@@ -1297,6 +1299,32 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
 
   when (req_valid) {
     timer := timer + 1.U
+  }
+
+  // Fast-drop a prefetch whose acquire was never sent: when the confidence
+  // tier of its engine falls below the busy threshold of the target bank,
+  // free the MSHR entry instead of letting a low-value prefetch occupy it.
+  // Only a prefetch with no in-flight side effect (acquire not sent, no
+  // release or probe pending, replacement settled, no merged demand) may be
+  // dropped; a dropped prefetch never reaches the NoC and is not useless.
+  val pfAbandon = req_valid && req_prefetch && !mergeA && !gotRetryAck &&
+    !state.s_acquire &&
+    state.s_release && state.w_releaseack &&
+    state.s_rprobe && state.w_rprobeackfirst && state.w_rprobeacklast &&
+    state.s_pprobe && state.w_pprobeackfirst && state.w_pprobeacklast &&
+    state.s_probeack && state.s_cmoresp && state.s_cmometaw &&
+    state.s_cbwrdata.getOrElse(true.B) && state.s_dct.getOrElse(true.B) &&
+    state.s_reissue.getOrElse(true.B) && state.s_retry &&
+    state.w_replResp &&
+    io.pfTierBlocked(PfConfidence.engIdx(req.reqSource))
+  io.pfAbandon := pfAbandon
+  when (pfAbandon) {
+    state.s_acquire := true.B
+    state.s_refill := true.B
+    state.w_grantfirst := true.B
+    state.w_grantlast := true.B
+    state.w_grant := true.B
+    state.s_rcompack.foreach(_ := true.B)
   }
 
   val no_schedule = state.s_refill && state.s_probeack && state.s_release &&

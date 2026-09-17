@@ -680,6 +680,9 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
 
         slice.io.l2Flush.foreach(_ := io.l2Flush.getOrElse(false.B))
 
+        slice.io.pfTierBlocked := prefetcher.map(_.io.tierBlocked(i))
+          .getOrElse(VecInit(Seq.fill(7)(false.B)))
+
         slice.io.prefetch.zip(prefetcher).foreach {
           case (s, p) =>
             s.req.valid := p.io.req(i).valid
