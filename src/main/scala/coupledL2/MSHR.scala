@@ -264,6 +264,10 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
 
   assert(!(req_valid && req_prefetch && dirResult.hit), "MSHR can not receive prefetch hit req")
 
+  // Driven by the fast-drop logic below; declared here so task scheduling
+  // can suppress a same-cycle acquire fire.
+  val pfAbandonWire = Wire(Bool())
+
   /* ======== Task allocation ======== */
   // The first Release with AllowRetry = 1 is sent to main pipe, because the task needs to write DS.
   // The second Release with AllowRetry = 0 is sent to TXREQ directly, because DS is already written.
@@ -272,9 +276,9 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   val release_valid2 = !state.s_reissue.getOrElse(false.B) && !state.w_releaseack && gotRetryAck && gotPCrdGrant
   // Theoretically, data to be released is saved in ReleaseBuffer, so Acquire can be sent as soon as req enters mshr
   // For cmo_clean/flush, dirty data should be released downward first, then Clean req can be sent
-  io.tasks.txreq.valid := !state.s_acquire && !(cmo_cbo && (!state.w_rprobeacklast || !state.w_releaseack || !state.s_cmometaw || !state.s_cbwrdata.get)) || 
+  io.tasks.txreq.valid := (!state.s_acquire && !(cmo_cbo && (!state.w_rprobeacklast || !state.w_releaseack || !state.s_cmometaw || !state.s_cbwrdata.get)) ||
                           !state.s_reissue.getOrElse(false.B) && !state.w_grant && gotRetryAck && gotPCrdGrant ||
-                          release_valid2
+                          release_valid2) && !pfAbandonWire
   val rcompack_valid = !state.s_rcompack.get && state.w_grant &&
     // For issue B, CompAck must not be sent until all transfers of read data have been received.
     // For issue C and afterwards, CompAck is allowed to be sent after at least one CompData packet is received.
@@ -1307,7 +1311,9 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   // Only a prefetch with no in-flight side effect (acquire not sent, no
   // release or probe pending, replacement settled, no merged demand) may be
   // dropped; a dropped prefetch never reaches the NoC and is not useless.
-  val pfAbandon = req_valid && req_prefetch && !mergeA && !gotRetryAck &&
+  val pfEngIdx = PfConfidence.engIdx(req.reqSource)
+  val pfTierBlockedSel = pfEngIdx < PfConfidence.ENG_NUM.U && io.pfTierBlocked(pfEngIdx)
+  val pfAbandon = req_valid && req_prefetch && !mergeA && !io.aMergeTask.valid && !gotRetryAck &&
     !state.s_acquire &&
     state.s_release && state.w_releaseack &&
     state.s_rprobe && state.w_rprobeackfirst && state.w_rprobeacklast &&
@@ -1316,7 +1322,8 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     state.s_cbwrdata.getOrElse(true.B) && state.s_dct.getOrElse(true.B) &&
     state.s_reissue.getOrElse(true.B) && state.s_retry &&
     state.w_replResp &&
-    io.pfTierBlocked(PfConfidence.engIdx(req.reqSource))
+    pfTierBlockedSel
+  pfAbandonWire := pfAbandon
   io.pfAbandon := pfAbandon
   when (pfAbandon) {
     state.s_acquire := true.B
