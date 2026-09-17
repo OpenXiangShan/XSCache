@@ -92,6 +92,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     /* for TopDown */
     val l2Miss = Output(Bool())
     val aMshrFull = Output(Bool())
+    val pfTierBlocked = Input(Vec(7, Bool()))
   })
 
   /*MSHR allocation pointer gen -> to Mainpipe*/
@@ -136,6 +137,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   mshrs.zipWithIndex.foreach {
     case (m, i) =>
       m.io.id := i.U
+      m.io.pfTierBlocked := io.pfTierBlocked
       m.io.alloc.valid := selectedMSHROH(i) && io.fromMainPipe.mshr_alloc_s3.valid
       m.io.alloc.bits := io.fromMainPipe.mshr_alloc_s3.bits
       m.io.alloc.bits.task.isKeyword.foreach(_:= io.fromMainPipe.mshr_alloc_s3.bits.task.isKeyword.getOrElse(false.B))
@@ -236,6 +238,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
 
   /* Performance counters */
+  XSPerfAccumulate("mshr_pf_abandon", PopCount(mshrs.map(_.io.pfAbandon)))
   XSPerfAccumulate("capacity_conflict_to_sinkA", a_mshrFull)
   XSPerfAccumulate("capacity_conflict_to_sinkB", mshrFull)
   XSPerfHistogram("mshr_alloc", io.toMainPipe.mshr_alloc_ptr,

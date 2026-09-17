@@ -155,6 +155,16 @@ object PfConfidence {
     val minTier = (minTierPacked >> (nocTier * 3.U))(2, 0)
     !en || !tracked || tier >= minTier
   }
+
+  def engReqSource(e: Int): UInt = e match {
+    case 0 => MemReqSource.Prefetch2L2Stream.id.U
+    case 1 => MemReqSource.Prefetch2L2Stride.id.U
+    case 2 => MemReqSource.Prefetch2L2Berti.id.U
+    case 3 => MemReqSource.Prefetch2L2SMS.id.U
+    case 4 => MemReqSource.Prefetch2L2BOP.id.U
+    case 5 => MemReqSource.Prefetch2L2PBOP.id.U
+    case 6 => MemReqSource.Prefetch2L2TP.id.U
+  }
 }
 
 class PrefetchReq(implicit p: Parameters) extends PrefetchBundle {
@@ -259,6 +269,9 @@ class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
   val snCBusy = Input(UInt(3.W))
   val txreqHardStall = Input(Bool())
   val l2PfqBusy = Output(Bool())
+  // Per bank per engine: the engine's confidence tier is below the minimum
+  // tier of the current NoC busy tier of that bank.
+  val tierBlocked = Output(Vec(1 << bankBits, Vec(7, Bool())))
   val resp = Vec(banks, Flipped(DecoupledIO(new PrefetchResp)))
   val recv_addr = Flipped(ValidIO(new Bundle() {
     val addr = UInt(64.W)
@@ -312,6 +325,11 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   def confAdmit(pfSource: UInt, bank: Int): Bool = PfConfidence.admit(
     pfSource, nocTier(bank), confTierVec, confMinTier, confGateMask, confThrottleEn =/= 0.U
   )
+  for (i <- 0 until banks) {
+    io.tierBlocked(i) := VecInit((0 until PfConfidence.ENG_NUM).map { e =>
+      !confAdmit(PfConfidence.engReqSource(e), i)
+    })
+  }
   l2ToL1PfCtrl.streamDegree := streamDegree
   l2ToL1PfCtrl.strideDegree := strideDegree
   l2ToL1PfCtrl.bertiDegree := bertiDegree
