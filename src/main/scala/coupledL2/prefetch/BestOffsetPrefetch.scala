@@ -1197,7 +1197,10 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   reqFilter.io.in_req.bits.samePagePaddr := s1_newPaddr
   reqFilter.io.in_req.bits.pfConf := PfConfidence.scoreToTier(
     scoreTable.io.prefetchScore,
-    Constantin.createRecord("vbop_confThresh" + cacheParams.hartId.toString, initValue = 940486)
+    // t1=5, t2=12, t3=18, t4=27 packed as four 5-bit thresholds: protects
+    // mid-score phases of high-value streams at t3 while tier4 keeps the
+    // near-saturation phases; calibrate with cal_useful/cal_useless_t*
+    Constantin.createRecord("vbop_confThresh" + cacheParams.hartId.toString, initValue = 903557)
   )
 
   io.tlb_req <> reqFilter.io.tlb_req
@@ -1294,7 +1297,7 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     s1_req.source := io.train.bits.source
     s1_req.pfConf := PfConfidence.scoreToTier(
       scoreTable.io.prefetchScore,
-      Constantin.createRecord("pbop_confThresh" + cacheParams.hartId.toString, initValue = 940486)
+      Constantin.createRecord("pbop_confThresh" + cacheParams.hartId.toString, initValue = 903557)
     )
     s1_issueOffset := issueOffset.asSInt
     s1_req_valid := enable && !s0_crossPage && issueEnable // stop prefetch when prefetch req crosses pages
