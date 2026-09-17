@@ -89,6 +89,8 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   // For Intent
   val fromL2pft = prefetchOpt.map(_ => Bool()) // Is the prefetch req from L2(BOP) or from L1 prefetch?
                                           // If true, MSHR should send an ack to L2 prefetcher.
+  // request-level confidence tier carried with a prefetch task
+  val pfConf = prefetchOpt.map(_ => UInt(3.W))
   val needHint = prefetchOpt.map(_ => Bool())
   val cdpPfDepth = if (hasCDP) prefetchOpt.map(_ => UInt(cdpPfDepthBits.get.W)) else None
 
@@ -417,6 +419,8 @@ class L2ToL1PfCtrl extends Bundle {
   val strideDegree = UInt(2.W)
   val bertiDegree = UInt(2.W)
   val smsDegree = UInt(2.W)
+  // NoC busy tier (max over banks) fed back for L1 prefetch issue gating
+  val nocTier = UInt(2.W)
 }
 
 object L2ToL1PfCtrl {
@@ -426,6 +430,7 @@ object L2ToL1PfCtrl {
     ctrl.strideDegree := 1.U
     ctrl.bertiDegree := 1.U
     ctrl.smsDegree := 1.U
+    ctrl.nocTier := 0.U
     ctrl
   }
 }

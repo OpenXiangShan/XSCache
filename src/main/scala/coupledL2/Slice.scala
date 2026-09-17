@@ -243,7 +243,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   )
   io.l2Miss := mshrCtl.io.l2Miss
   io.aMshrFull := mshrCtl.io.aMshrFull
-  mshrCtl.io.pfTierBlocked := io.pfTierBlocked
+  mshrCtl.io.pfMinTier := io.pfMinTier
 
   /* Connect upwards channels */
   val inBuf = cacheParams.innerBuf

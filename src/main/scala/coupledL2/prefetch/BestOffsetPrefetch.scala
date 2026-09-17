@@ -280,6 +280,8 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
     val phaseEndPulse = Output(Bool())
     val phaseBestOffsetCommitted = Output(UInt(offsetWidth.W))
     val phaseIssueEnable = Output(Bool())
+    // score of the current best offset: the request-level prior confidence
+    val prefetchScore = Output(UInt(scoreBits.W))
     val test = new TestOffsetBundle
   })
 
@@ -374,6 +376,7 @@ class OffsetScoreTable(name: String = "")(implicit p: Parameters) extends BOPMod
 
   io.req.ready := state === s_learn
   io.prefetchOffset := prefetchOffset
+  io.prefetchScore := bestScore
   io.prefetchDisable := prefetchDisable
   io.phaseEndPulse := RegNext(phaseEndCommit, false.B)
   io.phaseBestOffsetCommitted := phaseBestOffset
@@ -772,6 +775,8 @@ class BopReqBundle(implicit p: Parameters) extends BOPBundle{
   val issueOffset = SInt(offsetWidth.W)
   val samePagePaddrValid = Bool()
   val samePagePaddr = UInt(fullAddressBits.W)
+  // request-level confidence tier sampled from the score table at generation
+  val pfConf = UInt(3.W)
 }
 
 class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
@@ -785,6 +790,7 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
   val issueOffset = SInt(offsetWidth.W)
+  val pfConf = UInt(3.W)
 
   def fromBopReqBundle(req: BopReqBundle) = {
     vaddrNoOffset := get_block_addr(req.full_vaddr)
@@ -798,6 +804,7 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
     needT := req.needT
     source := req.source
     issueOffset := req.issueOffset
+    pfConf := req.pfConf
   }
 
   def toPrefetchReq(): PrefetchReq = {
@@ -809,6 +816,7 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
     req.source := source
     req.pfSource := MemReqSource.Prefetch2L2BOP.id.U
     req.cdpPfDepth.foreach(_ := 0.U)
+    req.pfConf := pfConf
     req
   }
 
@@ -1187,6 +1195,10 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   reqFilter.io.in_req.bits.issueOffset := s1_issueOffset
   reqFilter.io.in_req.bits.samePagePaddrValid := s1_samePagePaddrValid
   reqFilter.io.in_req.bits.samePagePaddr := s1_newPaddr
+  reqFilter.io.in_req.bits.pfConf := PfConfidence.scoreToTier(
+    scoreTable.io.prefetchScore,
+    Constantin.createRecord("vbop_confThresh" + cacheParams.hartId.toString, initValue = 940486)
+  )
 
   io.tlb_req <> reqFilter.io.tlb_req
   io.req <> reqFilter.io.out_req
@@ -1280,6 +1292,10 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     s1_req.set := parseFullAddress(s0_newAddr)._2
     s1_req.needT := io.train.bits.needT
     s1_req.source := io.train.bits.source
+    s1_req.pfConf := PfConfidence.scoreToTier(
+      scoreTable.io.prefetchScore,
+      Constantin.createRecord("pbop_confThresh" + cacheParams.hartId.toString, initValue = 940486)
+    )
     s1_issueOffset := issueOffset.asSInt
     s1_req_valid := enable && !s0_crossPage && issueEnable // stop prefetch when prefetch req crosses pages
   }.elsewhen(s1_fire) {
