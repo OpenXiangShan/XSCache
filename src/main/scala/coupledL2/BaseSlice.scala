@@ -44,7 +44,8 @@ abstract class BaseSliceIO[T_OUT <: BaseOuterBundle](implicit p: Parameters) ext
   val aMshrFull = Output(Bool())
   // Per prefetch engine: confidence tier is below the busy threshold of the
   // bank this slice talks to, so a queued low-tier prefetch may be dropped.
-  val pfTierBlocked = Input(Vec(7, Bool()))
+  // per-engine minimum confidence tier admitted under current NoC pressure
+  val pfMinTier = Input(Vec(7, UInt(3.W)))
   val l2Flush = Option.when(cacheParams.enableL2Flush) (Input(Bool()))
   val l2FlushDone = Option.when(cacheParams.enableL2Flush) (Output(Bool()))
   // statistics

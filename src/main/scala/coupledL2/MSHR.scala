@@ -20,7 +20,7 @@ package xscache.coupledL2
 import chisel3._
 import chisel3.util._
 import xscache.coupledL2.MetaData._
-import utility.{MemReqSource, ParallelLookUp, ParallelMux, ParallelPriorityMux, XSPerfAccumulate}
+import utility.{Constantin, MemReqSource, ParallelLookUp, ParallelMux, ParallelPriorityMux, XSPerfAccumulate}
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLPermissions._
@@ -63,7 +63,9 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     val aMergeTask = Flipped(ValidIO(new TaskBundle))
     val replResp = Flipped(ValidIO(new ReplacerResult))
     val pCrd = new PCrdQueryBundle
-    val pfTierBlocked = Input(Vec(7, Bool()))
+    // per-engine minimum confidence tier admitted under current NoC pressure;
+    // 0 for ungated engines so their requests are never abandoned
+    val pfMinTier = Input(Vec(7, UInt(3.W)))
     val pfAbandon = Output(Bool())
   })
 
@@ -804,6 +806,7 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
       alias = Some(aliasFinal),
       prefetch = req_prefetch || dirResult.hit && meta_pft,
       pfsrc = PfSource.fromMemReqSource(req.reqSource),
+      pfconf = req.pfConf.getOrElse(0.U),
       accessed = req_acquire || req_get,
       cdpPfDepth = req.cdpPfDepth.getOrElse(0.U)
     )
@@ -1311,8 +1314,14 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   // Only a prefetch with no in-flight side effect (acquire not sent, no
   // release or probe pending, replacement settled, no merged demand) may be
   // dropped; a dropped prefetch never reaches the NoC and is not useless.
+  val confDecayShift = Constantin.createRecord(s"l2pf_confDecayShift${cacheParams.hartId}", initValue = 10)
   val pfEngIdx = PfConfidence.engIdx(req.reqSource)
-  val pfTierBlockedSel = pfEngIdx < PfConfidence.ENG_NUM.U && io.pfTierBlocked(pfEngIdx)
+  val pfAge = timer >> confDecayShift(5, 0)
+  val pfDecay = Mux(pfAge > PfConfidence.TIER_MAX.U, PfConfidence.TIER_MAX.U, pfAge(2, 0))
+  val pfConfRaw = req.pfConf.getOrElse(0.U)
+  val pfEffTier = Mux(pfConfRaw > pfDecay, pfConfRaw - pfDecay, 0.U)
+  val pfTierBlockedSel = pfEngIdx < PfConfidence.ENG_NUM.U &&
+    pfEffTier < io.pfMinTier(pfEngIdx)
   val pfAbandon = req_valid && req_prefetch && !mergeA && !io.aMergeTask.valid && !gotRetryAck &&
     !state.s_acquire &&
     state.s_release && state.w_releaseack &&

@@ -92,7 +92,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     /* for TopDown */
     val l2Miss = Output(Bool())
     val aMshrFull = Output(Bool())
-    val pfTierBlocked = Input(Vec(7, Bool()))
+    // per-engine minimum confidence tier admitted under current NoC pressure
+    val pfMinTier = Input(Vec(7, UInt(3.W)))
   })
 
   /*MSHR allocation pointer gen -> to Mainpipe*/
@@ -137,7 +138,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   mshrs.zipWithIndex.foreach {
     case (m, i) =>
       m.io.id := i.U
-      m.io.pfTierBlocked := io.pfTierBlocked
+      m.io.pfMinTier := io.pfMinTier
       m.io.alloc.valid := selectedMSHROH(i) && io.fromMainPipe.mshr_alloc_s3.valid
       m.io.alloc.bits := io.fromMainPipe.mshr_alloc_s3.bits
       m.io.alloc.bits.task.isKeyword.foreach(_:= io.fromMainPipe.mshr_alloc_s3.bits.task.isKeyword.getOrElse(false.B))

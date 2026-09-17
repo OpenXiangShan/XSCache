@@ -560,6 +560,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     clients = Fill(clientBits, Mux(l2Error_s3, false.B, true.B)),
     alias = Some(metaW_s3_a_alias),
     pfsrc = meta_s3.prefetchSrc.getOrElse(0.U),
+    pfconf = meta_s3.prefetchConf.getOrElse(0.U),
     accessed = true.B,
     tagErr = metaOnHit_s3.tagErr,
     dataErr = metaOnHit_s3.dataErr,
@@ -575,6 +576,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       tagErr = metaOnHit_s3.tagErr,
       dataErr = metaOnHit_s3.dataErr,
       pfsrc = metaOnHit_s3.prefetchSrc.getOrElse(0.U),
+      pfconf = metaOnHit_s3.prefetchConf.getOrElse(0.U),
       cdpPfDepth = metaOnHit_s3.cdpPfDepth.getOrElse(0.U)
     )
   )
@@ -587,6 +589,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     tagErr = Mux(wen_c, req_s3.denied, metaOnHit_s3.tagErr),
     dataErr = Mux(wen_c, req_s3.corrupt, metaOnHit_s3.dataErr), // update error when write DS
     pfsrc = metaOnHit_s3.prefetchSrc.getOrElse(0.U),
+    pfconf = metaOnHit_s3.prefetchConf.getOrElse(0.U),
     cdpPfDepth = metaOnHit_s3.cdpPfDepth.getOrElse(0.U)
   )
 
@@ -726,6 +729,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     u.bits.reqSource := req_s3.reqSource
     u.bits.victimPAddr := Cat(io.replResp.bits.tag, req_s3.set, 0.U(offsetBits.W))
     u.bits.victimPfSource := io.replResp.bits.meta.prefetchSrc.getOrElse(PfSource.NoWhere.id.U)
+    u.bits.victimPfConf := io.replResp.bits.meta.prefetchConf.getOrElse(0.U)
   }
 
   io.prefetchTrain.foreach {

@@ -11,6 +11,8 @@ class ReplaceBundle()(implicit p: Parameters) extends L2Bundle {
   val reqSource = UInt(MemReqSource.reqSourceBits.W)
   val victimPAddr = UInt(fullAddressBits.W)
   val victimPfSource = UInt(PfSource.pfSourceBits.W)
+  // request-level confidence tier of the evicted prefetch block
+  val victimPfConf = UInt(3.W)
 }
 
 class DemandRefillBundle()(implicit p: Parameters) extends L2Bundle {
@@ -505,6 +507,22 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
     }
   }
   io.confTier := confTierVec
+
+  // Per-tier calibration for the request-level confidence of VBOP/PBOP:
+  // useful (demand or L1 prefetch hit on a prefetched block, attributed by
+  // the tier recorded in the directory meta) and useless (prefetched block
+  // evicted untouched, attributed by the victim tier). Compare against the
+  // pftq_issue_*_t* counters of the Prefetcher to get the measured accuracy
+  // of each tier and to tune the score-to-tier thresholds.
+  for (i <- Seq(4, 5)) {
+    for (t <- 0 until 5) {
+      XSPerfAccumulate(s"cal_useful_${PF_NAME_VEC(i)}_t$t", PopCount((0 until banks).map(s =>
+        (c0_statDemandCacheHitVec(i)(s) || c0_statL1PrefetchCacheHitVec(i)(s)) &&
+          dirResult(s).bits.meta.prefetchConf.getOrElse(0.U) === t.U)))
+      XSPerfAccumulate(s"cal_useless_${PF_NAME_VEC(i)}_t$t", PopCount((0 until banks).map(s =>
+        c0_statPfUselessVec(i)(s) && replaceRecord(s).bits.victimPfConf === t.U)))
+    }
+  }
 
   // record for debug //
   val statVecInit = VecInit(Seq.fill(PF_NUM)(VecInit(Seq.fill(banks)(false.B))))
