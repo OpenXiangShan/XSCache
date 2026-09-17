@@ -111,6 +111,52 @@ trait HasPrefetcherHelper extends HasCircularQueuePtrHelper with HasCoupledL2Par
   }
 }
 
+/* Per-engine prefetch confidence tier admission.
+ *
+ * The PrefetchController measures a 5-level accuracy tier per prefetch
+ * engine (0 <25%, 1 <50%, 2 <75%, 3 <90%, 4 >=90%). The NoC pressure tier is
+ * the CHI E.b CBusy[1:0] level of the target bank folded with the SN hint
+ * (0 <50%, 1 <75%, 2 <90%, 3 >=90%). A packed per-NoC-tier minimum confidence
+ * tier decides admission:
+ *   nocTier 0 (<50%): admit every prefetch (minTier 0)
+ *   nocTier 1 (<75%): admit accuracy >= 50% (minTier 2)
+ *   nocTier 2 (<90%): admit accuracy >= 75% (minTier 3)
+ *   nocTier 3 (>=90%): admit accuracy >= 90% (minTier 4)
+ * L1 engines (Stream/Stride/Berti/SMS) and NL bypass the gate: their L2-level
+ * useless accounting is biased, they are throttled by L1-side accuracy.
+ */
+object PfConfidence {
+  val ENG_NUM = 7
+  val TIER_MAX = 4
+
+  def engIdx(pfSource: UInt): UInt = {
+    MuxLookup(pfSource, ENG_NUM.U)(Seq(
+      MemReqSource.Prefetch2L2Stream.id.U -> 0.U,
+      MemReqSource.Prefetch2L2Stride.id.U -> 1.U,
+      MemReqSource.Prefetch2L2Berti.id.U  -> 2.U,
+      MemReqSource.Prefetch2L2SMS.id.U    -> 3.U,
+      MemReqSource.Prefetch2L2BOP.id.U    -> 4.U,
+      MemReqSource.Prefetch2L2PBOP.id.U   -> 5.U,
+      MemReqSource.Prefetch2L2TP.id.U     -> 6.U
+    ))
+  }
+
+  def admit(
+    pfSource: UInt,
+    nocTier: UInt,
+    confTier: Vec[UInt],
+    minTierPacked: UInt,
+    gateMask: UInt,
+    en: Bool
+  ): Bool = {
+    val idx = engIdx(pfSource)
+    val tracked = idx < ENG_NUM.U && gateMask(idx)
+    val tier = Mux(idx < ENG_NUM.U, confTier(idx), TIER_MAX.U)
+    val minTier = (minTierPacked >> (nocTier * 3.U))(2, 0)
+    !en || !tracked || tier >= minTier
+  }
+}
+
 class PrefetchReq(implicit p: Parameters) extends PrefetchBundle {
   val tag = UInt(fullTagBits.W)
   val set = UInt(setBits.W)
@@ -249,23 +295,30 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val pbopDegree = prefetchController.io.l2PfFbCtrl.pbopDegree
   val tpDegree = prefetchController.io.l2PfFbCtrl.tpDegree
 
-  // CHI E.b CBusy[1:0]: 00 <50%, 01 >50%, 10 >75%, 11 >90%.
-  // HN hint is per-bank; SN hint is global because DMT CompData comes from SN.
-  val bankCBusy = io.hnCBusy.map(_(1, 0))
-  val bankFarOff = RegInit(VecInit(Seq.fill(banks)(false.B)))
-  val snFarOff = RegInit(false.B)
+  // NoC pressure tier per bank: CHI E.b CBusy[1:0] of the target bank HN
+  // folded with the global SN hint (00 <50%, 01 >50%, 10 >75%, 11 >90%).
+  val confTierVec = prefetchController.io.confTier
+  val confThrottleEn = Constantin.createRecord(s"l2pf_confThrottle$hartId", initValue = 1)
+  // Packed 4x3-bit minimum confidence tier per NoC tier: 0, 2, 3, 4.
+  val confMinTier = Constantin.createRecord(s"l2pf_confMinTier$hartId", initValue = 2256)
+  // Gate only L2 native engines (VBOP/PBOP/TP); L1 engines bypass.
+  val confGateMask = Constantin.createRecord(s"l2pf_confGateMask$hartId", initValue = 112)
+  val nocTier = RegInit(VecInit(Seq.fill(banks)(0.U(2.W))))
   for (i <- 0 until banks) {
-    when(bankCBusy(i) >= 2.U) { bankFarOff(i) := true.B }.elsewhen(bankCBusy(i) <= 1.U) { bankFarOff(i) := false.B }
+    val hnTier = io.hnCBusy(i)(1, 0)
+    val snTier = io.snCBusy(1, 0)
+    nocTier(i) := Mux(hnTier > snTier, hnTier, snTier)
   }
-  when(io.snCBusy(1, 0) >= 2.U) { snFarOff := true.B }.elsewhen(io.snCBusy(1, 0) <= 1.U) { snFarOff := false.B }
-  val pftFarOff = VecInit(bankFarOff.map(_ || snFarOff))
+  def confAdmit(pfSource: UInt, bank: Int): Bool = PfConfidence.admit(
+    pfSource, nocTier(bank), confTierVec, confMinTier, confGateMask, confThrottleEn =/= 0.U
+  )
   l2ToL1PfCtrl.streamDegree := streamDegree
   l2ToL1PfCtrl.strideDegree := strideDegree
   l2ToL1PfCtrl.bertiDegree := bertiDegree
   l2ToL1PfCtrl.smsDegree := smsDegree
-  XSPerfAccumulate("pftq_cbusy_stall", PopCount(pftFarOff))
-  XSPerfAccumulate("pftq_hn_faroff", PopCount(bankFarOff))
-  XSPerfAccumulate("pftq_sn_faroff", snFarOff)
+  for (t <- 0 until 4) {
+    XSPerfAccumulate(s"pftq_noctier$t", PopCount(nocTier.map(_ === t.U)))
+  }
 
   val pfRcv_en = RegNextN(pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pf_recv_en, 2, Some(true.B))
   val pbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pbop_en
@@ -311,7 +364,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   }
   val l2Hard = l2HardCnt >= 2.U
   stashPrefetcher.io.recv := io.l3_recv
-  stashPrefetcher.io.allow := VecInit(pftFarOff.map(off => !off && !l2Hard))
+  stashPrefetcher.io.allow := VecInit(nocTier.map(t => t < 2.U && !l2Hard))
   XSPerfAccumulate("pftq_l2hard", l2Hard)
   io.stash_txreq <> stashPrefetcher.io.txreq
   stashPrefetcher.io.rxrsp <> io.stash_rxrsp
@@ -508,6 +561,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val pipe = Seq.tabulate(banks) { _ => Module(new Pipeline(new PrefetchReq, 1)) }
   val select = Wire(Vec(banks, Vec(SRC_NUM, Bool())))
   val selectOH = Wire(Vec(banks, Vec(SRC_NUM, Bool())))
+  val dropVecAll = Wire(Vec(banks, Vec(SRC_NUM, Bool())))
   io.l2PfqBusy := VecInit(pftQueue.map(_.io.full)).asUInt.orR
 
   for (i <- 0 until banks) {
@@ -521,40 +575,46 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
       tpDegree.orR,
       false.B
     )
-    select(i) := VecInit(reqsValid.zip(reqsSetAddr).zip(reqsAllowed).map {
-      case ((valid, addr), allowed) => valid && allowed && bank_eq(addr, i, bankBits)
+    // Admit by confidence tier at enqueue. A blocked prefetch is acknowledged
+    // and discarded so the source engine never holds it head-of-line; the
+    // drop is counted as not served, not as useless.
+    val admitVec = reqsBits.map(b => confAdmit(b.pfSource, i))
+    select(i) := VecInit(reqsValid.zip(reqsSetAddr).zip(reqsAllowed).zip(admitVec).map {
+      case (((valid, addr), allowed), admit) => valid && allowed && admit && bank_eq(addr, i, bankBits)
+    })
+    dropVecAll(i) := VecInit(reqsValid.zip(reqsSetAddr).zip(reqsAllowed).zip(admitVec).map {
+      case (((valid, addr), allowed), admit) => valid && allowed && !admit && bank_eq(addr, i, bankBits)
     })
     selectOH(i) := VecInit(PriorityEncoderOH(select(i).asUInt).asBools)
     pftQueue(i).io.enq.valid := select(i).asUInt.orR
     pftQueue(i).io.enq.bits := ParallelPriorityMux(select(i).asUInt, reqsBits)
-    pipe(i).io.in.valid := pftQueue(i).io.deq.valid && !pftFarOff(i)
+    // Re-check the tier at dequeue and discard instead of holding: a queued
+    // prefetch whose tier fell below the busy bank threshold is dropped fast
+    // so it cannot keep occupying NoC/L2 resources.
+    val deqAdmit = confAdmit(pftQueue(i).io.deq.bits.pfSource, i)
+    pipe(i).io.in.valid := pftQueue(i).io.deq.valid && deqAdmit
     pipe(i).io.in.bits := pftQueue(i).io.deq.bits
-    pftQueue(i).io.deq.ready := pipe(i).io.in.ready && !pftFarOff(i)
+    pftQueue(i).io.deq.ready := Mux(deqAdmit, pipe(i).io.in.ready, true.B)
     io.req(i) <> pipe(i).io.out
+    XSPerfAccumulate(s"pftq_enq_drop_bank$i", PopCount(dropVecAll(i)))
+    XSPerfAccumulate(s"pftq_deq_drop_bank$i", pftQueue(i).io.deq.valid && !deqAdmit)
   }
-  val pftqDeqHold = VecInit((0 until banks).map { i =>
-    pftQueue(i).io.deq.valid && pftFarOff(i)
-  })
   val pftqOverwrite = VecInit((0 until banks).map { i =>
     pftQueue(i).io.full && pftQueue(i).io.enq.fire && !pftQueue(i).io.deq.fire
   })
   val pftqIssueFire = VecInit((0 until banks).map { i =>
     pipe(i).io.in.fire
   })
-  val pftFarOffPrev = RegNext(pftFarOff, VecInit(Seq.fill(banks)(false.B)))
-  val pftqReleaseBurst = VecInit((0 until banks).map { i =>
-    pftFarOffPrev(i) && !pftFarOff(i) && pftQueue(i).io.deq.valid
-  })
-  XSPerfAccumulate("pftq_deq_hold", PopCount(pftqDeqHold))
   XSPerfAccumulate("pftq_full", PopCount(VecInit(pftQueue.map(_.io.full))))
   XSPerfAccumulate("pftq_enq_fire", PopCount(VecInit(pftQueue.map(_.io.enq.fire))))
   XSPerfAccumulate("pftq_overwrite", PopCount(pftqOverwrite))
   XSPerfAccumulate("pftq_issue_fire", PopCount(pftqIssueFire))
-  XSPerfAccumulate("pftq_release_burst", PopCount(pftqReleaseBurst))
 
   for ((reqOpt, j) <- reqs.zipWithIndex) {
     reqOpt.foreach { req =>
-      req.ready := (0 until banks).map(i => selectOH(i)(j)).reduce(_ || _)
+      val enqAck = (0 until banks).map(i => selectOH(i)(j)).reduce(_ || _)
+      val dropAck = (0 until banks).map(i => dropVecAll(i)(j)).reduce(_ || _)
+      req.ready := enqAck || dropAck
     }
   }
 
