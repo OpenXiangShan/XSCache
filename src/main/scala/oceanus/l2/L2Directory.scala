@@ -496,6 +496,14 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val entry_s3 = dirData_s3(way_s3)
   val metaValid = (s3_isDirRd && hit_s3) || (s3_isRepl && !replRetry)
 
+  // An Invalid entry must never carry client presence: (I, clients!=0) means a live client
+  // copy orphaned from the directory (inclusion breach). Readers rely on state==I implying
+  // no eviction work -- the REQ vPipe's evict_victim_invalid skip consumes this on ReplRd.
+  when (s3_valid && metaValid) {
+    assert(!(entry_s3.meta.state === L2Directory.MetaState.I && entry_s3.meta.clients.asUInt.orR),
+      "Directory: read response entry is Invalid but carries client presence")
+  }
+
   val plruWen = (s3_valid && s3_isDirRd && hit_s3) ||
                 (s3_valid && s3_isRepl && !replRetry)
   when(plruWen) {

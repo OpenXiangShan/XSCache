@@ -85,6 +85,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     val repl_retry = Input(Bool())
     val repl_done = Input(Bool())
     val repl_resp = Input(new L2Directory.ReplReadResult)
+    val repl_meta = Input(new L2Directory.Meta)   // victim way meta latched at ReplRdResp
 
     val dir_wb_locked = Output(Bool())
     val dir_wb_cancel = Output(Bool())
@@ -1428,14 +1429,25 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // unlocks never fire -- a circular wait inside one entry. The aliasing itself proves the
   // victim way is invalid (a valid way holding this tag would have hit the directory), so no
   // eviction is needed: skip the upstream EvictBack and unlock dir/ds locally.
+  // NEW: same for a victim that reads Invalid at ReplRd: nothing exists downstream to evict,
+  // so the looped-back EvictBack is pure overhead -- and it can deadlock: the EvictBack must
+  // nest into the TSHR holding the victim PA, which may itself be parked on an unbounded
+  // downstream wait (s7118: the victim-PA TSHR's hit-MU starved at L3 while this refill's
+  // blockRefill lock stayed armed, zeroing the set's victimMask). The Directory guarantees an
+  // invalid locked entry stays invalid until this refill's own commit (invalid entries cannot
+  // be hit-modified; the lock keeps other refills off the way), and an Invalid entry never
+  // carries client presence (guarded by a Directory read-response assertion), so the pick-time
+  // read cannot go stale in the unsafe direction.
   val evict_self_alias = io.repl_resp.paddr === io.tshr_paddr
+  val evict_victim_invalid = io.repl_meta.state === MetaState.I
+  val evict_not_needed = evict_self_alias || evict_victim_invalid
 
   when (io.repl_done) {
     p_prefill := false.B
     s_repl := false.B
     when (w_s_evict_up_evict) {
       w_s_evict_up_evict := false.B
-      s_evict_up_evict := !evict_self_alias
+      s_evict_up_evict := !evict_not_needed
     }
   }
 
@@ -1447,10 +1459,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val lock_ds = (p_prefill && io.repl_done) || rxevb_unsatisfied_evictback
 
   val unlock_self_evictback = RegNext(meta_wr_state_evictback_I) && !meta_wr_state_evictback_I
-  val unlock_self_alias = RegNext(io.repl_done && w_s_evict_up_evict && evict_self_alias)
+  val unlock_self_noevict = RegNext(io.repl_done && w_s_evict_up_evict && evict_not_needed)
 
-  val unlock_dir = io.self_unlock_dir || unlock_self_evictback || unlock_self_alias
-  val unlock_ds = io.self_unlock_ds || unlock_self_evictback || unlock_self_alias
+  val unlock_dir = io.self_unlock_dir || unlock_self_evictback || unlock_self_noevict
+  val unlock_ds = io.self_unlock_ds || unlock_self_evictback || unlock_self_noevict
 
   when (lock_dir) {
     w_unlock_dir := true.B
@@ -1490,12 +1502,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //    of 'meta_wr_state_evictback_I', which is itself a 'dir_wb_cancel' source, so the EVB host's
   //    pending invalidate is cancelled and there is never committed work left for the aux to trigger;
   //    re-arming on it manufactured a phantom (empty) DirWb that collided with a nested refill's
-  //    ReplRd (seed 3019). 'unlock_self_alias' is kept: its pulse always has the refill's locked
+  //    ReplRd (seed 3019). 'unlock_self_noevict' is kept: its pulse always has the refill's locked
   //    commit pending, and it is the only prompt trigger once 'expect_replace' has cleared.
   // 2. Trigger Directory write-back immediately on refill transactions to commit the un-committed 
   //    I state into Directory on reuse.
   // 3. Trigger Directory write-back immediately on EvictBack to commit the un-commited meta.
-  io.dir_wb_aux := io.self_unlock_dir || unlock_self_alias ||
+  io.dir_wb_aux := io.self_unlock_dir || unlock_self_noevict ||
                    ((io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept && expect_replace) ||
                    ((io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept && rxevb_satisfied_evictback)
 
