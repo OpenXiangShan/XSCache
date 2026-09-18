@@ -197,10 +197,7 @@ class PrefetchIO(implicit p: Parameters) extends PrefetchBundle {
   val tlb_req = new L2ToL1TlbIO(nRespDups= 1)
   val req = DecoupledIO(new PrefetchReq)
   val resp = Flipped(DecoupledIO(new PrefetchResp))
-  val recv_addr = Flipped(ValidIO(new Bundle() {
-    val addr = UInt(64.W)
-    val pfSource = UInt(MemReqSource.reqSourceBits.W)
-  }))
+  val recv_addr = Flipped(ValidIO(new PrefetchRecvAddr))
 }
 
 class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
@@ -210,10 +207,7 @@ class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
   val stash_txreq = DecoupledIO(new CHIREQ)
   val stash_rxrsp = Flipped(DecoupledIO(new CHIRSP))
   val resp = Vec(banks, Flipped(DecoupledIO(new PrefetchResp)))
-  val recv_addr = Flipped(ValidIO(new Bundle() {
-    val addr = UInt(64.W)
-    val pfSource = UInt(MemReqSource.reqSourceBits.W)
-  }))
+  val recv_addr = Flipped(ValidIO(new PrefetchRecvAddr))
   val l3_recv = Input(new PrefetchRecv)
 }
 
@@ -345,6 +339,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   // prefetch from upper level
   val pfRcv = if (hasReceiver) Some(Module(new PrefetchReceiver())) else None
+  // store prefetch from upper level (L1 store buffer)
+  val storePfBuf = Module(new StorePrefetchBuffer)
 
   val train = Wire(DecoupledIO(new PrefetchTrain))
   val resp = Wire(DecoupledIO(new PrefetchResp))
@@ -388,13 +384,26 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   }
   if (hasReceiver) {
     pfRcv.get.io.enable := pfRcv_en
-    pfRcv.get.io.recv_addr := ValidIODelay(io.recv_addr, 2)
+    val recvAddrDelayed = ValidIODelay(io.recv_addr, 2)
+    val isStorePfRecv = recvAddrDelayed.bits.pfSource === MemReqSource.Prefetch2L2Store.id.U
+    // store prefetch requests are filtered out here and go to the store prefetch
+    // mini buffer instead of the normal prefetch request path
+    pfRcv.get.io.recv_addr.valid := recvAddrDelayed.valid && !isStorePfRecv
+    pfRcv.get.io.recv_addr.bits := recvAddrDelayed.bits
+    storePfBuf.io.enable := pfRcv_en
+    storePfBuf.io.in.valid := recvAddrDelayed.valid && isStorePfRecv
+    storePfBuf.io.in.bits.addr := recvAddrDelayed.bits.addr
+    storePfBuf.io.in.bits.mask := recvAddrDelayed.bits.mask
     assert(!pfRcv.get.io.req.valid ||
       pfRcv.get.io.req.bits.pfSource === MemReqSource.Prefetch2L2SMS.id.U ||
       pfRcv.get.io.req.bits.pfSource === MemReqSource.Prefetch2L2Stream.id.U ||
       pfRcv.get.io.req.bits.pfSource === MemReqSource.Prefetch2L2Stride.id.U ||
       pfRcv.get.io.req.bits.pfSource === MemReqSource.Prefetch2L2Berti.id.U
     )
+  } else {
+    storePfBuf.io.enable := false.B
+    storePfBuf.io.in.valid := false.B
+    storePfBuf.io.in.bits := DontCare
   }
 
   if (hasNLPrefetcher) {
@@ -446,15 +455,18 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   // =================== Connection of all Prefetchers =====================
   /* prefetchers -> pftQueue -> pipe -> Slices.SinkA */
-  private val SRC_NUM = 6
-  private val Seq(rcv_idx, nl_idx, vbop_idx, pbop_idx, tp_idx, cdp_idx) = (0 until SRC_NUM).toSeq
+  // NOTE: the store prefetch buffer is the last source, so it has the lowest
+  // priority and never steals bandwidth from the load prefetchers
+  private val SRC_NUM = 7
+  private val Seq(rcv_idx, nl_idx, vbop_idx, pbop_idx, tp_idx, cdp_idx, store_idx) = (0 until SRC_NUM).toSeq
   val reqs = Seq(
     if (hasReceiver) Some(pfRcv.get.io.req) else None,
     if (hasNLPrefetcher) Some(nl.get.io.req) else None,
     if (hasBOP) Some(vbop.get.io.req) else None,
     if (hasBOP) Some(pbop.get.io.req) else None,
     if (hasTPPrefetcher) Some(tp.get.io.req) else None,
-    if (hasCDP) Some(cdp.get.io.pftReq) else None
+    if (hasCDP) Some(cdp.get.io.pftReq) else None,
+    Some(storePfBuf.io.req)
   )
   val reqsValid = reqs.map(_.map(_.valid).getOrElse(false.B))
   val reqsBits = reqs.map(_.map(_.bits).getOrElse(0.U.asTypeOf(new PrefetchReq)))
@@ -475,6 +487,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     vbopDegree.orR,
     pbopDegree.orR,
     tpDegree.orR,
+    true.B,
     true.B
   )
 
@@ -508,6 +521,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   XSPerfAccumulate("prefetch_req_fromTP", reqsValid(tp_idx))
   XSPerfAccumulate("prefetch_req_fromNL", reqsValid(nl_idx))
   XSPerfAccumulate("prefetch_req_fromCDP", reqsValid(cdp_idx))
+  XSPerfAccumulate("prefetch_req_fromStore", reqsValid(store_idx))
 
   XSPerfAccumulate("prefetch_req_selectL1", reqsFire(rcv_idx))
   XSPerfAccumulate("prefetch_req_selectVBOP", reqsFire(vbop_idx))
@@ -516,6 +530,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   XSPerfAccumulate("prefetch_req_selectTP", reqsFire(tp_idx))
   XSPerfAccumulate("prefetch_req_selectNL", reqsFire(nl_idx))
   XSPerfAccumulate("prefetch_req_selectCDP", reqsFire(cdp_idx))
+  XSPerfAccumulate("prefetch_req_selectStore", reqsFire(store_idx))
   XSPerfAccumulate("prefetch_req_SMS_other_overlapped",
     reqsValid(rcv_idx) &&
       (reqsValid(vbop_idx) || reqsValid(pbop_idx) || reqsValid(tp_idx) || reqsValid(nl_idx) || reqsValid(cdp_idx))

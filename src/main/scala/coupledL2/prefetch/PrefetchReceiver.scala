@@ -36,10 +36,7 @@ case class PrefetchReceiverParams(n: Int = 32) extends PrefetchParameters {
 class PrefetchReceiver()(implicit p: Parameters) extends PrefetchModule {
   val io = IO(new Bundle {
     val enable = Input(Bool())
-    val recv_addr = Flipped(ValidIO(new Bundle() {
-      val addr = UInt(64.W)
-      val pfSource = UInt(MemReqSource.reqSourceBits.W)
-    }))
+    val recv_addr = Flipped(ValidIO(new PrefetchRecvAddr))
     val req = DecoupledIO(new PrefetchReq)
    })
 

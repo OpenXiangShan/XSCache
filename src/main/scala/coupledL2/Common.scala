@@ -399,8 +399,18 @@ class PrefetchCtrlFromCore extends Bundle {
 class PrefetchRecv extends Bundle {
   val addr = UInt(64.W)
   val pf_source = UInt(MemReqSource.reqSourceBits.W)
+  // 64B line byte mask, only meaningful for the store-sourced prefetch
+  // (L1 store prefetch). Other sources leave it as 0.
+  val mask = UInt(64.W)
   val addr_valid = Bool()
   val pf_en = Bool()
+}
+
+// L2 internal prefetch receive address
+class PrefetchRecvAddr extends Bundle {
+  val addr = UInt(64.W)
+  val pfSource = UInt(MemReqSource.reqSourceBits.W)
+  val mask = UInt(64.W)
 }
 
 // custom l2 - l1 prefetch control interface
