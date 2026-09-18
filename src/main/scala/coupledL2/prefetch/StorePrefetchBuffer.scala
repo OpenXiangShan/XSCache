@@ -46,16 +46,25 @@ import xscache.coupledL2.utils._
   * earlier, which is where the timeliness of this prefetch comes from.
   */
 class StorePrefetchBuffer(implicit p: Parameters) extends PrefetchModule {
-  // capacity: 64B * 8, smaller than the L1 store buffer (64B * 16)
-  val SIZE = 8
+  // capacity: 64B * 4, leaving several entries of lead time before the
+  // default 9-entry Sbuffer replacement threshold is reached
+  val SIZE = 4
   val IN_FIFO_SIZE = 4
   val VICTIM_FIFO_SIZE = 4
+  val SHADOW_SIZE = 32
+  val AGE_BITS = 16
+  val MAX_AGE = (1 << AGE_BITS) - 1
 
   class StorePrefetchIn extends Bundle {
     // 64B-aligned block address
     val addr = UInt(64.W)
     // byte mask of the block, bit i means byte i of the block is written
     val mask = UInt(64.W)
+  }
+
+  class VictimEntry extends Bundle {
+    val addr = UInt(64.W)
+    val allocAge = UInt(AGE_BITS.W)
   }
 
   val io = IO(new Bundle {
@@ -71,7 +80,15 @@ class StorePrefetchBuffer(implicit p: Parameters) extends PrefetchModule {
   val entries = Reg(Vec(SIZE, UInt(64.W))) // block address, block offset bits are zero
   val masks = Reg(Vec(SIZE, UInt(64.W))) // merged byte mask
   val valids = RegInit(VecInit(Seq.fill(SIZE)(false.B)))
+  val allocAge = RegInit(VecInit(Seq.fill(SIZE)(0.U(AGE_BITS.W))))
   val plru = new ValidPseudoLRU(SIZE)
+
+  // FIFO history of recently emitted store prefetches. This is statistics-only
+  // state: it never applies backpressure to the prefetch path.
+  val shadowEntries = Reg(Vec(SHADOW_SIZE, UInt(64.W)))
+  val shadowValids = RegInit(VecInit(Seq.fill(SHADOW_SIZE)(false.B)))
+  val shadowEnqPtr = RegInit(0.U(log2Up(SHADOW_SIZE).W))
+  val shadowCount = RegInit(0.U(log2Up(SHADOW_SIZE + 1).W))
 
   // input queue: keep requests when the buffer cannot accept them in this cycle
   val inQ = Module(new Queue(new StorePrefetchIn, IN_FIFO_SIZE))
@@ -80,12 +97,17 @@ class StorePrefetchBuffer(implicit p: Parameters) extends PrefetchModule {
   XSPerfAccumulate("store_pf_buf_in_drop", io.in.valid && enable && !inQ.io.enq.ready)
 
   // victim queue: buffer the blocks which are replaced out and will be sent
-  val victimQ = Module(new Queue(UInt(64.W), VICTIM_FIFO_SIZE))
+  val victimQ = Module(new Queue(new VictimEntry, VICTIM_FIFO_SIZE))
 
   val inBlock = Cat(inQ.io.deq.bits.addr(inQ.io.deq.bits.addr.getWidth - 1, offsetBits), 0.U(offsetBits.W))
   val hitVec = VecInit((0 until SIZE).map(i => valids(i) && entries(i) === inBlock))
   val hit = hitVec.asUInt.orR
   val hitIdx = OHToUInt(hitVec.asUInt)
+  val inputBlock = Cat(io.in.bits.addr(io.in.bits.addr.getWidth - 1, offsetBits), 0.U(offsetBits.W))
+
+  val shadowHit = VecInit((0 until SHADOW_SIZE).map { i =>
+    shadowValids(i) && shadowEntries(i) === inputBlock
+  }).asUInt.orR
 
   // replacement: always pick the oldest valid way
   // NOTE: the way returned by ValidPseudoLRU has an unknown width, force it here
@@ -100,6 +122,14 @@ class StorePrefetchBuffer(implicit p: Parameters) extends PrefetchModule {
 
   inQ.io.deq.ready := process
 
+  // Age each resident entry until it is replaced. The replacement path copies
+  // the age into the victim FIFO before resetting the way for the new entry.
+  for (entryIdx <- 0 until SIZE) {
+    when (valids(entryIdx) && allocAge(entryIdx) =/= MAX_AGE.U) {
+      allocAge(entryIdx) := allocAge(entryIdx) + 1.U
+    }
+  }
+
   when(process) {
     when(hit) {
       // merge requests of the same block
@@ -109,17 +139,19 @@ class StorePrefetchBuffer(implicit p: Parameters) extends PrefetchModule {
       valids(victimIdx) := true.B
       entries(victimIdx) := inBlock
       masks(victimIdx) := inQ.io.deq.bits.mask
+      allocAge(victimIdx) := 0.U
       plru.access(victimIdx)
     }
   }
 
   victimQ.io.enq.valid := process && needSendSlot
-  victimQ.io.enq.bits := entries(victimIdx)
+  victimQ.io.enq.bits.addr := entries(victimIdx)
+  victimQ.io.enq.bits.allocAge := allocAge(victimIdx)
 
   // send the replaced block as a store prefetch request
   io.req.valid := victimQ.io.deq.valid && enable
-  io.req.bits.tag := parseFullAddress(victimQ.io.deq.bits)._1
-  io.req.bits.set := parseFullAddress(victimQ.io.deq.bits)._2
+  io.req.bits.tag := parseFullAddress(victimQ.io.deq.bits.addr)._1
+  io.req.bits.set := parseFullAddress(victimQ.io.deq.bits.addr)._2
   io.req.bits.vaddr.foreach(_ := 0.U)
   // store prefetch is a write prefetch: the block will be fully/partially written
   io.req.bits.needT := true.B
@@ -128,10 +160,28 @@ class StorePrefetchBuffer(implicit p: Parameters) extends PrefetchModule {
   io.req.bits.cdpPfDepth.foreach(_ := 0.U)
   victimQ.io.deq.ready := io.req.ready && enable
 
+  // Record only requests that were accepted by the downstream prefetch path.
+  // The input lookup intentionally observes the pre-update shadow state, so a
+  // request cannot hit the entry being inserted in the same cycle.
+  when(io.req.fire) {
+    shadowEntries(shadowEnqPtr) := victimQ.io.deq.bits.addr
+    shadowValids(shadowEnqPtr) := true.B
+    shadowEnqPtr := shadowEnqPtr + 1.U
+    when(shadowCount =/= SHADOW_SIZE.U) {
+      shadowCount := shadowCount + 1.U
+    }
+  }
+
   XSPerfAccumulate("store_pf_buf_alloc", process && !hit)
   XSPerfAccumulate("store_pf_buf_merge", process && hit)
   XSPerfAccumulate("store_pf_buf_send", io.req.fire)
+  XSPerfAccumulate("store_pf_buf_shadow_hit", io.in.valid && enable && shadowHit)
+  XSPerfAccumulate("store_pf_buf_shadow_valid", shadowCount =/= 0.U)
   XSPerfAccumulate("store_pf_buf_full_block_drop", process && !hit && victimFull)
   XSPerfAccumulate("store_pf_buf_in_valid", io.in.valid && enable)
   XSPerfHistogram("store_pf_buf_valid_num", PopCount(valids), true.B, 0, SIZE, 1)
+  XSPerfHistogram("store_pf_buf_alloc_to_send_latency", victimQ.io.deq.bits.allocAge, io.req.fire, 0, 128, 4, true, true)
+  XSPerfHistogram("store_pf_buf_alloc_to_send_latency", victimQ.io.deq.bits.allocAge, io.req.fire, 128, 512, 16, true, true)
+  XSPerfHistogram("store_pf_buf_alloc_to_send_latency", victimQ.io.deq.bits.allocAge, io.req.fire, 512, 4096, 64, true, true)
+  XSPerfHistogram("store_pf_buf_alloc_to_send_latency", victimQ.io.deq.bits.allocAge, io.req.fire, 4096, 65536, 4096, true, false)
 }
