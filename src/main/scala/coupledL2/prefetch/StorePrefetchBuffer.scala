@@ -83,18 +83,24 @@ class StorePrefetchBuffer(implicit p: Parameters) extends PrefetchModule {
   val allocAge = RegInit(VecInit(Seq.fill(SIZE)(0.U(AGE_BITS.W))))
   val plru = new ValidPseudoLRU(SIZE)
 
-  // FIFO history of recently emitted store prefetches. This is statistics-only
-  // state: it never applies backpressure to the prefetch path.
+  // FIFO history of recently emitted store prefetches. A repeated block is
+  // filtered before it enters the mini-buffer, so it cannot allocate another
+  // entry or trigger another victim prefetch.
   val shadowEntries = Reg(Vec(SHADOW_SIZE, UInt(64.W)))
   val shadowValids = RegInit(VecInit(Seq.fill(SHADOW_SIZE)(false.B)))
   val shadowEnqPtr = RegInit(0.U(log2Up(SHADOW_SIZE).W))
   val shadowCount = RegInit(0.U(log2Up(SHADOW_SIZE + 1).W))
 
+  val inputBlock = Cat(io.in.bits.addr(io.in.bits.addr.getWidth - 1, offsetBits), 0.U(offsetBits.W))
+  val shadowHit = VecInit((0 until SHADOW_SIZE).map { i =>
+    shadowValids(i) && shadowEntries(i) === inputBlock
+  }).asUInt.orR
+
   // input queue: keep requests when the buffer cannot accept them in this cycle
   val inQ = Module(new Queue(new StorePrefetchIn, IN_FIFO_SIZE))
-  inQ.io.enq.valid := io.in.valid && enable
+  inQ.io.enq.valid := io.in.valid && enable && !shadowHit
   inQ.io.enq.bits := io.in.bits
-  XSPerfAccumulate("store_pf_buf_in_drop", io.in.valid && enable && !inQ.io.enq.ready)
+  XSPerfAccumulate("store_pf_buf_in_drop", io.in.valid && enable && !shadowHit && !inQ.io.enq.ready)
 
   // victim queue: buffer the blocks which are replaced out and will be sent
   val victimQ = Module(new Queue(new VictimEntry, VICTIM_FIFO_SIZE))
@@ -103,11 +109,6 @@ class StorePrefetchBuffer(implicit p: Parameters) extends PrefetchModule {
   val hitVec = VecInit((0 until SIZE).map(i => valids(i) && entries(i) === inBlock))
   val hit = hitVec.asUInt.orR
   val hitIdx = OHToUInt(hitVec.asUInt)
-  val inputBlock = Cat(io.in.bits.addr(io.in.bits.addr.getWidth - 1, offsetBits), 0.U(offsetBits.W))
-
-  val shadowHit = VecInit((0 until SHADOW_SIZE).map { i =>
-    shadowValids(i) && shadowEntries(i) === inputBlock
-  }).asUInt.orR
 
   // Replacement is invalid-first. ValidPseudoLRU.way(valids) selects the oldest
   // valid candidate, so use the invalid mask while there is a free way and fall
@@ -180,6 +181,7 @@ class StorePrefetchBuffer(implicit p: Parameters) extends PrefetchModule {
   XSPerfAccumulate("store_pf_buf_merge", process && hit)
   XSPerfAccumulate("store_pf_buf_send", io.req.fire)
   XSPerfAccumulate("store_pf_buf_shadow_hit", io.in.valid && enable && shadowHit)
+  XSPerfAccumulate("store_pf_buf_shadow_drop", io.in.valid && enable && shadowHit)
   XSPerfAccumulate("store_pf_buf_shadow_valid", shadowCount =/= 0.U)
   XSPerfAccumulate("store_pf_buf_full_block_drop", process && !hit && victimFull)
   XSPerfAccumulate("store_pf_buf_in_valid", io.in.valid && enable)
