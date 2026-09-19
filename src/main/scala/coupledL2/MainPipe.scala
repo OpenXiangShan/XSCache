@@ -206,6 +206,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val meta_has_clients_s3       = meta_s3.clients.orR
   val metaOnHit_has_clients_s3    = metaOnHit_s3.clients.orR
   val req_needT_s3              = needT(req_s3.opcode, req_s3.param)
+  // SinkA encodes an L1 store prefetch as Hint + PREFETCH_WRITE.
+  val store_prefetch_s3         = req_prefetch_s3 && req_needT_s3
 
   val cmo_cbo_retention_s3      = req_cbo_clean_s3 || req_cbo_flush_s3
   val cmo_cbo_s3                = req_cbo_clean_s3 || req_cbo_flush_s3 || req_cbo_inval_s3
@@ -1113,6 +1115,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // directory access result
   val hit_s3 = task_s3.valid && !mshr_req_s3 && dirResult_s3.hit
   val miss_s3 = task_s3.valid && !mshr_req_s3 && !dirResult_s3.hit
+  val store_prefetch_hit_s3 = hit_s3 && store_prefetch_s3
+  val store_prefetch_miss_s3 = miss_s3 && store_prefetch_s3
+  val store_prefetch_branch_hit_no_upgrade_s3 =
+    store_prefetch_hit_s3 && metaOnHit_s3.state === BRANCH
   XSPerfAccumulate("a_req_hit", hit_s3 && req_s3.fromA)
   XSPerfAccumulate("acquire_hit", hit_s3 && req_s3.fromA &&
     (req_s3.opcode === AcquireBlock || req_s3.opcode === AcquirePerm))
@@ -1126,6 +1132,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
   XSPerfAccumulate("a_need_acquire_on_hit", task_s3.valid && req_s3.fromA && dirResult_s3.hit && acquire_on_hit_s3)
   XSPerfAccumulate("a_need_acquire_on_miss", task_s3.valid && req_s3.fromA && !dirResult_s3.hit && acquire_on_miss_s3)
+  XSPerfAccumulate("store_prefetch_l2_access", task_s3.valid && store_prefetch_s3)
+  XSPerfAccumulate("store_prefetch_l2_hit", store_prefetch_hit_s3)
+  XSPerfAccumulate("store_prefetch_l2_miss", store_prefetch_miss_s3)
+  XSPerfAccumulate("store_prefetch_l2_hit_branch_no_upgrade", store_prefetch_branch_hit_no_upgrade_s3)
+  XSPerfAccumulate("store_prefetch_l2_hit_trunk_or_tip", store_prefetch_hit_s3 && isT(metaOnHit_s3.state))
   XSPerfAccumulate("get_need_probe", task_s3.valid && need_probe_s3_a && req_get_s3)
   XSPerfAccumulate("acquire_need_probe_alias", task_s3.valid && cache_alias)
 
