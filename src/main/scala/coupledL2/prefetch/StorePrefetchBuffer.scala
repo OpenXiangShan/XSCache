@@ -46,9 +46,9 @@ import xscache.coupledL2.utils._
   * earlier, which is where the timeliness of this prefetch comes from.
   */
 class StorePrefetchBuffer(implicit p: Parameters) extends PrefetchModule {
-  // capacity: 64B * 4, leaving several entries of lead time before the
+  // capacity: 64B * 8, leaving one entry of lead time before the
   // default 9-entry Sbuffer replacement threshold is reached
-  val SIZE = 4
+  val SIZE = 8
   val IN_FIFO_SIZE = 4
   val VICTIM_FIFO_SIZE = 4
   val SHADOW_SIZE = 32
