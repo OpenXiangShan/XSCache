@@ -109,10 +109,14 @@ class StorePrefetchBuffer(implicit p: Parameters) extends PrefetchModule {
     shadowValids(i) && shadowEntries(i) === inputBlock
   }).asUInt.orR
 
-  // replacement: always pick the oldest valid way
+  // Replacement is invalid-first. ValidPseudoLRU.way(valids) selects the oldest
+  // valid candidate, so use the invalid mask while there is a free way and fall
+  // back to the resident valid entries only when the buffer is full.
   // NOTE: the way returned by ValidPseudoLRU has an unknown width, force it here
   val victimIdx = Wire(UInt(log2Up(SIZE).W))
-  victimIdx := plru.way(VecInit((0 until SIZE).map(i => valids(i))).reverse)._2
+  val invalidVictim = plru.way(VecInit((0 until SIZE).map(i => !valids(i))).reverse)
+  val validVictim = plru.way(VecInit((0 until SIZE).map(i => valids(i))).reverse)
+  victimIdx := Mux(invalidVictim._1, invalidVictim._2, validVictim._2)
   val victimValid = valids(victimIdx)
   val victimFull = victimValid && masks(victimIdx).andR
 
