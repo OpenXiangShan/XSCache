@@ -158,9 +158,10 @@ class Directory(implicit p: Parameters) extends L2Module {
 
   val sets = cacheParams.sets
   val ways = cacheParams.ways
-  private val setBankCount = intraSliceBankCount
+  private val setBankCount = p(L2ParamKey).dirSetSplit
   private val setBankBits = log2Ceil(setBankCount)
-  require(sets % setBankCount == 0, "sets must be divisible by intra-slice bank count")
+  require(isPow2(setBankCount), "directory set-bank split must be a power of two")
+  require(sets % setBankCount == 0, "sets must be divisible by directory set-bank split")
 
   val tagWen  = io.tagWReq.valid
   val metaWen = io.metaWReq.valid
@@ -364,11 +365,11 @@ class Directory(implicit p: Parameters) extends L2Module {
   dontTouch(metaArray.io)
   dontTouch(tagArray.io)
 
-  // Tag/Meta/replacer arrays are split by the local Set bit.  A read can
-  // overlap a write to another physical bank, but not a write to its own
-  // bank.  The old implementation blocked every read whenever any write
-  // was present, which created a global bubble.
-  def bankOf(set: UInt): UInt = set(setBankBits - 1, 0)
+  // Tag/Meta/replacer arrays are split by the low bits of the local set index.
+  // A read can overlap a write to another physical bank, but not a write to
+  // its own bank.  dirSetSplit = 1 keeps the SRAMs unsplit and degenerates to
+  // the original arbitration (every write blocks every read).
+  def bankOf(set: UInt): UInt = if (setBankCount == 1) 0.U else set(setBankBits - 1, 0)
   val readBank = bankOf(io.read.bits.set)
   val metaWriteConflict = io.metaWReq.valid && readBank === bankOf(io.metaWReq.bits.set)
   val tagWriteConflict = io.tagWReq.valid && readBank === bankOf(io.tagWReq.bits.set)

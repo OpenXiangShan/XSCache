@@ -127,6 +127,9 @@ case class L2Param(
   dataECC: Option[String] = None,
   enableTagECC: Boolean = false,
   enableDataECC: Boolean = false,
+  // Number of directory SRAM banks split by the low bits of the local set
+  // index; 1 keeps the SRAMs unsplit and the read port blocked by any write.
+  dirSetSplit: Int = 2,
   // DataCheck
   dataCheck: Option[String] = Some("oddparity"),
   enablePoison: Boolean = true,
