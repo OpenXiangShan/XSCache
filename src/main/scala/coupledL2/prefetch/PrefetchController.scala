@@ -199,7 +199,7 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
   latencyAvg := latencyAvgSliceVecReg.reduce(_ + _) >> bankBits
 
   // record for debug //
-  val refillRecordTable = ChiselDB.createTable("RefillRecordTable", new DemandRefillBundle, basicDB = true)
+  val refillRecordTable = ChiselDB.createTable("RefillRecordTable", new DemandRefillBundle, basicDB = false)
   dataRefill.foreach { r =>
     refillRecordTable.log(
       data = r.bits,
@@ -510,7 +510,7 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
       c1_statTnocVecReg(i).asUInt.orR ||
       c1_statTbusVecReg(i).asUInt.orR ||
       c1_statTbankVecReg(i).asUInt.orR
-    val latencyAttributeTable = ChiselDB.createTable(s"LatencyAttributeTable_${PF_NAME_VEC(i)}", new LatencyAttributeBundle, basicDB = true)
+    val latencyAttributeTable = ChiselDB.createTable(s"LatencyAttributeTable_${PF_NAME_VEC(i)}", new LatencyAttributeBundle, basicDB = false)
     latencyAttributeTable.log(latencyAttribute, w, "L2PrefetchController", clock, reset)
   }
 
@@ -701,7 +701,7 @@ when(controlMode === ipop.U) {
   for (i <- 0 until PF_NUM) {
     epochRecord.pe(i) := peVec(i).asUInt
   }
-  val epochRecordTable = ChiselDB.createTable("EpochRecordTable", new EpochRecordBundle(), basicDB = true)
+  val epochRecordTable = ChiselDB.createTable("EpochRecordTable", new EpochRecordBundle(), basicDB = false)
   epochRecordTable.log(epochRecord, epochEnd, "L2PrefetchController", clock, reset)
 
   XSPerfAccumulate("epochCount", epochEnd)
