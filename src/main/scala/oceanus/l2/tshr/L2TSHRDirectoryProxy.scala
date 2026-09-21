@@ -410,7 +410,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   }
 
   io.wb_accept := io.toDir.DirWb && fromDir_DirWbArbComp
-  io.wb_done := state_dirWrite.Done
+  io.wb_done := state_dirWrite.Done && !io.meta_modified.any && !io.tag_modified
 
   assert(!(fromDir_DirWbArbComp && !state_dirWrite.PreArb), "receiving DirWbArbComp on unexpected state (expecting PreArb)")
   assert(PopCount(state_dirWrite.asUInt) <= 1.U, "multiple active states in DirWriteFSM")
