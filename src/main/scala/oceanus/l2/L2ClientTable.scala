@@ -8,12 +8,14 @@ import org.chipsalliance.cde.config.Parameters
 import xscache.oceanus.compactchi.HasCCHIParameters
 
 
-class L2ClientTable(val sliceNum: Int)(implicit val p: Parameters) 
+class L2ClientTable(val sliceNum: Int, val clientNID: Int = 0)(implicit val p: Parameters) 
     extends Module 
     with HasL2Params
     with HasCCHIParameters {
 
-  val theOnlyDCacheNID = 0
+  // Single coherent upstream client for now (TODO: parameterize with coherent
+  // l2 client count); the NID is the configured Type-1 port NID.
+  val theOnlyDCacheNID = clientNID
 
   val io = IO(new Bundle {
     val queryREQ = Input(Vec(sliceNum, Vec(paramL2.mshrSize, UInt(paramCCHI.UpstreamNodeID_Width.W))))

@@ -8,6 +8,7 @@ import chisel3.stage.ChiselGeneratorAnnotation
 import utility._
 import oceanus.l2._
 import oceanus.chi._
+import xscache.oceanus.compactchi.{CCHIParameters, CCHIParametersKey}
 
 class TestTop_L2TSHRCtrl(implicit val p: Parameters) extends Module with HasL2Params {
 
@@ -54,6 +55,7 @@ object TestTop_L2TSHRCtrl extends App {
       reqAddrWidth = 48,
       dataWidth = 256
     )
+    case CCHIParametersKey => CCHIParameters()
     case LogUtilsOptionsKey => LogUtilsOptions(
       enableDebug = false,
       enablePerf = true,

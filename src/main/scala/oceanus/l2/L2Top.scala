@@ -20,16 +20,19 @@ import oceanus.chi.intf.CHIRNFRawInterface
 class L2Configuration(
   val nodeId: Int,
   val eSAM: Boolean,
-  val slices: Seq[Int]
+  val slices: Seq[Int],
+  val t1p0NID: Int = 0,
+  val t4p0NID: Int = 4,
+  val t4p1NID: Int = 5
 ) {
   def sliceNum = slices.size
 }
 
 class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Module with HasL2Params {
 
-  val t1p0_NID = 0 // TODO: configurable with upstream NID
-  val t4p0_NID = 4 // TODO: configurable with upstream NID
-  val t4p1_NID = 5 // TODO: configurable with upstream NID
+  val t1p0_NID = config.t1p0NID
+  val t4p0_NID = config.t4p0NID
+  val t4p1_NID = config.t4p1NID
 
   val io = IO(new Bundle {
     val t1p0 = new CCHIInterfaceType1
@@ -106,6 +109,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     slice.io.consts.sliceIdx := i.U
     slice.io.consts.sliceNID := config.slices(i).U
     slice.io.consts.nodeId := config.nodeId.U
+    slice.io.consts.clientNID := config.t1p0NID.U
   }
 
   // - Upstream RXEVT routing
@@ -283,7 +287,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   io.chi <> chiLink.io.out
 
   //
-  val clientTable = Module(new L2ClientTable(config.sliceNum))
+  val clientTable = Module(new L2ClientTable(config.sliceNum, config.t1p0NID))
 
   clientTable.io.queryEVT.zip(slices.map(_.io.toClientTableEVT)).foreach { case (sinks, sources) => {
     sinks.zip(sources).foreach { case (sink, source) => sink := source }

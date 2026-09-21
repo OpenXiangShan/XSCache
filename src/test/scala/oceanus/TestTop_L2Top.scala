@@ -8,6 +8,7 @@ import chisel3.stage.ChiselGeneratorAnnotation
 import utility._
 import oceanus.l2._
 import oceanus.chi._
+import xscache.oceanus.compactchi.{CCHIParameters, CCHIParametersKey}
 import scala.collection.mutable.ArrayBuffer
 
 class TestTop_L2Top(val l2cfg: L2Configuration)(implicit val p: Parameters) extends Module with HasL2Params {
@@ -91,6 +92,7 @@ Usage: TestTop_L2Top [<--option> <values>]
       reqAddrWidth = 48,
       dataWidth = 256
     )
+    case CCHIParametersKey => CCHIParameters()
     case LogUtilsOptionsKey => LogUtilsOptions(
       enableDebug = false,
       enablePerf = true,

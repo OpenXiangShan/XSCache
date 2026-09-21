@@ -271,6 +271,7 @@ class L2SnoopAgent(val sliceNum: Int)(implicit val p: Parameters) extends Module
   io.txSnp.valid := state === sSnpReq
   io.txSnp.bits := 0.U.asTypeOf(new FlitSNP)
   io.txSnp.bits.SrcID := io.consts.sliceNID // RN echoes SrcID into SnpResp.TgtID; must be our slice NID for L2Top demux
+  io.txSnp.bits.TgtID := io.consts.clientNID // target the (single) coherent upstream client; L2Top demuxes DnSNP on TgtID
   io.txSnp.bits.TxnID := io.consts.tshrId
   io.txSnp.bits.Opcode := serviceOpcode
   io.txSnp.bits.Addr := servicePaddr >> 3

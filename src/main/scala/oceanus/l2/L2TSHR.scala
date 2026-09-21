@@ -25,6 +25,7 @@ class L2SliceConsts(val sliceNum: Int)(implicit val p: Parameters) extends Bundl
   val sliceIdx = UInt(log2Ceil(math.max(sliceNum, 2)).W)
   val sliceNID = UInt(8.W) // CCHI flit SrcID width, see oceanus.compactchi Flit bundles
   val nodeId = UInt(paramCHI.nodeIdWidth.W)
+  val clientNID = UInt(8.W) // NID of the (single) coherent upstream client, see L2ClientTable
 }
 
 class L2TSHRConsts(sliceNum: Int)(implicit p: Parameters) extends L2SliceConsts(sliceNum) {

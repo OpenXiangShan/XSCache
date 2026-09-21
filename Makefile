@@ -102,6 +102,56 @@ test-top-l2openllc:
 	mill -i XSCache.test.runMain oceanus.TestTop_L2OpenLLC -td $(BUILD_DIR_L2OPENLLC) --l2 $(NUM_L2) --slices $(NUM_SLICE) $(PERF_ARGS) --target systemverilog --split-verilog
 	if [ -f "$(BUILD_DIR_L2OPENLLC)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2OPENLLC)/TestTop.sv.conf" "$(BUILD_DIR_L2OPENLLC)"; fi
 
+# per-L2 node IDs (comma lists, one value per L2); leave unset for defaults
+# (chi: 0,1,2,... / cchi-t1: all 0 / cchi-t4p0: all 4 / cchi-t4p1: all 5)
+CHI_NIDS ?=
+CCHI_T1_NIDS ?=
+CCHI_T4P0_NIDS ?=
+CCHI_T4P1_NIDS ?=
+# CHI pin export style (packed|separate; default packed), monitor taps
+# (off|separate|packed|both; default both) and pin naming (cohestra|compat;
+# default cohestra — 'compat' keeps the current unmodified harness building)
+CHI_STYLE ?=
+CHI_MON ?=
+CHI_NAMES ?=
+MULTICHI_ARGS = $(if $(CHI_NIDS),--chi-nids $(CHI_NIDS),) \
+				$(if $(CCHI_T1_NIDS),--cchi-t1-nids $(CCHI_T1_NIDS),) \
+				$(if $(CCHI_T4P0_NIDS),--cchi-t4p0-nids $(CCHI_T4P0_NIDS),) \
+				$(if $(CCHI_T4P1_NIDS),--cchi-t4p1-nids $(CCHI_T4P1_NIDS),) \
+				$(if $(CHI_STYLE),--chi-style $(CHI_STYLE),) \
+				$(if $(CHI_MON),--chi-mon $(CHI_MON),) \
+				$(if $(CHI_NAMES),--chi-names $(CHI_NAMES),)
+
+# TAG selects the output dir suffix: build/l2multichi$(TAG), empty TAG keeps
+# the plain build/l2multichi (used by test/boot.sh)
+TAG ?=
+BUILD_DIR_L2MULTICHI = ./build/l2multichi$(if $(TAG),_$(TAG),)
+
+# defaults to 1 L2 x 2 slices; override with NUM_L2=<n> / NUM_SLICE=<1-4>
+test-top-l2multichi: NUM_SLICE = 2
+test-top-l2multichi:
+	mill -i XSCache.test.runMain oceanus.TestTop_L2MultiCHI -td $(BUILD_DIR_L2MULTICHI) --l2 $(NUM_L2) --slices $(NUM_SLICE) $(PERF_ARGS) $(MULTICHI_ARGS) --target systemverilog --split-verilog
+	if [ -f "$(BUILD_DIR_L2MULTICHI)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2MULTICHI)/TestTop.sv.conf" "$(BUILD_DIR_L2MULTICHI)"; fi
+
+# full configuration matrix: {packed,separate} x {off,separate,packed,both} x {1,2} L2;
+# 2-L2 rows exercise per-instance NIDs (chi 2,3 / cchi-t1 0,8)
+test-top-l2multichi-matrix:
+	@for style in packed separate; do \
+	  for mon in off separate packed both; do \
+	    for l2 in 1 2; do \
+	      tag=$${style}_$${mon}_l$${l2}; \
+	      echo "=== matrix build: $$tag"; \
+	      if [ $$l2 -eq 2 ]; then \
+	        $(MAKE) --no-print-directory test-top-l2multichi TAG=$$tag NUM_L2=2 NO_PERF=1 \
+	          CHI_STYLE=$$style CHI_MON=$$mon CHI_NIDS=2,3 CCHI_T1_NIDS=0,8 || exit 1; \
+	      else \
+	        $(MAKE) --no-print-directory test-top-l2multichi TAG=$$tag NUM_L2=1 NO_PERF=1 \
+	          CHI_STYLE=$$style CHI_MON=$$mon || exit 1; \
+	      fi; \
+	    done; \
+	  done; \
+	done
+
 clean:
 	rm -rf ./build
 
