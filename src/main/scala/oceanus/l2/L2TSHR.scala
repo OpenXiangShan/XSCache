@@ -247,7 +247,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   assert(!(tshr_dealloc && meta_modified.asUInt.orR), "TSHR @ %m deallocated with un-committed modified meta")
 
-  assert(!(meta.state =/= L2Directory.MetaState.I && !meta.hit),
+  assert(!(meta_valid && meta.state =/= L2Directory.MetaState.I && !meta.hit),
     "TSHR @ %m tracked state with stale miss hit-flag")
 
   
