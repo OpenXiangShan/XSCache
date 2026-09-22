@@ -138,6 +138,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // when the transaction hit local/remote UU state with zero client, with local transition of UU to US
   // * NOTICE: Might be necessary when Coherent L1 I-Cache (Type 2 components) supported.
   val configReadSharedDemotionFromUU = false.B
+
+  // Whether, for a L1 StashShared, the returning permission was demoted from Unique to Shared
+  // when the transaction hit local/remote UU state with zero client, with local transition of UU to US
+  // * NOTICE: Might be necessary when Coherent L1 I-Cache (Type 2 components) supported.
+  val configStashSharedDemotionFromUU = false.B
   
   // Whether, for a L1 ReadShared, the returning permission was promoted from Shared to Unique
   // when the transaction missed with HN returning Unique
@@ -174,6 +179,13 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val rxreq_readunique = rxreq_opcode.is(CCHIOpcode.ReadUnique)
   val rxreq_readshared = rxreq_opcode.is(CCHIOpcode.ReadShared)
   val rxreq_makeunique = rxreq_opcode.is(CCHIOpcode.MakeUnique)
+  val rxreq_stashshared = rxreq_opcode.is(CCHIOpcode.StashShared)
+  val rxreq_stashunique = rxreq_opcode.is(CCHIOpcode.StashUnique)
+
+  // CCHI Stash is supported only as a fire-and-forget prefetch hint: with ExpCompStash=1 the
+  // completer owes the requester a CompStash on DnRSP, which this vPipe never issues.
+  assert(!(rxreq_fire && (rxreq_stashshared || rxreq_stashunique) && rxreq.ExpCompStash),
+    "TSHR @ %m REQ vPipe received StashShared/StashUnique with ExpCompStash=1 (CompStash response unsupported)")
 
   val rxevb = io.UpRXEVB.bits
   val rxevb_evictback = io.UpRXEVB.fire
@@ -489,7 +501,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val sched_compack_txreq_rd = issue_txreq_readshared ||
                                issue_txreq_readunique ||
-                               issue_txreq_makeunique
+                               issue_txreq_makeunique ||
+                               issue_txreq_stashshared ||
+                               issue_txreq_stashunique
 
   val reissue_txreq = io.fromPCreditPool
 
@@ -594,10 +608,15 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  ReadUnique          ReadUnique            64B
   //                         MakeReadUnique        64B
   //  -  MakeUnique          MakeUnique            64B
+  //  -  StashShared         ReadNotSharedDirty    64B
+  //  -  StashUnique         ReadUnique            64B
+  //                         MakeReadUnique        64B
   val txreq_size = ParallelMux(Seq(
     (p_rxreq_readshared,      Size64B.U),
     (p_rxreq_readunique,      Size64B.U),
-    (p_rxreq_makeunique,      Size64B.U)
+    (p_rxreq_makeunique,      Size64B.U),
+    (p_rxreq_stashshared,     Size64B.U),
+    (p_rxreq_stashunique,     Size64B.U)
   ))
 
   // Field 'LikelyShared':
@@ -606,10 +625,15 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  ReadUnique          ReadUnique            0
   //                         MakeReadUnique        0
   //  -  MakeUnique          MakeUnique            0
+  //  -  StashShared         ReadNotSharedDirty    0 (1 not utilized for now)
+  //  -  StashUnique         ReadUnique            0
+  //                         MakeReadUnique        0
   val txreq_likelyshared = ParallelMux(Seq(
     (p_rxreq_readshared,      false.B),
     (p_rxreq_readunique,      false.B),
-    (p_rxreq_makeunique,      false.B)
+    (p_rxreq_makeunique,      false.B),
+    (p_rxreq_stashshared,     false.B),
+    (p_rxreq_stashunique,     false.B)
   ))
 
   // Field 'Order':
@@ -618,10 +642,15 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  ReadUnique          ReadUnique            0b00 (No Ordering)
   //                         MakeReadUnique        0b00 (No Ordering)
   //  -  MakeUnique          MakeUnique            0b00 (No Ordering)
+  //  -  StashShared         ReadNotSharedDirty    0b00 (No Ordering)
+  //  -  StashUnique         ReadUnique            0b00 (No Ordering)
+  //                         MakeReadUnique        0b00 (No Ordering)
   val txreq_order = ParallelMux(Seq(
     (p_rxreq_readshared,      NoOrdering.U),
     (p_rxreq_readunique,      NoOrdering.U),
-    (p_rxreq_makeunique,      NoOrdering.U)
+    (p_rxreq_makeunique,      NoOrdering.U),
+    (p_rxreq_stashshared,     NoOrdering.U),
+    (p_rxreq_stashunique,     NoOrdering.U)
   ))
 
   // Field 'MemAttr':
@@ -630,10 +659,15 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  ReadUnique          ReadUnique            Cacheable + EWA + Allocate
   //                         MakeReadUnique        Cacheable + EWA + Allocate
   //  -  MakeUnique          MakeUnique            Cacheable + EWA
+  //  -  StashShared         ReadNotSharedDirty    Cacheable + EWA + Allocate
+  //  -  StashUnique         ReadUnique            Cacheable + EWA + Allocate
+  //                         MakeReadUnique        Cacheable + EWA + Allocate
   val txreq_memattr = ParallelMux(Seq(
     (p_rxreq_readshared,      Cacheable.U | EWA.U | Allocate.U),
     (p_rxreq_readunique,      Cacheable.U | EWA.U | Allocate.U),
-    (p_rxreq_makeunique,      Cacheable.U | EWA.U)
+    (p_rxreq_makeunique,      Cacheable.U | EWA.U),
+    (p_rxreq_stashshared,     Cacheable.U | EWA.U | Allocate.U),
+    (p_rxreq_stashunique,     Cacheable.U | EWA.U | Allocate.U)
   ))
 
   // Field 'SnpAttr':
@@ -642,10 +676,15 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  ReadUnique          ReadUnique            1
   //                         MakeReadUnique        1
   //  -  MakeUnique          MakeUnique            1
+  //  -  StashShared         ReadNotSharedDirty    1
+  //  -  StashUnique         ReadUnique            1
+  //                         MakeReadUnique        1
   val txreq_snpattr = ParallelMux(Seq(
     (p_rxreq_readshared,      true.B),
     (p_rxreq_readunique,      true.B),
-    (p_rxreq_makeunique,      true.B)
+    (p_rxreq_makeunique,      true.B),
+    (p_rxreq_stashshared,     true.B),
+    (p_rxreq_stashunique,     true.B)
   ))
 
   // Field 'ExpCompAck':
@@ -654,10 +693,15 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  ReadUnique          ReadUnique            1
   //                         MakeReadUnique        1
   //  -  MakeUnique          MakeUnique            1
+  //  -  StashShared         ReadNotSharedDirty    1
+  //  -  StashUnique         ReadUnique            1
+  //                         MakeReadUnique        1
   val txreq_expcompack = ParallelMux(Seq(
     (p_rxreq_readshared,      true.B),
     (p_rxreq_readunique,      true.B),
-    (p_rxreq_makeunique,      true.B)
+    (p_rxreq_makeunique,      true.B),
+    (p_rxreq_stashshared,     true.B),
+    (p_rxreq_stashunique,     true.B)
   ))
 
   io.DnTXREQ.valid := s_dn_txreq
@@ -705,9 +749,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val dn_rxrsp_respsepdata = dn_rxrsp_opcode.is(CHI_RespSepData)
   val dn_rxrsp_compdbidresp = dn_rxrsp_opcode.is(CHI_CompDBIDResp)
 
-  // ReadShared/ReadUnique expects a downstream Comp or CompData / DataSepResp + RespSepData
+  // Unsatisfied ReadShared/ReadUnique/StashShared/StashUnique
+  // expects a downstream Comp or CompData / DataSepResp + RespSepData
   val expect_dn_rd_comp_and_data = rxreq_unsatisfied_readshared ||
-                                   rxreq_unsatisfied_readunique
+                                   rxreq_unsatisfied_readunique ||
+                                   rxreq_unsatisfied_stashshared ||
+                                   rxreq_unsatisfied_stashunique
 
   // MakeUnique expects a dataless downstream Comp only (no data beats will follow)
   val expect_dn_rd_comp_only = rxreq_unsatisfied_makeunique
@@ -1035,6 +1082,55 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val meta_wr_alias_readshared = meta_wr_client_readshared_set
   // --------------------------------
 
+  // - StashUnique related meta/tag updates
+  val meta_wr_state_stashunique_UU_unsat = active && p_rxreq_stashunique &&
+                                           (dn_rxdat_compdata_first || dn_rxdat_datasepresp_first || dn_rxrsp_comp) &&
+                                           !(dirResult.hit && dirResult.clients.orR)
+
+  val meta_wr_state_stashunique_US_unsat = active && p_rxreq_stashunique &&
+                                           (dn_rxdat_compdata_first || dn_rxdat_datasepresp_first || dn_rxrsp_comp) &&
+                                           dirResult.hit && dirResult.clients.orR
+
+  assert(!(meta_wr_state_stashunique_US_unsat && dn_rxdat_compdata_first && !dn_rxdat_compdata_first_UC && !dn_rxdat_compdata_first_UD_PD),
+    "The subsequent of upstream StashUnique received CompData with unexpected Resp from downstream (expecting UC, UD_PD)")
+  assert(!(meta_wr_state_stashunique_US_unsat && dn_rxdat_datasepresp_first && !dn_rxdat_datasepresp_first_UC && !dn_rxdat_datasepresp_first_UD_PD),
+    "The subsequent of upstream StashUnique received DataSepResp with unexpected Resp from downstream (expecting UC, UD_PD)")
+
+  val meta_wr_state_stashunique_UU = meta_wr_state_stashunique_UU_unsat
+  val meta_wr_state_stashunique_US = meta_wr_state_stashunique_US_unsat
+
+  val meta_wr_dirty_stashunique_set = active && p_rxreq_stashunique &&
+                                      (dn_rxdat_compdata_first_UD_PD || dn_rxdat_datasepresp_first_UD_PD || dn_rxrsp_comp_UD_PD)
+  // --------------------------------
+
+  // - StashShared related meta/tag updates
+  val meta_wr_state_stashshared_UU_unsat = active && p_rxreq_stashshared && (
+                                             dn_rxdat_compdata_first_UC ||
+                                             dn_rxdat_compdata_first_UD_PD ||
+                                             dn_rxdat_datasepresp_first_UC ||
+                                             dn_rxdat_datasepresp_first_UD_PD
+                                           ) && !configStashSharedDemotionFromUU
+
+  val meta_wr_state_stashshared_US_unsat = active && p_rxreq_stashshared && (
+                                             dn_rxdat_compdata_first_UC ||
+                                             dn_rxdat_compdata_first_UD_PD ||
+                                             dn_rxdat_datasepresp_first_UC ||
+                                             dn_rxdat_datasepresp_first_UD_PD
+                                           ) && configStashSharedDemotionFromUU
+
+  val meta_wr_state_stashshared_S_unsat = active && p_rxreq_stashshared && (
+                                            dn_rxdat_compdata_first_SC ||
+                                            dn_rxdat_datasepresp_first_SC
+                                          )
+
+  val meta_wr_state_stashshared_UU = meta_wr_state_stashshared_UU_unsat
+  val meta_wr_state_stashshared_US = meta_wr_state_stashshared_US_unsat
+  val meta_wr_state_stashshared_S = meta_wr_state_stashshared_S_unsat
+
+  val meta_wr_dirty_stashshared_set = active && p_rxreq_stashshared &&
+                                      (dn_rxdat_compdata_first_UD_PD || dn_rxdat_datasepresp_first_UD_PD)
+  // --------------------------------
+
   // - EvictBack related meta/tag updates
   val meta_wr_state_evictback_I_evict = fire_txreq_evict
 
@@ -1052,11 +1148,16 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val meta_wr_state_UU = meta_wr_state_readunique_UU ||
                          meta_wr_state_readshared_UU ||
-                         meta_wr_state_makeunique_UU
+                         meta_wr_state_makeunique_UU ||
+                         meta_wr_state_stashunique_UU ||
+                         meta_wr_state_stashshared_UU
 
-  val meta_wr_state_US = meta_wr_state_readshared_US
+  val meta_wr_state_US = meta_wr_state_readshared_US ||
+                         meta_wr_state_stashunique_US ||
+                         meta_wr_state_stashshared_US
 
-  val meta_wr_state_S = meta_wr_state_readshared_S
+  val meta_wr_state_S = meta_wr_state_readshared_S ||
+                        meta_wr_state_stashshared_S
 
   val meta_wr_state_I = meta_wr_state_evictback_I
 
@@ -1065,7 +1166,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val meta_wr_dirty_set = meta_wr_dirty_sa_set ||
                           meta_wr_dirty_readunique_set ||
                           meta_wr_dirty_readshared_set ||
-                          meta_wr_dirty_makeunique_set
+                          meta_wr_dirty_makeunique_set ||
+                          meta_wr_dirty_stashunique_set ||
+                          meta_wr_dirty_stashshared_set
 
   val meta_wr_dirty_clr = meta_wr_dirty_evictback_clr
 
@@ -1400,7 +1503,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val expect_replace = !dirResult.hit && (
                            rxreq_readunique ||
                            rxreq_readshared ||
-                           rxreq_makeunique)
+                           rxreq_makeunique ||
+                           rxreq_stashshared ||
+                           rxreq_stashunique)
 
   val allow_replace = w_s_repl &&
                       (!io.tshr_meta_modified || io.dir_wb_done) &&
@@ -1429,7 +1534,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // unlocks never fire -- a circular wait inside one entry. The aliasing itself proves the
   // victim way is invalid (a valid way holding this tag would have hit the directory), so no
   // eviction is needed: skip the upstream EvictBack and unlock dir/ds locally.
-  // NEW: same for a victim that reads Invalid at ReplRd: nothing exists downstream to evict,
+  // Also same for a victim that reads Invalid at ReplRd: nothing exists downstream to evict,
   // so the looped-back EvictBack is pure overhead -- and it can deadlock: the EvictBack must
   // nest into the TSHR holding the victim PA, which may itself be parked on an unbounded
   // downstream wait (s7118: the victim-PA TSHR's hit-MU starved at L3 while this refill's
