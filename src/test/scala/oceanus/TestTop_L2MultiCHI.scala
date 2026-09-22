@@ -7,7 +7,7 @@ import chisel3.stage.ChiselGeneratorAnnotation
 import org.chipsalliance.cde.config._
 import scala.collection.mutable.ArrayBuffer
 import utility._
-import oceanus.l2.{L2Configuration, L2Params, L2ParamsKey, L2Top}
+import oceanus.l2.{L2Configuration, L2Params, L2ParamsKey, L2Top, L2UpstreamPortType, L2UpstreamTable, L2UpstreamTableEntry}
 import oceanus.chi.{CHIParameters, CHIParametersKey, EnumCHIIssue}
 import oceanus.chi.bundle.{CHIBundleDAT, CHIBundleREQ, CHIBundleRSP, CHIBundleSNP}
 import oceanus.chi.channel.AbstractCHIChannel
@@ -17,7 +17,8 @@ import xscache.oceanus.compactchi.{CCHIParameters, CCHIParametersKey}
  *  downstream CHI RN-F link of every L2 exported DIRECTLY as top-level pins
  *  for connection to other SoCs / NoCs (no OpenLLC/OpenNCB in the path):
  *
- *       CCHI upstream ports (one Type-1 + two Type-4 per L2)
+ *       CCHI upstream ports (per-L2 L2UpstreamTable, default one Type-1
+ *       + two Type-4 per L2)
  *                     |
  *                L2Top x numL2
  *                     |  CHIRNFInterface (oceanus.chi bundles)
@@ -26,10 +27,10 @@ import xscache.oceanus.compactchi.{CCHIParameters, CCHIParametersKey}
  *
  *  Per-instance identities:
  *    --chi-nids       CHI downstream node ID (SrcID on the RN-F link) per L2
- *    --cchi-t1-nids   CCHI Type-1 port NID per L2 (upstream coherent client;
- *                     also the snoop target and client-table NID)
- *    --cchi-t4p0-nids / --cchi-t4p1-nids
- *                     CCHI Type-4 (read-only non-coherent) port NIDs per L2
+ *    --cchi-upstream  upstream CCHI port table per L2 (port type + node ID of
+ *                     every exported CCHI port); multiple Type-1 ports per L2
+ *                     are different sources of the same single coherent client
+ *                     (shared Directory client bit, see L2UpstreamTable)
  *
  *  CHI pin styles (functional ports): exactly ONE style is exported per build,
  *  selected by --chi-style (default packed):
@@ -86,15 +87,20 @@ import xscache.oceanus.compactchi.{CCHIParameters, CCHIParametersKey}
  *       built as CHI::Eb::FlitConfiguration<11,48,4,4,256,true,true,true>
  *       to match this DUT's pinned CHIParameters.
  *
- *  CCHI upstream pin contract (unchanged, cohestra_v3-compatible):
- *    cchi_t1p{i}_{rxevt,rxreq,txsnp,txrsp,rxrsp,txdat,rxdat}_{valid,ready,bits_*}
- *    cchi_t4p{2i}/cchi_t4p{2i+1}_{rxreq,txdat}_*
+ *  CCHI upstream pin contract (unchanged, cohestra_v3-compatible); ports are
+ *  numbered with global running indices across all L2 instances in table
+ *  order (with the default per-L2 table t1:0,t4:4,t4:5 this reproduces
+ *  cchi_t1p{i}, cchi_t4p{2i}, cchi_t4p{2i+1}):
+ *    cchi_t1p{g}_{rxevt,rxreq,txsnp,txrsp,rxrsp,txdat,rxdat}_{valid,ready,bits_*}
+ *    cchi_t4p{g}_{rxreq,txdat}_*
  *
  *  Known boundaries:
  *    - DnTXREQ.TgtID (home node ID) stays hardwired to 0 in L2VPipeREQ
  *      ("E-SAM only currently"); only the L2's own node ID is configurable.
  *    - Slice NIDs stay 0 until numSlices (internal to each L2).
  *    - CCHI NIDs must fit CCHIParameters.UpstreamNodeID_Width (default 4).
+ *    - With multiple Type-1 ports, snoops are still generated only for the
+ *      first listed Type-1 NID (single-client semantics, see L2UpstreamTable).
  */
 
 sealed trait CHIFlitPinStyle
@@ -207,9 +213,7 @@ class TestTop_L2MultiCHI(
   val numL2: Int,
   val numSlices: Int,
   val chiNIDs: Seq[Int],
-  val t1NIDs: Seq[Int],
-  val t4p0NIDs: Seq[Int],
-  val t4p1NIDs: Seq[Int],
+  val upstreams: Seq[L2UpstreamTable],
   val chiStyle: CHIFlitPinStyle,
   val chiMon: CHIMonitorMode,
   val chiNames: CHIPinNaming
@@ -224,9 +228,7 @@ class TestTop_L2MultiCHI(
     nodeId = chiNIDs(i),
     eSAM = true,
     slices = 0 until numSlices,
-    t1p0NID = t1NIDs(i),
-    t4p0NID = t4p0NIDs(i),
-    t4p1NID = t4p1NIDs(i)))))
+    upstream = upstreams(i)))))
 
   // -- Cohestra V3 pin-level export ------------------------------------------
   // Every external pin is an individual IO named via suggestName, so emitted
@@ -332,20 +334,29 @@ class TestTop_L2MultiCHI(
     }
   }
 
-  l2s.zipWithIndex.foreach { case (l2, i) =>
-    // -- Exported upstream CCHI ports, one Type-1 + two Type-4 per L2
-    exportChannel(s"cchi_t1p${i}_rxevt", l2.io.t1p0.UpEVT, dutDrives = false)
-    exportChannel(s"cchi_t1p${i}_rxreq", l2.io.t1p0.UpREQ, dutDrives = false)
-    exportChannel(s"cchi_t1p${i}_txsnp", l2.io.t1p0.DnSNP, dutDrives = true)
-    exportChannel(s"cchi_t1p${i}_txrsp", l2.io.t1p0.DnRSP, dutDrives = true)
-    exportChannel(s"cchi_t1p${i}_rxrsp", l2.io.t1p0.UpRSP, dutDrives = false)
-    exportChannel(s"cchi_t1p${i}_txdat", l2.io.t1p0.DnDAT, dutDrives = true)
-    exportChannel(s"cchi_t1p${i}_rxdat", l2.io.t1p0.UpDAT, dutDrives = false)
+  // Global CCHI port indices across all L2 instances — cohestra_v3 detects
+  // ports by these names; with the default per-L2 table (t1:0,t4:4,t4:5) this
+  // reproduces cchi_t1p{i}, cchi_t4p{2i}, cchi_t4p{2i+1}.
+  var t1PortIdx = 0
+  var t4PortIdx = 0
 
-    exportChannel(s"cchi_t4p${2*i}_rxreq",   l2.io.t4p0.UpREQ, dutDrives = false)
-    exportChannel(s"cchi_t4p${2*i}_txdat",   l2.io.t4p0.DnDAT, dutDrives = true)
-    exportChannel(s"cchi_t4p${2*i+1}_rxreq", l2.io.t4p1.UpREQ, dutDrives = false)
-    exportChannel(s"cchi_t4p${2*i+1}_txdat", l2.io.t4p1.DnDAT, dutDrives = true)
+  l2s.zipWithIndex.foreach { case (l2, i) =>
+    // -- Exported upstream CCHI ports from the L2's L2UpstreamTable
+    l2.io.t1p.foreach { port =>
+      val g = t1PortIdx; t1PortIdx += 1
+      exportChannel(s"cchi_t1p${g}_rxevt", port.UpEVT, dutDrives = false)
+      exportChannel(s"cchi_t1p${g}_rxreq", port.UpREQ, dutDrives = false)
+      exportChannel(s"cchi_t1p${g}_txsnp", port.DnSNP, dutDrives = true)
+      exportChannel(s"cchi_t1p${g}_txrsp", port.DnRSP, dutDrives = true)
+      exportChannel(s"cchi_t1p${g}_rxrsp", port.UpRSP, dutDrives = false)
+      exportChannel(s"cchi_t1p${g}_txdat", port.DnDAT, dutDrives = true)
+      exportChannel(s"cchi_t1p${g}_rxdat", port.UpDAT, dutDrives = false)
+    }
+    l2.io.t4p.foreach { port =>
+      val g = t4PortIdx; t4PortIdx += 1
+      exportChannel(s"cchi_t4p${g}_rxreq", port.UpREQ, dutDrives = false)
+      exportChannel(s"cchi_t4p${g}_txdat", port.DnDAT, dutDrives = true)
+    }
 
     // -- Exported downstream CHI RN-F link (functional, one style copy)
     val aliasesTxReq = req(l2.io.chi.txreq.flit)
@@ -430,12 +441,13 @@ Usage: TestTop_L2MultiCHI [<--option> <values>]
                                 LogPerfEndpoint bulk; much faster firtool/verilation)
       --chi-nids <n,n,...>      CHI downstream node ID (RN-F SrcID) of each L2;
                                 one value per L2, defaults to 0,1,2,...
-      --cchi-t1-nids <n,n,...>  CCHI Type-1 port NID of each L2 (upstream coherent
-                                client NID), one value per L2, defaults to all 0
-      --cchi-t4p0-nids <n,n,...>
-                                CCHI Type-4 port 0 NID of each L2, defaults to all 4
-      --cchi-t4p1-nids <n,n,...>
-                                CCHI Type-4 port 1 NID of each L2, defaults to all 5
+      --cchi-upstream <spec>    upstream CCHI port table of each L2: ';'-separated
+                                per L2, each entry t1:<nid>|t4:<nid>, e.g.
+                                "t1:0,t4:4,t4:5;t1:8,t4:12,t4:13"; multiple Type-1
+                                ports per L2 are allowed (different sources of the
+                                same coherent client, see L2UpstreamTable); node IDs
+                                must not repeat within a table; defaults to
+                                "t1:0,t4:4,t4:5" per L2
       --chi-style <packed|separate>
                                 flit pin style of the functional RN-F CHI ports;
                                 exactly one style copy is exported, packed by default
@@ -459,9 +471,7 @@ Usage: TestTop_L2MultiCHI [<--option> <values>]
   var numSlices = 2
   var noPerf = false
   var chiNIDsArg: Option[Seq[Int]] = None
-  var t1NIDsArg: Option[Seq[Int]] = None
-  var t4p0NIDsArg: Option[Seq[Int]] = None
-  var t4p1NIDsArg: Option[Seq[Int]] = None
+  var upstreamArg: Option[String] = None
   var chiStyleArg: Option[String] = None
   var chiMonArg: Option[String] = None
   var chiNamesArg: Option[String] = None
@@ -472,17 +482,15 @@ Usage: TestTop_L2MultiCHI [<--option> <values>]
   var i = 0
   while (i < args.length) {
     args(i) match {
-      case "--l2"             => numL2 = args(i + 1).toInt; i += 2
-      case "--slices"         => numSlices = args(i + 1).toInt; i += 2
-      case "--noperf"         => noPerf = true; i += 1
-      case "--chi-nids"       => chiNIDsArg = Some(parseNIDList(args(i + 1))); i += 2
-      case "--cchi-t1-nids"   => t1NIDsArg = Some(parseNIDList(args(i + 1))); i += 2
-      case "--cchi-t4p0-nids" => t4p0NIDsArg = Some(parseNIDList(args(i + 1))); i += 2
-      case "--cchi-t4p1-nids" => t4p1NIDsArg = Some(parseNIDList(args(i + 1))); i += 2
-      case "--chi-style"      => chiStyleArg = Some(args(i + 1)); i += 2
-      case "--chi-mon"        => chiMonArg = Some(args(i + 1)); i += 2
-      case "--chi-names"      => chiNamesArg = Some(args(i + 1)); i += 2
-      case other              => varArgs += other; i += 1
+      case "--l2"            => numL2 = args(i + 1).toInt; i += 2
+      case "--slices"        => numSlices = args(i + 1).toInt; i += 2
+      case "--noperf"        => noPerf = true; i += 1
+      case "--chi-nids"      => chiNIDsArg = Some(parseNIDList(args(i + 1))); i += 2
+      case "--cchi-upstream" => upstreamArg = Some(args(i + 1)); i += 2
+      case "--chi-style"     => chiStyleArg = Some(args(i + 1)); i += 2
+      case "--chi-mon"       => chiMonArg = Some(args(i + 1)); i += 2
+      case "--chi-names"     => chiNamesArg = Some(args(i + 1)); i += 2
+      case other             => varArgs += other; i += 1
     }
   }
   varArgs.trimToSize()
@@ -514,14 +522,26 @@ Usage: TestTop_L2MultiCHI [<--option> <values>]
   }
 
   val chiNIDs = chiNIDsArg.getOrElse(0 until numL2)
-  val t1NIDs = t1NIDsArg.getOrElse(Seq.fill(numL2)(0))
-  val t4p0NIDs = t4p0NIDsArg.getOrElse(Seq.fill(numL2)(4))
-  val t4p1NIDs = t4p1NIDsArg.getOrElse(Seq.fill(numL2)(5))
+  require(chiNIDs.length == numL2, s"--chi-nids lists ${chiNIDs.length} NIDs but --l2 is $numL2")
 
-  Seq(("chi-nids", chiNIDs), ("cchi-t1-nids", t1NIDs),
-      ("cchi-t4p0-nids", t4p0NIDs), ("cchi-t4p1-nids", t4p1NIDs)).foreach { case (name, list) =>
-    require(list.length == numL2, s"--$name lists ${list.length} NIDs but --l2 is $numL2")
+  // Per-L2 upstream CCHI port tables; L2UpstreamTable itself rejects empty
+  // tables, duplicated node IDs and missing Type-1 ports.
+  val upstreams: Seq[L2UpstreamTable] = upstreamArg match {
+    case None => Seq.fill(numL2)(L2UpstreamTable.defaults)
+    case Some(spec) =>
+      spec.split(";").toIndexedSeq.map { perL2 =>
+        new L2UpstreamTable(perL2.split(",").toIndexedSeq.map { entry =>
+          entry.trim.split(":") match {
+            case Array("t1", nid) => L2UpstreamTableEntry(L2UpstreamPortType.Type1, nid.trim.toInt)
+            case Array("t4", nid) => L2UpstreamTableEntry(L2UpstreamPortType.Type4, nid.trim.toInt)
+            case _ => throw new IllegalArgumentException(
+              s"Malformed --cchi-upstream entry '${entry.trim}' (expected t1:<nid>|t4:<nid>)")
+          }
+        })
+      }
   }
+  require(upstreams.length == numL2,
+    s"--cchi-upstream lists ${upstreams.length} tables but --l2 is $numL2")
 
   // Keep in sync with the CHIParametersKey / CCHIParametersKey configs below.
   val chiNodeIdWidth = 11
@@ -529,9 +549,11 @@ Usage: TestTop_L2MultiCHI [<--option> <values>]
     s"CHI node IDs must fit nodeIdWidth=$chiNodeIdWidth: $chiNIDs")
 
   val cchiUpstreamNIDWidth = CCHIParameters().UpstreamNodeID_Width
-  require((t1NIDs ++ t4p0NIDs ++ t4p1NIDs).forall(n => n >= 0 && n < (1 << cchiUpstreamNIDWidth)),
-    s"CCHI upstream NIDs must fit UpstreamNodeID_Width=$cchiUpstreamNIDWidth: " +
-    s"$t1NIDs / $t4p0NIDs / $t4p1NIDs")
+  upstreams.zipWithIndex.foreach { case (table, l2) =>
+    require(table.entries.map(_.nid).forall(n => n >= 0 && n < (1 << cchiUpstreamNIDWidth)),
+      s"CCHI upstream NIDs of L2 $l2 must fit UpstreamNodeID_Width=$cchiUpstreamNIDWidth: " +
+      s"${table.entries.map(_.nid).mkString(", ")}")
+  }
 
   val config = new Config((_, _, _) => {
     case L2ParamsKey => L2Params (
@@ -567,7 +589,7 @@ Usage: TestTop_L2MultiCHI [<--option> <values>]
 
   (new ChiselStage).execute(varArgs.toArray,
     ChiselGeneratorAnnotation(() =>
-      new TestTop_L2MultiCHI(numL2, numSlices, chiNIDs, t1NIDs, t4p0NIDs, t4p1NIDs,
+      new TestTop_L2MultiCHI(numL2, numSlices, chiNIDs, upstreams,
         chiStyle, chiMon, chiNames)(config))
       +: TestTopFirtoolOptions())
 }

@@ -102,12 +102,12 @@ test-top-l2openllc:
 	mill -i XSCache.test.runMain oceanus.TestTop_L2OpenLLC -td $(BUILD_DIR_L2OPENLLC) --l2 $(NUM_L2) --slices $(NUM_SLICE) $(PERF_ARGS) --target systemverilog --split-verilog
 	if [ -f "$(BUILD_DIR_L2OPENLLC)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2OPENLLC)/TestTop.sv.conf" "$(BUILD_DIR_L2OPENLLC)"; fi
 
-# per-L2 node IDs (comma lists, one value per L2); leave unset for defaults
-# (chi: 0,1,2,... / cchi-t1: all 0 / cchi-t4p0: all 4 / cchi-t4p1: all 5)
+# per-L2 node IDs; CHI_NIDS is a comma list with one value per L2 (default
+# 0,1,2,...); CCHI_UPSTREAM is the per-L2 upstream CCHI port table spec
+# (';' separates L2s, entries t1:<nid>|t4:<nid>; default "t1:0,t4:4,t4:5"
+# per L2 — multiple t1 entries share the single coherent client)
 CHI_NIDS ?=
-CCHI_T1_NIDS ?=
-CCHI_T4P0_NIDS ?=
-CCHI_T4P1_NIDS ?=
+CCHI_UPSTREAM ?=
 # CHI pin export style (packed|separate; default packed), monitor taps
 # (off|separate|packed|both; default both) and pin naming (cohestra|compat;
 # default cohestra — 'compat' keeps the current unmodified harness building)
@@ -115,9 +115,7 @@ CHI_STYLE ?=
 CHI_MON ?=
 CHI_NAMES ?=
 MULTICHI_ARGS = $(if $(CHI_NIDS),--chi-nids $(CHI_NIDS),) \
-				$(if $(CCHI_T1_NIDS),--cchi-t1-nids $(CCHI_T1_NIDS),) \
-				$(if $(CCHI_T4P0_NIDS),--cchi-t4p0-nids $(CCHI_T4P0_NIDS),) \
-				$(if $(CCHI_T4P1_NIDS),--cchi-t4p1-nids $(CCHI_T4P1_NIDS),) \
+				$(if $(CCHI_UPSTREAM),--cchi-upstream "$(CCHI_UPSTREAM)",) \
 				$(if $(CHI_STYLE),--chi-style $(CHI_STYLE),) \
 				$(if $(CHI_MON),--chi-mon $(CHI_MON),) \
 				$(if $(CHI_NAMES),--chi-names $(CHI_NAMES),)
@@ -134,7 +132,7 @@ test-top-l2multichi:
 	if [ -f "$(BUILD_DIR_L2MULTICHI)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2MULTICHI)/TestTop.sv.conf" "$(BUILD_DIR_L2MULTICHI)"; fi
 
 # full configuration matrix: {packed,separate} x {off,separate,packed,both} x {1,2} L2;
-# 2-L2 rows exercise per-instance NIDs (chi 2,3 / cchi-t1 0,8)
+# 2-L2 rows exercise per-instance NIDs (chi 2,3 / cchi t1 0,8)
 test-top-l2multichi-matrix:
 	@for style in packed separate; do \
 	  for mon in off separate packed both; do \
@@ -143,7 +141,8 @@ test-top-l2multichi-matrix:
 	      echo "=== matrix build: $$tag"; \
 	      if [ $$l2 -eq 2 ]; then \
 	        $(MAKE) --no-print-directory test-top-l2multichi TAG=$$tag NUM_L2=2 NO_PERF=1 \
-	          CHI_STYLE=$$style CHI_MON=$$mon CHI_NIDS=2,3 CCHI_T1_NIDS=0,8 || exit 1; \
+	          CHI_STYLE=$$style CHI_MON=$$mon CHI_NIDS=2,3 \
+	          CCHI_UPSTREAM="t1:0,t4:4,t4:5;t1:8,t4:4,t4:5" || exit 1; \
 	      else \
 	        $(MAKE) --no-print-directory test-top-l2multichi TAG=$$tag NUM_L2=1 NO_PERF=1 \
 	          CHI_STYLE=$$style CHI_MON=$$mon || exit 1; \

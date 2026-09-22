@@ -17,27 +17,61 @@ import oceanus.chi.intf.CHIRNFInterface
 import oceanus.chi.intf.CHIRNFRawInterface
 
 
+sealed trait L2UpstreamPortType
+object L2UpstreamPortType {
+  case object Type1 extends L2UpstreamPortType
+  case object Type4 extends L2UpstreamPortType
+}
+
+case class L2UpstreamTableEntry(portType: L2UpstreamPortType, nid: Int)
+
+/* Upstream CCHI port table of an Oceanus L2: which upstream ports are exported
+ * and which node ID each of them takes.
+ *
+ * Multiple Type-1 ports are taken as different upstream sources of the SAME
+ * coherent client: they share the single client bit in the Directory (only one
+ * Type-1 client is supported for now), and all their node IDs are passed to
+ * L2ClientTable translated as the same client.
+ *
+ * NOTE: with multiple Type-1 ports, the user must guarantee that they have no
+ * operational address overlapping between each other. This is a documented
+ * contract only — intentionally NOT checked by any assertion. */
+class L2UpstreamTable(val entries: Seq[L2UpstreamTableEntry]) {
+  require(entries.nonEmpty, "L2UpstreamTable must contain at least one entry")
+  require(entries.map(_.nid).distinct.size == entries.size,
+    s"Duplicated node ID in L2UpstreamTable: ${entries.map(_.nid).mkString(", ")}")
+  require(entries.exists(_.portType == L2UpstreamPortType.Type1),
+    "L2UpstreamTable must contain at least one Type-1 port (the coherent upstream client)")
+
+  val type1 = entries.filter(_.portType == L2UpstreamPortType.Type1)
+  val type4 = entries.filter(_.portType == L2UpstreamPortType.Type4)
+}
+
+object L2UpstreamTable {
+  def defaults = new L2UpstreamTable(Seq(
+    L2UpstreamTableEntry(L2UpstreamPortType.Type1, 0),
+    L2UpstreamTableEntry(L2UpstreamPortType.Type4, 4),
+    L2UpstreamTableEntry(L2UpstreamPortType.Type4, 5)
+  ))
+}
+
 class L2Configuration(
   val nodeId: Int,
   val eSAM: Boolean,
   val slices: Seq[Int],
-  val t1p0NID: Int = 0,
-  val t4p0NID: Int = 4,
-  val t4p1NID: Int = 5
+  val upstream: L2UpstreamTable = L2UpstreamTable.defaults
 ) {
   def sliceNum = slices.size
 }
 
 class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Module with HasL2Params {
 
-  val t1p0_NID = config.t1p0NID
-  val t4p0_NID = config.t4p0NID
-  val t4p1_NID = config.t4p1NID
+  val t1NIDs = config.upstream.type1.map(_.nid)
+  val t4NIDs = config.upstream.type4.map(_.nid)
 
   val io = IO(new Bundle {
-    val t1p0 = new CCHIInterfaceType1
-    val t4p0 = new CCHIInterfaceType4
-    val t4p1 = new CCHIInterfaceType4
+    val t1p = Vec(t1NIDs.size, new CCHIInterfaceType1)
+    val t4p = Vec(t4NIDs.size, new CCHIInterfaceType4)
 
     val chi = new CHIRNFInterface
   })
@@ -45,13 +79,11 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   // ----------------------------------------------------------------
 
   //
-  val postSAM_t1p0 = Wire(new CCHIInterfaceType1)
-  val postSAM_t4p0 = Wire(new CCHIInterfaceType4)
-  val postSAM_t4p1 = Wire(new CCHIInterfaceType4)
+  val postSAM_t1p = Wire(Vec(t1NIDs.size, new CCHIInterfaceType1))
+  val postSAM_t4p = Wire(Vec(t4NIDs.size, new CCHIInterfaceType4))
 
-  postSAM_t1p0 <> io.t1p0
-  postSAM_t4p0 <> io.t4p0
-  postSAM_t4p1 <> io.t4p1
+  postSAM_t1p.zip(io.t1p).foreach { case (post, port) => post <> port }
+  postSAM_t4p.zip(io.t4p).foreach { case (post, port) => post <> port }
 
   // -- Upstream External SAM (L1 has no internal sam, slice mapped at L2)
   def map1(addr: UInt): UInt = config.slices.head.U
@@ -74,30 +106,22 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     val mappedIndex1 = addr.asBools.zipWithIndex.filter(_._2 % 2 == 1).map(_._1).xorR
     VecInit(config.slices.map(_.U))(Cat(mappedIndex1, mappedIndex0))
   }
- 
+
   if (config.eSAM) {
-    if (config.sliceNum == 1) {
-      postSAM_t1p0.UpEVT.bits.TgtID := map1(io.t1p0.UpEVT.bits.Addr)
-      postSAM_t1p0.UpREQ.bits.TgtID := map1(io.t1p0.UpREQ.bits.Addr)
-      postSAM_t4p0.UpREQ.bits.TgtID := map1(io.t4p0.UpREQ.bits.Addr)
-      postSAM_t4p1.UpREQ.bits.TgtID := map1(io.t4p1.UpREQ.bits.Addr)
-    } else if (config.sliceNum == 2) {
-      postSAM_t1p0.UpEVT.bits.TgtID := map2(io.t1p0.UpEVT.bits.Addr)
-      postSAM_t1p0.UpREQ.bits.TgtID := map2(io.t1p0.UpREQ.bits.Addr)
-      postSAM_t4p0.UpREQ.bits.TgtID := map2(io.t4p0.UpREQ.bits.Addr)
-      postSAM_t4p1.UpREQ.bits.TgtID := map2(io.t4p1.UpREQ.bits.Addr)
-    } else if (config.sliceNum == 3) {
-      postSAM_t1p0.UpEVT.bits.TgtID := map3(io.t1p0.UpEVT.bits.Addr)
-      postSAM_t1p0.UpREQ.bits.TgtID := map3(io.t1p0.UpREQ.bits.Addr)
-      postSAM_t4p0.UpREQ.bits.TgtID := map3(io.t4p0.UpREQ.bits.Addr)
-      postSAM_t4p1.UpREQ.bits.TgtID := map3(io.t4p1.UpREQ.bits.Addr)
-    } else if (config.sliceNum == 4) {
-      postSAM_t1p0.UpEVT.bits.TgtID := map4(io.t1p0.UpEVT.bits.Addr)
-      postSAM_t1p0.UpREQ.bits.TgtID := map4(io.t1p0.UpREQ.bits.Addr)
-      postSAM_t4p0.UpREQ.bits.TgtID := map4(io.t4p0.UpREQ.bits.Addr)
-      postSAM_t4p1.UpREQ.bits.TgtID := map4(io.t4p1.UpREQ.bits.Addr)
-    } else {
-      require(false, s"Unsupported slice count ${config.sliceNum} under eSAM")
+    require(config.sliceNum >= 1 && config.sliceNum <= 4,
+      s"Unsupported slice count ${config.sliceNum} under eSAM")
+    val samMap: UInt => UInt = config.sliceNum match {
+      case 1 => (addr: UInt) => map1(addr)
+      case 2 => (addr: UInt) => map2(addr)
+      case 3 => (addr: UInt) => map3(addr)
+      case 4 => (addr: UInt) => map4(addr)
+    }
+    io.t1p.zip(postSAM_t1p).foreach { case (port, post) =>
+      post.UpEVT.bits.TgtID := samMap(port.UpEVT.bits.Addr)
+      post.UpREQ.bits.TgtID := samMap(port.UpREQ.bits.Addr)
+    }
+    io.t4p.zip(postSAM_t4p).foreach { case (port, post) =>
+      post.UpREQ.bits.TgtID := samMap(port.UpREQ.bits.Addr)
     }
   }
   // ----------------------------------------------------------------
@@ -109,11 +133,13 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     slice.io.consts.sliceIdx := i.U
     slice.io.consts.sliceNID := config.slices(i).U
     slice.io.consts.nodeId := config.nodeId.U
-    slice.io.consts.clientNID := config.t1p0NID.U
+    // Snoops target the first listed Type-1 port: multiple Type-1 ports are
+    // sources of the same single coherent client (see L2UpstreamTable).
+    slice.io.consts.clientNID := t1NIDs.head.U
   }
 
   // - Upstream RXEVT routing
-  val postSAM_UpEVTs = Seq(postSAM_t1p0.UpEVT)
+  val postSAM_UpEVTs = postSAM_t1p.map(_.UpEVT).toSeq
   val preArb_UpEVTs = Wire(Vec(config.sliceNum, Vec(postSAM_UpEVTs.size, Decoupled(new FlitEVT))))
 
   postSAM_UpEVTs.zip(preArb_UpEVTs.transpose).foreach { case (sink, sources) => {
@@ -122,14 +148,14 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
 
   slices.zipWithIndex.foreach { case (slice, i) => {
     postSAM_UpEVTs.zipWithIndex.foreach { case (postSAM_UpEVT, j) => {
-      preArb_UpEVTs(i)(j).bits := postSAM_t1p0.UpEVT.bits
-      preArb_UpEVTs(i)(j).valid := postSAM_t1p0.UpEVT.valid && postSAM_t1p0.UpEVT.bits.TgtID === config.slices(i).U
+      preArb_UpEVTs(i)(j).bits := postSAM_UpEVT.bits
+      preArb_UpEVTs(i)(j).valid := postSAM_UpEVT.valid && postSAM_UpEVT.bits.TgtID === config.slices(i).U
     }}
     fastArb(preArb_UpEVTs(i), slice.io.UpRXEVT, Some(s"UpRXEVT_$i"))
   }}
 
   // - Upstream RXREQ routing (Including local loop-back)
-  val postSAM_UpREQs = Seq(postSAM_t1p0.UpREQ, postSAM_t4p0.UpREQ, postSAM_t4p1.UpREQ)
+  val postSAM_UpREQs = postSAM_t1p.map(_.UpREQ).toSeq ++ postSAM_t4p.map(_.UpREQ).toSeq
   val preArb_UpREQs = Wire(Vec(config.sliceNum, Vec(postSAM_UpREQs.size, Decoupled(new FlitREQ))))
 
   postSAM_UpREQs.zip(preArb_UpREQs.transpose).foreach { case (sink, sources) => {
@@ -147,7 +173,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   }}
 
   // - Upstream RXRSP routing
-  val postSAM_UpRSPs = Seq(postSAM_t1p0.UpRSP)
+  val postSAM_UpRSPs = postSAM_t1p.map(_.UpRSP).toSeq
   val preArb_UpRSPs = Wire(Vec(config.sliceNum, Vec(postSAM_UpRSPs.size, Decoupled(new FlitUpRSP))))
 
   postSAM_UpRSPs.zip(preArb_UpRSPs.transpose).foreach { case (sink, sources) => {
@@ -167,7 +193,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   }}
 
   // - Upstream RXDAT routing
-  val postSAM_UpDATs = Seq(postSAM_t1p0.UpDAT)
+  val postSAM_UpDATs = postSAM_t1p.map(_.UpDAT).toSeq
   val preArb_UpDATs = Wire(Vec(config.sliceNum, Vec(postSAM_UpDATs.size, Decoupled(new FlitUpDAT))))
 
   postSAM_UpDATs.zip(preArb_UpDATs.transpose).foreach { case (sink, sources) => {
@@ -187,7 +213,9 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   }}
 
   // - Upstream TXSNP routing
-  val port_DnSNPs = Seq((postSAM_t1p0.DnSNP, t1p0_NID))
+  // Snoops are generated only for the first listed Type-1 NID (single coherent
+  // client, see L2UpstreamTable); the demux still routes by TgtID.
+  val port_DnSNPs = postSAM_t1p.map(_.DnSNP).toSeq.zip(t1NIDs)
 
   val postSAM_DnSNPs = slices.map(_.io.UpTXSNP)
   val preArb_DnSNPs = Wire(Vec(port_DnSNPs.size, Vec(postSAM_DnSNPs.size, Decoupled(new FlitSNP))))
@@ -205,7 +233,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   }}
 
   // - Upstream TXRSP routing
-  val port_DnRSPs = Seq((postSAM_t1p0.DnRSP, t1p0_NID))
+  val port_DnRSPs = postSAM_t1p.map(_.DnRSP).toSeq.zip(t1NIDs)
 
   val postSAM_DnRSPs = slices.map(_.io.UpTXRSP)
   val preArb_DnRSPs = Wire(Vec(port_DnRSPs.size, Vec(postSAM_DnRSPs.size, Decoupled(new FlitDnRSP))))
@@ -223,7 +251,8 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   }}
 
   // - Upstream TXDAT routing
-  val port_DnDATs = Seq((postSAM_t1p0.DnDAT, t1p0_NID), (postSAM_t4p0.DnDAT, t4p0_NID), (postSAM_t4p1.DnDAT, t4p1_NID))
+  val port_DnDATs = postSAM_t1p.map(_.DnDAT).toSeq.zip(t1NIDs) ++
+                    postSAM_t4p.map(_.DnDAT).toSeq.zip(t4NIDs)
 
   val postSAM_DnDATs = slices.map(_.io.UpTXDAT)
   val preArb_DnDATs = Wire(Vec(port_DnDATs.size, Vec(postSAM_DnDATs.size, Decoupled(new FlitDnDAT))))
@@ -287,7 +316,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   io.chi <> chiLink.io.out
 
   //
-  val clientTable = Module(new L2ClientTable(config.sliceNum, config.t1p0NID))
+  val clientTable = Module(new L2ClientTable(config.sliceNum, t1NIDs))
 
   clientTable.io.queryEVT.zip(slices.map(_.io.toClientTableEVT)).foreach { case (sinks, sources) => {
     sinks.zip(sources).foreach { case (sink, source) => sink := source }

@@ -37,10 +37,13 @@ import cc.xiangshan.openncb.{EnumAXIMasterOrder, EnumCHIDataCheck, NCBParameters
  *
  *  Top-level port naming follows the Cohestra V3 contract (CHIron
  *  cchi/cohestra/cohestra_v3), exported pin-by-pin via suggestName:
- *    cchi_t1p{P}_{rxevt,rxreq,txsnp,txrsp,rxrsp,txdat,rxdat}_{valid,ready,bits_*}
- *      - one Type-1 port per L2; DUT inputs on rx*, DUT outputs on tx*
- *    cchi_t4p{2i}/cchi_t4p{2i+1}_{rxreq,txdat}_*
- *      - the two Type-4 ports of L2 i (no cohestra concept yet; same scheme)
+ *    cchi_t1p{G}_{rxevt,rxreq,txsnp,txrsp,rxrsp,txdat,rxdat}_{valid,ready,bits_*}
+ *      - Type-1 ports of every L2's L2UpstreamTable (default: one per L2);
+ *        G is a global running port index across L2s
+ *      - DUT inputs on rx*, DUT outputs on tx*
+ *    cchi_t4p{G}_{rxreq,txdat}_*
+ *      - Type-4 ports of every L2's table (default: two per L2), same global
+ *        running index (defaults reproduce cchi_t4p{2i}/cchi_t4p{2i+1})
  *    axi_m0_{awvalid,awready,awid,awaddr,awlen,awsize,awburst,
  *            wvalid,wready,wdata,wstrb,wlast,
  *            bvalid,bready,bid,bresp,
@@ -116,20 +119,27 @@ class TestTop_L2OpenLLC(val numL2: Int, val numSlices: Int)(implicit p: Paramete
       }
     }
 
-    // -- Exported upstream CCHI ports, one Type-1 + two Type-4 per L2
-    l2s.zipWithIndex.foreach { case (l2, i) =>
-      exportChannel(s"cchi_t1p${i}_rxevt", l2.io.t1p0.UpEVT, dutDrives = false)
-      exportChannel(s"cchi_t1p${i}_rxreq", l2.io.t1p0.UpREQ, dutDrives = false)
-      exportChannel(s"cchi_t1p${i}_txsnp", l2.io.t1p0.DnSNP, dutDrives = true)
-      exportChannel(s"cchi_t1p${i}_txrsp", l2.io.t1p0.DnRSP, dutDrives = true)
-      exportChannel(s"cchi_t1p${i}_rxrsp", l2.io.t1p0.UpRSP, dutDrives = false)
-      exportChannel(s"cchi_t1p${i}_txdat", l2.io.t1p0.DnDAT, dutDrives = true)
-      exportChannel(s"cchi_t1p${i}_rxdat", l2.io.t1p0.UpDAT, dutDrives = false)
-
-      exportChannel(s"cchi_t4p${2*i}_rxreq",   l2.io.t4p0.UpREQ, dutDrives = false)
-      exportChannel(s"cchi_t4p${2*i}_txdat",   l2.io.t4p0.DnDAT, dutDrives = true)
-      exportChannel(s"cchi_t4p${2*i+1}_rxreq", l2.io.t4p1.UpREQ, dutDrives = false)
-      exportChannel(s"cchi_t4p${2*i+1}_txdat", l2.io.t4p1.DnDAT, dutDrives = true)
+    // -- Exported upstream CCHI ports from each L2's L2UpstreamTable
+    // (default: one Type-1 + two Type-4 per L2); global running port indices
+    // across L2s, so defaults reproduce cchi_t1p{i}, cchi_t4p{2i}, cchi_t4p{2i+1}
+    var t1PortIdx = 0
+    var t4PortIdx = 0
+    l2s.foreach { l2 =>
+      l2.io.t1p.foreach { port =>
+        val g = t1PortIdx; t1PortIdx += 1
+        exportChannel(s"cchi_t1p${g}_rxevt", port.UpEVT, dutDrives = false)
+        exportChannel(s"cchi_t1p${g}_rxreq", port.UpREQ, dutDrives = false)
+        exportChannel(s"cchi_t1p${g}_txsnp", port.DnSNP, dutDrives = true)
+        exportChannel(s"cchi_t1p${g}_txrsp", port.DnRSP, dutDrives = true)
+        exportChannel(s"cchi_t1p${g}_rxrsp", port.UpRSP, dutDrives = false)
+        exportChannel(s"cchi_t1p${g}_txdat", port.DnDAT, dutDrives = true)
+        exportChannel(s"cchi_t1p${g}_rxdat", port.UpDAT, dutDrives = false)
+      }
+      l2.io.t4p.foreach { port =>
+        val g = t4PortIdx; t4PortIdx += 1
+        exportChannel(s"cchi_t4p${g}_rxreq", port.UpREQ, dutDrives = false)
+        exportChannel(s"cchi_t4p${g}_txdat", port.DnDAT, dutDrives = true)
+      }
     }
 
     // -- Downstream CHI: oceanus CHIRNFInterface <-> legacy PortIO via OceanusChannelAdapter

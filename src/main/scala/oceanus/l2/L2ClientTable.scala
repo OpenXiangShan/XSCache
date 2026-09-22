@@ -8,14 +8,16 @@ import org.chipsalliance.cde.config.Parameters
 import xscache.oceanus.compactchi.HasCCHIParameters
 
 
-class L2ClientTable(val sliceNum: Int, val clientNID: Int = 0)(implicit val p: Parameters) 
+class L2ClientTable(val sliceNum: Int, val clientNIDs: Seq[Int] = Seq(0))(implicit val p: Parameters) 
     extends Module 
     with HasL2Params
     with HasCCHIParameters {
 
   // Single coherent upstream client for now (TODO: parameterize with coherent
-  // l2 client count); the NID is the configured Type-1 port NID.
-  val theOnlyDCacheNID = clientNID
+  // l2 client count). Every Type-1 upstream port NID of the L2UpstreamTable is
+  // translated to the same client bit: multiple Type-1 ports are different
+  // upstream sources of the same client and share its Directory client bit.
+  val theOnlyDCacheNIDs = clientNIDs
 
   val io = IO(new Bundle {
     val queryREQ = Input(Vec(sliceNum, Vec(paramL2.mshrSize, UInt(paramCCHI.UpstreamNodeID_Width.W))))
@@ -27,11 +29,11 @@ class L2ClientTable(val sliceNum: Int, val clientNID: Int = 0)(implicit val p: P
 
   io.queryREQ.zip(io.clientsREQ).foreach { case (query, clients) => {
     query.zip(clients).foreach { case (query, clients) =>
-      clients.head := query === theOnlyDCacheNID.U
+      clients.head := theOnlyDCacheNIDs.map(nid => query === nid.U).reduce(_ || _)
   }}}
 
   io.queryEVT.zip(io.clientsEVT).foreach { case (query, clients) => {
     query.zip(clients).foreach { case (query, clients) =>
-      clients.head := query === theOnlyDCacheNID.U
+      clients.head := theOnlyDCacheNIDs.map(nid => query === nid.U).reduce(_ || _)
   }}}
 }
