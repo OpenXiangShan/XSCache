@@ -77,7 +77,7 @@ BUILD_DIR_TSHRCTRL = ./build/l2tshrctrl
 TOP_V_TSHRCTRL = $(BUILD_DIR_TSHRCTRL)/TestTop_L2TSHRCtrl.sv
 
 test-top-tshrctrl:
-	mill -i XSCache.test.runMain oceanus.TestTop_L2TSHRCtrl -td $(BUILD_DIR_TSHRCTRL) --target systemverilog --split-verilog
+	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2TSHRCtrl -td $(BUILD_DIR_TSHRCTRL) --target systemverilog --split-verilog
 	if [ -f "$(TOP_V_TSHRCTRL).conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(TOP_V_TSHRCTRL).conf" "$(BUILD_DIR_TSHRCTRL)"; fi
 
 BUILD_DIR_L2TOP = ./build/l2top
@@ -85,7 +85,7 @@ BUILD_DIR_L2TOP = ./build/l2top
 # defaults to 2 slices; override with NUM_SLICE=<1-4>
 test-top-l2top: NUM_SLICE = 2
 test-top-l2top:
-	mill -i XSCache.test.runMain oceanus.TestTop_L2Top -td $(BUILD_DIR_L2TOP) --slices $(NUM_SLICE) --target systemverilog --split-verilog
+	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2Top -td $(BUILD_DIR_L2TOP) --slices $(NUM_SLICE) --target systemverilog --split-verilog
 	if [ -f "$(BUILD_DIR_L2TOP)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2TOP)/TestTop.sv.conf" "$(BUILD_DIR_L2TOP)"; fi
 
 BUILD_DIR_L2OPENLLC = ./build/l2openllc
@@ -99,7 +99,7 @@ PERF_ARGS = $(if $(filter 1,$(NO_PERF)),--noperf,)
 NUM_L2 ?= 1
 test-top-l2openllc: NUM_SLICE = 2
 test-top-l2openllc:
-	mill -i XSCache.test.runMain oceanus.TestTop_L2OpenLLC -td $(BUILD_DIR_L2OPENLLC) --l2 $(NUM_L2) --slices $(NUM_SLICE) $(PERF_ARGS) --target systemverilog --split-verilog
+	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2OpenLLC -td $(BUILD_DIR_L2OPENLLC) --l2 $(NUM_L2) --slices $(NUM_SLICE) $(PERF_ARGS) --target systemverilog --split-verilog
 	if [ -f "$(BUILD_DIR_L2OPENLLC)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2OPENLLC)/TestTop.sv.conf" "$(BUILD_DIR_L2OPENLLC)"; fi
 
 # per-L2 node IDs; CHI_NIDS is a comma list with one value per L2 (default
@@ -128,7 +128,7 @@ BUILD_DIR_L2MULTICHI = ./build/l2multichi$(if $(TAG),_$(TAG),)
 # defaults to 1 L2 x 2 slices; override with NUM_L2=<n> / NUM_SLICE=<1-4>
 test-top-l2multichi: NUM_SLICE = 2
 test-top-l2multichi:
-	mill -i XSCache.test.runMain oceanus.TestTop_L2MultiCHI -td $(BUILD_DIR_L2MULTICHI) --l2 $(NUM_L2) --slices $(NUM_SLICE) $(PERF_ARGS) $(MULTICHI_ARGS) --target systemverilog --split-verilog
+	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2MultiCHI -td $(BUILD_DIR_L2MULTICHI) --l2 $(NUM_L2) --slices $(NUM_SLICE) $(PERF_ARGS) $(MULTICHI_ARGS) --target systemverilog --split-verilog
 	if [ -f "$(BUILD_DIR_L2MULTICHI)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2MULTICHI)/TestTop.sv.conf" "$(BUILD_DIR_L2MULTICHI)"; fi
 
 # full configuration matrix: {packed,separate} x {off,separate,packed,both} x {1,2} L2;

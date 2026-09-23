@@ -137,6 +137,15 @@ object XSCache extends HasChisel with $file.common.XSCacheModule {
       }
       override def scalacOptions = super.scalacOptions() ++ Agg("-deprecation", "-feature")
     }
+
+    object oceanus extends HasChisel {
+      override def millSourcePath = pwd
+      override def moduleDeps = super.moduleDeps ++ Seq(XSCache)
+      override def sources = T.sources {
+        Seq(PathRef(pwd / "src" / "test" / "scala" / "oceanus"))
+      }
+      override def scalacOptions = super.scalacOptions() ++ Agg("-deprecation", "-feature")
+    }
   }
 
   override def scalacOptions = super.scalacOptions() ++ Agg("-deprecation", "-feature")
