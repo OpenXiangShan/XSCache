@@ -29,9 +29,17 @@ class L2VPipeEVT(
 
     val tshr_paddr = Input(UInt(paramL2.physicalAddrWidth.W))
     val tshr_dirResult = Input(new L2Directory.MetaReadResult)
+    val tshr_meta = Input(new L2Directory.Meta) // live TSHR meta (commit-time base)
+
+    // A REQ/SNP vPipe of this TSHR is writing meta.state this cycle. Peer meta
+    // writes are hard-timed single-cycle pulses (downstream data arrival /
+    // snoop commit); the EVT commit is upstream-tolerant, so it yields.
+    val peer_meta_write_state = Input(Bool())
 
     val tshr_meta_write_en = Output(new L2Directory.MetaWriteMask)
     val tshr_meta_write_meta = Output(new L2Directory.Meta)
+
+    val at_commit = Output(Bool()) // parked at sWaitCommit (for TSHR-level assertions)
 
     val EVT_active = Output(Bool())
     val evtDataReadyOut = Output(Bool())
@@ -55,7 +63,7 @@ class L2VPipeEVT(
   val pTxnId = Reg(UInt(8.W))
   val pTraceTag = Reg(UInt(1.W))
   val pReqWay = Reg(UInt(4.W))
-  val pMissMeta = Reg(new L2Directory.MetaReadResult)
+  val pEntState = Reg(UInt(2.W)) // entrance-time directory state (assertion use only)
   val dataArmed = RegInit(false.B)
   val dirHit = RegInit(false.B)
   val inflightEvict = RegInit(false.B)
@@ -94,7 +102,7 @@ class L2VPipeEVT(
     pSrcId := io.UpRXEVT.bits.SrcID
     pTraceTag := io.UpRXEVT.bits.TraceTag
     pReqWay := dirResult.way
-    pMissMeta := dirResult
+    pEntState := dirResult.state
     dirHit := dirResult.hit
     dataArmed := false.B
     inflightEvict := true.B
@@ -114,7 +122,15 @@ class L2VPipeEVT(
     state := sWaitCommit
   }
 
-  when (state === sWaitCommit) {
+  // Commit stall: a REQ/SNP vPipe writing meta.state this cycle takes the slot
+  // (peer writes are hard-timed single-cycle pulses from downstream data
+  // arrival / snoop commit); the EVT commit is upstream-tolerant and yields,
+  // keeping the meta mask and the state exit atomic.
+  val commitStall = io.peer_meta_write_state
+
+  io.at_commit := state === sWaitCommit
+
+  when (state === sWaitCommit && !commitStall) {
     when (pIsWbFull) {
       // WriteBackFull: CompDBIDResp is the complete CCHI response; a trailing Comp is illegal
       state := sIdle
@@ -144,9 +160,13 @@ class L2VPipeEVT(
   io.UpTXRSP.bits.Way := pReqWay
   io.UpTXRSP.bits.TraceTag := pTraceTag
 
+  // Commit against the LIVE TSHR meta: another vPipe (e.g. a stash refill, an
+  // SA-free opcode that never snoops the client) may have written meta between
+  // this EVB's entrance and commit. The client-drop mapping must apply to the
+  // state current at commit, and the live dirty/alias/way must be preserved.
   val nextStateAfterClientDrop = WireDefault(L2Directory.MetaState.I)
   nextStateAfterClientDrop := MuxLookup(
-    pMissMeta.state,
+    io.tshr_meta.state,
     L2Directory.MetaState.I
   )(Seq(
     L2Directory.MetaState.UU -> L2Directory.MetaState.US,
@@ -156,7 +176,7 @@ class L2VPipeEVT(
   ))
 
   val newMeta = Wire(new L2Directory.Meta)
-  newMeta := pMissMeta
+  newMeta := io.tshr_meta
   newMeta.state := nextStateAfterClientDrop
   newMeta.clients(0) := false.B
   when (pIsWbFull) {
@@ -168,7 +188,7 @@ class L2VPipeEVT(
   metaMask.dirty := false.B
   metaMask.alias := false.B
   metaMask.clients.foreach(_ := false.B)
-  when (state === sWaitCommit && (pIsWbFull || dirHit)) {
+  when (state === sWaitCommit && (pIsWbFull || dirHit) && !commitStall) {
     metaMask.state := true.B
     metaMask.clients(0) := true.B
     when (pIsWbFull) {
@@ -181,7 +201,7 @@ class L2VPipeEVT(
 
   assert(!(copyBackWrDataMatch && evtDataReady), "EVT: unexpected extra CopyBackWrData after evtDataReady")
   assert(!(state === sWaitData && !dataArmed), "EVT: data arrived before CompDBIDResp armed reception")
-  assert(!(state === sWaitCommit && pIsWbFull && pMissMeta.state === L2Directory.MetaState.S),
+  assert(!(state === sWaitCommit && pIsWbFull && pEntState === L2Directory.MetaState.S),
     "EVT: WriteBackFull must not originate from shared-clean directory state")
   assert(!(state === sWaitCommit && pIsWbFull && newMeta.state === L2Directory.MetaState.UU && !newMeta.clients.asUInt.orR),
     "EVT: directory writeback must not leave unique-owner state without any client")
@@ -190,4 +210,14 @@ class L2VPipeEVT(
   // would clobber whatever line occupies 'dirResult.way' (hardcoded to 0 on a miss).
   assert(!(state === sWaitCommit && pIsWbFull && !dirHit),
     "EVT: WriteBackFull missed the directory - L1 copyback data would be silently dropped (inclusion broken)")
+
+  // Starvation tripwire: peer meta.state writes are single-cycle pulses, so the
+  // commit stall must be short; an unbounded stall here is a new livelock.
+  val stallCycles = RegInit(0.U(8.W))
+  when (state === sWaitCommit && commitStall) {
+    stallCycles := stallCycles + 1.U
+  } .otherwise {
+    stallCycles := 0.U
+  }
+  assert(stallCycles < 64.U, "EVT vPipe @ %m commit starved by peer meta writes")
 }

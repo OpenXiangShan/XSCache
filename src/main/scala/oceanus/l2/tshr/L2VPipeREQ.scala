@@ -76,6 +76,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     val blockRBE = Output(new L2RBE.PathVPipeBlock)
     val free = Output(Bool())
 
+    // The latched opcode never triggers the Snoop Agent (no toSA.SnpTo*), so
+    // its meta writes may legitimately coincide with an EVT vPipe commit on
+    // this TSHR (the EVT commit yields, see L2VPipeEVT). Whitelist for the
+    // TSHR-level assertion: StashShared & StashUnique for now.
+    val sa_free_opcode = Output(Bool())
+
     val ds_rd_en = Output(Bool())
     val ds_rd_cancel = Output(Bool())
     val ds_rd_done = Input(Bool())
@@ -244,6 +250,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val p_rxreq_opcode = p_rxreq.Opcode
   val p_rxreq_stashshared       = p_rxreq_opcode === CCHIOpcode.StashShared.U
   val p_rxreq_stashunique       = p_rxreq_opcode === CCHIOpcode.StashUnique.U
+
+  io.sa_free_opcode := p_rxreq_stashshared || p_rxreq_stashunique
   val p_rxreq_readnosnp         = p_rxreq_opcode === CCHIOpcode.ReadNoSnp.U
   val p_rxreq_readonce          = p_rxreq_opcode === CCHIOpcode.ReadOnce.U
   val p_rxreq_readshared        = p_rxreq_opcode === CCHIOpcode.ReadShared.U

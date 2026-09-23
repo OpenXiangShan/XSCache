@@ -517,6 +517,16 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   // connections between TSHR local and EVT vPipe
   vPipeEVT.io.tshr_paddr := tshr_paddr
   vPipeEVT.io.tshr_dirResult := dirResult
+  vPipeEVT.io.tshr_meta := meta
+  vPipeEVT.io.peer_meta_write_state := vPipeREQ.io.tshr_meta_write_en.state ||
+                                       vPipeSNP.io.tshr_meta_write_en.state
+
+  // Whitelist: a REQ-flow meta write racing an EVT vPipe commit is allowed only
+  // for opcodes that never interact with the Snoop Agent (StashShared &
+  // StashUnique for now; the EVT commit yields to them, see L2VPipeEVT). For
+  // SA-interacting opcodes the snoop serialization must make this impossible.
+  assert(!(vPipeEVT.io.at_commit && vPipeREQ.io.tshr_meta_write_en.state && !vPipeREQ.io.sa_free_opcode),
+    "TSHR @ %m EVT commit raced by REQ meta write on SA-interacting opcode (must serialize via Snoop Agent)")
 
   meta_write_EVT_mask := vPipeEVT.io.tshr_meta_write_en
   meta_write_EVT_meta := vPipeEVT.io.tshr_meta_write_meta
