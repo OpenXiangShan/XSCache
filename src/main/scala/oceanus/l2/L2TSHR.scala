@@ -549,6 +549,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   // connections between TSHR local and REQ vPipe
   vPipeREQ.io.tshr_paddr := tshr_paddr
   vPipeREQ.io.tshr_dirResult := dirResult
+  vPipeREQ.io.tshr_dealloc := tshr_dealloc
   vPipeREQ.io.tshr_meta_modified := meta_modified.asUInt.orR
   vPipeREQ.io.tshr_tag_modified := tag_modified
   vPipeREQ.io.tbuf_modified := tshr_buffer_modified

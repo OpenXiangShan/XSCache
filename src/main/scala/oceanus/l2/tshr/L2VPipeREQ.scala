@@ -60,6 +60,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
     val tshr_dirResult = Input(new L2Directory.MetaReadResult)
 
+    // Pulses when this TSHR deallocates; per-life bookkeeping registers that
+    // are not part of the free state must be cleared on it, so that nothing
+    // leaks into the entry's next life.
+    val tshr_dealloc = Input(Bool())
+
     val tshr_tag_write_en = Output(Bool())
     val tshr_meta_write_en = Output(new L2Directory.MetaWriteMask)
     val tshr_meta_write_meta = Output(new L2Directory.Meta)
@@ -288,7 +293,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val p_retryack_pcrdtype = Reg(UInt(paramCHI.rspPCrdTypeWidth.W))
   val p_retryack_srcid = Reg(UInt(paramCHI.nodeIdWidth.W))
 
-  val p_evict_cancelled = Reg(Bool())
+  val p_evict_cancelled = RegInit(false.B)
 
   val p_dbid = Reg(UInt(paramCHI.rspDBIDWidth.W))
   val p_homenid = Reg(UInt(paramCHI.nodeIdWidth.W))
@@ -537,6 +542,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   when (issue_txreq || reissue_txreq) {
     s_dn_txreq := true.B
     p_txreq_reissue := reissue_txreq
+  }
+
+  when (io.tshr_dealloc) {
+    p_txreq_reissue := false.B
+    p_evict_cancelled := false.B
   }
 
   when (sched_compack_txreq_rd) {
