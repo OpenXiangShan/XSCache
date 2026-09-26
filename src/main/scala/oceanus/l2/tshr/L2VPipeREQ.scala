@@ -974,7 +974,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                  rxreq_satisfied_makeunique
 
   val expect_up_rd_compack_unsat = (p_rxreq_readunique || p_rxreq_readshared || p_rxreq_makeunique) &&
-                                   (dn_rxrsp_comp || dn_rxdat_compdata_first || dn_rxrsp_respsepdata)
+                                   (dn_rxrsp_comp || dn_rxdat_compdata_first || dn_rxdat_datasepresp_first)
 
   val expect_up_rd_compack = expect_up_rd_compack_sat || expect_up_rd_compack_unsat
 
@@ -986,7 +986,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     w_rd_up_compack := false.B
   }
 
-  assert(!(up_rxrsp_compack && !w_rd_up_compack), "Receiving upstream RXRSP CompAck on non-valid 'w_up_rd_compack' in TSHR @ %m REQ vPipe")
+  assert(!(up_rxrsp_compack && !w_rd_up_compack), "Receiving upstream RXRSP CompAck on non-valid 'w_rd_up_compack' in TSHR @ %m REQ vPipe")
   assert(!(dn_rxrsp_comp && !(w_rd_dn_comp || w_evict_dn_comp || w_evict_dn_compdbid)),
     "TSHR @ %m REQ vPipe received downstream Comp on non-valid expectation")
   // ----------------------------------------------------------------
