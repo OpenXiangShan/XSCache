@@ -509,8 +509,13 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
     CHI_SnpStashUnique,
     CHI_SnpStashShared
   )
+  // A nested eviction cancelled during a P-credit retry carries PCrdReturn
+  // (L2VPipeREQ.evictback_txreq_opcode): it performs no write-back and has no
+  // meta effect (the tables' defaults already produce that) — accept it as
+  // supported.
+  val req_evict_pcrdreturn = req_evict_valid && req_evict_opcode === CHI_PCrdReturn.asUInt
   val req_evict_supported = !req_evict_valid || nested_writeBackFull ||
-                            nested_writeCleanFull || nested_writeEvictX
+                            nested_writeCleanFull || nested_writeEvictX || req_evict_pcrdreturn
   val dir_state_unique = io.tshr_dirResult.state === L2Directory.MetaState.US ||
                          io.tshr_dirResult.state === L2Directory.MetaState.UU
   val rxsnp_no_sa_uop = rxsnp_snpQuery || rxsnp_snpStashUnique || rxsnp_snpStashShared
