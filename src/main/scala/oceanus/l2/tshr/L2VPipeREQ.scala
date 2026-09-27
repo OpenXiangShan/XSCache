@@ -629,12 +629,21 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  StashShared         ReadNotSharedDirty    64B
   //  -  StashUnique         ReadUnique            64B
   //                         MakeReadUnique        64B
+  //  -  ReadOnce            ReadOnce              64B
+  //                         ReadNotSharedDirty    64B (configInclusiveReadOnce)
+  //  -  EvictBack           WriteBackFull         64B
+  //                         WriteEvictOrEvict     64B
+  //                         WriteEvictFull        64B
+  //                         Evict                 64B
+  //  -  *                   PCrdReturn            0 (forced at the Size assignment below)
   val txreq_size = ParallelMux(Seq(
     (p_rxreq_readshared,      Size64B.U),
     (p_rxreq_readunique,      Size64B.U),
     (p_rxreq_makeunique,      Size64B.U),
     (p_rxreq_stashshared,     Size64B.U),
-    (p_rxreq_stashunique,     Size64B.U)
+    (p_rxreq_stashunique,     Size64B.U),
+    (p_rxreq_readonce,        Size64B.U),
+    (p_rxreq_evictback,       Size64B.U)
   ))
 
   // Field 'LikelyShared':
@@ -646,12 +655,17 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  StashShared         ReadNotSharedDirty    0 (1 not utilized for now)
   //  -  StashUnique         ReadUnique            0
   //                         MakeReadUnique        0
+  //  -  EvictBack           WriteBackFull         0
+  //                         WriteEvictOrEvict     0
+  //                         WriteEvictFull        0
+  //                         Evict                 0 (required 0 for dataless)
   val txreq_likelyshared = ParallelMux(Seq(
     (p_rxreq_readshared,      false.B),
     (p_rxreq_readunique,      false.B),
     (p_rxreq_makeunique,      false.B),
     (p_rxreq_stashshared,     false.B),
-    (p_rxreq_stashunique,     false.B)
+    (p_rxreq_stashunique,     false.B),
+    (p_rxreq_evictback,       false.B)
   ))
 
   // Field 'Order':
@@ -663,12 +677,17 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  StashShared         ReadNotSharedDirty    0b00 (No Ordering)
   //  -  StashUnique         ReadUnique            0b00 (No Ordering)
   //                         MakeReadUnique        0b00 (No Ordering)
+  //  -  EvictBack           WriteBackFull         0b00 (No Ordering)
+  //                         WriteEvictOrEvict     0b00 (No Ordering)
+  //                         WriteEvictFull        0b00 (No Ordering)
+  //                         Evict                 0b00 (No Ordering)
   val txreq_order = ParallelMux(Seq(
     (p_rxreq_readshared,      NoOrdering.U),
     (p_rxreq_readunique,      NoOrdering.U),
     (p_rxreq_makeunique,      NoOrdering.U),
     (p_rxreq_stashshared,     NoOrdering.U),
-    (p_rxreq_stashunique,     NoOrdering.U)
+    (p_rxreq_stashunique,     NoOrdering.U),
+    (p_rxreq_evictback,       NoOrdering.U)
   ))
 
   // Field 'MemAttr':
@@ -680,12 +699,20 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  StashShared         ReadNotSharedDirty    Cacheable + EWA + Allocate
   //  -  StashUnique         ReadUnique            Cacheable + EWA + Allocate
   //                         MakeReadUnique        Cacheable + EWA + Allocate
+  //  -  ReadOnce            ReadOnce              Cacheable + EWA
+  //                         ReadNotSharedDirty    Cacheable + EWA (configInclusiveReadOnce; non-allocating)
+  //  -  EvictBack           WriteBackFull         Cacheable + EWA + Allocate
+  //                         WriteEvictOrEvict     Cacheable + EWA + Allocate
+  //                         WriteEvictFull        Cacheable + EWA + Allocate
+  //                         Evict                 Cacheable + EWA + Allocate
   val txreq_memattr = ParallelMux(Seq(
     (p_rxreq_readshared,      Cacheable.U | EWA.U | Allocate.U),
     (p_rxreq_readunique,      Cacheable.U | EWA.U | Allocate.U),
     (p_rxreq_makeunique,      Cacheable.U | EWA.U),
     (p_rxreq_stashshared,     Cacheable.U | EWA.U | Allocate.U),
-    (p_rxreq_stashunique,     Cacheable.U | EWA.U | Allocate.U)
+    (p_rxreq_stashunique,     Cacheable.U | EWA.U | Allocate.U),
+    (p_rxreq_readonce,        Cacheable.U | EWA.U),
+    (p_rxreq_evictback,       Cacheable.U | EWA.U | Allocate.U)
   ))
 
   // Field 'SnpAttr':
@@ -697,12 +724,17 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  StashShared         ReadNotSharedDirty    1
   //  -  StashUnique         ReadUnique            1
   //                         MakeReadUnique        1
+  //  -  EvictBack           WriteBackFull         1
+  //                         WriteEvictOrEvict     1
+  //                         WriteEvictFull        1
+  //                         Evict                 1
   val txreq_snpattr = ParallelMux(Seq(
     (p_rxreq_readshared,      true.B),
     (p_rxreq_readunique,      true.B),
     (p_rxreq_makeunique,      true.B),
     (p_rxreq_stashshared,     true.B),
-    (p_rxreq_stashunique,     true.B)
+    (p_rxreq_stashunique,     true.B),
+    (p_rxreq_evictback,       true.B)
   ))
 
   // Field 'ExpCompAck':
@@ -714,12 +746,17 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  StashShared         ReadNotSharedDirty    1
   //  -  StashUnique         ReadUnique            1
   //                         MakeReadUnique        1
+  //  -  EvictBack           WriteEvictOrEvict     1
+  //                         WriteBackFull         0
+  //                         WriteEvictFull        0
+  //                         Evict                 0
   val txreq_expcompack = ParallelMux(Seq(
     (p_rxreq_readshared,      true.B),
     (p_rxreq_readunique,      true.B),
     (p_rxreq_makeunique,      true.B),
     (p_rxreq_stashshared,     true.B),
-    (p_rxreq_stashunique,     true.B)
+    (p_rxreq_stashunique,     true.B),
+    (p_rxreq_evictback && (evictback_txreq_opcode === CHI_WriteEvictOrEvict.U), true.B)
   ))
 
   io.DnTXREQ.valid := s_dn_txreq
@@ -732,6 +769,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.DnTXREQ.bits.ReturnTxnID_StashLPIDValid_StashLPID.get := 0.U
   io.DnTXREQ.bits.Opcode.get := txreq_opcode
   io.DnTXREQ.bits.Size.get := Mux(txreq_pcrdreturn, 0.U, txreq_size)
+  assert(!(io.DnTXREQ.fire && io.DnTXREQ.bits.Opcode.get =/= CHI_PCrdReturn.U && io.DnTXREQ.bits.Size.get === 0.U),
+    "TSHR @ %m REQ vPipe issuing non-PCrdReturn TXREQ with Size=0")
   io.DnTXREQ.bits.Addr.get := Mux(txreq_pcrdreturn, 0.U, io.tshr_paddr)
   io.DnTXREQ.bits.NS.get := 0.U // TODO: confirm default NS value or NS mechanism
   io.DnTXREQ.bits.LikelyShared.get := Mux(txreq_pcrdreturn, 0.U, txreq_likelyshared)
