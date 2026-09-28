@@ -424,6 +424,7 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     stashOnceShared_s4
   )
   comp_s4.bits.state.s_comp := false.B
+  comp_s4.bits.state.s_data := !(readUnique_s4 || readNotSharedDirty_s4)
   comp_s4.bits.state.s_urgentRead := true.B
   comp_s4.bits.state.w_datRsp := !(readNotSharedDirty_s4 || readUnique_s4 || stashMissRead_s4)
   comp_s4.bits.state.w_snpRsp := !Cat(snpVec_comp_s4).orR
@@ -508,6 +509,7 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   // Return CompData when local cache access hits
   comp_s6.valid := task_s6.valid && !cleanSelfDirty_s6
   comp_s6.bits.state.s_comp := false.B
+  comp_s6.bits.state.s_data := false.B
   comp_s6.bits.state.s_urgentRead := true.B
   comp_s6.bits.state.w_datRsp := true.B
   comp_s6.bits.state.w_snpRsp := !Cat(req_s6.snpVec).orR

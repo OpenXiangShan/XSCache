@@ -25,7 +25,8 @@ import xscache.chi._
 import xscache.chi.CHICohStates._
 
 class ResponseState(implicit p: Parameters) extends LLCBundle {
-  val s_comp = Bool()
+  val s_comp = Bool() // completion response submitted (CompData or RespSepData for reads)
+  val s_data = Bool() // read data handed to TXDAT; initially true for non-reads
   val s_urgentRead = Bool()
   val w_datRsp = Bool()
   val w_snpRsp = Bool()
@@ -45,6 +46,7 @@ class ResponseEntry(implicit p: Parameters) extends TaskEntry {
   val data = new DSBlock()
   val beatValids = Vec(beatSize, Bool())
   val is_miss = Bool()
+  val separateRead = Bool() // fixed at allocation, never switch after offering a response
 }
 
 class ResponseInfo(implicit p: Parameters) extends BlockInfo {
@@ -76,8 +78,8 @@ class ResponseUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
     val rnRxrsp = Flipped(ValidIO(new Resp()))
 
     /* generate responses sent to the Request Node. */
-    val txrsp = DecoupledIO(new Task()) // Comp(DBIDResp)
-    val txdat = DecoupledIO(new TaskWithData()) // CompData
+    val txrsp = DecoupledIO(new Task()) // Comp(DBIDResp)/RespSepData
+    val txdat = DecoupledIO(new TaskWithData()) // CompData/DataSepResp
 
     /* Response buffers info */
     val respInfo = Vec(mshrs.response, ValidIO(new ResponseInfo()))
@@ -101,7 +103,15 @@ class ResponseUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
   val txrspArb = Module(new FastArbiter(new Task(), mshrs.response))
   val txdatArb = Module(new FastArbiter(new TaskWithData(), mshrs.response))
 
+  val enableSeparateRead = cacheParams.enableReadUniqueSep && after(issue, Issue.Eb)
+  def dataReady(state: ResponseState): Bool = state.w_datRsp && state.w_snpRsp && state.s_urgentRead
+  def separateRead(req: ResponseRequest): Bool =
+    enableSeparateRead.B && req.task.chiOpcode === ReadUnique && !dataReady(req.state)
+
   /* Alloc */
+  // RequestArb serializes prior same-line pipeline/response/refill work before
+  // MainPipe allocates here. The directory already records the new requester.
+  // Replacement snoops targeting this requester remain gated by its CompAck.
   val freeVec_s6 = VecInit(buffer.map(!_.valid))
   val idOH_s6    = PriorityEncoderOH(freeVec_s6)
   val freeVec_s4 = 
@@ -119,7 +129,7 @@ class ResponseUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
   val canAlloc_s6 = alloc_s6.valid && !full_s6
   val canAlloc_s4 = alloc_s4.valid && !full_s4
 
-  // Task_s6 can only be CompData
+  // S6 carries local data, but may still need to wait for snoop responses.
   when(canAlloc_s6) {
     val entry = buffer(insertIdx_s6)
     entry.valid := true.B
@@ -128,6 +138,7 @@ class ResponseUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
     entry.data := alloc_s6.bits.data.get
     entry.beatValids := VecInit(Seq.fill(beatSize)(true.B))
     entry.is_miss := alloc_s6.bits.is_miss
+    entry.separateRead := separateRead(alloc_s6.bits)
   }
 
   when(canAlloc_s4) {
@@ -137,6 +148,7 @@ class ResponseUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
     entry.task := alloc_s4.bits.task
     entry.beatValids := VecInit(Seq.fill(beatSize)(false.B))
     entry.is_miss := alloc_s4.bits.is_miss
+    entry.separateRead := separateRead(alloc_s4.bits)
   }
 
   assert(!(full_s6 && alloc_s6.valid || full_s4 && alloc_s4.valid) , "ResponseBuf overflow")
@@ -248,7 +260,7 @@ class ResponseUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
   def handleCompAck(ack: Valid[Resp]): Unit = {
     when(ack.valid) {
       val update_vec = buffer.map(e =>
-        e.task.reqID === ack.bits.txnID && e.valid && e.state.w_datRsp && e.state.s_comp && !e.state.w_compack &&
+        e.task.reqID === ack.bits.txnID && e.valid && e.state.s_comp && !e.state.w_compack &&
         ack.bits.opcode === CompAck
       )
       assert(PopCount(update_vec) < 2.U, "Response task repeated")
@@ -272,35 +284,46 @@ class ResponseUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
   /* Issue */
   val isRead = buffer.map(e => e.task.chiOpcode === ReadUnique || e.task.chiOpcode === ReadNotSharedDirty)
   txdatArb.io.in.zip(buffer).zip(isRead).foreach { case ((in, e), r) =>
-    in.valid := e.valid && e.state.w_datRsp && e.state.w_snpRsp && e.state.s_urgentRead && !e.state.s_comp && r
+    in.valid := e.valid && dataReady(e.state) && !e.state.s_data && r
     in.bits.task := e.task
     in.bits.data := e.data
+    in.bits.task.chiOpcode := (if (enableSeparateRead) Mux(e.separateRead, DataSepResp, CompData) else CompData)
   }
   txdatArb.io.out.ready := txdat.ready
   txdat.valid := txdatArb.io.out.valid
   txdat.bits := txdatArb.io.out.bits
-  txdat.bits.task.chiOpcode := CompData
   when(txdat.fire) {
     val entry = buffer(txdatArb.io.chosen)
-    entry.state.s_comp := true.B
+    assert(entry.valid && !entry.state.s_data, "Duplicate read data response")
+    entry.state.s_data := true.B
+    // CompData completes both parts; DataSepResp leaves completion to TXRSP.
+    when(!entry.separateRead) {
+      entry.state.s_comp := true.B
+    }
   }
 
   txrspArb.io.in.zip(buffer).zip(isRead).foreach { case ((in, e), r) =>
-    in.valid := e.valid && e.state.w_datRsp && e.state.w_snpRsp && e.state.w_comp && e.state.s_urgentRead &&
-      !e.state.s_comp && !r
+    val nonReadReady = !r && dataReady(e.state) && e.state.w_comp
+    // RespSepData orders the request; it does not wait for this request's
+    // snoops/data. Resp=0 leaves the final UC/UD_PD state to DataSepResp.
+    in.valid := e.valid && !e.state.s_comp && (e.separateRead || nonReadReady)
+    val sendSeparateResp = enableSeparateRead.B && e.separateRead
+    val sendDBIDResp = e.task.chiOpcode === WriteBackFull || e.task.chiOpcode === WriteCleanFull ||
+      afterIssueEbOrElse(e.task.chiOpcode === WriteEvictOrEvict, false.B) && e.is_miss
     in.bits := e.task
+    in.bits.chiOpcode := Mux(
+      sendSeparateResp,
+      afterIssueEbOrElse(RespSepData, Comp),
+      Mux(sendDBIDResp, CompDBIDResp, Comp)
+    )
+    in.bits.resp := Mux(sendSeparateResp, 0.U, e.task.resp)
   }
   txrspArb.io.out.ready := txrsp.ready
   txrsp.valid := txrspArb.io.out.valid
   txrsp.bits := txrspArb.io.out.bits
-  txrsp.bits.chiOpcode := Mux(
-    txrspArb.io.out.bits.chiOpcode === WriteBackFull || txrspArb.io.out.bits.chiOpcode === WriteCleanFull ||
-    afterIssueEbOrElse(txrspArb.io.out.bits.chiOpcode === WriteEvictOrEvict, false.B) && buffer(txrspArb.io.chosen).is_miss,
-    CompDBIDResp,
-    Comp
-  )
   when(txrsp.fire) {
     val entry = buffer(txrspArb.io.chosen)
+    assert(entry.valid && !entry.state.s_comp, "Duplicate completion response")
     entry.state.s_comp := true.B
   }
 
@@ -327,7 +350,9 @@ class ResponseUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
   urgentRead.bits := urgentTask
 
   /* Dealloc */
-  val will_free_vec = buffer.map(e => e.valid && e.state.w_datRsp && e.state.s_comp && e.state.w_compack &&
+  // TXDAT owns a complete, immutable copy after txdat.fire. Early CompAck must
+  // not release this entry while its data is still being collected or offered.
+  val will_free_vec = buffer.map(e => e.valid && e.state.w_datRsp && e.state.s_comp && e.state.s_data && e.state.w_compack &&
     e.state.w_snpRsp && e.state.w_comp && e.state.s_urgentRead)
   buffer.zip(will_free_vec).foreach { case (e, v) =>
     when(v) {

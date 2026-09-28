@@ -49,7 +49,10 @@ case class OpenLLCParam
   hartIds: Seq[Int] = Seq[Int](),
 
   // Network layer SAM
-  sam: Seq[(AddressSet, Int)] = Seq(AddressSet.everything -> 0)
+  sam: Seq[(AddressSet, Int)] = Seq(AddressSet.everything -> 0),
+
+  // RespSepData/DataSepResp for ReadUnique; active only for CHI E.b and later.
+  enableReadUniqueSep: Boolean = true
 ) {
   def toCacheParams: CacheParameters = CacheParameters(
     name = name,
