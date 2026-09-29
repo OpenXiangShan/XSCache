@@ -812,11 +812,18 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   when (dn_rxrsp_comp) {
     p_homenid := io.DnRXRSP.bits.SrcID.get
     p_dbid := io.DnRXRSP.bits.DBID.get
-    w_rd_dn_data0 := false.B
-    w_rd_dn_data2 := false.B
-    w_rd_dn_comp := false.B
-    w_evict_dn_comp := false.B
-    w_evict_dn_compdbid := false.B
+    // A dataless Comp answers ONE subsequence.  While an eviction/writeback subsequence is
+    // outstanding this Comp belongs to it (cf. issue_dn_evict_compack and the assert below);
+    // clearing the read subsequence's data-wait flags here would unblock a still-outstanding
+    // refill beat and ship stale TSHR buffer halves.
+    when (w_evict_dn_comp || w_evict_dn_compdbid) {
+      w_evict_dn_comp := false.B
+      w_evict_dn_compdbid := false.B
+    } .otherwise {
+      w_rd_dn_data0 := false.B
+      w_rd_dn_data2 := false.B
+      w_rd_dn_comp := false.B
+    }
   }
 
   when (dn_rxrsp_compdbidresp) {
