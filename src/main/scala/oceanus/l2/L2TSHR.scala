@@ -143,10 +143,13 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   io.valid := tshr_valid
 
 
-  // meta
-  val dirResult = Reg(new L2Directory.MetaReadResult)
-  val replResult = Reg(new L2Directory.ReplReadResult)
-  val replResultMeta = Reg(new L2Directory.Meta)   // victim entry meta latched at ReplRdResp
+  // meta — RegInit so +RANDOMIZE_REG_INIT does not leave stale non-I state with hit=0
+  val dirResultInit = WireInit(0.U.asTypeOf(new L2Directory.MetaReadResult))
+  dirResultInit.state := L2Directory.MetaState.I
+  dirResultInit.hit := false.B
+  val dirResult = RegInit(dirResultInit)
+  val replResult = RegInit(0.U.asTypeOf(new L2Directory.ReplReadResult))
+  val replResultMeta = RegInit(0.U.asTypeOf(new L2Directory.Meta))
 
   /* NOTICE: For current design, any partial write to meta would never assert 'meta_valid'.
              Any later read request on full meta line would result in a Directory Read if no any read done yet.
@@ -247,7 +250,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   assert(!(tshr_dealloc && meta_modified.asUInt.orR), "TSHR @ %m deallocated with un-committed modified meta")
 
-  assert(!(meta.state =/= L2Directory.MetaState.I && !meta.hit),
+  assert(!(tshr_valid && meta.state =/= L2Directory.MetaState.I && !meta.hit),
     "TSHR @ %m tracked state with stale miss hit-flag")
 
   
@@ -327,6 +330,11 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   when (tshr_buffer_commit || tshr_buffer_drop) {
     tshr_buffer_fullModified_q := false.B
+    // Half-write flags must be retired together with the buffer, otherwise a stale half
+    // survives TSHR recycling and tshr_buffer_wen_DS (gated on !tshr_buffer_modified)
+    // gets blocked, so a later hit would read a half-stale line.
+    tshr_buffer_halfWritten_0_q := false.B
+    tshr_buffer_halfWritten_2_q := false.B
   }
 
   /*
