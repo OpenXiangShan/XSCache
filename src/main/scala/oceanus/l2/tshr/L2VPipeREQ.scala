@@ -390,7 +390,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val active = w_snpresp0 || w_snpresp2 || s_snpcompack ||
                s_dn_txreq || w_dn_pcrdgrant ||
                w_ds_resp ||
-               s_rd_dn_compack || w_rd_dn_data0 || w_rd_dn_data2 || w_rd_dn_comp ||
+               w_s_rd_dn_compack || s_rd_dn_compack || w_rd_dn_data0 || w_rd_dn_data2 || w_rd_dn_comp ||
                w_rd_up_compack ||
                w_s_rd_up_compdata0 || s_rd_up_compdata0 || w_s_rd_up_compdata2 || s_rd_up_compdata2 ||
                w_s_rd_up_comp || s_rd_up_comp ||
