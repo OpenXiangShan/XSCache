@@ -525,6 +525,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                              p_rxreq_evictback && // this predication might not be necessary
                              (!dirResult.hit || dirResult.state === MetaState.I)
 
+  when (rxreq_fire || rxevb_unsatisfied_evictback) {
+    // any new REQ/EVB phase: retry bookkeeping belongs to the previous life
+    p_txreq_reissue := false.B
+    p_evict_cancelled := false.B
+  }
+
   when (io.DnTXREQ.fire) {
     s_dn_txreq := false.B
     p_txreq_issued_opcode := io.DnTXREQ.bits.Opcode.get
