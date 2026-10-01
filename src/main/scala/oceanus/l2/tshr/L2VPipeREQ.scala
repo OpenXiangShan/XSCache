@@ -1034,6 +1034,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   assert(!(up_rxrsp_compack && !w_rd_up_compack), "Receiving upstream RXRSP CompAck on non-valid 'w_rd_up_compack' in TSHR @ %m REQ vPipe")
   assert(!(dn_rxrsp_comp && !(w_rd_dn_comp || w_evict_dn_comp || w_evict_dn_compdbid)),
     "TSHR @ %m REQ vPipe received downstream Comp on non-valid expectation")
+  assert(!(dn_rxdat_compdata && !(w_rd_dn_data0 || w_rd_dn_data2)),
+    "TSHR @ %m REQ vPipe received downstream CompData with no data expectation (mesh/protocol anomaly)")
   // ----------------------------------------------------------------
 
   // -- Interactions with TSHR local meta
