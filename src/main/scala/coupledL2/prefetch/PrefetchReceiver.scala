@@ -27,7 +27,17 @@ import utility._
 // TODO: PrefetchReceiver is temporarily used since L1&L2 do not support Hint.
 // TODO: Delete this after Hint is accomplished.
 
-case class PrefetchReceiverParams(n: Int = 32) extends PrefetchParameters {
+case class PrefetchReceiverParams(
+  n: Int = 32,
+  offloadLowAccuracy: Boolean = false,
+  offloadStreamOnly: Boolean = false,
+  cdpRatioNumerator: Int = 1,
+  cdpRatioDenominator: Int = 2,
+  accuracyNumerator: Int = 1,
+  accuracyDenominator: Int = 2
+) extends PrefetchParameters {
+  require(cdpRatioDenominator > 0 && cdpRatioNumerator >= 0 && cdpRatioNumerator <= cdpRatioDenominator)
+  require(accuracyDenominator > 0 && accuracyNumerator >= 0 && accuracyNumerator <= accuracyDenominator)
   override val hasPrefetchBit:  Boolean = true
   override val hasPrefetchSrc:  Boolean = true
   override val inflightEntries: Int = n

@@ -105,6 +105,7 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
 
   val io = IO(new Bundle {
     val recv = Input(new PrefetchRecv)
+    val offload = Input(new PrefetchRecv)
     val txreq = DecoupledIO(new CHIREQ)
     val rxrsp = Flipped(DecoupledIO(new CHIRSP))
   })
@@ -118,6 +119,19 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
   l3PftQueue.io.enq.bits.addr := io.recv.addr(fullAddressBits - 1, 0)
   l3PftQueue.io.enq.bits.pfSource := io.recv.pf_source
 
+  val l2OffloadQueue = Module(new OverwriteQueue(
+    gen = new StashPrefetchReq,
+    entries = stashPrefetchEntryCount,
+    hasFlow = true
+  ))
+  l2OffloadQueue.io.enq.valid := io.offload.addr_valid && io.offload.pf_en
+  l2OffloadQueue.io.enq.bits.addr := io.offload.addr(fullAddressBits - 1, 0)
+  l2OffloadQueue.io.enq.bits.pfSource := io.offload.pf_source
+
+  val queueArb = Module(new Arbiter(new StashPrefetchReq, 2))
+  queueArb.io.in(0) <> l3PftQueue.io.deq
+  queueArb.io.in(1) <> l2OffloadQueue.io.deq
+
   val stashPrefetchEntries = Seq.tabulate(stashPrefetchEntryCount) { i =>
     val entry = Module(new StashPrefetchEntry)
     entry.io.id := i.U
@@ -126,10 +140,10 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
 
   val allocReadys = VecInit(stashPrefetchEntries.map(_.io.alloc.ready))
   val allocOH = PriorityEncoderOH(allocReadys)
-  l3PftQueue.io.deq.ready := allocReadys.asUInt.orR
+  queueArb.io.out.ready := allocReadys.asUInt.orR
   stashPrefetchEntries.zipWithIndex.foreach { case (entry, i) =>
-    entry.io.alloc.valid := l3PftQueue.io.deq.valid && allocOH(i)
-    entry.io.alloc.bits := l3PftQueue.io.deq.bits
+    entry.io.alloc.valid := queueArb.io.out.valid && allocOH(i)
+    entry.io.alloc.bits := queueArb.io.out.bits
     entry.io.rxrsp.valid := io.rxrsp.valid && entry.io.waitResp && io.rxrsp.bits.txnID === i.U
     entry.io.rxrsp.bits := io.rxrsp.bits
   }
@@ -145,7 +159,9 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
   io.txreq <> txreqArb.io.out
 
   XSPerfAccumulate("l3_prefetch_recv", io.recv.addr_valid && io.recv.pf_en)
+  XSPerfAccumulate("l3_prefetch_offload_recv", io.offload.addr_valid && io.offload.pf_en)
   XSPerfAccumulate("l3_prefetch_queue_fire", l3PftQueue.io.deq.fire)
+  XSPerfAccumulate("l3_prefetch_offload_queue_fire", l2OffloadQueue.io.deq.fire)
   XSPerfAccumulate("l3_prefetch_txreq_valid", io.txreq.valid)
   XSPerfAccumulate("l3_prefetch_txreq_blocked", io.txreq.valid && !io.txreq.ready)
   XSPerfAccumulate("l3_prefetch_txreq_fire", io.txreq.fire)

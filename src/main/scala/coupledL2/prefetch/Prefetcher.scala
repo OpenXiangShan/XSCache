@@ -232,6 +232,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val pfCtrlFromCore = IO(Input(new PrefetchCtrlFromCore))
   val l2ToL1PfCtrl = IO(Output(new L2ToL1PfCtrl))
   val pfFeedbackVec = IO(Input(Vec(banks, new PrefetchFeedbackBundle())))
+  val pfStat = IO(Input(new PrefetchStat))
+  val l2Offload = IO(Output(new PrefetchRecv))
 
   val prefetchController = Module(new PrefetchController)
   prefetchController.io.pfFeedbackVec := pfFeedbackVec
@@ -286,6 +288,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   val stashPrefetcher = Module(new StashPrefetcher)
   stashPrefetcher.io.recv := io.l3_recv
+  stashPrefetcher.io.offload := l2Offload
   io.stash_txreq <> stashPrefetcher.io.txreq
   stashPrefetcher.io.rxrsp <> io.stash_rxrsp
 
@@ -358,6 +361,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   // prefetch from upper level
   val pfRcv = if (hasReceiver) Some(Module(new PrefetchReceiver())) else None
+  val rcvLocalReq = if (hasReceiver) Some(Wire(Decoupled(new PrefetchReq))) else None
 
   val train = Wire(DecoupledIO(new PrefetchTrain))
   val resp = Wire(DecoupledIO(new PrefetchResp))
@@ -407,6 +411,36 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
       pfRcv.get.io.req.bits.pfSource === MemReqSource.Prefetch2L2Stride.id.U ||
       pfRcv.get.io.req.bits.pfSource === MemReqSource.Prefetch2L2Berti.id.U
     )
+
+    val params = prefetchers.collectFirst { case r: PrefetchReceiverParams => r }.get
+    val recvReq = pfRcv.get.io.req
+    val recvSource = PfSource.fromMemReqSource(recvReq.bits.pfSource)
+    val sourceSent = pfStat.pfSentVec(recvSource)
+    val sourceHit = pfStat.pfHitVec(recvSource)
+    val totalSent = pfStat.pfSentVec.reduce(_ +& _)
+    val cdpSent = pfStat.pfSentVec(PfSource.CDP.id)
+    // gem5's stream-only mode selects SMS SStride/SPht hints.  XiangShan's
+    // SMS combines those generators and exposes them as Prefetch2L2SMS.
+    val smsSource = recvReq.bits.pfSource === MemReqSource.Prefetch2L2SMS.id.U
+    val offload = recvReq.valid && params.offloadLowAccuracy.B &&
+      ((!params.offloadStreamOnly).B || smsSource) && sourceSent =/= 0.U &&
+      cdpSent * params.cdpRatioDenominator.U > totalSent * params.cdpRatioNumerator.U &&
+      sourceHit * params.accuracyDenominator.U < sourceSent * params.accuracyNumerator.U
+
+    rcvLocalReq.get.valid := recvReq.valid && !offload
+    rcvLocalReq.get.bits := recvReq.bits
+    recvReq.ready := offload || rcvLocalReq.get.ready
+
+    l2Offload.addr_valid := offload
+    l2Offload.addr := recvReq.bits.addr
+    // StashPrefetcher does not classify the request by source; retain the
+    // original source value so an eventual L3 source-aware consumer can
+    // distinguish the SMS hint from ordinary L1->L3 stream/stride hints.
+    l2Offload.pf_source := recvReq.bits.pfSource
+    l2Offload.pf_en := true.B
+    XSPerfAccumulate("prefetch_req_offload_to_l3", offload)
+  } else {
+    l2Offload := 0.U.asTypeOf(l2Offload)
   }
 
   if (hasNLPrefetcher) {
@@ -461,7 +495,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   private val SRC_NUM = 6
   private val Seq(rcv_idx, nl_idx, vbop_idx, pbop_idx, tp_idx, cdp_idx) = (0 until SRC_NUM).toSeq
   val reqs = Seq(
-    if (hasReceiver) Some(pfRcv.get.io.req) else None,
+    rcvLocalReq,
     if (hasNLPrefetcher) Some(nl.get.io.req) else None,
     if (hasBOP) Some(vbop.get.io.req) else None,
     if (hasBOP) Some(pbop.get.io.req) else None,

@@ -1001,6 +1001,7 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       for ((s, i) <- slices.zipWithIndex) {
         m.io.sliceStat(i) := s.io.pfMonitorStat.get
       }
+      prefetcher.foreach(_.pfStat := m.io.stat)
       if (hasCDP) {
         prefetcher.foreach(_.cdpio.pfStat.get := m.io.stat)
       }

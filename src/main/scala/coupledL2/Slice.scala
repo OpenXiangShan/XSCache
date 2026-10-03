@@ -219,7 +219,10 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
     }.getOrElse(zeroVec)
 
     stat.pfSentVec := sentInc
-    stat.pfHitVec := VecInit((0 until pfSourceCount).map(i => dirHitInc(i) +& mshrHitInc(i)))
+    // PrefetcherMonitor.pfHitVec models gem5's pfUseful_srcs: only a demand
+    // hit on a prefetched cache line is useful.  MSHR hits are late-prefetch
+    // events and remain available through pfStatInMSHR/TopDownMonitor.
+    stat.pfHitVec := dirHitInc
   }
   prefetchOpt.foreach {
     _ =>
