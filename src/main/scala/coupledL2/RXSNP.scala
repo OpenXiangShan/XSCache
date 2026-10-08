@@ -32,7 +32,11 @@ class RXSNP(
   val io = IO(new Bundle() {
     val rxsnp = Flipped(DecoupledIO(new CHISNP()))
     val task = DecoupledIO(new TaskBundle())
-    val msInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo())))
+    // A normal request, a snoop context, and a replacement victim can all be
+    // live concurrently. Keep their addresses independent.
+    val refillInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo())))
+    val snoopInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo())))
+    val replaceInfo = Vec(mshrsAll, Flipped(ValidIO(new ReplaceMSHRInfo)))
   })
 
   val rxsnp = Wire(io.rxsnp.cloneType)
@@ -55,11 +59,32 @@ class RXSNP(
     *    because snoop has higher priority than request.
     * 5. Before MSHR completes Probe to L1 for alias replacing, snoop should be **blocked*.
     */
-  val reqBlockSnpMask = VecInit(io.msInfo.map(s =>
-      s.valid && s.bits.set === task.set && s.bits.reqTag === task.tag && (
-      s.bits.w_grantfirst || // See [2], [3] above with 's.bits.blockRefill'
-      s.bits.aliasTask.getOrElse(false.B) && !s.bits.w_rprobeacklast // See [5] above
-    ) && (s.bits.blockRefill || s.bits.w_releaseack) && !s.bits.willFree
+  val reqBlockSnpMask = VecInit(io.refillInfo.map(s =>
+      s.valid && s.bits.set === task.set && s.bits.reqTag === task.tag && !s.bits.willFree && (
+      // A SourceD Grant has already transferred ownership to L1, while the
+      // normal refill commit may still be absent from Directory. Keep the
+      // snoop in the queue until that commit is visible; otherwise the snoop
+      // would take the transient directory-miss/no-client direct path.
+      !s.bits.postGrantReleaseHold && (
+        s.bits.grantPending ||
+        ((s.bits.w_grantfirst || // See [2], [3] above with 's.bits.blockRefill'
+          s.bits.aliasTask.getOrElse(false.B) && !s.bits.w_rprobeacklast) &&
+          (s.bits.blockRefill || s.bits.w_releaseack ||
+          // A Grant task can leave the MSHR several cycles before its refill
+          // reaches DataStorage. During that interval the directory cannot serve
+          // a same-line snoop with the newly granted data.
+            (s.bits.s_refill && !s.bits.willFree)))
+      ) ||
+      // In the post-Grant ReleaseData window the paired-snoop fast path only
+      // works if the paired context is allocated before the normal commit can
+      // fire.  A snoop that is still queued cannot win that race (MainPipe
+      // congestion may delay its allocation past the commit), and would then
+      // answer a Directory-miss SnpResp while the commit re-installs the line
+      // afterwards.  Hold it until the deferred commit is fully visible; the
+      // commit never depends on a snoop that has not been allocated, so this
+      // cannot deadlock.
+      s.bits.postGrantReleaseHold && s.bits.refillCommitPending
+    )
   )).asUInt
   val reqBlockSnp = reqBlockSnpMask.orR
 
@@ -74,43 +99,88 @@ class RXSNP(
     *    release tasks to MainPipe (DS write was done in release tasks on MainPipe), the incoming snoop of Y should 
     *    be **blocked**.
     */
-  val cmoBlockSnpMask = VecInit(io.msInfo.map(s => 
+  val cmoBlockSnpMask = VecInit(io.refillInfo.map(s =>
     s.valid && s.bits.dirHit && isValid(s.bits.meta.state) &&
     !s.bits.s_cmoresp && (!s.bits.s_release || !s.bits.w_rprobeacklast || !s.bits.s_cmometaw) &&
     !s.bits.willFree
   )).asUInt
   val cmoBlockSnp = cmoBlockSnpMask.orR
-  val replaceBlockSnpMask = VecInit(io.msInfo.map(s =>
+  val replaceBlockSnpMask = VecInit(io.refillInfo.map(s =>
     s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag && !s.bits.dirHit && isValid(s.bits.meta.state) &&
     s.bits.s_cmoresp && s.bits.w_replResp && (!s.bits.w_rprobeacklast || s.bits.w_releaseack || !RegNext(s.bits.w_replResp)) &&
     !s.bits.willFree
   )).asUInt
   val replaceBlockSnp = replaceBlockSnpMask.orR
+  val sidecarBlockSnpMask = VecInit(io.replaceInfo.map(s =>
+    s.valid && s.bits.set === task.set && s.bits.tag === task.tag
+  )).asUInt
+
+  // A sidecar owns the victim ReleaseBuf until lower transport completes.
+  // CHI requires an RN to service snoops while a CopyBack is outstanding, so
+  // releaseStarted is not a blocking boundary. Only a CopyBackWrData already
+  // issued to MainPipe is immutable; wait for its final data beat in that
+  // narrow interval.
+  val sidecarNestSnpMask = VecInit(io.replaceInfo.map(s =>
+      s.valid && s.bits.set === task.set && s.bits.tag === task.tag &&
+      s.bits.probeDone && s.bits.releaseBufReady &&
+      (!s.bits.releaseStarted || !s.bits.copyBackIssued)
+  )).asUInt
 
   // '!s.bits.dirHit'     : Nesting a Cache Replacement subsequent release
   // '!s.bits.s_cmoresp'  : Nesting a CMO subsequent release
-  val replaceNestSnpMask = VecInit(io.msInfo.map(s =>
+  val normalReplaceNestSnpMask = VecInit(io.refillInfo.map(s =>
       s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag &&
       (!s.bits.dirHit || !s.bits.s_cmoresp) && s.bits.meta.state =/= INVALID &&
       RegNext(s.bits.w_replResp) && s.bits.w_rprobeacklast && !s.bits.w_releaseack
     )).asUInt
-  val releaseToInvalNestSnpMask = replaceNestSnpMask & VecInit(io.msInfo.map(s =>
-      !s.bits.releaseToClean
-    )).asUInt
-  val releaseToCleanNestSnpMask = replaceNestSnpMask & VecInit(io.msInfo.map(s =>
-      s.bits.releaseToClean
-    )).asUInt
-  val replaceDataMask = VecInit(io.msInfo.map(_.bits.replaceData)).asUInt
+  // A sidecar is the sole ReleaseBuf owner after the parent has delegated a
+  // victim. Do not count that same replacement through both representations.
+  val replaceNestSnpMask = Mux(
+    sidecarNestSnpMask.orR,
+    sidecarNestSnpMask,
+    normalReplaceNestSnpMask
+  )
+  val releaseToInvalNestSnpMask = VecInit((0 until mshrsAll).map { i =>
+    replaceNestSnpMask(i) && Mux(sidecarNestSnpMask(i),
+      !io.replaceInfo(i).bits.releaseToClean, !io.refillInfo(i).bits.releaseToClean)
+  }).asUInt
+  val releaseToCleanNestSnpMask = VecInit((0 until mshrsAll).map { i =>
+    replaceNestSnpMask(i) && Mux(sidecarNestSnpMask(i),
+      io.replaceInfo(i).bits.releaseToClean, io.refillInfo(i).bits.releaseToClean)
+  }).asUInt
+  // A sidecar's ReleaseBuf snapshot is the only legal source once its parent
+  // can reuse the victim DS way. For an older normal-MSHR replacement path,
+  // retain the existing data-bearing-release predicate.
+  val nestedSnoopDataMask = VecInit((0 until mshrsAll).map { i =>
+    Mux(sidecarNestSnpMask(i),
+      io.replaceInfo(i).bits.releaseBufReady && !io.replaceInfo(i).bits.snoopInvalidated,
+      io.refillInfo(i).bits.replaceData)
+  }).asUInt
+  val sidecarAlreadyInvalidMask = VecInit(io.replaceInfo.map(s =>
+    s.valid && s.bits.snoopInvalidated
+  )).asUInt
+  when (rxsnp.valid && sidecarNestSnpMask.orR && !(sidecarNestSnpMask & sidecarAlreadyInvalidMask).orR) {
+    assert((sidecarNestSnpMask & nestedSnoopDataMask).orR,
+      "a sidecar-nested snoop must source data from the victim ReleaseBuf")
+  }
 
-  val replaceNestSnpMeta = ParallelOR(io.msInfo.zip(replaceNestSnpMask.asBools).map { case (ms, hit) => {
-    Mux(hit, ms.bits.meta, MetaEntry())
-  }})
+  val replaceNestSnpMeta = ParallelOR((0 until mshrsAll).map { i =>
+    Mux(replaceNestSnpMask(i),
+      Mux(sidecarNestSnpMask(i),
+        Mux(io.replaceInfo(i).bits.snoopInvalidated, MetaEntry(), io.replaceInfo(i).bits.meta),
+        io.refillInfo(i).bits.meta),
+      MetaEntry())
+  })
 
   assert(!rxsnp.valid || PopCount(replaceNestSnpMask) <= 1.U, "multiple replace nest snoop")
 
   task := fromSnpToTaskBundle(rxsnp.bits)
 
-  val stall = reqBlockSnp || replaceBlockSnp || cmoBlockSnp // addrConflict || replaceConflict
+  val snoopContextBlock = VecInit(io.snoopInfo.map(s =>
+    s.valid && s.bits.blocksSnoop && s.bits.set === task.set && s.bits.reqTag === task.tag
+  )).asUInt.orR
+  val sidecarBlockSnp = (sidecarBlockSnpMask & ~sidecarNestSnpMask).orR
+  val stall = reqBlockSnp || replaceBlockSnp || cmoBlockSnp || sidecarBlockSnp || snoopContextBlock
   io.task.valid := rxsnp.valid && !stall
   io.task.bits := task
   rxsnp.ready := io.task.ready && !stall
@@ -167,7 +237,7 @@ class RXSNP(
     task.snpHitRelease := replaceNestSnpMask.orR
     task.snpHitReleaseToInval := releaseToInvalNestSnpMask.orR
     task.snpHitReleaseToClean := releaseToCleanNestSnpMask.orR
-    task.snpHitReleaseWithData := (replaceNestSnpMask & replaceDataMask).orR
+    task.snpHitReleaseWithData := (replaceNestSnpMask & nestedSnoopDataMask).orR
     task.snpHitReleaseIdx := PriorityEncoder(replaceNestSnpMask)
     task.snpHitReleaseMeta := replaceNestSnpMeta
     task.tgtID.foreach(_ := 0.U) // TODO

@@ -79,12 +79,54 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   // MSHR may send Release(Data) or Grant(Data) or ProbeAck(Data) through Main Pipe
   val mshrTask = Bool()                   // is task from mshr
   val mshrId = UInt(mshrBits.W)           // mshr entry index (used only in mshr-task)
+  // Context owner for tasks emitted by a physical MSHR slot.
+  // 0: normal, 1: snoop, 2: replace. Non-MSHR tasks use 0.
+  val mshrContext = UInt(2.W)
+  // Normal refill task must snapshot the victim into ReleaseBuf for replace.
+  val replaceTask = Bool()
+  // ReplaceMSHR-internal DS read.  The task has no external channel side
+  // effect; MainPipe writes the captured old line into ReplaceMSHR's
+  // ReleaseBuf entry.
+  val replaceCapture = Bool()
+  // SnoopMSHR-internal RefillBuf[N] -> ReleaseBuf[S] copy for a post-Grant
+  // ReleaseData that arrived before this snoop was allocated. No external
+  // channel side effect; MainPipe writes ReleaseBuf[mshrId] from RefillBuf.
+  val refillToReleaseCopy = Bool()
+  // RefillBuf read index for refillToReleaseCopy (paired normal id). Ordinary
+  // tasks keep reading RefillBuf[mshrId].
+  val refillBufReadId = UInt(mshrBits.W)
+  // Internal normal-MSHR refill. It consumes RefillBuf and updates L2 state,
+  // but must not become a TileLink SourceD response to L1.
+  val refillOnly = Bool()
+  // The L1-visible refill response must not overwrite a victim delegated to
+  // a newly allocated ReplaceMSHR; a later refillOnly task performs the write.
+  val deferRefillWrite = Bool()
+  // This refill response task may merge the refill install into its own
+  // MainPipe pass when its folded replacer read returns a no-probe victim
+  // (invalid or client-less) at S3: the pass then snapshots the victim DS
+  // data into the sidecar ReleaseBuf and writes Directory tag/meta, and the
+  // later refillOnly commit degenerates to the DS write alone.  Stamped by
+  // the MSHR for contexts free of corner-case pairing (denied/CMO/mergeA/
+  // nested-release), the actual decision is made at S3 from the ReplacerResult.
+  val grantInstallEn = Bool()
+  // QoS class stamped by MSHRCtl's task arbitration (0 = highest priority).
+  // RequestArb uses it to keep background-class MSHR tasks from preempting
+  // sink requests at s1. Channel (non-MSHR) tasks leave it at 0.
+  val qosClass = UInt(3.W)
+  // A delayed normal refill that originally hit re-reads Directory before its
+  // final commit. It has no data/tag/meta side effect itself.
+  val normalRefillRevalidate = Bool()
   val aliasTask = aliasBitsOpt.map(_ => Bool()) // Anti-alias
   val useProbeData = Bool()               // data source, true for ReleaseBuf and false for RefillBuf
   val mshrRetry = Bool()                  // is retry task for mshr conflict
 
   val readProbeDataDown = Bool()          // whether data from ReleaseBuf was needed on mainpipe by downward operations
                                           // reads by upwards was handled in RequestArb by 'mshrTask_s2_a_upwards'
+  val readRefillData = Bool()             // whether data from RefillBuf was needed on mainpipe
+                                          // (Get-on-TRUNK / cache-alias probeack reads its captured ProbeAckData)
+  val readDataFromDS = Bool()             // grant responds with the hit line's DS data:
+                                          // dirResult.hit && !gotGrantData && !probeDirty
+                                          // (neither RefillBuf nor ReleaseBuf holds the data)
 
   // For Intent
   val fromL2pft = prefetchOpt.map(_ => Bool()) // Is the prefetch req from L2(BOP) or from L1 prefetch?
@@ -174,6 +216,23 @@ class PipeStatus(implicit p: Parameters) extends L2Bundle
 class PipeEntranceStatus(implicit p: Parameters) extends L2Bundle {
   val tags = Vec(4, UInt(tagBits.W))
   val sets = Vec(4, UInt(setBits.W))
+  // `a_tag/a_set` describe RequestBuffer's input so MainPipe can block a
+  // same-set enqueue.  Sidecar ownership instead needs the task that will
+  // actually leave RequestBuffer and enter RequestArb.
+  val aCandidateValid = Bool()
+  val aCandidateTag   = UInt(tagBits.W)
+  val aCandidateSet   = UInt(setBits.W)
+  // B's address is otherwise present even when no snoop is entering S1.
+  // Consumers that arbitrate normal-MSHR grants need this qualifier to close
+  // the S1-to-SnoopMSHR allocation window.
+  val bValid = Bool()
+  // B is an invalidating snoop. This lets a matching normal MSHR preserve the
+  // invalidation after the transient S1 arbitration window has passed.
+  val bToN = Bool()
+  // The B task has actually handshaken into RequestArb. Unlike bValid, this
+  // is a one-cycle ownership-transfer event and can safely reserve a sidecar.
+  val bFire = Bool()
+  val cReleaseData = Bool()
 
   def c_tag = tags(0)
   def b_tag = tags(1)
@@ -206,6 +265,10 @@ class MSHRStatus(implicit p: Parameters) extends L2Bundle
   val w_c_resp = Bool()
   val w_d_resp = Bool()
   val will_free = Bool()
+  // normal-context data windows that must exclude a snoop allocation (N+X
+  // mutual exclusion): CMO lifetime, and the release data-read window
+  val isCmo = Bool()
+  val releaseDataWindow = Bool()
 
   /*
   val way = UInt(wayBits.W)
@@ -263,6 +326,12 @@ class MSHRInfo(implicit p: Parameters) extends L2Bundle with HasTLChannelBits {
   val param = UInt(3.W)
   val mergeA = Bool() // whether the mshr already merge an acquire(avoid alias merge)
 
+  // A normal MSHR may send the L1-visible Grant before its delayed refill
+  // commit reaches DataStorage/Directory. Keep that ownership window visible
+  // to RXSNP so a same-line Snoop cannot take the transient miss/no-client
+  // direct path.
+  val grantPending = Bool()
+
   val w_grantfirst = Bool()
   val w_grantlast = Bool()
   val w_grant = Bool()
@@ -274,10 +343,107 @@ class MSHRInfo(implicit p: Parameters) extends L2Bundle with HasTLChannelBits {
   val w_replResp = Bool()
   val w_rprobeacklast = Bool()
 
-  val replaceData = Bool() // If there is a replace, WriteBackFull or Evict
+  // A ReleaseData accepted after the L1-visible Grant supersedes the normal
+  // context's RXDAT while the payload is still private to RefillBuf. RXSNP
+  // must allocate a paired snoop context instead of taking the no-client
+  // direct-response path in this interval.
+  val postGrantReleaseHold = Bool()
+
+  // The deferred normal refill commit (Directory tag/meta + RefillBuf->DS
+  // data) has not fully landed yet.  During postGrantReleaseHold a queued
+  // same-line snoop must still wait for this to clear: pairing only works
+  // when the commit cannot have fired before the snoop's Directory lookup.
+  val refillCommitPending = Bool()
+
+  // Stronger than !refillCommitPending for RequestBuffer's early release:
+  // the commit task has been accepted AND its S3 Directory/DS write pulse
+  // has completed (refillWriteDone).  Unlike refillCommitPending this does
+  // not include the way-commit margin, so it goes high ~6 cycles earlier --
+  // still strictly after the line's final state is visible to later readers.
+  val refillCommitLanded = Bool()
+
+  val replaceData = Bool() // Replacement requires a data-bearing lower-level release
 
   // release to T with data or UC (e.g. WriteCleanFull)
   val releaseToClean = Bool()
+
+  // A lightweight snoop context owns this address while it waits for an upper
+  // ProbeAck or emits SnpResp/DCT. A following snoop must not overtake it.
+  val blocksSnoop = Bool()
+
+  // A replacement sidecar may outlive its parent normal context. These fields
+  // let directory/RXSNP retain ownership of the old victim address without
+  // increasing the physical MSHR or buffer count.
+  val replace = new ReplaceMSHRInfo
+}
+
+class ReplaceMSHRInfo(implicit p: Parameters) extends L2Bundle {
+  val valid = Bool()
+  // The normal MSHR which owns RefillBuf and eventually installs the new line.
+  // The replace context itself runs in a different physical MSHR slot.
+  val parentId = UInt(mshrBits.W)
+  val parentEpoch = Bool()
+  // Cleared after a normal parent retires. The sidecar keeps its victim
+  // ownership, but must no longer be associated with a reused normal slot.
+  val parentAttached = Bool()
+  val detached = Bool()
+  // A victim snapshot has reached the physical ReleaseBuf. Every valid victim
+  // is captured so a later nested snoop never has to read a reused DS way.
+  val releaseBufReady = Bool()
+  // The victim probe and ReleaseBuf snapshot are complete, so the normal
+  // refill may overwrite the selected DS way.
+  val refillReady = Bool()
+  // Only a sidecar that has actually issued a probe and is still waiting for
+  // its ProbeAck may consume a SinkC response by address; otherwise the probe
+  // data of a stale/coincidental address match would be absorbed incorrectly.
+  val awaitingProbeAck = Bool()
+  val set = UInt(setBits.W)
+  val tag = UInt(tagBits.W)
+  val way = UInt(wayBits.W)
+  val meta = new MetaEntry
+  val metaTag = UInt(tagBits.W)
+  val probeDone = Bool()
+  // The lower-level release task has entered RequestArb. Its transport is
+  // still live, but CHI snoops may consume ReleaseBuf until CopyBackWrData is
+  // issued and becomes immutable.
+  val releaseStarted = Bool()
+  // CopyBackWrData has entered MainPipe and can no longer be rewritten to
+  // reflect a later snoop response.
+  val copyBackIssued = Bool()
+  // An invalidating snoop completed after the lower release started. The
+  // ReleaseBuf remains for transport, but the protocol-visible cache state is I.
+  val snoopInvalidated = Bool()
+  val releaseAck = Bool()
+  val needRelease = Bool()
+  val replaceData = Bool()
+  val releaseToClean = Bool()
+  val leaseHeld = Bool()
+}
+
+class ReplaceRequest(implicit p: Parameters) extends L2Bundle {
+  val parentId = UInt(mshrBits.W)
+  val parentEpoch = Bool()
+  // A C ReleaseData may arrive after its L2 directory entry has already been
+  // replaced. It still needs a lower-level writeback but has no refill parent.
+  val parentAttached = Bool()
+  val dirResult = new DirResult
+  val task = new TaskBundle
+  val mode = UInt(2.W)
+  val needProbe = Bool()
+  val probeParam = UInt(3.W)
+  val captureFromDS = Bool()
+}
+
+object ReplaceMSHRMode {
+  val victim = 0.U(2.W)
+  val cmoClean = 1.U(2.W)
+  val cmoFlush = 2.U(2.W)
+  val cmoInval = 3.U(2.W)
+}
+
+class ReplaceDone(implicit p: Parameters) extends L2Bundle {
+  val parentId = UInt(mshrBits.W)
+  val parentEpoch = Bool()
 }
 
 class RespInfoBundle(implicit p: Parameters) extends L2Bundle
