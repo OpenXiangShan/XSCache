@@ -104,6 +104,7 @@ class Slice()(implicit p: Parameters) extends LLCModule {
     0.U.asTypeOf(new DSBlock()),
     RegNext(refillUnit.io.read.valid, false.B)
   )
+  dataStorage.io.writeFirst := mainPipe.io.toDS_s4.writeFirst
   mainPipe.io.rdataFromDS_s6 <> dataStorage.io.rdata
 
   directory.io.read <> reqArb.io.dirRead_s1
