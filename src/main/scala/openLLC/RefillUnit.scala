@@ -108,19 +108,24 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     val clients_meta = entry.dirResult.clients.meta
 
     assert(
-      !isWrite || inv_CBWrData || clients_hit && clients_meta(responseData.srcID).valid,
-      "Non-exist block release?(addr: 0x%x)",
+      // The client directory is a finite snoop filter.  A WriteBackFull can
+      // legitimately arrive for an entry it no longer tracks, but a tracked
+      // line must still name the returning RN as a sharer.
+      !isWrite || inv_CBWrData || !clients_hit || clients_meta(responseData.srcID).valid,
+      "Tracked block release from non-owner?(addr: 0x%x)",
       Cat(entry.task.tag, entry.task.set, entry.task.bank, entry.task.off)
     )
 
     val beatId = responseData.dataID >> log2Ceil(beatBytes / 16)
     val newBeatValids = entry.beatValids.asUInt | UIntToOH(beatId)
+    val dataLast = beatId === (beatSize - 1).U
     entry.valid := !cancel
     entry.beatValids := VecInit(newBeatValids.asBools)
     entry.state.w_datRsp := newBeatValids.andR
     entry.data.data(beatId) := responseData.data
     entry.task.resp := responseData.resp
-    when(responseData.opcode === SnpRespData) {
+    // A multi-beat SnpRespData completes the entry only on its last beat.
+    when(responseData.opcode === SnpRespData && dataLast) {
       val src_idOH  = UIntToOH(responseData.srcID)(numRNs - 1, 0)
       val newSnpVec = VecInit((entry.task.snpVec.asUInt & ~src_idOH).asBools)
       entry.task.snpVec := newSnpVec
@@ -144,7 +149,13 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     }
   }
 
-  val rnRespDataUpdateVec = VecInit(buffer.map(e => e.task.reqID === rnRespData.bits.txnID && e.valid))
+  // A SnpRespData only counts for an entry still awaiting that RN: an
+  // unrelated RN's response must not retire (or corrupt) this refill.
+  val rnRespDataSrcOH = UIntToOH(rnRespData.bits.srcID)(numRNs - 1, 0)
+  val rnRespDataUpdateVec = VecInit(buffer.map(e =>
+    e.task.reqID === rnRespData.bits.txnID && e.valid &&
+      (rnRespData.bits.opcode =/= SnpRespData || (e.task.snpVec.asUInt & rnRespDataSrcOH).orR)
+  ))
   val snRespDataUpdateVec = VecInit(buffer.map(e =>
     e.task.reqID === snRespData.bits.txnID && e.valid && e.task.chiOpcode === StashOnceShared
   ))
@@ -181,15 +192,16 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   }
 
   when(rsp.valid) {
+    val src_idOH = UIntToOH(rsp.bits.srcID)(numRNs - 1, 0)
     val update_vec = buffer.map(e =>
-      e.task.reqID === rsp.bits.txnID && e.valid && !e.state.w_snpRsp && rsp.bits.opcode === SnpResp
+      e.task.reqID === rsp.bits.txnID && e.valid && !e.state.w_snpRsp &&
+        (e.task.snpVec.asUInt & src_idOH).orR && rsp.bits.opcode === SnpResp
     )
     assert(PopCount(update_vec) < 2.U, "Refill task repeated")
     val canUpdate = Cat(update_vec).orR
     val update_id = PriorityEncoder(update_vec)
     when(canUpdate) {
       val entry = buffer(update_id)
-      val src_idOH = UIntToOH(rsp.bits.srcID)(numRNs - 1, 0)
       val newSnpVec = VecInit((entry.task.snpVec.asUInt & ~src_idOH).asBools)
       entry.task.snpVec := newSnpVec
       entry.state.w_snpRsp := !Cat(newSnpVec).orR
@@ -199,15 +211,24 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   when(rnRespData.valid && rsp.valid) {
     when(rnRespData.bits.opcode === SnpRespData && rsp.bits.opcode === SnpResp) {
       when(rnRespData.bits.txnID === rsp.bits.txnID) {
-        val update_vec = buffer.map(e => e.task.reqID === rsp.bits.txnID && e.valid && !e.state.w_snpRsp)
+        val src_idOH_dat = UIntToOH(rnRespData.bits.srcID)(numRNs - 1, 0)
+        val src_idOH_rsp = UIntToOH(rsp.bits.srcID)(numRNs - 1, 0)
+        val update_vec = buffer.map(e =>
+          e.task.reqID === rsp.bits.txnID && e.valid && !e.state.w_snpRsp &&
+            (e.task.snpVec.asUInt & src_idOH_dat).orR &&
+            (e.task.snpVec.asUInt & src_idOH_rsp).orR
+        )
         assert(PopCount(update_vec) < 2.U, "Refill task repeated")
         val update_id = PriorityEncoder(update_vec)
         val entry = buffer(update_id)
         val canUpdate = Cat(update_vec).orR
         when(canUpdate) {
-          val src_idOH_dat = UIntToOH(rnRespData.bits.srcID)(numRNs - 1, 0)
-          val src_idOH_rsp = UIntToOH(rsp.bits.srcID)(numRNs - 1, 0)
-          val newSnpVec = VecInit((entry.task.snpVec.asUInt & ~src_idOH_dat & ~src_idOH_rsp).asBools)
+          // A same-cycle SnpResp pair completes the vector; the data side
+          // only clears its RN on the last beat of the SnpRespData.
+          val beatId = rnRespData.bits.dataID >> log2Ceil(beatBytes / 16)
+          val dataLast = beatId === (beatSize - 1).U
+          val dataClearOH = Mux(dataLast, src_idOH_dat, 0.U)
+          val newSnpVec = VecInit((entry.task.snpVec.asUInt & ~dataClearOH & ~src_idOH_rsp).asBools)
           entry.task.snpVec := newSnpVec
           entry.state.w_snpRsp := !Cat(newSnpVec).orR
         }

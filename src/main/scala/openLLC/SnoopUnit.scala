@@ -25,6 +25,9 @@ import xscache.chi.HasCHIOpcodes
 
 class SnoopEntry(implicit p: Parameters) extends TaskEntry {
   val ready  = Bool()
+  // TXSNP may finish before the target RN returns SnpResp/SnpRespData.  Keep
+  // this context visible to RequestArb throughout that response window.
+  val issued = Bool()
   val waitID = UInt(TXNID_WIDTH.W) // Indicates which CompAck the task needs to wait for to wake itself up
 }
 
@@ -42,6 +45,10 @@ class SnoopUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     /* CompAck from upstream RXRSP channel */
     val ack = Flipped(ValidIO(new Resp()))
 
+    /* Snoop completion from upstream RXRSP/RXDAT channels */
+    val snpRsp = Flipped(ValidIO(new Resp()))
+    val snpData = Flipped(ValidIO(new RespWithData()))
+
     /* snoop buffers info */
     val snpInfo = Vec(mshrs.snoop, ValidIO(new BlockInfo()))
   })
@@ -49,6 +56,9 @@ class SnoopUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   val in  = io.in
   val out = io.out
   val ack = io.ack
+
+  val snpRsp = io.snpRsp
+  val snpData = io.snpData
 
   /* Data Structure */
   val buffer   = RegInit(VecInit(Seq.fill(mshrs.snoop)(0.U.asTypeOf(new SnoopEntry()))))
@@ -65,31 +75,30 @@ class SnoopUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   )).asUInt
   def snpConflict(a: Task): Bool = snpConflictMask(a).orR
 
-  // flow not allowed when arbiter output is valid, or entries might starve
-  val canFlow = !snpConflict(in.bits) && !arbValid
-  val doFlow = canFlow && out.ready
-
   /* Alloc */
   /**
     * A snoop caused by a replacement may be blocked if it is preceded by a
     * snoop with the same target address triggered by a Read/Dataless request
     */
   val insertIdx = PriorityEncoder(buffer.map(!_.valid))
-  val alloc = !full && in.valid && !doFlow
+  // Do not bypass the buffer: a direct TXSNP flow would have no entry to
+  // reserve the address while its SnpResp is still in flight.
+  val alloc = !full && in.valid
   when(alloc) {
     val entry = buffer(insertIdx)
     val conflictIdx = PriorityEncoder(snpConflictMask(in.bits))
     entry.valid := true.B
     entry.ready := !snpConflict(in.bits)
+    entry.issued := false.B
     entry.task := in.bits
     entry.waitID := io.respInfo(conflictIdx).bits.reqID
   }
-  assert(!full || !in.valid || doFlow, "SnoopBuf overflow")
+  assert(!full || !in.valid, "SnoopBuf overflow")
 
   /* Update ready */
   when(ack.valid) {
     val update_vec = buffer.map(e =>
-      e.valid && !e.ready && ack.bits.opcode === CompAck && ack.bits.txnID === e.waitID
+      e.valid && !e.issued && !e.ready && ack.bits.opcode === CompAck && ack.bits.txnID === e.waitID
     )
     assert(PopCount(update_vec) < 2.U, "Snoop task repeated")
     val canUpdate = Cat(update_vec).orR
@@ -101,20 +110,50 @@ class SnoopUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   }
 
   /* Issue */
-  // once fired at issueArb, it is ok to enter TXSNP without conflict
+  // Issued entries stay allocated until every selected RN has returned its
+  // snoop response; only unissued entries are candidates for TXSNP.
   issueArb.io.in.zip(buffer).foreach { case (in, e) =>
-    in.valid := e.valid && e.ready
+    in.valid := e.valid && e.ready && !e.issued
     in.bits := e.task
   }
   issueArb.io.out.ready := out.ready
-  out.valid := in.valid && canFlow || arbValid
-  out.bits := Mux(canFlow, in.bits, issueArb.io.out.bits)
+  out.valid := arbValid
+  out.bits := issueArb.io.out.bits
 
-  /* Dealloc */
+  /* Mark issued, then retain the address until SnpResp/SnpRespData. */
   when(out.fire && arbValid) {
     val entry = buffer(issueArb.io.chosen)
-    entry.valid := false.B
     entry.ready := false.B
+    entry.issued := true.B
+    when(!entry.task.snpVec.asUInt.orR) {
+      entry.valid := false.B
+      entry.issued := false.B
+    }
+  }
+
+  val lastSnpDataID = (beatBytes * (beatSize - 1) * 8).U(
+    log2Ceil(blockBytes * 8) - 1,
+    log2Ceil(blockBytes * 8) - 2
+  )
+  buffer.foreach { entry =>
+    val rspMatch = snpRsp.valid && snpRsp.bits.opcode === SnpResp &&
+      entry.valid && entry.issued && entry.task.txnID === snpRsp.bits.txnID
+    val dataMatch = snpData.valid && isSnpRespDataX(snpData.bits.opcode) &&
+      snpData.bits.dataID === lastSnpDataID && entry.valid && entry.issued &&
+        entry.task.txnID === snpData.bits.txnID
+    val rspOH = UIntToOH(snpRsp.bits.srcID)(numRNs - 1, 0)
+    val dataOH = UIntToOH(snpData.bits.srcID)(numRNs - 1, 0)
+    val completedOH = Mux(rspMatch, rspOH, 0.U(numRNs.W)) |
+      Mux(dataMatch, dataOH, 0.U(numRNs.W))
+    val remainingOH = entry.task.snpVec.asUInt & ~completedOH
+    when(completedOH.orR) {
+      entry.task.snpVec := VecInit(remainingOH.asBools)
+      when(!remainingOH.orR) {
+        entry.valid := false.B
+        entry.ready := false.B
+        entry.issued := false.B
+      }
+    }
   }
 
   /* block info */
@@ -123,7 +162,7 @@ class SnoopUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     m.bits.tag := buffer(i).task.tag
     m.bits.set := buffer(i).task.set
     m.bits.opcode := buffer(i).task.chiOpcode
-    m.bits.reqID := buffer(i).task.reqID
+    m.bits.reqID := buffer(i).task.txnID
   }
 
   /* Performance Counter */
