@@ -17,6 +17,7 @@ import utility.MemReqSource
 import xscache.coupledL2.MetaData._
 import xscache.chi.CHICohStates._
 import xscache.chi.{CHIChannel, CHIREQ, CHIRSP, HasCHIOpcodes}
+import xscache.coupledL2.prefetch.DemandRefillBundle
 
 /**
   * The B-channel half of a physical MSHR entry.
@@ -222,6 +223,9 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   io.tasks.txrsp.bits := 0.U.asTypeOf(new CHIRSP)
   io.tasks.txdat.valid := false.B
   io.tasks.txdat.bits := 0.U.asTypeOf(new TaskBundle)
+  // The snoop context never completes a demand/prefetch refill.
+  io.dataRefill.valid := false.B
+  io.dataRefill.bits := 0.U.asTypeOf(new DemandRefillBundle)
 
   // A post-Grant ReleaseData proves the client no longer owns this block.
   // Waiting for a new ProbeAck would deadlock against the C release path.
