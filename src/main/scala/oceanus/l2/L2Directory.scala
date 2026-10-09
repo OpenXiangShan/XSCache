@@ -185,8 +185,10 @@ object PLRU4 {
 //   cycle (N+1) so the bitmask write has landed and later reads will hit.
 // Resp: driven at S3, routed one-to-one to fromDir(s3_tshr).
 //
-// replStall (internal): any in-flight PLRU writer blocks new ReplRd
-//   grants, closing the PLRU register S3-write/S1-read RAW window.
+// replStall (internal): an in-flight PLRU writer blocks a new ReplRd grant,
+//   closing the PLRU register S3-write/S1-read RAW window. By default any
+//   writer blocks every new ReplRd. With replStallSameSetOnly the stall is
+//   per set: only a ReplRd whose set matches the writer's set is blocked.
 
 class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val MAX_AGE = 15.U(4.W)
@@ -466,12 +468,19 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     freeWayMask_s3 := freeWayMask_s2
   }
 
-  // replStall: any in-flight PLRU writer blocks new ReplRd grant.
-  replStall :=
-    (s2_valid && s2_isRepl) ||
-    (s3_valid && s3_isRepl) ||
-    (s2_valid && s2_isDirRd) ||
-    (s3_valid && s3_isDirRd && hit_s3)
+  // replStall: an in-flight PLRU writer blocks a new ReplRd grant.
+  // A writer is any ReplRd in S2/S3, or a DirRd that hits (only a hit updates
+  // PLRU). Default: any such writer stalls every new ReplRd. Same-set-only:
+  // the candidate ReplRd is stalled only when its set equals the writer's set,
+  // since the PLRU RAW window is per register, not global.
+  val plruWriterS2 = s2_valid && (s2_isRepl || s2_isDirRd)
+  val plruWriterS3 = s3_valid && (s3_isRepl || (s3_isDirRd && hit_s3))
+  val replStallGlobal = plruWriterS2 || plruWriterS3
+  val replStallSameSet = anyReplRd && (
+    (plruWriterS2 && (io.toDir(winReplRd).PADDR(offsetBits + setBits - 1, offsetBits) === s2_set)) ||
+    (plruWriterS3 && (io.toDir(winReplRd).PADDR(offsetBits + setBits - 1, offsetBits) === s3_set))
+  )
+  replStall := Mux(paramL2.replStallSameSetOnly.B, replStallSameSet, replStallGlobal)
 
   val invalidVec = VecInit(dirData_s3.map(_.meta.state === L2Directory.MetaState.I))
   val hasInvalid = invalidVec.asUInt.orR
@@ -652,6 +661,31 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     "Directory: multiple grants in one cycle")
   assert(!(grantReplRd && replStall),
     "Directory: ReplRd granted while replStall (PLRU hazard)")
+  when(paramL2.replStallSameSetOnly.B) {
+    // A granted ReplRd must not share its set with a ReplRd already in S2 or S3:
+    // that is exactly the per-set PLRU RAW the narrowed stall is supposed to close.
+    val grantedSet = reqSet
+    when(grantReplRd) {
+      assert(!(s2_valid && s2_isRepl && (grantedSet === s2_set)),
+        "Directory: granted ReplRd set matches in-flight S2 ReplRd (same-set PLRU hazard)")
+      assert(!(s3_valid && s3_isRepl && (grantedSet === s3_set)),
+        "Directory: granted ReplRd set matches in-flight S3 ReplRd (same-set PLRU hazard)")
+      // A DirRd that hits also writes PLRU, at S3 of its own pipeline. A ReplRd granted on
+      // that same cycle reads plruRegs(reqSet) before the write lands, so a same-set grant
+      // here is the same RAW the stall is meant to close. S2 DirRd is not checked: whether
+      // it hits is only known once its read data is compared at S3.
+      assert(!(s3_valid && s3_isDirRd && hit_s3 && (grantedSet === s3_set)),
+        "Directory: granted ReplRd set matches in-flight S3 hit DirRd (same-set PLRU hazard)")
+    }
+    // The refill picked this cycle must not land on a (set, way) an earlier
+    // in-flight refill already holds. blockRefill is one entry per (set, way),
+    // so two refills choosing the same pair is exactly "this pick finds the
+    // entry already locked".
+    when(s3_valid && s3_isRepl && !hit_s3 && !replRetry) {
+      assert(!blockRefill(s3_set)(way_s3).locked,
+        "Directory: two in-flight refills selected the same (set, way)")
+    }
+  }
   assert(PopCount(blockRefill.flatten.map(_.locked)) <= nMSHR.U,
     "Directory: blockRefill lock count exceeds TSHR count")
   // Functional requests ARE allowed at the directory ports during the power-on

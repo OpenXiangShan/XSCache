@@ -17,6 +17,9 @@ case class L2Params(
     hasMbist: Boolean = false,
     hasSramCtl: Boolean = false,
     dataECC: Option[String] = Some("secded"),
+    // Narrow PLRU RAW stalls to the candidate replacement set.
+    // Disabled by default to retain the original global stall.
+    replStallSameSetOnly: Boolean = false,
 )
 
 case object L2ParamsKey extends Field[L2Params](L2Params())
