@@ -255,8 +255,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val p_rxreq_opcode = p_rxreq.Opcode
   val p_rxreq_stashshared       = p_rxreq_opcode === CCHIOpcode.StashShared.U
   val p_rxreq_stashunique       = p_rxreq_opcode === CCHIOpcode.StashUnique.U
-
-  io.sa_free_opcode := p_rxreq_stashshared || p_rxreq_stashunique
   val p_rxreq_readnosnp         = p_rxreq_opcode === CCHIOpcode.ReadNoSnp.U
   val p_rxreq_readonce          = p_rxreq_opcode === CCHIOpcode.ReadOnce.U
   val p_rxreq_readshared        = p_rxreq_opcode === CCHIOpcode.ReadShared.U
@@ -270,6 +268,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val p_rxreq_readunique        = p_rxreq_opcode === CCHIOpcode.ReadUnique.U
   val p_rxreq_makeunique        = p_rxreq_opcode === CCHIOpcode.MakeUnique.U
   val p_rxreq_evictback         = p_rxreq_opcode === CCHIOpcode.EvictBack.U
+
+  io.sa_free_opcode := p_rxreq_stashshared || p_rxreq_stashunique
 
   when (rxreq_fire) {
     p_rxreq := rxreq
