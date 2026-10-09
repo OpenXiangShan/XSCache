@@ -45,8 +45,14 @@ class TXREQ(implicit p: Parameters) extends CoupledL2Module {
   assert(!io.pipeReq.valid || io.pipeReq.ready, "TXREQ should always be ready for pipeline req")
   require(chiOpt.isDefined)
 
-  // TODO: an mshrsAll-entry queue is too much, evaluate for a proper size later
-  val queue = Module(new Queue(new CHIREQ, entries = mshrsAll, flow = false))
+  // Worst-case flit pressure in the multi-context MSHR design:
+  //   normal reads (one CHI read per normal context)      <= mshrsAll
+  //   ReplaceMSHR releases (WriteBackFull/Evict per child) <= mshrsAll
+  // Snoop contexts do not issue TXREQ, so the bound is 2*mshrsAll (in the
+  // pre-split design one MSHR issued read->release sequentially and the bound
+  // was mshrsAll). The queue and gate must cover both classes or a stalled
+  // link overflows the always-ready pipeReq path and silently drops a flit.
+  val queue = Module(new Queue(new CHIREQ, entries = 2 * mshrsAll, flow = false))
   
   // Back pressure logic from TXREQ
   val queueCnt = queue.io.count
@@ -63,9 +69,9 @@ class TXREQ(implicit p: Parameters) extends CoupledL2Module {
     1.U - s2ReturnCredit.asUInt + //Fix Timing: always take credit and s2 return if not take 
     queueCnt
 
-  assert(inflightCnt <= mshrsAll.U, "in-flight overflow at TXREQ")
+  assert(inflightCnt <= (2 * mshrsAll + 4).U, "in-flight overflow at TXREQ")
 
-  val noSpace = inflightCnt >= mshrsAll.U
+  val noSpace = inflightCnt >= (2 * mshrsAll).U
 
   io.toReqArb.blockMSHRReqEntrance := noSpace
 

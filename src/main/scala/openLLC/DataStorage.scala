@@ -25,6 +25,7 @@ import org.chipsalliance.cde.config.Parameters
 class DSRequest(implicit p: Parameters) extends LLCBundle {
   val way = UInt(wayBits.W)
   val set = UInt(setBits.W)
+  val tag = UInt(tagBits.W)
 }
 
 class DSBeat(implicit p: Parameters) extends LLCBundle {
@@ -36,7 +37,9 @@ class DSBlock(implicit p: Parameters) extends LLCBundle {
 }
 
 class WBEntry(implicit p: Parameters) extends LLCBundle {
+  val valid = Bool()
   val blockIdx = UInt(blockBits.W)
+  val tag = UInt(tagBits.W)
   val data = new DSBlock
 }
 
@@ -44,13 +47,15 @@ class DataStorage(implicit p: Parameters) extends LLCModule {
   val io = IO(new Bundle() {
     /**
       * Support read and write request in the same cycle.
-      * When reading and writing the same address,
-      * the data before writing is returned
+      * Reads normally observe the data before a same-cycle write. The
+      * writeFirst input enables an explicit write-first exception for the
+      * dirty replacement-snoop path.
       */
     val read  = Flipped(ValidIO(new DSRequest()))
     val write = Flipped(ValidIO(new DSRequest()))
     val rdata = Output(new DSBlock())
     val wdata = Input(new DSBlock())
+    val writeFirst = Input(Bool())
   })
 
   val array = Module(new SRAMTemplate(
@@ -66,6 +71,8 @@ class DataStorage(implicit p: Parameters) extends LLCModule {
   val writeIdx = Cat(io.write.bits.way, io.write.bits.set)
 
   val writeBuffer = RegInit(0.U.asTypeOf(new WBEntry()))
+  val writeHitsBufferedLine = writeBuffer.valid &&
+    writeIdx === writeBuffer.blockIdx && io.write.bits.tag === writeBuffer.tag
 
   /* WriteBuffer update logic */
   /**
@@ -73,24 +80,38 @@ class DataStorage(implicit p: Parameters) extends LLCModule {
     * but are written to the buffer first.
     */
   when (wen) {
+    writeBuffer.valid := true.B
     writeBuffer.blockIdx := writeIdx
+    writeBuffer.tag := io.write.bits.tag
     writeBuffer.data := io.wdata
   }
 
   /* SRAM write logic */
-  // SRAM is written when the data block of the buffer is replaced
-  val writeHit = writeIdx === writeBuffer.blockIdx
-  val writeBack = !writeHit && wen
+  // Flush when a new write replaces the buffered logical cache line. A way
+  // alone is not enough: different tags can reuse the same (way, set).
+  val writeBack = wen && writeBuffer.valid && !writeHitsBufferedLine
   array.io.w.apply(writeBack, writeBuffer.data, writeBuffer.blockIdx, 1.U)
 
+  when(wen && writeBuffer.valid && writeIdx === writeBuffer.blockIdx &&
+    io.write.bits.tag =/= writeBuffer.tag) {
+    assert(writeBack, "a different tag reusing a buffered DS slot must flush the old line")
+  }
+
   /* Read request response */
-  val readHit = readIdx === writeBuffer.blockIdx
+  val readHit = writeBuffer.valid && readIdx === writeBuffer.blockIdx &&
+    io.read.bits.tag === writeBuffer.tag
+  val writeFirstRead = io.writeFirst && ren && wen && readIdx === writeIdx &&
+    io.read.bits.tag === io.write.bits.tag
   val readBuffer = readHit && ren
   array.io.r.apply(!readBuffer, readIdx)
   val rdata_s1 = Mux(
-    RegNext(readBuffer, false.B), 
-    RegEnable(writeBuffer.data, 0.U.asTypeOf(new DSBlock), readBuffer),
-    array.io.r.resp.data(0)
+    RegNext(writeFirstRead, false.B),
+    RegEnable(io.wdata, 0.U.asTypeOf(new DSBlock), writeFirstRead),
+    Mux(
+      RegNext(readBuffer, false.B),
+      RegEnable(writeBuffer.data, 0.U.asTypeOf(new DSBlock), readBuffer),
+      array.io.r.resp.data(0)
+    )
   )
   val rdata_s2 = RegEnable(rdata_s1, 0.U.asTypeOf(new DSBlock), RegNext(ren, false.B))
   io.rdata := rdata_s2

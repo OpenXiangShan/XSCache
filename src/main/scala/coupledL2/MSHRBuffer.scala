@@ -27,6 +27,7 @@ class MSHRBufRead(implicit p: Parameters) extends L2Bundle {
 }
 
 class MSHRBufResp(implicit p: Parameters) extends L2Bundle {
+  val id = Output(UInt(mshrBits.W))
   val data = Output(new DSBlock)
 }
 
@@ -36,11 +37,16 @@ class MSHRBufWrite(implicit p: Parameters) extends L2Bundle {
   val beatMask = Output(UInt(beatSize.W))
 }
 
-// MSHR Buffer is used when MSHR needs to save data, so each buffer entry corresponds to an MSHR
+// MSHR Buffer is indexed by physical MSHR ID. MSHRCtl grants a per-entry lease
+// before either context can issue a Probe that may return ProbeAckData.
 class MSHRBuffer(wPorts: Int = 1)(implicit p: Parameters) extends L2Module {
   val io = IO(new Bundle() {
     val r = Flipped(ValidIO(new MSHRBufRead))
     val resp = new MSHRBufResp
+    // Second read port for the direct ReplaceMSHR->TXDAT copyback path
+    // (flop-based array, so this is just another read mux).
+    val r2 = Flipped(ValidIO(new MSHRBufRead))
+    val resp2 = new MSHRBufResp
     val w = Vec(wPorts, Flipped(ValidIO(new MSHRBufWrite)))
   })
 
@@ -62,7 +68,14 @@ class MSHRBuffer(wPorts: Int = 1)(implicit p: Parameters) extends L2Module {
   }
 
   val rdata = buffer(io.r.bits.id).asUInt
+  val rid = RegEnable(io.r.bits.id, 0.U, io.r.valid)
+  io.resp.id := rid
   io.resp.data.data := RegEnable(rdata, 0.U.asTypeOf(rdata), io.r.valid)
+
+  val rdata2 = buffer(io.r2.bits.id).asUInt
+  val rid2 = RegEnable(io.r2.bits.id, 0.U, io.r2.valid)
+  io.resp2.id := rid2
+  io.resp2.data.data := RegEnable(rdata2, 0.U.asTypeOf(rdata2), io.r2.valid)
 }
 
 // may consider just choose an empty entry to insert
