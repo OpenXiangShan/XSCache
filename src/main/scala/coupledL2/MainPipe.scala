@@ -30,6 +30,18 @@ import xscache.coupledL2.MetaData._
 import xscache.chi.{CHIREQ, HasCHIOpcodes}
 import xscache.chi.CHICohStates._
 
+class L2LineReplacementTrace(implicit p: Parameters) extends L2Bundle {
+  val setIdx = UInt(setBits.W)
+  val way = UInt(wayBits.W)
+  val tag = UInt(tagBits.W)
+  val lineAddr = UInt(fullAddressBits.W)
+  val reqSource = UInt(MemReqSource.reqSourceBits.W)
+  val reqChannel = UInt(3.W)
+  val reqOpcode = UInt(3.W) // refill task opcode, not the original demand opcode
+  val victimPrefetched = Bool()
+  val victimAccessed = Bool()
+}
+
 class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes with HasPerfEvents {
   val io = IO(new Bundle() {
     /* receive task from arbiter at stage 2 */
@@ -726,6 +738,34 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     u.bits.reqSource := req_s3.reqSource
     u.bits.victimPAddr := Cat(io.replResp.bits.tag, req_s3.set, 0.U(offsetBits.W))
     u.bits.victimPfSource := io.replResp.bits.meta.prefetchSrc.getOrElse(PfSource.NoWhere.id.U)
+  }
+
+  // Exact valid-line replacements, counted only when the refill commits its new tag.
+  val lineReplacementExact = io.tagWReq.valid && need_repl && req_s3.fromA
+  XSPerfAccumulate("l2_line_replacement_exact", lineReplacementExact)
+  val replacementSetStep = math.max(1, (cacheParams.sets + 63) / 64)
+  XSPerfHistogram("l2_line_replacement_set_region", perfCnt = io.replResp.bits.set,
+    enable = lineReplacementExact, start = 0, stop = cacheParams.sets, step = replacementSetStep)
+
+  // Select this table with --dump-select-db for offline line-frequency analysis.
+  // No line frequency is inferred in hardware.
+  if (cacheParams.enableMonitor && !cacheParams.FPGAPlatform) {
+    val traceTable = ChiselDB.createRuntimeGatedTable(
+      s"L2LineReplacementTrace_hart${cacheParams.hartId}_slice${p(SliceIdKey)}",
+      new L2LineReplacementTrace
+    )
+    val trace = Wire(new L2LineReplacementTrace)
+    trace.setIdx := io.replResp.bits.set
+    trace.way := io.replResp.bits.way
+    trace.tag := io.replResp.bits.tag
+    trace.lineAddr := restoreAddress(Cat(io.replResp.bits.tag, io.replResp.bits.set, 0.U(offsetBits.W)), p(SliceIdKey))
+    trace.reqSource := req_s3.reqSource
+    trace.reqChannel := req_s3.channel
+    trace.reqOpcode := req_s3.opcode
+    trace.victimPrefetched := io.replResp.bits.meta.prefetch.getOrElse(false.B)
+    trace.victimAccessed := io.replResp.bits.meta.accessed
+    traceTable.log(trace, lineReplacementExact,
+      s"L2${cacheParams.hartId}_${p(SliceIdKey)}", clock, reset)
   }
 
   io.prefetchTrain.foreach {
