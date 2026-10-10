@@ -78,8 +78,9 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
   private val PF_VBOP   = 4
   private val PF_PBOP   = 5
   private val PF_TP     = 6
-  private val PF_NUM    = 7
-  private val PF_NAME_VEC = Seq("Stream", "Stride", "Berti", "SMS", "VBOP", "PBOP", "TP")
+  private val PF_CDP    = 7
+  private val PF_NUM    = 8
+  private val PF_NAME_VEC = Seq("Stream", "Stride", "Berti", "SMS", "VBOP", "PBOP", "TP", "CDP")
 
   private def pfIdxFromReqSource(src: UInt): UInt = {
     MuxLookup(src, PF_NUM.U)(Seq(
@@ -89,7 +90,8 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
       MemReqSource.Prefetch2L2SMS.id.U    -> PF_SMS.U,
       MemReqSource.Prefetch2L2BOP.id.U    -> PF_VBOP.U,
       MemReqSource.Prefetch2L2PBOP.id.U   -> PF_PBOP.U,
-      MemReqSource.Prefetch2L2TP.id.U     -> PF_TP.U
+      MemReqSource.Prefetch2L2TP.id.U     -> PF_TP.U,
+      MemReqSource.Prefetch2L2CDP.id.U    -> PF_CDP.U
     ))
   }
 
@@ -101,7 +103,8 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
       PfSource.SMS.id.U    -> PF_SMS.U,
       PfSource.BOP.id.U    -> PF_VBOP.U,
       PfSource.PBOP.id.U   -> PF_PBOP.U,
-      PfSource.TP.id.U     -> PF_TP.U
+      PfSource.TP.id.U     -> PF_TP.U,
+      PfSource.CDP.id.U   -> PF_CDP.U
     ))
   }
 
@@ -113,7 +116,8 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
       src === MemReqSource.Prefetch2L2SMS.id.U,
       src === MemReqSource.Prefetch2L2BOP.id.U,
       src === MemReqSource.Prefetch2L2PBOP.id.U,
-      src === MemReqSource.Prefetch2L2TP.id.U
+      src === MemReqSource.Prefetch2L2TP.id.U,
+      src === MemReqSource.Prefetch2L2CDP.id.U
     ))
   }
 
@@ -125,7 +129,8 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
       src === PfSource.SMS.id.U,
       src === PfSource.BOP.id.U,
       src === PfSource.PBOP.id.U,
-      src === PfSource.TP.id.U
+      src === PfSource.TP.id.U,
+      src === PfSource.CDP.id.U
     ))
   }
 
@@ -178,7 +183,9 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
   val latencyLastEpoch = RegInit(0.U(timestampBits.W))
   val phtValid = RegInit(VecInit(Seq.fill(banks)(VecInit(Seq.fill(PHT_ENTRIES)(false.B)))))
   val phtTag = RegInit(VecInit(Seq.fill(banks)(VecInit(Seq.fill(PHT_ENTRIES)(0.U(PHT_TAG_BITS.W))))))
-  val phtPfId = RegInit(VecInit(Seq.fill(banks)(VecInit(Seq.fill(PHT_ENTRIES)(0.U(log2Ceil(PF_NUM).W))))))
+  // PF_NUM is also the unmapped-source sentinel, so reserve one extra value.
+  val pfIdBits = log2Ceil(PF_NUM + 1)
+  val phtPfId = RegInit(VecInit(Seq.fill(banks)(VecInit(Seq.fill(PHT_ENTRIES)(0.U(pfIdBits.W))))))
   // TODO lyq: 一些信息感觉不需要分 bank 存储？因为地址是不会重合的？
 
   // io alias
@@ -212,10 +219,10 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
   // ========== pht lookup and update ==========
   val p0_phtHitVec = Wire(Vec(banks, Bool()))
   val p0_phtHitLatencyVec = Wire(Vec(banks, UInt(timestampBits.W)))
-  val p0_phtHitPfIdx = Wire(Vec(banks, UInt(log2Ceil(PF_NUM).W)))
+  val p0_phtHitPfIdx = Wire(Vec(banks, UInt(pfIdBits.W)))
   val p1_phtHitVec = RegNext(p0_phtHitVec)
   val p1_phtHitLatencyVec = Wire(Vec(banks, UInt(timestampBits.W)))
-  val p1_phtHitPfIdx = Wire(Vec(banks, UInt(log2Ceil(PF_NUM).W)))
+  val p1_phtHitPfIdx = Wire(Vec(banks, UInt(pfIdBits.W)))
 
   for (s <- 0 until banks) {
     val rValid = dataRefill(s).valid && dataRefill(s).bits.isDemand
