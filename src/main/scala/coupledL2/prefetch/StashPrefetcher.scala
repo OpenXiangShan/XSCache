@@ -152,9 +152,10 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
   val txreqArb = Module(new TwoLevelRRArbiter(chiselTypeOf(io.txreq.bits), stashPrefetchEntries.size))
   txreqArb.suggestName("stash_prefetch_txreq_arb")
   stashPrefetchEntries.map(_.io.txreq).zip(txreqArb.io.in).foreach { case (req, in) =>
-    in.valid := req.valid && io.allow(entryBank)
+    val reqBank = if (bankBits == 0) 0.U else req.bits.addr(offsetBits + bankBits - 1, offsetBits)
+    in.valid := req.valid && io.allow(reqBank)
     in.bits := req.bits
-    req.ready := in.ready && io.allow(entryBank)
+    req.ready := in.ready && io.allow(reqBank)
   }
   io.txreq <> txreqArb.io.out
 
