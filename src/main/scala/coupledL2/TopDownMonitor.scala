@@ -201,10 +201,23 @@ class TopDownMonitor()(implicit p: Parameters) extends L2Module {
     val name = x._1
     XSPerfAccumulate(s"l2prefetchSent$name", PopCount(l2pfSentVec(i)))
     XSPerfAccumulate(s"l2prefetchSentToPipe$name", PopCount(l2pfSentToPipeVec(i)))
+    // `Sent` is the slice prefetch request fire boundary; `SentToPipe` is the
+    // later directory observation. Keep both names and expose lifecycle terms
+    // with the same explicit observation boundaries.
+    XSPerfAccumulate(s"l2prefetchReq$name", PopCount(l2pfSentVec(i)))
+    XSPerfAccumulate(s"l2prefetchPipeReq$name", PopCount(l2pfSentToPipeVec(i)))
     XSPerfAccumulate(s"l2prefetchHit$name", l2hitPfVec(i))
+    XSPerfAccumulate(s"l2prefetchUseful$name", l2hitPfVec(i))
     XSPerfAccumulate(s"l2prefetchHitInCache$name", PopCount(l2hitPfInCacheVec(i)))
+    XSPerfAccumulate(s"l2prefetchHitCache$name", PopCount(l2hitPfInCacheVec(i)))
     XSPerfAccumulate(s"l2prefetchHitInMSHR$name", PopCount(l2hitPfInMSHRVec(i)))
+    XSPerfAccumulate(s"l2prefetchHitPos$name", PopCount(l2hitPfInMSHRVec(i)))
     XSPerfAccumulate(s"l2prefetchLate$name", l2pfLateVec(i))
+    val pipeReq = PopCount(l2pfSentToPipeVec(i))
+    val accounted = l2hitPfVec(i) + l2pfLateVec(i)
+    // A signed lifecycle residual is not identifiable in hardware because
+    // useful/late events are observed at different pipeline boundaries.
+    XSPerfAccumulate(s"l2prefetchDeadProxy$name", Mux(pipeReq >= accounted, pipeReq - accounted, 0.U))
     XSPerfAccumulate(s"l2prefetchLateInCache$name", PopCount(l2pfLateInCache(i)))
     XSPerfAccumulate(s"l2prefetchLateInMSHR$name", PopCount(l2pfLateInMSHR(i)))
     XSPerfRolling(s"L2PrefetchAccuracy$name", l2hitPfVec(i), PopCount(l2pfSentVec(i)), 1000, io.debugTopDown.robTrueCommit, clock, reset)

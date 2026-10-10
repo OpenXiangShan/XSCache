@@ -509,6 +509,16 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   val reqsFire = reqs.map(_.map(_.fire).getOrElse(false.B))
 
+  // Per-engine lifecycle at the prefetch arbitration boundary. `dropProxy`
+  // means the engine presented a request but lost this cycle's selection; the
+  // overwrite queue has no source-tagged drop output in this revision.
+  val lifecycleNames = Seq("L1", "NextLine", "VBOP", "PBOP", "TP", "CDP")
+  for ((name, i) <- lifecycleNames.zipWithIndex) {
+    XSPerfAccumulate(s"l2prefetchReq$name", reqsValid(i))
+    XSPerfAccumulate(s"l2prefetchPipeReq$name", reqsFire(i))
+    XSPerfAccumulate(s"l2prefetchDropProxy$name", reqsValid(i) && !reqsFire(i))
+  }
+
   XSPerfAccumulate("prefetch_train_valid", train.valid)
   XSPerfAccumulate("prefetch_train_in_valid", PopCount(io.train.map(_.valid)))
   XSPerfAccumulate("prefetch_resp_valid", resp.valid)
