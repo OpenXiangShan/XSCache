@@ -1461,7 +1461,9 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   // time stamp
   val acquire_period = Option.when(cacheParams.enablePerf)(IO(ValidIO(UInt(64.W))))
   val release_period = Option.when(cacheParams.enablePerf)(IO(ValidIO(UInt(64.W))))
+  val txreq_wait = Option.when(cacheParams.enablePerf)(IO(ValidIO(UInt(64.W))))
   if (cacheParams.enablePerf) {
+    val alloc_ts = RegEnable(timer, io.alloc.valid)
     val acquire_start = io.tasks.txreq.fire && !state.s_acquire
     val release_start = io.tasks.mainpipe.fire && !state.s_release
     val acquire_ts = RegEnable(timer, acquire_start)
@@ -1473,5 +1475,8 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     acquire_period.get.bits := timer - acquire_ts
     release_period.get.valid := release_finish && !RegNext(release_finish)
     release_period.get.bits := timer - release_ts
+    // L2 内部排队:MSHR 分配(alloc)到 TXREQ 首次发出,不含在 acquire_period 内
+    txreq_wait.get.valid := acquire_start
+    txreq_wait.get.bits := timer - alloc_ts
   }
 }

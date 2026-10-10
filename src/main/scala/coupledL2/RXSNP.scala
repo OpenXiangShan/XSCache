@@ -129,6 +129,12 @@ class RXSNP(
 
   assert(!(stall && rxsnp.fire))
 
+  // These are the precise CHI ingress boundaries. The response counters are
+  // kept in TXRSP/TXDAT where the emitted opcode and fire are available.
+  XSPerfAccumulate("l2_snoop_req", io.rxsnp.fire)
+  XSPerfAccumulate("l2_snoop_req_stall", io.rxsnp.valid && !io.rxsnp.ready)
+  XSPerfAccumulate("l2_snoop_to_mainpipe", io.task.fire)
+
   def fromSnpToTaskBundle(snp: CHISNP): TaskBundle = {
     val task = WireInit(0.U.asTypeOf(new TaskBundle))
     task.channel := "b010".U

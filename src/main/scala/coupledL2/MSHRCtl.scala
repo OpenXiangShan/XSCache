@@ -258,6 +258,43 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     XSPerfHistogram("release_period", release_period, release_period_en, 100, 200, 10, true, true)
     XSPerfHistogram("release_period", release_period, release_period_en, 200, 1000, 100, true, true)
     XSPerfHistogram("release_period", release_period, release_period_en, 1000, 5000, 1000, true, false)
+
+    // ===== 按请求来源分类的端到端延迟(sum=周期和, cnt=样本数, mean=sum/cnt) =====
+    // acquire_period: TXREQ 发出 -> 最后 grant 数据拍(含 NoC+HN+L3 全程)
+    // txreq_wait:     MSHR 分配 -> TXREQ 首次发出(L2 内部排队, TX 仲裁/等待)
+    val acquire_src = ParallelMux(mshrs.map(m => m.acquire_period.get.valid -> m.io.status.bits.reqSource))
+    val txreq_wait   = ParallelMux(mshrs.map(m => m.txreq_wait.get.valid -> m.txreq_wait.get.bits))
+    val txreq_wait_en = mshrs.map(_.txreq_wait.get.valid).reduce(_ || _)
+    val txreq_src    = ParallelMux(mshrs.map(m => m.txreq_wait.get.valid -> m.io.status.bits.reqSource))
+    def srcIn(src: UInt, ids: Seq[Int]): Bool = Cat(ids.map(i => src === i.U)).orR
+    val clsSeq: Seq[(String, UInt => Bool)] = Seq(
+      "demand" -> ((src: UInt) => srcIn(src, Seq(MemReqSource.NoWhere.id, MemReqSource.CPUInst.id, MemReqSource.CPULoadData.id,
+        MemReqSource.CPUStoreData.id, MemReqSource.CPUAtomicData.id, MemReqSource.PTW.id))),
+      "l1pf" -> ((src: UInt) => srcIn(src, Seq(MemReqSource.L1DataPrefetch.id, MemReqSource.L1InstPrefetch.id))),
+      "l2pf_cdp" -> ((src: UInt) => srcIn(src, Seq(MemReqSource.Prefetch2L2CDP.id))),
+      "l2pf_oth" -> ((src: UInt) => srcIn(src, Seq(MemReqSource.Prefetch2L2BOP.id, MemReqSource.Prefetch2L2PBOP.id,
+        MemReqSource.Prefetch2L2SMS.id, MemReqSource.Prefetch2L2Stream.id, MemReqSource.Prefetch2L2Stride.id,
+        MemReqSource.Prefetch2L2TP.id, MemReqSource.Prefetch2L2Berti.id, MemReqSource.Prefetch2L2NL.id,
+        MemReqSource.Prefetch2L2Unknown.id, MemReqSource.Prefetch2L2Matrix.id)))
+    )
+    for ((clsName, clsHit) <- clsSeq) {
+      val aen = acquire_period_en && clsHit(acquire_src)
+      XSPerfAccumulate(s"acquire_period_${clsName}_sum", Mux(aen, acquire_period, 0.U))
+      XSPerfAccumulate(s"acquire_period_${clsName}_cnt", aen)
+      val ten = txreq_wait_en && clsHit(txreq_src)
+      XSPerfAccumulate(s"txreq_wait_${clsName}_sum", Mux(ten, txreq_wait, 0.U))
+      XSPerfAccumulate(s"txreq_wait_${clsName}_cnt", ten)
+    }
+    { // other = 未归入上面任何类(Prefetch2L3*/预留编码)
+      val hit = !clsSeq.map(_._2(acquire_src)).reduce(_ || _)
+      val aen = acquire_period_en && hit
+      XSPerfAccumulate("acquire_period_other_sum", Mux(aen, acquire_period, 0.U))
+      XSPerfAccumulate("acquire_period_other_cnt", aen)
+      val hitT = !clsSeq.map(_._2(txreq_src)).reduce(_ || _)
+      val ten = txreq_wait_en && hitT
+      XSPerfAccumulate("txreq_wait_other_sum", Mux(ten, txreq_wait, 0.U))
+      XSPerfAccumulate("txreq_wait_other_cnt", ten)
+    }
  
     val timers = RegInit(VecInit(Seq.fill(mshrsAll)(0.U(64.W))))
     for (((timer, m), i) <- timers.zip(mshrs).zipWithIndex) {

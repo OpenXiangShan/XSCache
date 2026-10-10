@@ -22,7 +22,7 @@ import chisel3.util._
 import utility._
 import org.chipsalliance.cde.config.Parameters
 import xscache.coupledL2.TaskBundle
-import xscache.chi.{CHIRSP, RespErrEncodings}
+import xscache.chi.{CHIRSP, HasCHIOpcodes, RespErrEncodings}
 
 class TXRSPBlockBundle(implicit p: Parameters) extends TXBlockBundle {
   val blockSinkBReqEntrance = Bool()
@@ -30,7 +30,7 @@ class TXRSPBlockBundle(implicit p: Parameters) extends TXBlockBundle {
   override def apply() = 0.U.asTypeOf(this)
 }
 
-class TXRSP(implicit p: Parameters) extends CoupledL2Module {
+class TXRSP(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   val io = IO(new Bundle() {
     // val in = Flipped(DecoupledIO(new TaskBundle()))
     val pipeRsp = Flipped(DecoupledIO(new TaskBundle))
@@ -94,4 +94,7 @@ class TXRSP(implicit p: Parameters) extends CoupledL2Module {
     // TODO: Finish this
     rsp
   }
+
+  XSPerfAccumulate("l2_snoop_resp", io.out.fire &&
+    (io.out.bits.opcode === SnpResp || io.out.bits.opcode === SnpRespFwded))
 }

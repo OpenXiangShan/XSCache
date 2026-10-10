@@ -745,6 +745,24 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
         io.replResp.bits.meta.prefetch.getOrElse(false.B) && 
         io.replResp.bits.meta.prefetchSrc.getOrElse(false.B) === PfSource.CDP.id.U
 
+      val l2_prefetch_unused_evict = task_s3.valid && mshr_refill_s3 && req_s3.replTask &&
+        !io.replResp.bits.retry && !io.replResp.bits.meta.accessed &&
+        io.replResp.bits.meta.prefetch.getOrElse(false.B)
+      val l2_prefetch_unused_sources = Seq(
+        "SMS" -> PfSource.SMS.id,
+        "BOP" -> PfSource.BOP.id,
+        "PBOP" -> PfSource.PBOP.id,
+        "Stream" -> PfSource.Stream.id,
+        "Stride" -> PfSource.Stride.id,
+        "TP" -> PfSource.TP.id,
+        "Berti" -> PfSource.Berti.id,
+        "NextLine" -> PfSource.NL.id,
+        "CDP" -> PfSource.CDP.id
+      )
+      for ((name, sourceId) <- l2_prefetch_unused_sources) {
+        XSPerfAccumulate(s"l2prefetchUseless$name",
+          l2_prefetch_unused_evict && io.replResp.bits.meta.prefetchSrc.getOrElse(PfSource.NoWhere.id.U) === sourceId.U)
+      }
       if (hasCDP) {
         train.bits.cdp_vpn_train_valid.get  := cdp_vpn_train_valid
         train.bits.cdp_filter_train_hit.get := cdp_filter_train_hit
@@ -1137,6 +1155,36 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   XSPerfAccumulate("b_req_hit", hit_s3 && req_s3.fromB)
   XSPerfAccumulate("b_req_miss", miss_s3 && req_s3.fromB)
 
+  // Read/write classification is exact at this observation point: A-channel
+  // Acquire/Get requests are reads, while C-channel requests are writes.
+  val l2_read_req_s3 = task_s3.valid && req_acquire_s3 || task_s3.valid && req_get_s3
+  val l2_write_req_s3 = task_s3.valid && sinkC_req_s3
+  val l2_read_hit_s3 = l2_read_req_s3 && hit_s3
+  val l2_read_miss_s3 = l2_read_req_s3 && miss_s3
+  val l2_write_hit_s3 = l2_write_req_s3 && hit_s3
+  val l2_write_miss_s3 = l2_write_req_s3 && miss_s3
+  XSPerfAccumulate("l2_read_req", l2_read_req_s3)
+  XSPerfAccumulate("l2_read_hit", l2_read_hit_s3)
+  XSPerfAccumulate("l2_read_miss", l2_read_miss_s3)
+  XSPerfAccumulate("l2_write_req", l2_write_req_s3)
+  XSPerfAccumulate("l2_write_hit", l2_write_hit_s3)
+  XSPerfAccumulate("l2_write_miss", l2_write_miss_s3)
+
+  // One task_s3 observation occupies one MainPipe directory service cycle.
+  // These are local processing-time sums, while acquire_period_* and
+  // txreq_wait_* in MSHRCtl provide the longer end-to-end/queue delays.
+  XSPerfAccumulate("l2_read_hit_processing_time", l2_read_hit_s3)
+  XSPerfAccumulate("l2_read_miss_processing_time", l2_read_miss_s3)
+  XSPerfAccumulate("l2_write_hit_processing_time", l2_write_hit_s3)
+  XSPerfAccumulate("l2_write_miss_processing_time", l2_write_miss_s3)
+
+  // Separate fixed hits from demand hits covered by a prefetched line. These
+  // set histograms make a fixHitRate anomaly attributable to hot set ranges.
+  val l2_fix_hit_s3 = l2_read_hit_s3 && !metaOnHit_s3.prefetch.getOrElse(false.B)
+  val l2_prefetch_cover_hit_s3 = l2_read_hit_s3 && metaOnHit_s3.prefetch.getOrElse(false.B)
+  XSPerfAccumulate("l2_fix_hit", l2_fix_hit_s3)
+  XSPerfAccumulate("l2_prefetch_cover_hit", l2_prefetch_cover_hit_s3)
+
   XSPerfHistogram("a_req_access_way", perfCnt = dirResult_s3.way,
     enable = task_s3.valid && !mshr_req_s3 && req_s3.fromA, start = 0, stop = cacheParams.ways, step = 1)
   XSPerfHistogram("a_req_hit_way", perfCnt = dirResult_s3.way,
@@ -1144,15 +1192,28 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   XSPerfHistogram("a_req_miss_way_choice", perfCnt = dirResult_s3.way,
     enable = miss_s3 && req_s3.fromA, start = 0, stop = cacheParams.ways, step = 1)
   
+  val set_hist_step = math.max(1, cacheParams.sets / 64)
   XSPerfHistogram("a_req_access_set", perfCnt = task_s3.bits.set,
     enable = task_s3.valid && !mshr_req_s3 && req_s3.fromA,
-    start = 0, stop = cacheParams.sets, step = cacheParams.sets / 64)
+    start = 0, stop = cacheParams.sets, step = set_hist_step)
   XSPerfHistogram("a_req_hit_set", perfCnt = task_s3.bits.set,
     enable = hit_s3 && req_s3.fromA,
-    start = 0, stop = cacheParams.sets, step = cacheParams.sets / 64)
+    start = 0, stop = cacheParams.sets, step = set_hist_step)
   XSPerfHistogram("a_req_miss_set", perfCnt = task_s3.bits.set,
     enable = miss_s3 && req_s3.fromA,
-    start = 0, stop = cacheParams.sets, step = cacheParams.sets / 64)
+    start = 0, stop = cacheParams.sets, step = set_hist_step)
+  XSPerfHistogram("l2_fix_hit_set", perfCnt = task_s3.bits.set,
+    enable = l2_fix_hit_s3, start = 0, stop = cacheParams.sets, step = set_hist_step)
+  XSPerfHistogram("l2_prefetch_cover_hit_set", perfCnt = task_s3.bits.set,
+    enable = l2_prefetch_cover_hit_s3, start = 0, stop = cacheParams.sets, step = set_hist_step)
+  XSPerfHistogram("l2_read_hit_set", perfCnt = task_s3.bits.set,
+    enable = l2_read_hit_s3, start = 0, stop = cacheParams.sets, step = set_hist_step)
+  XSPerfHistogram("l2_read_miss_set", perfCnt = task_s3.bits.set,
+    enable = l2_read_miss_s3, start = 0, stop = cacheParams.sets, step = set_hist_step)
+  XSPerfHistogram("l2_write_hit_set", perfCnt = task_s3.bits.set,
+    enable = l2_write_hit_s3, start = 0, stop = cacheParams.sets, step = set_hist_step)
+  XSPerfHistogram("l2_write_miss_set", perfCnt = task_s3.bits.set,
+    enable = l2_write_miss_s3, start = 0, stop = cacheParams.sets, step = set_hist_step)
 
   // pipeline stages for TX and sourceD reqs
   val pipe_len = Seq(5.U, 4.U, 3.U)

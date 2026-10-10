@@ -107,6 +107,11 @@ class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     beatValids := VecInit(next_beatsOH.asBools)
   }
 
+  XSPerfAccumulate("l2_snoop_resp_data", io.out.fire &&
+    (io.out.bits.opcode === SnpRespData ||
+      io.out.bits.opcode === SnpRespDataPtl ||
+      io.out.bits.opcode === SnpRespDataFwded))
+
   def getBeat(data: UInt, beatsOH: UInt): (UInt, UInt) = {
     // get one beat from data according to beatsOH
     require(data.getWidth == (blockBytes * 8))
