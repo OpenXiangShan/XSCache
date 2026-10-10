@@ -24,7 +24,7 @@ import xscache.coupledL2.utils._
 import utility.{ChiselDB, Code, MemReqSource, ParallelPriorityMux, RegNextN, XSPerfAccumulate, MaskToOH}
 import utility.sram.SRAMTemplate
 import org.chipsalliance.cde.config.Parameters
-import xscache.coupledL2.prefetch.PfSource
+import xscache.coupledL2.prefetch.{PfPolicy, PfSource}
 import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.util.SeqToAugmentedSeq
 
@@ -38,6 +38,8 @@ class MetaEntry(implicit p: Parameters) extends L2Bundle {
   val prefetchSrc = if (hasPrefetchSrc) Some(UInt(PfSource.pfSourceBits.W)) else None // prefetch source
   // request-level confidence tier of the prefetch that filled this block
   val prefetchConf = if (hasPrefetchSrc) Some(UInt(3.W)) else None
+  val prefetchRawScore = if (hasPrefetchSrc) Some(UInt(PfPolicy.ScoreWidth.W)) else None
+  val prefetchPolicyScores = if (hasPrefetchSrc) Some(Vec(PfPolicy.PolicyCount, UInt(PfPolicy.ScoreWidth.W))) else None
   val accessed = Bool()
   val tagErr = Bool() // ECC error from L1/L3; DataCheck for CHI
   val dataErr = Bool()
@@ -58,7 +60,7 @@ object MetaEntry {
   def apply(dirty: Bool, state: UInt, clients: UInt, alias: Option[UInt], prefetch: Bool = false.B,
             pfsrc: UInt = PfSource.NoWhere.id.U, accessed: Bool = false.B,
             tagErr: Bool = false.B, dataErr: Bool = false.B, cdpPfDepth: UInt = 0.U,
-            pfconf: UInt = 0.U
+            pfconf: UInt = 0.U, pfraw: UInt = 0.U, pfpolicyscores: UInt = 0.U
   )(implicit p: Parameters) = {
     val entry = Wire(new MetaEntry)
     entry.dirty := dirty
@@ -68,6 +70,8 @@ object MetaEntry {
     entry.prefetch.foreach(_ := prefetch)
     entry.prefetchSrc.foreach(_ := pfsrc)
     entry.prefetchConf.foreach(_ := pfconf)
+    entry.prefetchRawScore.foreach(_ := pfraw)
+    entry.prefetchPolicyScores.foreach(scores => scores := pfpolicyscores.asTypeOf(scores))
     entry.accessed := accessed
     entry.tagErr := tagErr
     entry.dataErr := dataErr

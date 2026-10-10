@@ -651,6 +651,11 @@ class NextLinePrefetch(implicit p: Parameters) extends NLModule {
   io.req.bits.source := 0.U  
   io.req.bits.pfSource := MemReqSource.Prefetch2L2NL.id.U  
   io.req.bits.pfConf := PfConfidence.TIER_MAX.U  
+  io.req.bits.pfConfValid := false.B
+  io.req.bits.pfRawScore := 0.U
+  io.req.bits.pfEvent512Score := 0.U
+  io.req.bits.pfEvent512Valid := false.B
+  io.req.bits.pfPolicyScores := 0.U.asTypeOf(io.req.bits.pfPolicyScores)
 
   // ========== performance counter==========
   XSPerfAccumulate("nlTotalTrainTimes", io.enable && io.train.fire)//nl accept req times

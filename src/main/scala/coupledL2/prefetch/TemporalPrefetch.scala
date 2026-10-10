@@ -395,6 +395,11 @@ class TemporalPrefetch(implicit p: Parameters) extends TPModule {
   io.req.bits.vaddr.foreach(_ := 0.U)
   io.req.bits.needT := true.B
   io.req.bits.pfConf := PfConfidence.TIER_MAX.U
+  io.req.bits.pfConfValid := false.B
+  io.req.bits.pfRawScore := 0.U
+  io.req.bits.pfEvent512Score := 0.U
+  io.req.bits.pfEvent512Valid := false.B
+  io.req.bits.pfPolicyScores := 0.U.asTypeOf(io.req.bits.pfPolicyScores)
   io.req.bits.source := 0.U // TODO: ensure source 0 is dcache
   io.req.bits.pfSource := MemReqSource.Prefetch2L2TP.id.U
 

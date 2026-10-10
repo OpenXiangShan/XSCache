@@ -91,6 +91,10 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
                                           // If true, MSHR should send an ack to L2 prefetcher.
   // request-level confidence tier carried with a prefetch task
   val pfConf = prefetchOpt.map(_ => UInt(3.W))
+  val pfConfValid = prefetchOpt.map(_ => Bool())
+  val pfRawScore = prefetchOpt.map(_ => UInt(prefetch.PfPolicy.ScoreWidth.W))
+  val pfPolicyScores = prefetchOpt.map(_ => Vec(prefetch.PfPolicy.PolicyCount, UInt(prefetch.PfPolicy.ScoreWidth.W)))
+  val pfEvent512Valid = prefetchOpt.map(_ => Bool())
   val needHint = prefetchOpt.map(_ => Bool())
   val cdpPfDepth = if (hasCDP) prefetchOpt.map(_ => UInt(cdpPfDepthBits.get.W)) else None
 

@@ -777,6 +777,11 @@ class BopReqBundle(implicit p: Parameters) extends BOPBundle{
   val samePagePaddr = UInt(fullAddressBits.W)
   // request-level confidence tier sampled from the score table at generation
   val pfConf = UInt(3.W)
+  val pfConfValid = Bool()
+  val pfRawScore = UInt(PfPolicy.ScoreWidth.W)
+  val pfEvent512Score = UInt(PfPolicy.ScoreWidth.W)
+  val pfEvent512Valid = Bool()
+  val pfPolicyScores = Vec(PfPolicy.PolicyCount, UInt(PfPolicy.ScoreWidth.W))
 }
 
 class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
@@ -791,6 +796,10 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
   val source = UInt(sourceIdBits.W)
   val issueOffset = SInt(offsetWidth.W)
   val pfConf = UInt(3.W)
+  val pfConfValid = Bool()
+  val pfRawScore = UInt(PfPolicy.ScoreWidth.W)
+  val pfEvent512Score = UInt(PfPolicy.ScoreWidth.W)
+  val pfEvent512Valid = Bool()
 
   def fromBopReqBundle(req: BopReqBundle) = {
     vaddrNoOffset := get_block_addr(req.full_vaddr)
@@ -805,6 +814,10 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
     source := req.source
     issueOffset := req.issueOffset
     pfConf := req.pfConf
+    pfConfValid := req.pfConfValid
+    pfRawScore := req.pfRawScore
+    pfEvent512Score := req.pfEvent512Score
+    pfEvent512Valid := req.pfEvent512Valid
   }
 
   def toPrefetchReq(): PrefetchReq = {
@@ -817,6 +830,11 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
     req.pfSource := MemReqSource.Prefetch2L2BOP.id.U
     req.cdpPfDepth.foreach(_ := 0.U)
     req.pfConf := pfConf
+    req.pfConfValid := pfConfValid
+    req.pfRawScore := pfRawScore
+    req.pfEvent512Score := pfEvent512Score
+    req.pfEvent512Valid := pfEvent512Valid
+    req.pfPolicyScores := 0.U.asTypeOf(req.pfPolicyScores)
     req
   }
 
@@ -1202,6 +1220,11 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     // near-saturation phases; calibrate with cal_useful/cal_useless_t*
     Constantin.createRecord("vbop_confThresh" + cacheParams.hartId.toString, initValue = 903557)
   )
+  reqFilter.io.in_req.bits.pfConfValid := true.B
+  reqFilter.io.in_req.bits.pfRawScore := scoreTable.io.prefetchScore
+  reqFilter.io.in_req.bits.pfEvent512Score := scoreTable.io.prefetchScore
+  reqFilter.io.in_req.bits.pfEvent512Valid := false.B
+  reqFilter.io.in_req.bits.pfPolicyScores := 0.U.asTypeOf(reqFilter.io.in_req.bits.pfPolicyScores)
 
   io.tlb_req <> reqFilter.io.tlb_req
   io.req <> reqFilter.io.out_req
@@ -1299,6 +1322,11 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
       scoreTable.io.prefetchScore,
       Constantin.createRecord("pbop_confThresh" + cacheParams.hartId.toString, initValue = 903557)
     )
+    s1_req.pfConfValid := true.B
+    s1_req.pfRawScore := scoreTable.io.prefetchScore
+    s1_req.pfEvent512Score := scoreTable.io.prefetchScore
+    s1_req.pfEvent512Valid := false.B
+    s1_req.pfPolicyScores := 0.U.asTypeOf(s1_req.pfPolicyScores)
     s1_issueOffset := issueOffset.asSInt
     s1_req_valid := enable && !s0_crossPage && issueEnable // stop prefetch when prefetch req crosses pages
   }.elsewhen(s1_fire) {

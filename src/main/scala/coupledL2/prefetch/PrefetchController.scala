@@ -13,6 +13,9 @@ class ReplaceBundle()(implicit p: Parameters) extends L2Bundle {
   val victimPfSource = UInt(PfSource.pfSourceBits.W)
   // request-level confidence tier of the evicted prefetch block
   val victimPfConf = UInt(3.W)
+  val victimPfRawScore = UInt(PfPolicy.ScoreWidth.W)
+  val victimPfPolicyScores = Vec(PfPolicy.PolicyCount, UInt(PfPolicy.ScoreWidth.W))
+  val victimPfUseless = Bool()
 }
 
 class DemandRefillBundle()(implicit p: Parameters) extends L2Bundle {
@@ -352,6 +355,7 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
       c0_statPfLateInCacheVec(i)(s) := dirResult(s).valid && dirResult(s).bits.replacerInfo.channel === 1.U &&
         dirResult(s).bits.hit && c0_dirResultReqSrcOH(s)(i)
       c0_statPfUselessVec(i)(s) := replaceRecord(s).valid &&
+        replaceRecord(s).bits.victimPfUseless &&
         c0_replaceVictimPfSrcOH(s)(i)
       c0_statTnocVec(i)(s) := busContention(s).valid && busContention(s).bits.delayHit &&
         c0_busContentionPfReqSrcOH(s)(i)

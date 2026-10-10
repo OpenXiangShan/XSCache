@@ -807,6 +807,8 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
       prefetch = req_prefetch || dirResult.hit && meta_pft,
       pfsrc = PfSource.fromMemReqSource(req.reqSource),
       pfconf = req.pfConf.getOrElse(0.U),
+      pfraw = req.pfRawScore.getOrElse(0.U),
+      pfpolicyscores = req.pfPolicyScores.map(_.asUInt).getOrElse(0.U),
       accessed = req_acquire || req_get,
       cdpPfDepth = req.cdpPfDepth.getOrElse(0.U)
     )
@@ -1323,6 +1325,8 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   val pfConfRaw = req.pfConf.getOrElse(0.U)
   val pfEffTier = Mux(pfConfRaw > pfDecay, pfConfRaw - pfDecay, 0.U)
   val pfTierBlockedSel = pfEngIdx < PfConfidence.ENG_NUM.U &&
+    req.pfConfValid.getOrElse(false.B) &&
+    !req.pfEvent512Valid.getOrElse(false.B) &&
     pfEffTier < io.pfMinTier(pfEngIdx)
   val pfAbandon = req_valid && req_prefetch && !mergeA && !io.aMergeTask.valid && !gotRetryAck &&
     !state.s_acquire &&

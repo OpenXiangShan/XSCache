@@ -1035,6 +1035,11 @@ class PrefetchFilterEntry(implicit p: Parameters) extends CDPBundle {
     req.tag := parseFullAddress(fullAddr)._1
     req.set := parseFullAddress(fullAddr)._2
     req.pfSource := MemReqSource.Prefetch2L2CDP.id.U
+    req.pfConfValid := false.B
+    req.pfRawScore := 0.U
+    req.pfEvent512Score := 0.U
+    req.pfEvent512Valid := false.B
+    req.pfPolicyScores := 0.U.asTypeOf(req.pfPolicyScores)
     req.cdpPfDepth.foreach(_ := pfDepth)
 
     req

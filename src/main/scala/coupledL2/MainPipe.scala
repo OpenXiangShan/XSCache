@@ -573,6 +573,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     alias = Some(metaW_s3_a_alias),
     pfsrc = meta_s3.prefetchSrc.getOrElse(0.U),
     pfconf = meta_s3.prefetchConf.getOrElse(0.U),
+    pfraw = meta_s3.prefetchRawScore.getOrElse(0.U),
+    pfpolicyscores = meta_s3.prefetchPolicyScores.map(_.asUInt).getOrElse(0.U),
     accessed = true.B,
     tagErr = metaOnHit_s3.tagErr,
     dataErr = metaOnHit_s3.dataErr,
@@ -589,6 +591,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       dataErr = metaOnHit_s3.dataErr,
       pfsrc = metaOnHit_s3.prefetchSrc.getOrElse(0.U),
       pfconf = metaOnHit_s3.prefetchConf.getOrElse(0.U),
+      pfraw = metaOnHit_s3.prefetchRawScore.getOrElse(0.U),
+      pfpolicyscores = metaOnHit_s3.prefetchPolicyScores.map(_.asUInt).getOrElse(0.U),
       cdpPfDepth = metaOnHit_s3.cdpPfDepth.getOrElse(0.U)
     )
   )
@@ -602,6 +606,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     dataErr = Mux(wen_c, req_s3.corrupt, metaOnHit_s3.dataErr), // update error when write DS
     pfsrc = metaOnHit_s3.prefetchSrc.getOrElse(0.U),
     pfconf = metaOnHit_s3.prefetchConf.getOrElse(0.U),
+    pfraw = metaOnHit_s3.prefetchRawScore.getOrElse(0.U),
+    pfpolicyscores = metaOnHit_s3.prefetchPolicyScores.map(_.asUInt).getOrElse(0.U),
     cdpPfDepth = metaOnHit_s3.cdpPfDepth.getOrElse(0.U)
   )
 
@@ -742,6 +748,9 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     u.bits.victimPAddr := Cat(io.replResp.bits.tag, req_s3.set, 0.U(offsetBits.W))
     u.bits.victimPfSource := io.replResp.bits.meta.prefetchSrc.getOrElse(PfSource.NoWhere.id.U)
     u.bits.victimPfConf := io.replResp.bits.meta.prefetchConf.getOrElse(0.U)
+    u.bits.victimPfRawScore := io.replResp.bits.meta.prefetchRawScore.getOrElse(0.U)
+    u.bits.victimPfPolicyScores := io.replResp.bits.meta.prefetchPolicyScores.map(_.asUInt).getOrElse(0.U).asTypeOf(u.bits.victimPfPolicyScores)
+    u.bits.victimPfUseless := io.replResp.bits.meta.prefetch.getOrElse(false.B) && !io.replResp.bits.meta.accessed
   }
 
   // Exact valid-line replacements, counted only when the refill commits its new tag.
