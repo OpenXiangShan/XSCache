@@ -160,14 +160,6 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
   XSPerfAccumulate("l3_prefetch_txreq_fire", io.txreq.fire)
   XSPerfAccumulate("l3_prefetch_rxrsp_fire", l3PrefetchResp)
 
-  // StashPrefetcher has no demand-consumption or LLC-directory hit feedback.
-  // These counters expose the observable boundaries as proxies; exact
-  // useful/useless/late/dead and hitCache/hitPos require a matching line tag
-  // and consumer event in the downstream HN/directory.
-  XSPerfAccumulate("l3_prefetch_useful_proxy", l3PrefetchResp)
-  XSPerfAccumulate("l3_prefetch_useless_proxy", l3PrefetchDrop)
-  XSPerfAccumulate("l3_prefetch_late_proxy", l3PrefetchPipeBlocked)
-  XSPerfAccumulate("l3_prefetch_dead_proxy", l3PrefetchDrop)
-  XSPerfAccumulate("l3_prefetch_hitCache_proxy", false.B)
-  XSPerfAccumulate("l3_prefetch_hitPos_proxy", false.B)
+  // The response is transaction completion only. Exact useful/useless and
+  // demand-consumption events are counted at the HN directory boundary.
 }

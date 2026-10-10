@@ -1210,14 +1210,6 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   XSPerfAccumulate("l2_write_hit", l2_write_hit_s3)
   XSPerfAccumulate("l2_write_miss", l2_write_miss_s3)
 
-  // One task_s3 observation occupies one MainPipe directory service cycle.
-  // These are local processing-time sums, while acquire_period_* and
-  // txreq_wait_* in MSHRCtl provide the longer end-to-end/queue delays.
-  XSPerfAccumulate("l2_read_hit_processing_time", l2_read_hit_s3)
-  XSPerfAccumulate("l2_read_miss_processing_time", l2_read_miss_s3)
-  XSPerfAccumulate("l2_write_hit_processing_time", l2_write_hit_s3)
-  XSPerfAccumulate("l2_write_miss_processing_time", l2_write_miss_s3)
-
   // Separate fixed hits from demand hits covered by a prefetched line. These
   // set histograms make a fixHitRate anomaly attributable to hot set ranges.
   val l2_fix_hit_s3 = l2_read_hit_s3 && !metaOnHit_s3.prefetch.getOrElse(false.B)
