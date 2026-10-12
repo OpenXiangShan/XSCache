@@ -10,3 +10,6 @@
 [submodule "ZhuJiang"]
 	path = ZhuJiang
 	url = https://github.com/OpenXiangShan/ZhuJiang.git
+[submodule "test/CHIron"]
+	path = test/CHIron
+	url = https://github.com/RISMicroDevices/CHIron.git
