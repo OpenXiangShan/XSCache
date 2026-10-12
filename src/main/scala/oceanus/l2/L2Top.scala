@@ -192,6 +192,14 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     fastArb(preArb_UpRSPs(i), slice_io_UpRXRSP_decoupled, Some(s"UpRXRSP_$i"))
   }}
 
+  // Assert: an upstream RXRSP flit must target a configured slice NID. An
+  // unmatched TgtID never fires any demux entry and the flit stalls at the
+  // demux forever (sink.ready above is the OR of entry fires).
+  postSAM_UpRSPs.zipWithIndex.foreach { case (flit, j) => {
+    assert(!flit.valid || config.slices.map(n => flit.bits.TgtID === n.U).reduce(_ || _),
+      s"UpRXRSP flit from upstream port $j with TgtID matching no slice NID @ %m")
+  }}
+
   // - Upstream RXDAT routing
   val postSAM_UpDATs = postSAM_t1p.map(_.UpDAT).toSeq
   val preArb_UpDATs = Wire(Vec(config.sliceNum, Vec(postSAM_UpDATs.size, Decoupled(new FlitUpDAT))))
@@ -210,6 +218,13 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     slice.io.UpRXDAT.valid := slice_io_UpRXDAT_decoupled.valid
     slice_io_UpRXDAT_decoupled.ready := true.B
     fastArb(preArb_UpDATs(i), slice_io_UpRXDAT_decoupled, Some(s"UpRXDAT_$i"))
+  }}
+
+  // Assert: an upstream RXDAT flit must target a configured slice NID (same
+  // stall-forever failure mode as RXRSP above).
+  postSAM_UpDATs.zipWithIndex.foreach { case (flit, j) => {
+    assert(!flit.valid || config.slices.map(n => flit.bits.TgtID === n.U).reduce(_ || _),
+      s"UpRXDAT flit from upstream port $j with TgtID matching no slice NID @ %m")
   }}
 
   // - Upstream TXSNP routing
@@ -250,6 +265,15 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     fastArb(preArb_DnRSPs(i), port._1, Some(s"DnRSP_$i"))
   }}
 
+  // Assert: a slice-emitted UpTXRSP flit must target a configured upstream
+  // Type-1 port NID (its TgtID is the requester SrcID recorded at allocation).
+  // An unmatched TgtID never fires any demux entry and the flit stalls at the
+  // demux forever (sink.ready above is the OR of entry fires).
+  postSAM_DnRSPs.zipWithIndex.foreach { case (flit, j) => {
+    assert(!flit.valid || t1NIDs.map(n => flit.bits.TgtID === n.U).reduce(_ || _),
+      s"UpTXRSP flit from slice $j with TgtID matching no upstream Type-1 port NID @ %m")
+  }}
+
   // - Upstream TXDAT routing
   val port_DnDATs = postSAM_t1p.map(_.DnDAT).toSeq.zip(t1NIDs) ++
                     postSAM_t4p.map(_.DnDAT).toSeq.zip(t4NIDs)
@@ -267,6 +291,13 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       preArb_DnDATs(i)(j).valid := postSAM_DnDAT.valid && postSAM_DnDAT.bits.TgtID === port._2.U
     }}
     fastArb(preArb_DnDATs(i), port._1, Some(s"DnDAT_$i"))
+  }}
+
+  // Assert: a slice-emitted UpTXDAT flit must target a configured upstream port
+  // NID (Type-1 or Type-4). Same stall-forever failure mode as UpTXRSP above.
+  postSAM_DnDATs.zipWithIndex.foreach { case (flit, j) => {
+    assert(!flit.valid || (t1NIDs ++ t4NIDs).map(n => flit.bits.TgtID === n.U).reduce(_ || _),
+      s"UpTXDAT flit from slice $j with TgtID matching no upstream port NID @ %m")
   }}
 
 
