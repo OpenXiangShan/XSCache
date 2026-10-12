@@ -179,7 +179,17 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
 
   val pfThrottleByMSHR = RegNext(PopCount(io.pipeStatusVec.map(_.valid) ++ io.mshrInfo.map(_.valid)) >= (mshrsAll - 3).U)
 
-  def prefetchBlocked(task: TaskBundle): Bool = task.fromA && task.opcode === Hint && pfThrottleByMSHR
+  // prefetch valve: once the buffer is mostly occupied, stop admitting prefetch
+  // requests so a demand request always finds a free entry; input-side only,
+  // entries already inside must stay issuable or a full prefetch buffer deadlocks
+  // threshold 3 loses badly on mcf (+10% CPI on mcf_6753): prefetch occupies
+  // 3 of 4 entries and starves latency-sensitive demand; 2 is the sweet spot
+  val pfOccThreshold = 2
+  val pfThrottleByOcc = PopCount(buffer.map(_.valid)) >= pfOccThreshold.U
+
+  def isPrefetchTask(task: TaskBundle): Bool = task.fromA && task.opcode === Hint
+  def prefetchBlocked(task: TaskBundle): Bool = isPrefetchTask(task) && (pfThrottleByMSHR || pfThrottleByOcc)
+  def prefetchBlockedByMSHR(task: TaskBundle): Bool = isPrefetchTask(task) && pfThrottleByMSHR
 
   // flow not allowed when full, or entries might starve
   val canFlow = flow.B && !full && !conflict(in) && !chosenQValid && !Cat(io.mainPipeBlock).orR && !noFreeWay(in) && !prefetchBlocked(in)
@@ -242,7 +252,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   /* ======== Issue ======== */
   issueArb.io.in zip buffer foreach {
     case(in, e) =>
-      in.valid := e.valid && e.rdy && !prefetchBlocked(e.task)
+      in.valid := e.valid && e.rdy && !prefetchBlockedByMSHR(e.task)
       in.bits  := e
   }
 
@@ -303,7 +313,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   // when entry.rdy is no longer true,
   // we cancel req in chosenQ, with the entry still held in buffer to issue later
 //  val cancel = (canFlow && sameSet(chosenQ.io.deq.bits.bits.task, io.in.bits)) || !buffer(chosenQ.io.deq.bits.id).rdy
-  val cancel = !Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.rdy && !prefetchBlocked(e.task)))
+  val cancel = !Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.rdy && !prefetchBlockedByMSHR(e.task)))
 
   chosenQ.io.deq.ready := io.out.ready || cancel
   io.out.valid := chosenQValid && !cancel || io.in.valid && canFlow
@@ -339,6 +349,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     XSPerfAccumulate("recv_normal", io.in.fire && !isPrefetch)
     XSPerfAccumulate("chosenQ_cancel", chosenQValid && cancel)
     XSPerfAccumulate("req_buffer_mergeA", io.hasMergeA)
+    XSPerfAccumulate("req_buffer_pf_block_occ", io.in.valid && isPrefetchTask(in) && pfThrottleByOcc)
     // TODO: count conflict
     for(i <- 0 until entries){
       val cntEnable = PopCount(buffer.map(_.valid)) === i.U
