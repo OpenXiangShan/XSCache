@@ -50,6 +50,8 @@ class RequestArb(implicit p: Parameters) extends L2Module
     /* send s1 task info to mainpipe to help hint */
     val mshrHintQInfo = ValidIO(new TaskBundle)
     val sinkCHintQInfo = ValidIO(new TaskBundle)
+    /* hint staging queue status from mainpipe, to block hint-generating fires */
+    val hint_s1QueueFull = Input(Bool())
 
     /* send mshrBuf read request */
     val refillBufRead_s2 = ValidIO(new MSHRBufRead)
@@ -206,7 +208,24 @@ class RequestArb(implicit p: Parameters) extends L2Module
   val ds_mcp2_stall = prev_ds_fire && task_s1.valid && !task_s1_isAHint &&
     get_data_bank(task_s1.bits.set) === prev_ds_bank
 
-  s2_ready  := !ds_mcp2_stall
+  // mirror of the s1 hint-generation conditions in CustomL1Hint:
+  // MSHR Grant/GrantData/AccessAckData/CBOAck (incl. merged A) and any sinkC
+  // Release. Such a fire must be blocked when the hint staging queue is full,
+  // since the hint it generates would have nowhere to go.
+  val mshr_wouldHint_s1 = mshr_task_s1.valid && mshr_task_s1.bits.fromA && (
+    mshr_task_s1.bits.opcode === Grant ||
+    mshr_task_s1.bits.opcode === GrantData ||
+    mshr_task_s1.bits.opcode === AccessAckData ||
+    mshr_task_s1.bits.opcode === CBOAck ||
+    mshr_task_s1.bits.mergeA && (
+      mshr_task_s1.bits.aMergeTask.opcode === Grant ||
+      mshr_task_s1.bits.aMergeTask.opcode === GrantData
+    )
+  )
+  val chnl_wouldHint_s1 = !mshr_task_s1.valid && sinkValids(0)
+  val hint_stall = (mshr_wouldHint_s1 || chnl_wouldHint_s1) && io.hint_s1QueueFull
+
+  s2_ready  := !ds_mcp2_stall && !hint_stall
 
   val task_s2 = RegInit(0.U.asTypeOf(task_s1))
   task_s2.valid := s1_fire

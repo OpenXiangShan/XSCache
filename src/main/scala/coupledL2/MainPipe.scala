@@ -62,6 +62,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val cmoHitInvalid = Input(Bool())
     val replResp = Flipped(ValidIO(new ReplacerResult()))
     val retryFastFwd_s2 = Input(Bool())
+    val hint_s1QueueFull = Output(Bool())
 
     /* send task to MSHRCtl at stage 3 */
     val toMSHRCtl = new Bundle() {
@@ -879,6 +880,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   customL1Hint.io.mshrHintQInfo := io.mshrHintQInfo
   customL1Hint.io.sinkCHintQInfo := io.sinkCHintQInfo
   customL1Hint.io.retry_s2 := io.retryFastFwd_s2 && task_s2.valid
+  io.hint_s1QueueFull := customL1Hint.io.hint_s1QueueFull
 
   customL1Hint.io.s3.task      := task_s3
   // overwrite opcode: if sinkReq can respond, use sink_resp_s3.bits.opcode = Grant/GrantData
