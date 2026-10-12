@@ -198,8 +198,13 @@ class RequestArb(implicit p: Parameters) extends L2Module
 
   /* ========  Stage 2 ======== */
   val s1_AHint_fire = io.sinkA.fire && io.sinkA.bits.opcode === Hint
-  // any req except AHint might access DS, and continuous DS accesses are prohibited
-  val ds_mcp2_stall = RegNext(s1_fire && !s1_AHint_fire)
+  // any req except AHint might access DS; with the DS split into set banks,
+  // only two consecutive accesses hitting the same bank need a bubble
+  val task_s1_isAHint = !task_s1.bits.mshrTask && task_s1.bits.fromA && task_s1.bits.opcode === Hint
+  val prev_ds_fire = RegNext(s1_fire && !s1_AHint_fire, false.B)
+  val prev_ds_bank = RegEnable(get_data_bank(task_s1.bits.set), s1_fire)
+  val ds_mcp2_stall = prev_ds_fire && task_s1.valid && !task_s1_isAHint &&
+    get_data_bank(task_s1.bits.set) === prev_ds_bank
 
   s2_ready  := !ds_mcp2_stall
 

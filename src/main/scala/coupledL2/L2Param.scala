@@ -130,6 +130,9 @@ case class L2Param(
   // Number of directory SRAM banks split by the low bits of the local set
   // index; 1 keeps the SRAMs unsplit and the read port blocked by any write.
   dirSetSplit: Int = 2,
+  // Number of data SRAM banks split by the low bits of the local set index;
+  // 1 keeps the SRAM unsplit and forces a bubble between any two accesses.
+  dataSetSplit: Int = 2,
   // DataCheck
   dataCheck: Option[String] = Some("oddparity"),
   enablePoison: Boolean = true,
