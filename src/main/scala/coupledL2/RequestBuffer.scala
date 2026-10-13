@@ -145,8 +145,23 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     // multiple normal refill contexts").  SPEC shows the early release is
     // perf-free (<=0.1% of instructions).
     s.valid && sameAddr(a, s.bits) && !s.bits.willFree)).asUInt
+  // A context that has selected this line as its replacement victim keeps
+  // holding it for its whole pre-commit window, not just when a lower-level
+  // release is owed: Directory suppresses A-channel hits on the victim way
+  // from victim selection until the install lands (victimPendingWayMask_s3,
+  // `!dirHit && w_replResp && !refillCommitLanded`).  Releasing a follow-up in
+  // that window drops it to the miss path (the suppressed hit is invisible),
+  // and it then installs a SECOND copy of the same line into another way --
+  // leaving the tag in two ways (observed: "Set should not have more than one
+  // hit").  Hold it until the context retires instead; `willFree` is reached
+  // only after refillCommitLanded, so the whole suppression window is covered.
   def conflictMaskVic(a: TaskBundle): UInt = VecInit(io.mshrInfo.map(s =>
-    s.valid && a.set === s.bits.set && a.tag === s.bits.metaTag && s.bits.needRelease &&
+    s.valid && a.set === s.bits.set && a.tag === s.bits.metaTag &&
+      // An INVALID replacement way retains an arbitrary old tag, but owns
+      // no victim line. CMO misses also set w_replResp without replacing a
+      // way. Neither may turn that stale tag into an address dependency.
+      (s.bits.needRelease || (!s.bits.isCmo && s.bits.w_replResp &&
+        !s.bits.dirHit && s.bits.meta.state =/= MetaData.INVALID)) &&
       !s.bits.willFree)).asUInt
   def conflictMask(a: TaskBundle): UInt = conflictMaskReq(a) | conflictMaskVic(a)
   def snoopConflict(a: TaskBundle): Bool = VecInit(io.snoopInfo.map(s =>
