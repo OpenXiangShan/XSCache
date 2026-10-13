@@ -736,9 +736,22 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     (!postGrantReleaseSeen || postGrantReleasePayloadReady) &&
     !io.postGrantReleaseSnoopActive
   val mp_dct_valid = !state.s_dct.getOrElse(true.B) && state.s_probeack
-  // CMO metadata is committed by its child release task.  A CMO without a
-  // valid old line still uses the existing parent-only compensation path.
-  val mp_cmometaw_valid = !state.s_cmometaw && (!cmo_cbo || !sidecarOwnsVictim)
+  // CMO metadata is committed by its child release task.  A CMO that missed
+  // has no line to repair, so it never takes the compensation path.
+  // A delegating CMO never writes meta itself: the child sidecar's release
+  // task owns the post-CMO Directory update (and replaceDone arms
+  // s_cmometaw).  Suppress from allocation on, not just once the child
+  // exists, so the meta is never written twice with different values.
+  // The compensation only repairs a line that is STILL a hit.  A nested
+  // toN snoop converts the hit into a miss (nestedwb_hit_match clears
+  // dirResult.hit and sets meta.state to INVALID) while leaving the
+  // s_cmometaw armed by the earlier ProbeAck pending; writing it then
+  // stamps TIP/no-client onto the victim way WITHOUT touching the tag, so
+  // the line the snoop just invalidated stays findable as an exclusive
+  // ghost and the next acquire is granted T with no probe (tl-test:
+  // "one CAgent got T on non-INVALID in other agents").
+  val mp_cmometaw_valid = !state.s_cmometaw && dirResult.hit &&
+    (!cmo_cbo || state.s_release)
   io.tasks.mainpipe.valid :=
     mp_release_valid ||
       mp_probeack_valid ||
@@ -2500,6 +2513,11 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       dirResult.hit := false.B
       meta.clients := Fill(clientBits, false.B)
       state.w_replResp := cmo_cbo // never query replacer on CMO
+      // The line is gone, so the cbo.clean meta compensation armed by an
+      // earlier ProbeAck no longer has a line to repair.  mp_cmometaw now
+      // requires dirResult.hit, so leaving s_cmometaw pending would pin this
+      // context forever (will_free demands it).
+      state.s_cmometaw := true.B
       req.aliasTask.foreach(_ := false.B)
     }
   }
