@@ -36,8 +36,9 @@ class RXRSP(implicit p: Parameters) extends CoupledL2Module {
    3. RetryAck
    4. PCrdGrant
    */
-  io.in.valid := io.out.valid 
+  io.in.valid := io.out.valid
   io.in.mshrId := io.out.bits.txnID
+  io.in.txnID := io.out.bits.txnID
   io.in.set := 0.U(setBits.W)
   io.in.tag := 0.U(tagBits.W)
 

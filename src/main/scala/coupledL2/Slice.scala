@@ -216,7 +216,12 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   val rxdatWriteRefillBuf = WireInit(rxdat.io.refillBufWrite)
   val rxdatTargetsReleaseOwnedRefill =
     (UIntToOH(rxdat.io.refillBufWrite.bits.id, mshrsAll) & mshrCtl.io.refillBufReleaseOwner).orR
-  rxdatWriteRefillBuf.valid := rxdat.io.refillBufWrite.valid && !rxdatTargetsReleaseOwnedRefill
+  // A CompData whose DBID belongs to the previous tenant of this TxnID must
+  // not overwrite the new tenant's RefillBuf (see MSHRCtl.rxdatStaleSlots).
+  val rxdatTargetsStaleSlot =
+    (UIntToOH(rxdat.io.refillBufWrite.bits.id, mshrsAll) & mshrCtl.io.rxdatStaleSlots).orR
+  rxdatWriteRefillBuf.valid := rxdat.io.refillBufWrite.valid &&
+    !rxdatTargetsReleaseOwnedRefill && !rxdatTargetsStaleSlot
   // A Get-on-TRUNK DS snapshot is only a fallback.  Once matching
   // ReleaseData owns RefillBuf, a later S5 snapshot must not overwrite the
   // authoritative dirty payload.

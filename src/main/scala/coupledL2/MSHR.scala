@@ -79,6 +79,14 @@ class MSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   val alloc = Flipped(ValidIO(new MSHRRequest))
   val tasks = new MSHRTasks()
   val resps = new MSHRResps()
+  // DBID of the read response this context has already accepted, valid once
+  // w_grantfirst is set.  MSHRCtl uses it to drop a CompData that only matches
+  // this slot's recycled TxnID and belongs to an earlier tenant.
+  val readDBID = Output(ValidIO(UInt(TXNID_WIDTH.W)))
+  // Epoch stamped into the high bits of the TxnID of the read this context has
+  // in flight.  A returning CompData/Comp must carry the same epoch; a smaller
+  // value belongs to an earlier tenant of this slot.
+  val readTxnEpoch = Output(UInt((TXNID_WIDTH - bankBits - 2 - mshrBits).W))
   val nestedwb = Input(new NestedWriteback)
   val nestedwbData = Output(Bool())
   // An invalid victim was made dirty by nested ReleaseData after selection.
@@ -317,6 +325,21 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   // Snoop ordering is handled by RXSNP and HN response serialization; it must
   // never create another normal CHI read for the same upper request.
   val readTxnInFlight = RegInit(false.B)
+  // TxnID is this slot's index, so it is reused by the next tenant the moment
+  // this one retires.  A CompData for the retired read can still be in flight
+  // and, matched by TxnID alone, completes the new tenant's read with the old
+  // address's data.  Stamp the unused high bits with a per-issue epoch and
+  // only accept a response carrying the epoch of the read now in flight.
+  // The response path extracts the slot as txnID(mshrBits-1, 0) (RXDAT/RXRSP
+  // assign mshrId := txnID, and mshrId is mshrBits wide), so the epoch must sit
+  // strictly above mshrBits.  setSliceID keeps the low stashPrefetchIdBits bits
+  // as the entry id and overwrites everything above them, and restoreTXNID only
+  // clears the MMIO flag bit, so the epoch survives the round trip iff it lives
+  // in [stashPrefetchIdBits-1 : mshrBits].
+  val readTxnSlotBits = mshrBits
+  val readTxnEpochWidth = (TXNID_WIDTH - bankBits - 2) - readTxnSlotBits
+  val readTxnEpochGen = RegInit(0.U(readTxnEpochWidth.W))
+  val readTxnEpochSent = RegInit(0.U(readTxnEpochWidth.W))
   // RequestArb's directory pipeline takes several cycles to return a
   // ReplacerResult.  Keep the request in flight during that interval so a
   // refill-only task cannot issue the same replacement read again.
@@ -867,7 +890,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     oa.qos := Fill(QOS_WIDTH, 1.U(1.W)) - 1.U // TODO
     oa.tgtID := Mux(!state.s_reissue.getOrElse(false.B), srcid_retryack, 0.U)
     oa.srcID := 0.U
-    oa.txnID := io.id
+    oa.txnID := Cat(readTxnEpochGen, io.id(readTxnSlotBits - 1, 0))
     oa.returnNID := 0.U
     oa.stashNID := 0.U
     oa.stashNIDValid := false.B
@@ -1872,6 +1895,11 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       )
       readTxnInFlight := true.B
     }
+    // Remember which epoch went out, then move on so the next read from this
+    // slot (after it is recycled) is distinguishable from this one.  Applies to
+    // CMO control reads too: they share the slot's TxnID.
+    readTxnEpochSent := readTxnEpochGen
+    readTxnEpochGen := readTxnEpochGen + 1.U
     state.s_acquire := Mux(cmo_cbo, state.s_acquire || state.w_releaseack, true.B)
     when(!state.s_reissue.get) {
       state.s_reissue.get := true.B
@@ -2006,6 +2034,12 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   // completion flags are required here.
   val readTxnTerminal = readTxnInFlight && state.w_grant && state.w_grantlast &&
     state.s_rcompack.getOrElse(true.B)
+  // The first accepted read beat latches its DBID into txnid_rcompack.  Expose
+  // it so a CompData arriving afterwards can be checked against the response
+  // this context actually owns, instead of only against the reused TxnID.
+  io.readDBID.valid := req_valid && state.w_grantfirst
+  io.readDBID.bits := txnid_rcompack
+  io.readTxnEpoch := readTxnEpochSent
   when(!io.alloc.valid && readTxnTerminal) {
     readTxnInFlight := false.B
   }
