@@ -687,8 +687,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.toMSHRCtl.grantInstallDone.valid := grantMergeInstall_s3
   io.toMSHRCtl.grantInstallDone.bits := req_s3.mshrId
 
-  // DataStorage set-bank split: MainPipe issues a single-cycle request pulse;
-  // DataStorage latches the target bank's req/wdata for the extra MCP2 cycle.
+  // DataStorage set-bank split: MainPipe issues a single-cycle request pulse.
+  // DataStorage latches the target bank's req/wdata internally (and asserts
+  // they stay stable for the MCP2 cycle), so the old two-cycle replay of
+  // ren/wen/way -- including the merged-grant victim hold -- is obsolete.
   io.toDS.en_s3 := task_s3.valid && (ren || wen)
   io.toDS.req_s3.valid := io.toDS.en_s3
   io.toDS.req_s3.bits.way := Mux(
