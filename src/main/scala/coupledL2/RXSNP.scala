@@ -99,12 +99,19 @@ class RXSNP(
     *    release tasks to MainPipe (DS write was done in release tasks on MainPipe), the incoming snoop of Y should 
     *    be **blocked**.
     */
+  // A CMO in flight only conflicts with snoops for its OWN line: blocking
+  // every snoop would deadlock against openLLC, whose snoop-unit occupancy
+  // gates the entrance that must accept the CMO sidecar's writeback.
+  // (observed: CMO waits releaseAck <- openLLC entrance blocked by full
+  // snpUnit <- snoop responses blocked here -> ReqBuf Leak).
+  // For the CMO's own line, a nestable sidecar services the snoop from its
+  // ReleaseBuf snapshot, so yield the block whenever nesting applies.
   val cmoBlockSnpMask = VecInit(io.refillInfo.map(s =>
     s.valid && s.bits.dirHit && isValid(s.bits.meta.state) &&
     !s.bits.s_cmoresp && (!s.bits.s_release || !s.bits.w_rprobeacklast || !s.bits.s_cmometaw) &&
-    !s.bits.willFree
+    !s.bits.willFree &&
+    s.bits.set === task.set && s.bits.reqTag === task.tag
   )).asUInt
-  val cmoBlockSnp = cmoBlockSnpMask.orR
   val replaceBlockSnpMask = VecInit(io.refillInfo.map(s =>
     s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag && !s.bits.dirHit && isValid(s.bits.meta.state) &&
     s.bits.s_cmoresp && s.bits.w_replResp && (!s.bits.w_rprobeacklast || s.bits.w_releaseack || !RegNext(s.bits.w_replResp)) &&
@@ -125,6 +132,10 @@ class RXSNP(
       s.bits.probeDone && s.bits.releaseBufReady &&
       (!s.bits.releaseStarted || !s.bits.copyBackIssued)
   )).asUInt
+
+  // A same-line snoop during a CMO is serviced by the CMO sidecar's ReleaseBuf
+  // snapshot whenever nesting applies, so the CMO block yields to nesting.
+  val cmoBlockSnp = cmoBlockSnpMask.orR && !sidecarNestSnpMask.orR
 
   // '!s.bits.dirHit'     : Nesting a Cache Replacement subsequent release
   // '!s.bits.s_cmoresp'  : Nesting a CMO subsequent release
