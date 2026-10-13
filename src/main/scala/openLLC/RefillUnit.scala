@@ -133,6 +133,25 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     }
   }
 
+  // SnoopUnit owns the data returned by a replace snoop and either writes the
+  // evicted line back or discards it. RefillUnit still sees the same upstream
+  // SnpRespData and must consume its completion, but must not copy that victim
+  // data into the normal request refill entry. Otherwise this entry keeps its
+  // snoop bit set after SnoopUnit retires, filling refillInfo and leaking the
+  // upstream RequestBuffer.
+  def updateReplaceSnoopDataEntry(entry: RefillEntry, responseData: RespWithData): Unit = {
+    val beatId = responseData.dataID >> log2Ceil(beatBytes / 16)
+    val dataLast = beatId === (beatSize - 1).U
+    when(dataLast) {
+      val srcIdOH = UIntToOH(responseData.srcID)(numRNs - 1, 0)
+      val newSnpVec = VecInit((entry.task.snpVec.asUInt & ~srcIdOH).asBools)
+      entry.task.snpVec := newSnpVec
+      entry.state.w_snpRsp := !Cat(newSnpVec).orR
+      // The common cancel path retires a completed data-less entry on the
+      // next cycle, after any simultaneous SnpResp has also been accounted for.
+    }
+  }
+
   def updateBypassRespDataEntry(entry: RefillEntry): Unit = {
     val bypassBeatValids = VecInit(bypassRespData.map(_.valid))
     val newBeatValids = entry.beatValids.asUInt | bypassBeatValids.asUInt
@@ -183,7 +202,11 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
       "Refill task receives data from multiple sources"
     )
     when(rnRespDataHit) {
-      updateRespDataEntry(entry, rnRespData.bits)
+      when(entry.task.replSnp && isSnpRespDataX(rnRespData.bits.opcode)) {
+        updateReplaceSnoopDataEntry(entry, rnRespData.bits)
+      }.otherwise {
+        updateRespDataEntry(entry, rnRespData.bits)
+      }
     }.elsewhen(snRespDataHit) {
       updateRespDataEntry(entry, snRespData.bits)
     }.elsewhen(bypassRespDataHit) {
@@ -225,6 +248,8 @@ class RefillUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
         when(canUpdate) {
           // A same-cycle SnpResp pair completes the vector; the data side
           // only clears its RN on the last beat of the SnpRespData.
+          // Payload ownership does not change response completion: include
+          // the final data beat even when SnoopUnit owns the victim data.
           val beatId = rnRespData.bits.dataID >> log2Ceil(beatBytes / 16)
           val dataLast = beatId === (beatSize - 1).U
           val dataClearOH = Mux(dataLast, src_idOH_dat, 0.U)

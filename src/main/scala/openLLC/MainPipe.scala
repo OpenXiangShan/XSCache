@@ -390,9 +390,9 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   refill_s4.bits.state.s_refill := false.B
   refill_s4.bits.state.w_datRsp := false.B
   refill_s4.bits.state.w_snpRsp := !Cat(snpVec_refill_s4).orR
+  // Keep the requester's own address. A replace snoop targets a different
+  // line that shares this reqID, so its data must not be refilled here.
   refill_s4.bits.task := req_s4
-  refill_s4.bits.task.tag := parseAddress(snp_address_s4)._1
-  refill_s4.bits.task.set := parseAddress(snp_address_s4)._2
   refill_s4.bits.task.refillTask := true.B
   refill_s4.bits.task.snpVec := snpVec_refill_s4
   refill_s4.bits.task.replSnp := replace_snoop_s4
