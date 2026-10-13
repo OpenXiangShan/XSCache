@@ -469,9 +469,13 @@ class RespInfoBundle(implicit p: Parameters) extends L2Bundle
   val traceTag = chiOpt.map(_ => Bool())
 }
 
-class RespBundle(implicit p: Parameters) extends L2Bundle {
+class RespBundle(implicit p: Parameters) extends L2Bundle with HasCHIMsgParameters {
   val valid = Bool()
   val mshrId = UInt(mshrBits.W)
+  // Full TxnID as it arrived, high bits included.  mshrId keeps only the slot
+  // index; the high bits carry the per-read epoch a context uses to reject a
+  // response that belongs to an earlier tenant of its slot.
+  val txnID = UInt(TXNID_WIDTH.W)
   val set = UInt(setBits.W)
   val tag = UInt(tagBits.W)
   val respInfo = new RespInfoBundle

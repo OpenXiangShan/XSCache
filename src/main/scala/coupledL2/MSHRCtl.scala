@@ -163,6 +163,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     // Once ReleaseData replaces a normal context's payload, later beats from
     // its already-issued L3 read remain control responses only.
     val refillBufReleaseOwner = Output(UInt(mshrsAll.W))
+    // Slots whose current tenant has already accepted a read response with a
+    // different DBID than the CompData on io.resps.rxdat.  That beat belongs to
+    // an earlier tenant of the same TxnID and must reach neither the MSHR nor
+    // its RefillBuf.
+    val rxdatStaleSlots = Output(UInt(mshrsAll.W))
 
     /* Independent normal, snoop, and replacement ownership views. */
     val refillInfo = Vec(mshrsAll, ValidIO(new MSHRInfo()))
@@ -834,6 +839,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
 
   /* Port connection of physical MSHR entries and their two contexts. */
+  val rxdatStaleSlotOH = WireDefault(VecInit(Seq.fill(mshrsAll)(false.B)))
   refillMshrs.zip(snoopMshrs).zipWithIndex.foreach {
     case ((refill, snoop), i) =>
       Seq[MSHRContextBase](refill, snoop).zipWithIndex.foreach {
@@ -851,13 +857,35 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
           m.io.aMergeTask.bits := io.aMergeTask.bits.task
       }
 
-      refill.io.resps.rxdat.valid := refill.io.status.valid && io.resps.rxdat.valid && io.resps.rxdat.mshrId === i.U
+      // A CompData is routed by TxnID, which is this slot's index and is reused
+      // as soon as the context retires.  A response to the previous tenant can
+      // therefore still be in flight and would silently complete the new
+      // context's read (tl-test: uncached Get "Data mismatch", the returned
+      // data belonging to the address the slot read for its previous tenant).
+      // Once this context has accepted its own first beat it latched that
+      // response's DBID; a later beat must carry the same one.
+      val rxdatForThisSlot = io.resps.rxdat.valid && io.resps.rxdat.mshrId === i.U
+      val rxdatDBIDMismatch = refill.io.readDBID.valid &&
+        io.resps.rxdat.respInfo.dbID.get =/= refill.io.readDBID.bits
+      // The TxnID high bits carry the epoch of the read that was issued.  A
+      // response whose epoch is not the one this context sent belongs to an
+      // earlier tenant and must be dropped before it can complete the read.
+      val readTxnEpochHi = TXNID_WIDTH - bankBits - 3
+      val rxdatEpochMismatch = io.resps.rxdat.txnID(
+        readTxnEpochHi, mshrBits) =/= refill.io.readTxnEpoch
+      rxdatStaleSlotOH(i) := rxdatForThisSlot && (rxdatDBIDMismatch || rxdatEpochMismatch)
+      refill.io.resps.rxdat.valid := refill.io.status.valid && rxdatForThisSlot &&
+        !rxdatDBIDMismatch && !rxdatEpochMismatch
       refill.io.resps.rxdat.bits := io.resps.rxdat.respInfo
-      refill.io.resps.rxrsp.valid := refill.io.status.valid && io.resps.rxrsp.valid && (io.resps.rxrsp.mshrId === i.U)
+      val rxrspEpochMismatch = io.resps.rxrsp.txnID(
+        readTxnEpochHi, mshrBits) =/= refill.io.readTxnEpoch
+      refill.io.resps.rxrsp.valid := refill.io.status.valid && io.resps.rxrsp.valid &&
+        io.resps.rxrsp.mshrId === i.U && !rxrspEpochMismatch
       refill.io.resps.rxrsp.bits := io.resps.rxrsp.respInfo
       refill.io.replResp.valid := io.replResp.valid && io.replResp.bits.mshrId === i.U
       val replRespForRefill = WireInit(io.replResp.bits)
-      when(replRespOwnerConflict || replRespParentConflict || replRespNoReplaceSlot) {
+      when(replRespOwnerConflict || replRespParentConflict || replRespNoReplaceSlot ||
+        replRespCmoConflict) {
         replRespForRefill.retry := true.B
       }
       refill.io.replResp.bits := replRespForRefill
@@ -1116,6 +1144,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       io.replaceInfo(i) := replaceInfoForOutput
       io.pCrd(i) <> refill.io.pCrd
   }
+  io.rxdatStaleSlots := rxdatStaleSlotOH.asUInt
   io.toMainPipe.snoopDataHolds := io.snoopInfo
   io.toMainPipe.postGrantReleaseHolds := io.refillInfo
   io.toMainPipe.normalRefillLateSnoopToN :=

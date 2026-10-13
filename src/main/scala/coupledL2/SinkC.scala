@@ -162,6 +162,7 @@ class SinkC(implicit p: Parameters) extends L2Module {
 
   io.resp.valid := io.c.valid && (first || last) && !isRelease
   io.resp.mshrId := 0.U // DontCare
+  io.resp.txnID := 0.U
   io.resp.tag := parseAddress(io.c.bits.address)._1
   io.resp.set := parseAddress(io.c.bits.address)._2
   io.resp.respInfo := 0.U.asTypeOf(io.resp.respInfo.cloneType)

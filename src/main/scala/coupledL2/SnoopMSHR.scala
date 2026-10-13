@@ -66,6 +66,10 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   val sourceBProbeIssued = RegInit(false.B)
   // Only normal MSHR allocations can create replacement transactions.
   io.allocEpoch := false.B
+  // Snoop contexts issue no CHI read of their own, so they never own a DBID.
+  io.readDBID.valid := false.B
+  io.readDBID.bits := 0.U
+  io.readTxnEpoch := 0.U
   io.replaceParentRelease := false.B
   io.sidecarDelegated := false.B
   io.probeIssued := sourceBProbeIssued
