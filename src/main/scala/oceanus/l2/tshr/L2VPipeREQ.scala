@@ -1660,8 +1660,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //    cancel all non-arbitered Directory & Data Storage write back for L2 Eviction
   // 2. Cancel same way unfinished meta commiting on satisfied EvictBack since we're unlocking
   //    peer Directory commit immediately
+  // 3. Cancel at snoop-response completion of an unsatisfied EvictBack.
+  //    This drops the Snoop Agent's clients-clear the same cycle it rises
+  //    (L2SnoopAgent.scala clear_client_en) and the pending first-beat PASSDIRTY dirty-set.
   io.dir_wb_cancel := meta_wr_state_evictback_I ||
-                      rxevb_satisfied_evictback && dirResult.way === rxevb.Way
+                      rxevb_satisfied_evictback && dirResult.way === rxevb.Way ||
+                      p_rxreq_evictback && sa_resp_last
 
   io.ds_wb_cancel := w_evict_dn_comp || w_evict_dn_compdbid ||
                      s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2 || s_evict_dn_compack
