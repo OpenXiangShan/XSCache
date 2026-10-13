@@ -112,20 +112,25 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   val isCmoFlush = mode === ReplaceMSHRMode.cmoFlush
   val isCmoInval = mode === ReplaceMSHRMode.cmoInval
   val victimAlwaysData = mode === ReplaceMSHRMode.victim
-  val needsData = victimAlwaysData || victim.meta.dirty || probeAckDataRecv || isCmoClean
+  // CBO.inval always evicts without data, even for a dirty line: the
+  // invalidation discards the contents (RISC-V CMO semantics), mirroring the
+  // baseline's isWriteBackFull, which excludes req_cboInval.  Keeping the two
+  // sides consistent is essential -- a data-bearing opcode whose
+  // needsCopyBack is false would retire the sidecar before CopyBackWrData,
+  // leaving the L3 refill entry waiting for beats forever.
+  val needsData = victimAlwaysData || isCmoClean ||
+    (!isCmoInval && (victim.meta.dirty || probeAckDataRecv))
   // All valid replacement victims are captured, including clean ones. The
   // snapshot may be needed only by a later nested snoop; it does not force a
   // data-bearing lower-level release.
   val releaseBufRequired = captureFromDS || needsData
-  // CBO.inval mirrors the existing normal-MSHR path: its Evict carries no
-  // CopyBackWrData.  Clean and dirty Flush use the data-bearing path.
   // Preserve the release's data obligation after a snoop changes the
   // protocol-visible victim state to I. CHI still requires an outstanding
   // CopyBack flow to finish after CompDBIDResp.
   val activeReleaseNeedsData = Mux(releaseSent, releaseNeedsData, needsData)
   val needsCopyBack = Mux(isCmoInval, false.B, activeReleaseNeedsData)
   val releaseOpcode = Mux(isCmoClean, WriteCleanFull,
-    Mux(isCmoFlush, Mux(needsData, WriteBackFull, Evict),
+    Mux(isCmoInval, Evict,
       Mux(needsData, WriteBackFull, Evict)))
 
   when (io.alloc.valid) {
@@ -168,7 +173,7 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     victim.releaseAck := false.B
     victim.needRelease := true.B
     victim.replaceData := io.alloc.bits.dirResult.meta.dirty
-    victim.releaseToClean := false.B
+    victim.releaseToClean := io.alloc.bits.mode === ReplaceMSHRMode.cmoClean
     victim.leaseHeld := false.B
   }
 
@@ -281,6 +286,11 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   copyBackTask.tgtID.get := releaseTgtId
   copyBackTask.readProbeDataDown := true.B
   copyBackTask.useProbeData := true.B
+  // The release pass already committed the CMO Directory/DS update. A
+  // later CopyBack only transports data: replaying those writes could undo
+  // a snoop that invalidated or downgraded the line in the meantime.
+  copyBackTask.metaWen := false.B
+  copyBackTask.dsWen := false.B
   // A CopyBack request remains live after a late SnpUnique. Its WriteData
   // cache state must describe the state after the snoop, not the earlier UD.
   // TXDAT deasserts byte enables for CopyBackWrData_I.

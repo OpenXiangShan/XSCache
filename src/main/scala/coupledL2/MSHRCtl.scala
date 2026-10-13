@@ -248,6 +248,16 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     )
   ).asUInt
   val replRespSnoopConflict = replRespSnoopConflictOH.orR
+  // A line with a live CMO context must not be evicted from under it: the
+  // CMO sidecar will probe/capture/write back that very line.  Force the
+  // replacer read to retry until the CMO retires, mirroring the sidecar and
+  // snoop conflicts.  (A hit CMO holds its line by reqTag.)
+  val replRespCmoConflict = VecInit(refillMshrs.map { refill =>
+    replRespHasVictim && refill.io.status.valid && refill.io.status.bits.isCmo &&
+      !refill.io.status.bits.will_free &&
+      refill.io.status.bits.set === io.replResp.bits.set &&
+      refill.io.status.bits.reqTag === io.replResp.bits.tag
+  }).asUInt.orR
   val replRespOwnerConflict = replRespSidecarConflict || replRespSnoopConflict
   val replRespParentOH = UIntToOH(io.replResp.bits.mshrId, mshrsAll)
   val replaceParentMatches = Seq.tabulate(mshrsAll) { parent =>
@@ -319,7 +329,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val replRespReservationOH = Mux1H(replRespParentOH, replaceReserveSlotOHByParent)
   val replRespNoReplaceSlot = replRespNeedsReplaceRaw && !replRespReservationOH.orR
   val replRespNeedsReplace = replRespNeedsReplaceRaw && !replRespNoReplaceSlot
-  io.toMainPipe.replRespRetry := replRespSnoopConflict || replRespParentConflict || replRespNoReplaceSlot
+  io.toMainPipe.replRespRetry := replRespSnoopConflict || replRespParentConflict || replRespNoReplaceSlot ||
+    replRespCmoConflict
   // A refill grant pass may merge the refill install when its folded
   // ReplacerResult selects a no-probe victim.  The victim/slot/ownership
   // side of that decision lives here (single source); MainPipe adds the
@@ -327,7 +338,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val replRespNoProbeVictim = io.replResp.valid && !io.replResp.bits.hit && !io.replResp.bits.retry &&
     (io.replResp.bits.meta.state === INVALID || !io.replResp.bits.meta.clients.orR)
   io.toMainPipe.grantInstallOK := replRespNoProbeVictim &&
-    !replRespOwnerConflict && !replRespParentConflict &&
+    !replRespOwnerConflict && !replRespParentConflict && !replRespCmoConflict &&
     (io.replResp.bits.meta.state === INVALID || replRespReservationOH.orR)
   io.toMainPipe.grantInstallSlot := OHToUInt(replRespReservationOH)
   when(replRespSnoopConflict) {
@@ -374,11 +385,22 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   val orphanReleaseTargetsReplace = orphanReplaceTargetOH.orR
   val orphanReleaseData = orphanReleaseCandidate && !orphanReleaseTargetsReplace
-  val replaceNeedsAlloc = replRespNeedsReplace || nestedReleaseNeedsReplace || orphanReleaseData
-  val replaceParentOH = Mux(replRespNeedsReplace, replRespParentOH, nestedReleaseParentOH)
+  // A CMO context whose hit line needs a lower-level writeback requests a
+  // CMO-mode ReplaceMSHR (probe+capture+release of its own line).  Lowest
+  // priority: it waits behind any replacement-path allocation and never
+  // preempts a snoop allocation.  The parent keeps requesting until the
+  // child appears, so no reservation is needed.
+  val cmoSidecarReqOH = VecInit(refillMshrs.map(_.io.cmoSidecarReq)).asUInt
+  val cmoSidecarAlloc = cmoSidecarReqOH.orR && !replRespNeedsReplace &&
+    !nestedReleaseNeedsReplace && !orphanReleaseData && !snoopAllocRequest
+  val cmoSidecarParentOH = PriorityEncoderOH(cmoSidecarReqOH)
+  val replaceNeedsAlloc = replRespNeedsReplace || nestedReleaseNeedsReplace ||
+    orphanReleaseData || cmoSidecarAlloc
+  val replaceParentOH = Mux(replRespNeedsReplace, replRespParentOH,
+    Mux(cmoSidecarAlloc, cmoSidecarParentOH, nestedReleaseParentOH))
   val replaceParentId = OHToUInt(replaceParentOH)
   assert(
-    PopCount(Cat(replRespNeedsReplace, nestedReleaseNeedsReplace, orphanReleaseData)) <= 1.U,
+    PopCount(Cat(replRespNeedsReplace, nestedReleaseNeedsReplace, orphanReleaseData, cmoSidecarAlloc)) <= 1.U,
     "two independent ReplaceMSHR allocations requested in one cycle"
   )
   when(nestedReleaseNeedsReplace) {
@@ -403,6 +425,14 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     incomingVictim.way := io.replResp.bits.way
     incomingVictim.meta := io.replResp.bits.meta
   }
+  when(cmoSidecarAlloc) {
+    // The CMO's own hit line plays the victim role: way/meta come from the
+    // parent's live registers (a hit never re-reads the replacer).
+    incomingVictim.tag := Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.reqTag))
+    incomingVictim.set := Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.set))
+    incomingVictim.way := Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.way))
+    incomingVictim.meta := Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.meta))
+  }
   when(orphanReleaseData) {
     incomingVictim.tag := io.nestedwb.tag
     incomingVictim.set := io.nestedwb.set
@@ -420,15 +450,25 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   incomingReplaceReq.parentEpoch := Mux1H(replaceParentOH, refillMshrs.map(_.io.allocEpoch))
   incomingReplaceReq.parentAttached := !orphanReleaseData
   incomingReplaceReq.dirResult := incomingVictim
-  incomingReplaceReq.mode := ReplaceMSHRMode.victim
-  incomingReplaceReq.needProbe := replRespNeedsReplace && incomingVictim.meta.clients.orR
+  incomingReplaceReq.mode := Mux(cmoSidecarAlloc,
+    Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.cmoSidecarMode)),
+    ReplaceMSHRMode.victim)
+  incomingReplaceReq.needProbe := (replRespNeedsReplace || cmoSidecarAlloc) &&
+    incomingVictim.meta.clients.orR
   // A victim replacement must revoke every upper copy before its old data is
   // released to L3.  ReplaceRequest is zero-initialized, and zero is toT.
-  incomingReplaceReq.probeParam := toN
+  // CBO.clean keeps the line shared (probe toB); flush/inval revoke it.
+  incomingReplaceReq.probeParam := Mux(
+    cmoSidecarAlloc && incomingReplaceReq.mode === ReplaceMSHRMode.cmoClean, toB, toN)
   // When the parent's grant pass merges the install this very cycle, it also
   // performs the victim DS snapshot (ReleaseBuf write lands at its S5), so
   // the new sidecar must not issue a second capture of its own.
-  incomingReplaceReq.captureFromDS := replRespNeedsReplace && !io.fromMainPipe.grantInstallDone.valid
+  // CMO sidecars always capture from DS -- including CBO.inval, whose Evict
+  // carries no data but whose ReleaseBuf snapshot lets a racing same-line
+  // snoop be answered with the pre-invalidation contents (nestability is
+  // what breaks the CMO <-> snoop deadlock cycle).
+  incomingReplaceReq.captureFromDS := (replRespNeedsReplace &&
+      !io.fromMainPipe.grantInstallDone.valid) || cmoSidecarAlloc
   incomingReplaceReq.task := 0.U.asTypeOf(new TaskBundle)
   incomingReplaceReq.task.set := incomingVictim.set
   incomingReplaceReq.task.tag := incomingVictim.tag
@@ -1208,6 +1248,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   replaceMshrs.zipWithIndex.foreach { case (m, i) =>
     m.io.tasks.txdat.ready := cbPresent && cbSelOH(i) && cbSelStillValid && io.toTXDAT.ready
   }
+  XSPerfAccumulate("cmo_sidecar_alloc_cnt",
+    replaceNeedsAlloc && cmoSidecarAlloc && replaceAllocValid)
+  XSPerfAccumulate("replresp_cmo_conflict_retry_cnt",
+    io.replResp.valid && replRespCmoConflict)
   XSPerfAccumulate("txdat_direct_copyback_cnt", io.toTXDAT.fire)
   XSPerfAccumulate("txdat_direct_abort_cnt", cbPresent && !cbSelStillValid)
   XSPerfAccumulate("txdat_direct_wait_sum",
