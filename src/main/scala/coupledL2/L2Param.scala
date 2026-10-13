@@ -104,6 +104,9 @@ case class L2Param(
   hartId: Int = 0,
   // Prefetch
   prefetch: Seq[PrefetchParameters] = Nil,
+  // Redirect low-accuracy Stride/SMS hints to the downstream CHI stash path.
+  // Enabled by the XiangShan performance configuration, opt-in for other users.
+  enableL2HintOffload: Boolean = false,
   // L2 Flush
   enableL2Flush: Boolean = false,
   // AsyncBridge

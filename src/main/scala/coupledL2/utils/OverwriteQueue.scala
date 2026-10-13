@@ -39,6 +39,7 @@ class OverwriteQueue[T <: Data](
   val io = IO(new Bundle {
     val enq = Flipped(DecoupledIO(gen))
     val deq = DecoupledIO(gen)
+    val overwrite = Output(Bool())
   })
   def wrapInc(ptr: UInt): UInt = Mux(ptr === (entries - 1).U, 0.U, ptr + 1.U)
   require(entries > 1, "Queue must have positive entries")
@@ -73,6 +74,7 @@ class OverwriteQueue[T <: Data](
   val flowHappens = if (hasFlow) empty && do_enq && io.deq.ready else false.B
 
   val overwriteHappens =  full &&  do_enq && !do_deq 
+  io.overwrite := overwriteHappens
   
   when(overwriteHappens) {
     maybe_full := true.B // Overwrite: both pointers advance together, queue stays full

@@ -128,7 +128,20 @@ class TestTop_CHIL2(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, ext
     mmioClientNode
   }
 
+  // Receiver-enabled configurations need both hint bridges connected, even
+  // when a standalone cache test does not generate hints.
+  val hintSources = l2_nodes.flatMap { l2 =>
+    Seq(l2.pf_recv_node, l2.l3_pf_recv_node).flatten.map { sink =>
+      val source = BundleBridgeSource(() => new PrefetchRecv)
+      sink := source
+      source
+    }
+  }
+
   lazy val module = new LazyModuleImp(this){
+    hintSources.foreach { source =>
+      source.out.head._1 := 0.U.asTypeOf(source.out.head._1)
+    }
 
     val time_sim = if (extTime) {
       IO(Input(UInt(64.W)))

@@ -36,6 +36,7 @@ case class PrefetchReceiverParams(n: Int = 32) extends PrefetchParameters {
 class PrefetchReceiver()(implicit p: Parameters) extends PrefetchModule {
   val io = IO(new Bundle {
     val enable = Input(Bool())
+    val active = Output(Bool())
     val recv_addr = Flipped(ValidIO(new Bundle() {
       val addr = UInt(64.W)
       val pfSource = UInt(MemReqSource.reqSourceBits.W)
@@ -46,6 +47,7 @@ class PrefetchReceiver()(implicit p: Parameters) extends PrefetchModule {
   // 0 / 1: whether to enable
   private val cstEnable = Constantin.createRecord("pfRcv_enable"+cacheParams.hartId.toString, initValue = 1)
   val enable = io.enable && cstEnable.orR
+  io.active := enable
 
   io.req.valid := enable && io.recv_addr.valid
   io.req.bits.tag := parseFullAddress(io.recv_addr.bits.addr)._1

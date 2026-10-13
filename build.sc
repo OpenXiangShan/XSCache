@@ -98,6 +98,15 @@ object XSCache extends HasChisel with $file.common.XSCacheModule {
 
   def openNCBModule: ScalaModule = openNCB
 
+  object offloadTest extends HasChisel {
+    override def moduleDeps = Seq(XSCache)
+    override def sources = T.sources {
+      Seq("L2HintOffloadTest.scala", "TestTopL2.scala").map { name =>
+        PathRef(pwd / "src" / "test" / "scala" / name)
+      }
+    }
+  }
+
   object test extends SbtTests with TestModule.ScalaTest {
     override def sources = T.sources {
       Seq(

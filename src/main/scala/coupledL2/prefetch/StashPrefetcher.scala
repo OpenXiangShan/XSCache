@@ -105,6 +105,7 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
 
   val io = IO(new Bundle {
     val recv = Input(new PrefetchRecv)
+    val offload = Flipped(DecoupledIO(new StashPrefetchReq))
     val txreq = DecoupledIO(new CHIREQ)
     val rxrsp = Flipped(DecoupledIO(new CHIRSP))
   })
@@ -118,6 +119,22 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
   l3PftQueue.io.enq.bits.addr := io.recv.addr(fullAddressBits - 1, 0)
   l3PftQueue.io.enq.bits.pfSource := io.recv.pf_source
 
+  // Keep native L3 hints and redirected L2 hints in separate queues: a native
+  // hint must not overwrite an accepted offload. Backpressure allows the L2
+  // receiver to fall back to its normal route when this queue is full.
+  val allocReq = Wire(Decoupled(new StashPrefetchReq))
+  val offloadAllocated = WireDefault(false.B)
+  if (cacheParams.enableL2HintOffload && hasReceiver && hasCDP) {
+    val allocQueue = Module(new L2HintOffloadQueue(new StashPrefetchReq, stashPrefetchEntryCount))
+    allocQueue.io.offload <> io.offload
+    allocQueue.io.native <> l3PftQueue.io.deq
+    allocReq <> allocQueue.io.out
+    offloadAllocated := allocQueue.io.offloadAllocated
+  } else {
+    allocReq <> l3PftQueue.io.deq
+    io.offload.ready := false.B
+  }
+
   val stashPrefetchEntries = Seq.tabulate(stashPrefetchEntryCount) { i =>
     val entry = Module(new StashPrefetchEntry)
     entry.io.id := i.U
@@ -126,10 +143,10 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
 
   val allocReadys = VecInit(stashPrefetchEntries.map(_.io.alloc.ready))
   val allocOH = PriorityEncoderOH(allocReadys)
-  l3PftQueue.io.deq.ready := allocReadys.asUInt.orR
+  allocReq.ready := allocReadys.asUInt.orR
   stashPrefetchEntries.zipWithIndex.foreach { case (entry, i) =>
-    entry.io.alloc.valid := l3PftQueue.io.deq.valid && allocOH(i)
-    entry.io.alloc.bits := l3PftQueue.io.deq.bits
+    entry.io.alloc.valid := allocReq.valid && allocOH(i)
+    entry.io.alloc.bits := allocReq.bits
     entry.io.rxrsp.valid := io.rxrsp.valid && entry.io.waitResp && io.rxrsp.bits.txnID === i.U
     entry.io.rxrsp.bits := io.rxrsp.bits
   }
@@ -146,6 +163,11 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
 
   XSPerfAccumulate("l3_prefetch_recv", io.recv.addr_valid && io.recv.pf_en)
   XSPerfAccumulate("l3_prefetch_queue_fire", l3PftQueue.io.deq.fire)
+  XSPerfAccumulate("l3_prefetch_native_overwrite", l3PftQueue.io.overwrite)
+  XSPerfAccumulate("l3_offload_accept", io.offload.fire)
+  XSPerfAccumulate("l3_offload_alloc", offloadAllocated)
+  XSPerfAccumulate("l3_offload_queue_full",
+    (cacheParams.enableL2HintOffload && hasReceiver && hasCDP).B && !io.offload.ready)
   XSPerfAccumulate("l3_prefetch_txreq_valid", io.txreq.valid)
   XSPerfAccumulate("l3_prefetch_txreq_blocked", io.txreq.valid && !io.txreq.ready)
   XSPerfAccumulate("l3_prefetch_txreq_fire", io.txreq.fire)

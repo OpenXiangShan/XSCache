@@ -284,8 +284,68 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   io.tlb_req.resp.ready := true.B
 
+  val pfRcv = if (hasReceiver) Some(Module(new PrefetchReceiver())) else None
   val stashPrefetcher = Module(new StashPrefetcher)
   stashPrefetcher.io.recv := io.l3_recv
+  stashPrefetcher.io.offload.valid := false.B
+  stashPrefetcher.io.offload.bits := 0.U.asTypeOf(new StashPrefetchReq)
+
+  // Make the decision at hint reception, before the L2 request queue. Only
+  // actual L2 dequeues contribute to the denominator; redirected traffic does
+  // not. Count directory useful hits separately from CDP's hit+MSHR feedback.
+  val receivedHint = ValidIODelay(io.recv_addr, 2)
+  val receiverHint = WireInit(receivedHint)
+  if (cacheParams.enableL2HintOffload && hasReceiver && hasCDP) {
+    val enableOffload = Constantin.createRecord(
+      s"l2pf_hintOffloadEnable${cacheParams.hartId}", initValue = true)
+    val policy = Module(new L2HintOffloadPolicy)
+    def accumulate(events: Seq[Bool]): UInt = {
+      val count = RegInit(0.U(64.W))
+      count := count + PopCount(events)
+      count
+    }
+    policy.io.total := accumulate(io.req.map(_.fire))
+    policy.io.cdp := accumulate(io.req.map(r => r.fire && r.bits.isCDP))
+    val sources = Seq(
+      (MemReqSource.Prefetch2L2Stride.id, PfSource.Stride.id, "stride"),
+      (MemReqSource.Prefetch2L2SMS.id, PfSource.SMS.id, "sms")
+    )
+    val candidates = sources.zipWithIndex.map { case ((reqSrc, metaSrc, name), i) =>
+      val sent = io.req.map(r => r.fire && r.bits.pfSource === reqSrc.U)
+      val useful = pfFeedbackVec.map { f =>
+        val d = f.dirResult
+        d.valid && d.bits.replacerInfo.channel === 1.U &&
+          MemReqSource.isCPUReq(d.bits.replacerInfo.reqSource) && d.bits.hit &&
+          d.bits.meta.prefetch.getOrElse(false.B) && !d.bits.meta.accessed &&
+          d.bits.meta.prefetchSrc.getOrElse(PfSource.NoWhere.id.U) === metaSrc.U
+      }
+      policy.io.sent(i) := accumulate(sent)
+      policy.io.useful(i) := accumulate(useful)
+      XSPerfAccumulate(s"hint_offload_${name}_l2_sent", PopCount(sent))
+      XSPerfAccumulate(s"hint_offload_${name}_l2_useful", PopCount(useful))
+      XSPerfAccumulate(s"hint_offload_${name}_eligible_cycles", policy.io.offload(i))
+      receivedHint.bits.pfSource === reqSrc.U && policy.io.offload(i)
+    }
+    // pfRcv has an independent Constantin gate. Honour it on both routes.
+    val candidate = receivedHint.valid && pfRcv.get.io.active &&
+      enableOffload && candidates.reduce(_ || _)
+    stashPrefetcher.io.offload.valid := candidate
+    stashPrefetcher.io.offload.bits.addr := receivedHint.bits.addr(fullAddressBits - 1, 0)
+    stashPrefetcher.io.offload.bits.pfSource := receivedHint.bits.pfSource
+    // The source has no ready signal. A full stash queue must NOT drop the
+    // hint, stall the core, or allocate it at both levels: retain the L2 route.
+    receiverHint.valid := receivedHint.valid && !stashPrefetcher.io.offload.fire
+    assert(!(stashPrefetcher.io.offload.fire && receiverHint.valid))
+    for ((reqSrc, _, name) <- sources) {
+      XSPerfAccumulate(s"hint_offload_${name}_accepted",
+        stashPrefetcher.io.offload.fire && receivedHint.bits.pfSource === reqSrc.U)
+    }
+    XSPerfAccumulate("hint_offload_candidate", candidate)
+    XSPerfAccumulate("hint_offload_accepted", stashPrefetcher.io.offload.fire)
+    XSPerfAccumulate("hint_offload_fallback_l2", candidate && !stashPrefetcher.io.offload.ready)
+    XSPerfAccumulate("hint_offload_l2_total_sent", PopCount(io.req.map(_.fire)))
+    XSPerfAccumulate("hint_offload_l2_cdp_sent", PopCount(io.req.map(r => r.fire && r.bits.isCDP)))
+  }
   io.stash_txreq <> stashPrefetcher.io.txreq
   stashPrefetcher.io.rxrsp <> io.stash_rxrsp
 
@@ -356,8 +416,6 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   val cdp = if (hasCDP) Some(Module(new CDPPrefetcher())) else None
 
-  // prefetch from upper level
-  val pfRcv = if (hasReceiver) Some(Module(new PrefetchReceiver())) else None
 
   val train = Wire(DecoupledIO(new PrefetchTrain))
   val resp = Wire(DecoupledIO(new PrefetchResp))
@@ -400,7 +458,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   }
   if (hasReceiver) {
     pfRcv.get.io.enable := pfRcv_en
-    pfRcv.get.io.recv_addr := ValidIODelay(io.recv_addr, 2)
+    pfRcv.get.io.recv_addr := receiverHint
     assert(!pfRcv.get.io.req.valid ||
       pfRcv.get.io.req.bits.pfSource === MemReqSource.Prefetch2L2SMS.id.U ||
       pfRcv.get.io.req.bits.pfSource === MemReqSource.Prefetch2L2Stream.id.U ||
