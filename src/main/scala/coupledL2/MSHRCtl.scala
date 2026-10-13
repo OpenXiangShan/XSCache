@@ -1049,9 +1049,12 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       // response leaves TXRSP/TXDAT. The reservation prevents the sidecar
       // from observing B only in S1, then releasing the same victim while B
       // is still in MainPipe.
+      // Any snoop that consumes this sidecar's ReleaseBuf must reserve it --
+      // including one arriving after the copyback was issued (a late snoop is
+      // still served from the snapshot).  snoopDone is unconditional, so the
+      // reservation must be too, or the completion asserts.
       replaceMshrs(i).io.snoopStarted := io.fromReqArb.status_s1.bFire &&
       replaceMshrs(i).io.info.valid &&
-      !replaceMshrs(i).io.info.bits.copyBackIssued &&
       replaceMshrs(i).io.info.bits.set === io.fromReqArb.status_s1.b_set &&
       replaceMshrs(i).io.info.bits.tag === io.fromReqArb.status_s1.b_tag
       val snoopDone = Seq(io.txdatDone, io.txrspDone).map { done =>
@@ -1061,7 +1064,12 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       replaceMshrs(i).io.snoopDone := snoopDone
       val snoopToInvalDone = Seq(io.txdatDone, io.txrspDone).map { done =>
         done.valid && done.bits.fromB && done.bits.snpHitRelease &&
-        done.bits.snpHitReleaseToInval && done.bits.snpHitReleaseIdx === i.U
+        // A clean sidecar can also lose the line to an invalidating snoop.
+        // The response state (I or I_PD) records that outcome; the release
+        // mode alone only describes the state before the snoop.
+        (done.bits.snpHitReleaseToInval ||
+          done.bits.snpHitReleaseToClean && done.bits.resp.get(1, 0) === 0.U) &&
+        done.bits.snpHitReleaseIdx === i.U
       }.reduce(_ || _)
       replaceMshrs(i).io.snoopToInvalDone := snoopToInvalDone
       replaceMshrs(i).io.copyBackDone := io.txdatDone.valid &&
