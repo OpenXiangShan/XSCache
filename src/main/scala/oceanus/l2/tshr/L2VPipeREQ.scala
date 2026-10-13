@@ -202,11 +202,19 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val rxreq_stashshared = rxreq_opcode.is(CCHIOpcode.StashShared)
   val rxreq_stashunique = rxreq_opcode.is(CCHIOpcode.StashUnique)
 
-  io.bopTrain.valid := rxreq_fire &&
-                       (rxreq_readshared || rxreq_readunique) &&
-                       !rxreq_stashshared && !rxreq_stashunique &&
-                       !dirResult.hit
+  val rxreq_demand = rxreq.SrcID =/= io.consts.pfSrcID
+  // coupledL2 MainPipe:173 includes AcquirePerm in req_acquire_s3; :759-766
+  // trains eligible misses/prefetched hits (plus mergeA). MakeUnique is its
+  // base counterpart. Train RS/RU/MU misses and prefetched hits alike.
+  // dirResult is the OLD registered meta: training and clear sample it before
+  // the same edge, even if the lossy training receiver is not ready.
+  val prefetched_hit_train = rxreq_fire && rxreq_demand && dirResult.hit && dirResult.prefetched &&
+    (rxreq_readshared || rxreq_readunique || rxreq_makeunique)
+  io.bopTrain.valid := rxreq_fire && rxreq_demand &&
+    (((rxreq_readshared || rxreq_readunique || rxreq_makeunique) && !dirResult.hit) ||
+      (dirResult.hit && dirResult.prefetched && (rxreq_readshared || rxreq_readunique || rxreq_makeunique)))
   io.bopTrain.bits := io.tshr_paddr
+  XSPerfAccumulate("prefetchedHitTrain", prefetched_hit_train)
 
   // CCHI Stash is supported only as a fire-and-forget prefetch hint: with ExpCompStash=1 the
   // completer owes the requester a CompStash on DnRSP, which this vPipe never issues.
@@ -267,6 +275,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // -- Private payload registers and enchantment signals
   val p_rxreq = Reg(new FlitREQStripped)
+  val p_rxreq_prefetch_refill = RegInit(false.B)
   val p_rxreq_opcode = p_rxreq.Opcode
   val p_rxreq_stashshared       = p_rxreq_opcode === CCHIOpcode.StashShared.U
   val p_rxreq_stashunique       = p_rxreq_opcode === CCHIOpcode.StashUnique.U
@@ -288,6 +297,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   when (rxreq_fire) {
     p_rxreq := rxreq
+    p_rxreq_prefetch_refill := rxreq_stashshared && rxreq.SrcID === io.consts.pfSrcID && !dirResult.hit
   }
 
   // *NOTE: EvictBack opcode is not formally used in REQ channel,
@@ -1333,6 +1343,19 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                       meta_wr_alias_readshared ||
                       meta_wr_alias_makeunique
 
+  val meta_wr_prefetched_set = p_rxreq_prefetch_refill &&
+    (meta_wr_state_stashshared_UU || meta_wr_state_stashshared_US || meta_wr_state_stashshared_S)
+  // L2 BOP and L1 Stash are independent: external Stash must neither mark
+  // nor consume an internal prefetch, including StashUnique hit upgrades.
+  // New tags already start with zeroed p_prefill_meta and force this bit
+  // through repl_tshr_meta_wr, so external Stash needs no separate write.
+  // Consume RS/RU/MU demand hits at entrance, using the old bit for training.
+  // MU extends the frozen e2dc7b6 RS/RU-only clear policy: coupledL2's direct
+  // A-hit MetaEntry defaults prefetch=false (MainPipe:538,557; Directory:56).
+  // Its MSHR hit refill retains meta_pft (MSHR:795); base has no corresponding
+  // MSHR pipeline and consumes even hits requiring a downstream permission upgrade.
+  val meta_wr_prefetched_clear = prefetched_hit_train
+
   // --------------------------------
   val prefill_meta_wr_state = p_prefill && (meta_wr_state_UU || 
                                             meta_wr_state_US || 
@@ -1368,6 +1391,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   when (prefill_meta_wr_alias) {
     p_prefill_meta.alias := p_rxreq.TagAlias
+  }
+  when (p_prefill && meta_wr_prefetched_set) {
+    p_prefill_meta.prefetched := meta_wr_prefetched_set
   }
 
   // --------------------------------
@@ -1426,6 +1452,13 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   io.tshr_meta_write_en.alias := tshr_meta_wr_alias
   io.tshr_meta_write_meta.alias := Mux(p_prefill, p_prefill_meta.alias, p_rxreq.TagAlias)
+
+  // Every new tag overwrites this bit, including demand/external Stash fills
+  // with value zero. A zero data bit with mask=0 would retain the victim's bit
+  // in Directory's bitmask SRAM. ReplRd victim meta is never the refill base.
+  io.tshr_meta_write_en.prefetched := repl_tshr_meta_wr ||
+    (!p_prefill && (meta_wr_prefetched_set || meta_wr_prefetched_clear))
+  io.tshr_meta_write_meta.prefetched := Mux(p_prefill, p_prefill_meta.prefetched, meta_wr_prefetched_set)
   // ----------------------------------------------------------------
 
   // -- Interactions with TSHR local data and Data Storage Read

@@ -220,6 +220,7 @@ class L2VPipeEVT(
   metaMask.state := false.B
   metaMask.dirty := false.B
   metaMask.alias := false.B
+  metaMask.prefetched := false.B
   metaMask.clients.foreach(_ := false.B)
   // Commit points: WriteBackFull at the CompDBIDResp handshake (wbCommitNow);
   // clean Evict at sWaitCommit as before. A WriteBackFull directory miss still

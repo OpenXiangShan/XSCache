@@ -133,6 +133,25 @@
  *                 prefetched-clear-after-fix-20260921.log:45
  *                 (baseline=0, afterSecond=1, delta=1).
  *
+ * [Implementation detail 9 — relative to frozen e2dc7b6, paper not checked]
+ *                 Training covers MakeUnique (训练覆盖 MakeUnique): miss and prefetched hit.
+ * Reference:      coupledL2 MainPipe:173 includes AcquirePerm; :759-766 trains
+ *                 needHint Acquire/Get misses or prefetched hits, plus mergeA.
+ *                 Its direct A-hit MetaEntry defaults prefetch=false (:538,557;
+ *                 Directory:56). MSHR hit refill instead retains meta_pft (MSHR:795).
+ * This implementation: RS/RU/MU demand hits train using the old prefetched bit
+ *                 and clear it at the same edge. Frozen e2dc7b6 cleared only RS/RU.
+ *                 RS/RU/MU misses train as well; frozen e2dc7b6 omitted MU miss/hit.
+ *                 AcquirePerm is explicitly included in the reference miss predicate.
+ * Reason:         MU corresponds to AcquirePerm. Base has no corresponding MSHR
+ *                 pipeline; hits requiring permission upgrades also consume the bit.
+ * Status:         Verified by TestTop_L2Prefetched SC/UC RS/RU/MU: first hit
+ *                 reads SRAM prefetched=1 with trainDelta=1; second hit reads
+ *                 0 with trainDelta=0. External Stash train=0; replacement
+ *                 checks victim bit=1, new-tag mask=1/data=0, SRAM readback=0.
+ *                 MU miss SC/UC: cold miss trainDelta=1/internalFills=1, subsequent
+ *                 ordinary hit trainDelta=0. A/B six groups have identical counts.
+ *
  * [Implementation detail — not a deviation] The coupledL2 PBOP structure is flattened.
  * Reference:      coupledL2 separates RecentRequestTable, OffsetScoreTable, and
  *                 DelayQueue modules, uses Constantin controls, and retains ChiselDB

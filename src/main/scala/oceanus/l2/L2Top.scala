@@ -222,6 +222,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     // Snoops target the first listed Type-1 port: multiple Type-1 ports are
     // sources of the same single coherent client (see L2UpstreamTable).
     slice.io.consts.clientNID := t1NIDs.head.U
+    slice.io.consts.pfSrcID := config.pfSrcID.U
   }
 
   // - Upstream RXEVT routing

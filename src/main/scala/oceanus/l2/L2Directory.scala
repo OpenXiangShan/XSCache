@@ -66,6 +66,7 @@ object L2Directory {
     val dirty = Bool()
     val clients = Vec(1, Bool()) // TODO: parameterize with coherent l2 client count
     val alias = UInt(paramCCHI.TagAlias_Width.W)
+    val prefetched = Bool()
   }
 
   class MetaReadResult(implicit override val p: Parameters) extends Meta with HasL2Params {
@@ -78,6 +79,7 @@ object L2Directory {
     val dirty = Bool()
     val clients = Vec(1, Bool()) // TODO: parameterize with coherent l2 client count
     val alias = Bool()
+    val prefetched = Bool()
 
     def any = this.asUInt.orR
 
@@ -85,6 +87,7 @@ object L2Directory {
       when (state) { dst.state := src.state }
       when (dirty) { dst.dirty := src.dirty }
       when (alias) { dst.alias := src.alias }
+      when (prefetched) { dst.prefetched := src.prefetched }
       clients.zip(dst.clients.zip(src.clients)).foreach { case (mask, (dst, src)) => when (mask) { dst := src } }
     }
 
@@ -93,6 +96,7 @@ object L2Directory {
       when (state) { dstFlag.state := true.B }
       when (dirty) { dstFlag.dirty := true.B }
       when (alias) { dstFlag.alias := true.B }
+      when (prefetched) { dstFlag.prefetched := true.B }
       clients.zip(dstFlag.clients).foreach { case (mask, dst) => when (mask) { dst := true.B } }
     }
 
@@ -100,6 +104,7 @@ object L2Directory {
       when (!state) { dst.state := src.state }
       when (!dirty) { dst.dirty := src.dirty }
       when (!alias) { dst.alias := src.alias }
+      when (!prefetched) { dst.prefetched := src.prefetched }
       clients.zip(dst.clients.zip(src.clients)).foreach { case (mask, (dst, src)) => when (!mask) { dst := src } }
     }
   }
@@ -365,6 +370,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   initMeta.state := L2Directory.MetaState.I
   initMeta.dirty := false.B
   initMeta.alias := 0.U
+  initMeta.prefetched := false.B
   initMeta.clients.foreach(_ := false.B)
   val initEntry = Wire(new L2Directory.DirEntry)
   initEntry.tag := 0.U
@@ -374,6 +380,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   initMask.meta.state := Fill(2, true.B)
   initMask.meta.dirty := true.B
   initMask.meta.alias := Fill(2, true.B)
+  initMask.meta.prefetched := true.B
   initMask.meta.clients.foreach(_ := true.B)
   val initWayMask = Fill(ways, true.B)
   when(initActive) {
@@ -514,6 +521,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   wbMask.meta.state := Fill(2, winReq.META_WEN.state)
   wbMask.meta.dirty := winReq.META_WEN.dirty
   wbMask.meta.alias := Fill(2, winReq.META_WEN.alias)
+  wbMask.meta.prefetched := winReq.META_WEN.prefetched
   wbMask.meta.clients.zip(winReq.META_WEN.clients).foreach { case (m, w) => m := w }
 
   val dirWriteValid = initActive || isDirWb
@@ -785,6 +793,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
       o.META.dirty   := entry_s3.meta.dirty
       o.META.clients := entry_s3.meta.clients
       o.META.alias   := entry_s3.meta.alias
+      o.META.prefetched := entry_s3.meta.prefetched
       o.META.way     := way_s3
       o.META.hit     := Mux(s3_isRepl, false.B, hit_s3)
     }

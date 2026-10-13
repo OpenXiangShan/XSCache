@@ -84,6 +84,7 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
     t.io.consts.sliceNID := io.consts.sliceNID
     t.io.consts.nodeId := io.consts.nodeId
     t.io.consts.clientNID := io.consts.clientNID
+    t.io.consts.pfSrcID := io.consts.pfSrcID
   }
 
   tshrs.foreach { case t => 
