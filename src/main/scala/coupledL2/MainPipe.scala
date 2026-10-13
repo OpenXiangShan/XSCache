@@ -689,28 +689,29 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // This is to let io.toDS.req_s3.valid hold for 2 cycles (see DataStorage for details)
   val task_s3_valid_hold2 = RegEnable(task_s2.valid, false.B, !RegNext(task_s2.valid, false.B))
 
-  // A merge-install grant's victim DS read addresses the ReplacerResult way,
-  // which exists only during the response's single S3 cycle.  DataStorage
-  // (MCP2) requires the request to hold unchanged for a second cycle; other
-  // tasks get that for free because their request derives from the held
-  // task_s3 bits.  Latch the merged read so its hold cycle replays exactly
-  // the same request.
+  // A merged grant's ReplacerResult is only valid on its first S3 cycle.
   val grantVictimCapHold = RegNext(grantVictimCap_s3, false.B)
-  val grantVictimWayHold = RegEnable(io.replResp.bits.way, grantVictimCap_s3)
 
+  // ren/wen fold in the live Directory result (need_data_a/need_data_b read
+  // dirResult_s3.hit).  That result already describes the next lookup on the
+  // hold cycle, so a hit read would drop after one cycle and break DataStorage's
+  // two-cycle-stable MCP2 request (tl-test: "DataStorage req fails to hold for
+  // 2 cycles").  Replay the cycle the request was actually decided on.
+  val renWenHold = RegEnable(ren || wen, false.B, task_s3.valid)
+  val wenHold = RegEnable(wen, false.B, task_s3.valid)
   io.toDS.en_s3 := task_s3.valid && (ren || wen)
-  io.toDS.req_s3.valid := task_s3_valid_hold2 && (ren || wen || grantVictimCapHold)
-  io.toDS.req_s3.bits.way := Mux(
-    grantVictimCapHold,
-    grantVictimWayHold,
-    Mux(
-      commitReplWay,
-      io.replResp.bits.way,
-      Mux(mshr_req_s3, req_s3.way, dirResult_s3.way)
-    )
+  io.toDS.req_s3.valid := task_s3_valid_hold2 && (Mux(task_s3.valid, ren || wen, renWenHold) || grantVictimCapHold)
+  val dsWay_s3 = Mux(
+    commitReplWay,
+    io.replResp.bits.way,
+    Mux(mshr_req_s3, req_s3.way, dirResult_s3.way)
   )
+  // Channel reads also use a live Directory result. Preserve the selected
+  // way on every MCP2 hold cycle, not only on merged-grant victim reads.
+  val dsWayHold = RegEnable(dsWay_s3, io.toDS.en_s3)
+  io.toDS.req_s3.bits.way := Mux(RegNext(io.toDS.en_s3, false.B), dsWayHold, dsWay_s3)
   io.toDS.req_s3.bits.set := req_s3.set
-  io.toDS.req_s3.bits.wen := wen
+  io.toDS.req_s3.bits.wen := Mux(task_s3.valid, wen, wenHold)
   io.toDS.wdata_s3.data := Mux(
     !mshr_req_s3,
     c_releaseData_s3,
