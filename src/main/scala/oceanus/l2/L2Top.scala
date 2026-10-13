@@ -129,6 +129,18 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   //
   val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId)))
 
+  val bop = Module(new OceanusBOP())
+  val bopTrainArb = Module(new FastArbiter(UInt(paramL2.physicalAddrWidth.W), config.sliceNum))
+  bopTrainArb.io.in.zip(slices).foreach { case (sink, source) =>
+    sink.valid := source.io.bopTrain.valid
+    sink.bits := source.io.bopTrain.bits
+  }
+  bop.io.train <> bopTrainArb.io.out
+  bop.io.req.ready := true.B
+  XSPerfAccumulate("oceanus_bop_cross_page_drop", bop.io.crossPageDrop)
+  XSPerfAccumulate("oceanus_bop_disabled_drop", bop.io.disabledDrop)
+  XSPerfAccumulate("oceanus_bop_delay_queue_full_drop", bop.io.delayQueueFullDrop)
+
   slices.zipWithIndex.foreach { case (slice, i) =>
     slice.io.consts.sliceIdx := i.U
     slice.io.consts.sliceNID := config.slices(i).U

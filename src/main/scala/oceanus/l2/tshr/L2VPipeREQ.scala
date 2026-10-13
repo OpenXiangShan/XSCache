@@ -135,6 +135,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     val L1EVT_data_pending = Input(Bool())
 
     val L2EVT_opcode = Valid(UInt(paramCHI.reqOpcodeWidth.W))
+
+    val bopTrain = Valid(UInt(paramL2.physicalAddrWidth.W))
   })
 
   val dirResult = io.tshr_dirResult
@@ -199,6 +201,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val rxreq_makeunique = rxreq_opcode.is(CCHIOpcode.MakeUnique)
   val rxreq_stashshared = rxreq_opcode.is(CCHIOpcode.StashShared)
   val rxreq_stashunique = rxreq_opcode.is(CCHIOpcode.StashUnique)
+
+  io.bopTrain.valid := rxreq_fire &&
+                       (rxreq_readshared || rxreq_readunique) &&
+                       !rxreq_stashshared && !rxreq_stashunique &&
+                       !dirResult.hit
+  io.bopTrain.bits := io.tshr_paddr
 
   // CCHI Stash is supported only as a fire-and-forget prefetch hint: with ExpCompStash=1 the
   // completer owes the requester a CompStash on DnRSP, which this vPipe never issues.

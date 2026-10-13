@@ -68,6 +68,8 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
 
     val toClientTableEVT = Output(Vec(paramL2.mshrSize, UInt(paramCCHI.UpstreamNodeID_Width.W)))
     val fromClientTableEVT = Input(Vec(paramL2.mshrSize, Vec(1, Bool()))) // TODO: parameterize with coherent l2 client count
+
+    val bopTrain = Valid(UInt(paramL2.physicalAddrWidth.W))
   })
 
   //
@@ -107,6 +109,8 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   assert(!io.UpRXDAT.valid || (PopCount(tshrs.map(_.io.UpRXDAT.valid)) =/= 0.U), "UpRXDAT valid but no TSHR selected, flit lost")
   assert(!io.DnRXRSP.valid || (PopCount(tshrs.map(_.io.DnRXRSP.valid)) =/= 0.U), "DnRXRSP valid but no TSHR selected, flit lost")
   assert(!io.DnRXDAT.valid || (PopCount(tshrs.map(_.io.DnRXDAT.valid)) =/= 0.U), "DnRXDAT valid but no TSHR selected, flit lost")
+  io.bopTrain.valid := tshrs.map(_.io.bopTrain.valid).orR
+  io.bopTrain.bits := PriorityMux(tshrs.map(t => t.io.bopTrain.valid -> t.io.bopTrain.bits))
   // ----------------------------------------------------------------
 
   // -- TSHR Allocation connections

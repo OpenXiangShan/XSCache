@@ -104,6 +104,8 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
     val self_unlock_dir_ack = Input(Bool())
 
     val valid = Output(Bool())
+
+    val bopTrain = Valid(UInt(paramL2.physicalAddrWidth.W))
   })
 
   // TSHR valid
@@ -529,6 +531,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   vPipeREQ.io.UpRXREQ := rbeREQ.io.out
   vPipeREQ.io.UpRXEVB := rbeEVB.io.out
+  io.bopTrain := vPipeREQ.io.bopTrain
 
   vPipeREQ.io.DnRXRSP := io.DnRXRSP
   vPipeREQ.io.DnRXDAT := io.DnRXDAT
