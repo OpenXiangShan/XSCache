@@ -2364,6 +2364,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   io.statAlloc.bits.channel := io.alloc.bits.task.channel
 
   io.msInfo.valid := req_valid
+  io.msInfo.bits.isCmo := cmo_cbo
   io.msInfo.bits.set := req.set
   io.msInfo.bits.way := dirResult.way
   io.msInfo.bits.reqTag := req.tag

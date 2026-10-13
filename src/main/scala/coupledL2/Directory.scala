@@ -322,7 +322,15 @@ class Directory(implicit p: Parameters) extends L2Module {
   // SRAM read raced the victim selection is still caught.
   val victimPendingWayMask_s3 = VecInit(io.refillInfo.map(s =>
     Mux(
-      s.valid && (s.bits.set === req_s3.set) && !s.bits.dirHit &&
+      // Only a context that will actually overwrite its way may suppress hits
+      // on it.  A CMO is allocated with w_replResp set and dirHit clear on a
+      // miss too, but it never installs: its dirResult.way is just the
+      // lookup's invalid-way guess.  Counting it reserved that way, so a line
+      // installed there afterwards had its hits suppressed and the follow-up
+      // was allocated as a miss that installed a second copy (tl-test: "Set
+      // should not have more than one hit"). Use the stable request type:
+      // s_cmoresp becomes true before a CMO context actually retires.
+      s.valid && !s.bits.isCmo && (s.bits.set === req_s3.set) && !s.bits.dirHit &&
         s.bits.w_replResp && !s.bits.refillCommitLanded,
       UIntToOH(s.bits.way, ways),
       0.U(ways.W)

@@ -300,6 +300,7 @@ class MSHRRequest(implicit p: Parameters) extends L2Bundle {
 
 // MSHR info to ReqBuf and SinkB
 class MSHRInfo(implicit p: Parameters) extends L2Bundle with HasTLChannelBits {
+  val isCmo = Bool()
   val set = UInt(setBits.W)
   val way = UInt(wayBits.W)
   val reqTag = UInt(tagBits.W)
