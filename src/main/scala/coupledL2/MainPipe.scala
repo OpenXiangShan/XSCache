@@ -467,9 +467,13 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     req_s3.chiOpcode.get === SnpOnce
   // For forwarding snoops, if the RetToSrc value is 1, must return a copy is the cache line is Dirty or Clean.
   val shouldRespData_retToSrc_fwd = nestable_dirResult_s3.hit && retToSrc && isSnpXFwd(req_s3.chiOpcode.get)
-  // For non-forwarding snoops, ig the RetToSrc value is 1, must return a copy if the cache line is Shared Clean and
-  // snoopee retains a copy of the cache line.
-  val shouldRespData_retToSrc_nonFwd = nestable_dirResult_s3.hit && retToSrc && nestable_meta_s3.state === BRANCH && (
+  // For non-forwarding snoops, if RetToSrc is 1 the snoopee must return a copy
+  // of any cache line it holds, not only a Shared one.  A clean exclusive
+  // copy (TIP, dirty=0) used to fall through all four terms above and answer
+  // SnpResp with no data; the line was then invalidated, so the only copy was
+  // destroyed and the requester read stale data from downstream (tl-test:
+  // uncached Get "Data mismatch" on an address never written by any agent).
+  val shouldRespData_retToSrc_nonFwd = nestable_dirResult_s3.hit && retToSrc && nestable_meta_s3.state =/= INVALID && (
     req_s3.chiOpcode.get === SnpOnce ||
     req_s3.chiOpcode.get === SnpUnique ||
     req_s3.chiOpcode.get === SnpPreferUnique ||
