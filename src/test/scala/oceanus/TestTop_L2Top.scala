@@ -14,6 +14,7 @@ import scala.collection.mutable.ArrayBuffer
 class TestTop_L2Top(val l2cfg: L2Configuration)(implicit val p: Parameters) extends Module with HasL2Params {
 
   val module = Module(new L2Top(l2cfg))
+  val observation = L2TopObservation.attach(module, nMSHR)
 
   val io = IO(module.io.cloneType)
 
@@ -44,6 +45,8 @@ class TestTop_L2Top(val l2cfg: L2Configuration)(implicit val p: Parameters) exte
 }
 
 object TestTop_L2Top extends App {
+  L2TopCases.registerResponseModel(L2TopBuiltInResponseModel)
+  L2TopCases.dispatch(args)
 
   val usage = """
 Usage: TestTop_L2Top [<--option> <values>]
@@ -78,7 +81,9 @@ Usage: TestTop_L2Top [<--option> <values>]
   val l2cfg = new L2Configuration(
     nodeId = 0,
     eSAM = true,
-    slices = 0 until numSlices
+    slices = 0 until numSlices,
+    // This BOP observation harness preserves its enabled elaboration configuration.
+    bopEnable = true
   )
 
   val config = new Config((_, _, _) => {

@@ -1,0 +1,247 @@
+package oceanus
+
+import chisel3._
+import chisel3.simulator.{ChiselSim, HasSimulator}
+import oceanus.compactchi.CCHIOpcode
+import oceanus.chi._
+import oceanus.chi.field.CHIFieldResp
+import oceanus.l2._
+import org.chipsalliance.cde.config._
+import utility._
+import xscache.oceanus.compactchi.{CCHIParameters, CCHIParametersKey}
+import scala.collection.mutable
+
+/** Directed production-path checks. No forced metadata or synthetic prefetch bit. */
+object TestTop_L2Prefetched extends App with ChiselSim {
+  val selectedName = args.collectFirst { case s if s.startsWith("--case=") => s.stripPrefix("--case=") }.get
+  require(args.sliding(2).exists(a => a.sameElements(Array("--slices", "1"))), "2c directed cases use one slice")
+  val caseNames = if (selectedName == "bop-2c-all") {
+    for (fill <- Seq("sc", "uc"); variant <- Seq("readshared", "readunique", "makeunique", "makeunique-miss", "external-stash", "replacement"))
+      yield s"bop-2c-$variant-$fill"
+  } else Seq(selectedName)
+  // These directed cases require internal fills; opt in despite base's off default.
+  val l2cfg = new L2Configuration(8, true, Seq(0), bopEnable = true, pfSrcID = 3, bopParams = OceanusBOPParameters(badScore = 0))
+  val config = new Config((_, _, _) => {
+    case L2ParamsKey => L2Params(mshrSize = 8)
+    case CHIParametersKey => CHIParameters(issue = EnumCHIIssue.E, nodeIdWidth = 11, reqAddrWidth = 48, dataWidth = 256)
+    case CCHIParametersKey => CCHIParameters()
+    case LogUtilsOptionsKey => LogUtilsOptions(enableDebug = false, enablePerf = true, fpgaPlatform = false)
+    case PerfCounterOptionsKey => PerfCounterOptions(enablePerfPrint = true, enablePerfDB = false,
+      perfLevel = XSPerfLevel.VERBOSE, 0)
+  })
+  implicit val simulator: HasSimulator = HasSimulator.default
+  simulate(new TestTop_L2Top(l2cfg)(config)) { dut =>
+    // One hardware configuration; each variant gets a complete reset, SRAM/BOP
+    // initialization, and fresh host queues/counters before independent checks.
+    caseNames.foreach { name =>
+      println(s"BOP_2C_RESET case=$name")
+      val fillUC = name.endsWith("-uc")
+      val variant = name.stripPrefix("bop-2c-").stripSuffix(if (fillUC) "-uc" else "-sc")
+      require(Set("readshared", "readunique", "makeunique", "makeunique-miss", "external-stash", "replacement").contains(variant))
+      val demand = BigInt("10000", 16)
+      val target = demand + 0x80
+      val replacement = BigInt("18080", 16)
+      val hitOpcode = variant match {
+        case "readunique" => CCHIOpcode.ReadUnique.opcode
+        case "makeunique" | "makeunique-miss" => CCHIOpcode.MakeUnique.opcode
+        case _ => CCHIOpcode.ReadShared.opcode
+      }
+      def req(addr: BigInt, opcode: BigInt) = UpRequestSpec(MasterId.t1p0, 0, 0, 0, opcode, addr)
+      val rawRequests = variant match {
+        // Cold MU trains once, produces P via +2, then an ordinary second
+        // MU hit does not train. Readback Stash verifies the demand bit=0.
+        // Downstream MU is dataless Comp; SC/UC affects the internal P fill
+        // only. Expected total train=1, internal fills={P}, no upstream data.
+        case "makeunique-miss" => Seq(req(demand, hitOpcode), req(demand, hitOpcode),
+          req(demand, CCHIOpcode.StashShared.opcode))
+        case "external-stash" => Seq.fill(2)(req(target, CCHIOpcode.StashShared.opcode))
+        case "replacement" => Seq(req(demand, CCHIOpcode.ReadShared.opcode)) ++
+          Seq("12080", "14080", "16080").map(a => req(BigInt(a, 16), CCHIOpcode.StashShared.opcode)) ++
+          Seq(req(replacement, CCHIOpcode.ReadShared.opcode), req(replacement, CCHIOpcode.StashShared.opcode))
+        case _ => Seq(req(demand, CCHIOpcode.ReadShared.opcode), req(target, hitOpcode),
+          req(target, hitOpcode), req(target, CCHIOpcode.StashShared.opcode))
+      }
+      val requests = rawRequests.zipWithIndex.map { case (r, i) =>
+        r.copy(txnId = i, expCompData = r.opcode != CCHIOpcode.StashShared.opcode)
+      }
+      val fillResp = BigInt(if (fillUC) CHIFieldResp.CompData_UC else CHIFieldResp.CompData_SC)
+      val spec = CaseSpec(name, UpConfig(Seq(MasterId.t1p0), ExplicitRequestStream(requests,
+        Seq.fill(requests.size)(BigInt(CHIFieldResp.CompData_UC))), SnoopPolicy.SnpRespI),
+        DnConfig(FixedLatency(12), FixedOutstanding(64), ImmediateCreditPolicy(), readNotSharedDirtyResp = fillResp),
+        2500, (0, 2500), Seq.empty)
+
+      // Expectations established before simulation:
+      // D=0x10000 miss trains once and production BOP(badScore=0, offset=2)
+      // fills P=D+2*64=0x10080 with prefetched=1, state SC->S / UC->UU, clean.
+      // RS/RU/MU first P hit reads SRAM bit=1, trains once using OLD meta, clears
+      // bit, and creates one additional prefetch P+0x80 in set 4. Second P hit
+      // reads SRAM bit=0 and never trains. Final external StashShared hit reads
+      // bit=0 and neither trains nor clears/sets. Total training=2 (D + first P),
+      // internal prefetch fills=2; RS/RU return 2 beats per hit, MU one Comp.
+      // AcquirePerm is included in coupledL2 MainPipe:173,759-766 -> MU trains.
+      // Use nondefault pfSrcID=3 to verify the entire consts path (smoke uses 1).
+      // External StashShared: SrcID=0 != pfSrcID=3; first fills P with bit=0,
+      // second SRAM hit reads 0; train=0, internal fills=0, no upstream response.
+      // Replacement: P(set 2) is inserted in way 0. External stash 0x12080,
+      // 0x14080,0x16080 fill ways 1,2,3 without training or client presence.
+      // PLRU touches 0,1,2,3 leave victim way 0. Demand 0x18080(set 2) must pick
+      // P with SRAM victim bit=1 and install a NEW tag with bit=0 AND mask=1.
+      // Final external StashShared hit on 0x18080 must read bit=0 from SRAM.
+      // Total train=2 (D + replacement miss); two BOP prefetch fills use sets 2,4.
+      val up = new L2TopUpstreamModel(dut, spec)
+      val dn = new L2TopDownstreamModel(dut, spec)
+      val dataQ = mutable.Queue.empty[PendingDnComp]
+      val rspQ = mutable.Queue.empty[PendingDnRsp]
+      val ackQ = mutable.Queue.empty[PendingUpAck]
+      val snpQ = mutable.Queue.empty[PendingSnpRsp]
+      val landed = mutable.Map.empty[BigInt, (BigInt, Boolean)]
+      val installed = mutable.ArrayBuffer.empty[(BigInt, Boolean, Boolean)]
+      val internalFills = mutable.Set.empty[BigInt]
+      var cycle = 0
+      var current = -1
+      var accepted = false
+      var trainCount = 0
+      var dataCount = 0
+      var compCount = 0
+      val reads = mutable.ArrayBuffer.empty[(Boolean, Boolean)]
+      val victims = mutable.ArrayBuffer.empty[(BigInt, Boolean)]
+      def flag(b: Bool): Boolean = b.peek().litToBoolean
+      def value(u: UInt): BigInt = u.peek().litValue
+      def quiet: Boolean = dataQ.isEmpty && rspQ.isEmpty && ackQ.isEmpty && snpQ.isEmpty &&
+        !flag(dut.observation.bopReqValid) &&
+        dut.observation.dirProbeBySlice(0).forall(d => !flag(d.valid) && !flag(d.reqActive))
+      def tick(): Unit = {
+        up.clearResponses()
+        dn.clearResponses()
+        var upRspDriven = false
+        ackQ.headOption.filter(_.due <= cycle).foreach { a =>
+          up.driveUpCompAck(a.upDBID, 0); ackQ.dequeue(); upRspDriven = true
+        }
+        if (!upRspDriven) snpQ.headOption.filter(_.due <= cycle).foreach { s =>
+          up.driveUpSnpResp(s.snpTxnID, s.tgtId); snpQ.dequeue()
+        }
+        dataQ.headOption.filter(p => p.due <= cycle && dn.canDriveRxDat).foreach { p =>
+          dn.driveDnData(p); dataQ.dequeue(); dn.noteResponse(p.dnTxnID, p.beat == 1, cycle)
+        }
+        rspQ.headOption.filter(p => p.due <= cycle && dn.canDriveRxRsp).foreach { p =>
+          dn.driveDnRsp(p)
+          if (p.opcode == L2TopDownstreamOpcodes.Comp) dut.io.chi.rxrsp.flit.Resp.get.poke(CHIFieldResp.Comp_UC.U)
+          rspQ.dequeue(); dn.noteResponse(p.dnTxnID, finalBeat = true, cycle)
+        }
+        if (current >= 0 && flag(dut.io.t1p(0).UpREQ.valid) && flag(dut.io.t1p(0).UpREQ.ready)) accepted = true
+        if (flag(dut.observation.bopTrainFire)) {
+          assert(current >= 0 && value(dut.observation.bopTrainAddr) == requests(current).addr,
+            "training must identify the current demand, never its Stash prefetch")
+          trainCount += 1
+          println(s"BOP_2C_TRAIN cycle=$cycle addr=0x${value(dut.observation.bopTrainAddr).toString(16)}")
+        }
+        dut.observation.dirProbeBySlice(0).foreach { d =>
+          val addr = value(d.tshrPaddr)
+          if (flag(d.dirWbLand)) landed(addr) = (value(d.dirResultState), flag(d.dirResultPrefetched))
+          if (flag(d.tagWrite)) {
+            installed += ((addr, flag(d.metaWrReqPrefetched), flag(d.metaWrReqMetaPrefetched)))
+            assert(flag(d.metaWrReqPrefetched), "every new tag must overwrite prefetched, even for data=0")
+            if (flag(d.pRxReqIsPrefetch)) internalFills += addr
+          }
+          if (current >= 0 && addr == requests(current).addr) {
+            if (flag(d.dirRdResp)) {
+              reads += ((flag(d.fromDirMetaHit), flag(d.fromDirMetaPrefetched)))
+              println(s"BOP_2C_SRAM index=$current hit=${flag(d.fromDirMetaHit)} prefetched=${flag(d.fromDirMetaPrefetched)}")
+            }
+            if (flag(d.replRdResp)) victims += ((value(d.fromDirReplPaddr), flag(d.fromDirMetaPrefetched)))
+          }
+        }
+        if (flag(dut.io.chi.txreq.flitv)) {
+          val txn = DnTxnID(value(dut.io.chi.txreq.flit.TxnID.get))
+          val src = value(dut.io.chi.txreq.flit.SrcID.get)
+          val op = value(dut.io.chi.txreq.flit.Opcode.get)
+          dn.noteRequest(txn)
+          if (dn.isEvictReq(op) || op == 0x0c) {
+            val response = if (op == 0x0c) BigInt(L2TopDownstreamOpcodes.Comp) else dn.downstreamEvictRspOpcode(op)
+            rspQ.enqueue(PendingDnRsp(txn, src, cycle + 12, response))
+          } else {
+            val resp = if (op == L2TopDownstreamOpcodes.ReadNotSharedDirty) fillResp else BigInt(CHIFieldResp.CompData_UC)
+            dataQ.enqueue(PendingDnComp(txn, src, cycle + 12, 0, resp), PendingDnComp(txn, src, cycle + 13, 1, resp))
+          }
+        }
+        if (flag(dut.io.t1p(0).DnDAT.valid) && flag(dut.io.t1p(0).DnDAT.ready)) {
+          assert(current >= 0 && value(dut.io.t1p(0).DnDAT.bits.TxnID) == requests(current).txnId)
+          dataCount += 1
+          if (value(dut.io.t1p(0).DnDAT.bits.DataID) == 1) ackQ.enqueue(PendingUpAck(0,
+            UpDBID(value(dut.io.t1p(0).DnDAT.bits.DBID)), UpTxnID(requests(current).txnId), cycle + 1, 0))
+        }
+        if (flag(dut.io.t1p(0).DnRSP.valid) && flag(dut.io.t1p(0).DnRSP.ready)) {
+          assert(current >= 0 && requests(current).opcode == CCHIOpcode.MakeUnique.opcode)
+          assert(value(dut.io.t1p(0).DnRSP.bits.Opcode) == CCHIOpcode.Comp.opcode)
+          compCount += 1
+          ackQ.enqueue(PendingUpAck(0, UpDBID(value(dut.io.t1p(0).DnRSP.bits.DBID)),
+            UpTxnID(requests(current).txnId), cycle + 1, 0))
+        }
+        if (flag(dut.io.t1p(0).DnSNP.valid) && flag(dut.io.t1p(0).DnSNP.ready))
+          snpQ.enqueue(PendingSnpRsp(SnpTxnID(value(dut.io.t1p(0).DnSNP.bits.TxnID)),
+            value(dut.io.t1p(0).DnSNP.bits.SrcID), cycle + 1))
+        dn.stepWithCredits(cycle)
+        cycle += 1
+        assert(cycle < 2500, s"2c watchdog index=$current pending=${dataQ.size}/${rspQ.size}/${ackQ.size}/${snpQ.size}")
+      }
+      up.initInputs(); dn.initInputs()
+      dut.log.dump.poke(false.B); dut.log.clean.poke(false.B)
+      dut.reset.poke(true.B)
+      // Reset hardware before starting fresh host credit trackers for each case.
+      dut.clock.step(8)
+      dut.reset.poke(false.B); dn.activateRxLink()
+      for (i <- 0 until 300) dn.stepWithCredits(i - 300)
+      requests.indices.foreach { index =>
+        current = index; accepted = false; reads.clear(); victims.clear()
+        val beforeTrain = trainCount
+        val beforeData = dataCount
+        val beforeComp = compCount
+        up.driveRead(index)
+        while (!accepted) tick()
+        up.clearUpReq()
+        var drained = 0
+        while (drained < 16) { tick(); drained = if (quiet) drained + 1 else 0 }
+        val r = requests(index)
+        val stash = r.opcode == CCHIOpcode.StashShared.opcode
+        assert(dataCount - beforeData == (if (stash || r.opcode == CCHIOpcode.MakeUnique.opcode) 0 else 2))
+        assert(compCount - beforeComp == (if (r.opcode == CCHIOpcode.MakeUnique.opcode) 1 else 0))
+        if (variant == "external-stash") {
+          assert(trainCount == 0 && landed(target)._2 == false)
+          assert(reads.toSeq == Seq((index != 0, false)), s"external Stash SRAM reads=$reads")
+        } else if (variant == "makeunique-miss") {
+          assert(reads.toSeq == Seq((index != 0, false)))
+          assert(trainCount - beforeTrain == (if (index == 0) 1 else 0))
+          assert(landed(demand)._2 == false)
+          assert(landed(target) == ((if (fillUC) BigInt(3) else BigInt(1)), true))
+          assert(internalFills.toSet == Set(target))
+        } else if (index == 0) {
+          assert(trainCount - beforeTrain == 1 && landed(target) == ((if (fillUC) BigInt(3) else BigInt(1)), true))
+          assert(internalFills.toSet == Set(target))
+        } else if (variant == "replacement") {
+          if (index == 4) {
+            assert(reads.toSeq == Seq((false, false)))
+            assert(victims.toSeq == Seq((target, true)), s"replacement must evict prefetched P: $victims")
+            assert(installed.exists(e => e == ((replacement, true, false))))
+            assert(landed(replacement)._2 == false && trainCount - beforeTrain == 1)
+          } else {
+            assert(trainCount == beforeTrain)
+            assert(reads.toSeq == Seq((index == 5, false)))
+            assert(landed(r.addr)._2 == false)
+          }
+        } else {
+          assert(reads.toSeq == Seq((true, index == 1)), s"first/second hit SRAM reads=$reads")
+          assert(trainCount - beforeTrain == (if (index == 1) 1 else 0))
+          assert(landed(target)._2 == false)
+        }
+        println(s"BOP_2C_PHASE pass=true case=$name index=$index trainDelta=${trainCount - beforeTrain} dataDelta=${dataCount - beforeData} compDelta=${compCount - beforeComp}")
+      }
+      assert(quiet)
+      val expectedTrains = if (variant == "external-stash") 0 else if (variant == "makeunique-miss") 1 else 2
+      assert(trainCount == expectedTrains)
+      assert(internalFills.size == expectedTrains)
+      if (variant != "external-stash" && variant != "makeunique-miss") assert(internalFills.toSet == Set(target,
+        (if (variant == "replacement") replacement else target) + 0x80))
+      println(s"BOP_2C_RESULT pass=true case=$name train=$trainCount internalFills=${internalFills.size} pending=0 active=0 SRAM_READBACK=true")
+    }
+  }
+}
