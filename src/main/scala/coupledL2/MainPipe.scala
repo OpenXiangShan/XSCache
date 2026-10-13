@@ -729,14 +729,25 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   //  1. SnpOnce nesting WriteCleanFull under UD (SnpOnceFwd always needs MSHR) for UD -> SC
   // no-client fwd snoops (direct path): toN-fwd -> INVALID, toB-fwd -> BRANCH,
   // SnpOnceFwd preserves state -- mirror SnoopMSHR probeack meta with probeDirty=0
-  val metaW_valid_s3_b = sinkB_req_s3 && !need_mshr_s3_b && dirResult_s3.hit &&
+  // A snoop can consume a CMO sidecar before its release task has
+  // invalidated the Directory. The nested response suppresses metaWen since
+  // an ordinary replacement victim may already have lost its way. Invalidate
+  // here when the lookup still hits the old address, using the actual hit way.
+  // snpHitReleaseToInval describes the RN giving up the line, even for a
+  // shared snoop: its response reports I and the sidecar is consumed.
+  val invalidateNestedReleaseHit = req_s3.snpHitReleaseToInval
+  val metaW_valid_s3_b = sinkB_req_s3 && dirResult_s3.hit &&
+    (invalidateNestedReleaseHit || (!need_mshr_s3_b &&
     (!isSnpOnce(req_s3.chiOpcode.get) || (req_s3.snpHitReleaseToClean && req_s3.snpHitReleaseMeta.dirty)) &&
     !isSnpStashX(req_s3.chiOpcode.get) && !isSnpQuery(req_s3.chiOpcode.get) &&
     (!doFwd || !isSnpOnceFwd(req_s3.chiOpcode.get)) && (
       metaOnHit_s3.state === TIP || metaOnHit_s3.state === BRANCH && isSnpToN(req_s3.chiOpcode.get) ||
       doFwd && metaOnHit_s3.state === TRUNK
-    )
+    )))
   val metaW_valid_s3_c = sinkC_req_s3 && dirResult_s3.hit
+  // MSHR writes use their reserved way; dirResult_s3 is not a lookup for
+  // these tasks. Sidecar ordering cancels a consumed CMO before release,
+  // and CopyBack tasks carry no Directory/DS write enables.
   val metaW_valid_s3_mshr = mshr_req_s3 && !normalRefillLateSnoopToN_s3 && (
     req_s3.metaWen && !(mshr_refill_s3 && (retry || mshr_defer_refill_write_s3)) ||
       grantMergeInstall_s3
@@ -761,7 +772,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     dataErr = metaOnHit_s3.dataErr,
     cdpPfDepth = 0.U,
   )
-  val metaW_s3_b = Mux(isSnpToN(req_s3.chiOpcode.get), MetaEntry(),
+  val metaW_s3_b = Mux(isSnpToN(req_s3.chiOpcode.get) || invalidateNestedReleaseHit, MetaEntry(),
     MetaEntry(
       dirty = false.B,
       state = Mux(req_s3.chiOpcode.get === SnpCleanShared, metaOnHit_s3.state, BRANCH),

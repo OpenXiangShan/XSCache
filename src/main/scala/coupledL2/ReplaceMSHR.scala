@@ -78,7 +78,22 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   val copyBackSent = RegInit(false.B)
   val releaseNeedsData = RegInit(false.B)
   val postSnoopToInval = RegInit(false.B)
-  val snoopInFlight = RegInit(false.B)
+  // Several same-line snoops can be reserved simultaneously: openLLC may have
+  // two snoops to one line outstanding at once, RXSNP buffers both, and it
+  // keeps admitting more while the earlier responses drain through MainPipe
+  // and the TXRSP/TXDAT queues.  The reservation is therefore a tally -- every
+  // snoopStarted is matched by exactly one snoopDone, and the sidecar stays
+  // reserved until the last one leaves.  Width covers every response that can
+  // be in flight at once: TXDAT caps sinkB at 2*mshrsAll (its inflightCnt) and
+  // RequestArb/MainPipe add a few in-flight stages.
+  val snoopInFlightWidth = log2Up(2 * mshrsAll + 8)
+  val snoopInFlightMax = ((BigInt(1) << snoopInFlightWidth) - 1).U
+  // start and done may coincide (one snoop starts while another completes) and
+  // then cancel exactly.
+  val snoopStart = io.snoopStarted && !io.snoopDone
+  val snoopFinish = io.snoopDone && !io.snoopStarted
+  val snoopInFlightCnt = RegInit(0.U(snoopInFlightWidth.W))
+  val snoopInFlight = snoopInFlightCnt =/= 0.U
   val snoopConsumed = RegInit(false.B)
   val captureIssued = RegInit(false.B)
   val releaseBufCaptured = RegInit(false.B)
@@ -143,7 +158,6 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     copyBackSent := false.B
     releaseNeedsData := false.B
     postSnoopToInval := false.B
-    snoopInFlight := false.B
     snoopConsumed := false.B
     captureIssued := false.B
     releaseBufCaptured := false.B
@@ -384,13 +398,20 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   when (io.snoopStarted) {
     assert(valid && !copyBackSent,
       "a nested snoop must reserve ReplaceMSHR before CopyBackWrData is issued")
-    snoopInFlight := true.B
+  }
+  when (snoopStart) {
+    assert(snoopInFlightCnt =/= snoopInFlightMax, "nested snoop reservation tally overflow")
   }
   when (io.snoopDone) {
     assert(valid && snoopInFlight,
       "nested snoop completion arrived without a reserved ReplaceMSHR")
-    snoopInFlight := false.B
   }
+  // Tally as it stands after this cycle's events. Allocation can only happen on
+  // a free context, hence with no reservation outstanding, so it wins outright.
+  val snoopInFlightNext = Mux(io.alloc.valid, 0.U,
+    Mux(snoopStart, snoopInFlightCnt + 1.U,
+      Mux(snoopFinish, Mux(snoopInFlight, snoopInFlightCnt - 1.U, 0.U), snoopInFlightCnt)))
+  snoopInFlightCnt := snoopInFlightNext
   when (io.snoopToInvalDone) {
     when (!releaseSent) {
       assert(valid, "an invalidating nested snoop arrived without ReplaceMSHR")
@@ -426,11 +447,17 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
       releaseDbId := io.rxrsp.bits.dbID.getOrElse(0.U)
     }
   }
-  when (valid && io.snoopToInvalDone && !releaseSent) {
+  // An invalidating snoop that found no release in flight consumes the sidecar.
+  // Retire in the same cycle, as before, unless another reserved response is
+  // still travelling -- retiring then would make that response's completion
+  // arrive at an invalid sidecar. snoopInFlightNext subtracts this snoop's own
+  // reservation, so the single-snoop case is unchanged.
+  when (valid && (snoopConsumed || io.snoopToInvalDone) && !releaseSent && snoopInFlightNext === 0.U) {
     valid := false.B
     victim.valid := false.B
     donePulse := true.B
-  }.elsewhen (valid && releaseAck && (!needsCopyBack || io.copyBackDone)) {
+  }.elsewhen (valid && releaseAck && (!needsCopyBack || io.copyBackDone) &&
+    !snoopInFlight && !io.snoopStarted) {
     when (needsCopyBack) {
       assert(copyBackSent, "CopyBackWrData completed without being issued by ReplaceMSHR")
     }
