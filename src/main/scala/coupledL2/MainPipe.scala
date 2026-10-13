@@ -358,7 +358,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     req_cbo_inval_s3
   )
   val need_release_s3_a = dirResult_s3.hit && (
-    req_cbo_clean_s3 && (!need_probe_s3_a && metaOnHit_s3.dirty) ||
+    // Delegate the first probe as well: if the parent probes first, its dirty
+    // data lands in RefillBuf and a later sidecar would capture stale DS data
+    // after a second, data-less probe. A clean response may conservatively
+    // write back the unchanged line through the same sidecar path.
+    req_cbo_clean_s3 && (need_probe_s3_a || metaOnHit_s3.dirty) ||
     req_cbo_flush_s3 && (isValid(metaOnHit_s3.state)) ||
     req_cbo_inval_s3 && (isValid(metaOnHit_s3.state))
   )
@@ -1299,7 +1303,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     }
     // need Probe for alias
     // need Probe when Get hits on a TRUNK block
-    when (cache_alias || need_probe_s3_a) {
+    // A CMO that needs a lower-level writeback (need_release_s3_a) delegates
+    // probe+capture+release to a CMO-mode ReplaceMSHR, so the parent context
+    // must not probe the line itself (a double Probe would violate CHI/TL
+    // ordering: no second Probe before the first ProbeAck returns).
+    when (cache_alias || need_probe_s3_a && !(cmo_cbo_s3 && need_release_s3_a)) {
       alloc_state.s_rprobe := false.B
       alloc_state.w_rprobeackfirst := false.B
       alloc_state.w_rprobeacklast := false.B

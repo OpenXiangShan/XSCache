@@ -144,6 +144,13 @@ class MSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   // replacer read returned a no-probe victim).  The later refillOnly commit
   // degenerates to the RefillBuf->DS write alone.
   val grantInstallDone = Input(Bool())
+  // This CMO hit a line that needs a lower-level writeback (need_release_s3_a
+  // armed s_release=0 at allocation).  The split design delegates
+  // probe+capture+release to a CMO-mode ReplaceMSHR; the parent never probes
+  // nor releases by itself.  The request drops once the child is allocated
+  // (sidecarOwnsVictim) or completes (s_release via replaceDone).
+  val cmoSidecarReq = Output(Bool())
+  val cmoSidecarMode = Output(UInt(2.W))
   // A ReleaseData for the stale replacement candidate was accepted by SinkC.
   // Do not re-read the replacer until that C task reaches MainPipe and updates
   // the Directory snapshot used by the next replacement read.
@@ -2558,6 +2565,17 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   val nestedReleaseNeedsReplace = nestedwb_match && io.nestedwb.c_set_dirty &&
     !nestedReleaseTargetsRefill
   io.nestedReleaseNeedsReplace := nestedReleaseNeedsReplace
+  // A CMO whose hit line needs a lower-level writeback (s_release was armed
+  // pending at allocation) delegates probe+capture+release to a CMO-mode
+  // ReplaceMSHR.  Self-limiting: drops once the child exists (replaceActive)
+  // or after it completed (s_release set by replaceDone).
+  // Gate on the *registered* delegation latch only: a combinational peek at
+  // replaceActive would loop through MSHRCtl's same-cycle alloc decision
+  // (req -> parentOH -> replaceActive -> sidecarOwnsVictim -> req).
+  io.cmoSidecarReq := req_valid && cmo_cbo && dirResult.hit &&
+    !state.s_release && !sidecarDelegatedLatched
+  io.cmoSidecarMode := Mux(req_cboClean, ReplaceMSHRMode.cmoClean,
+    Mux(req_cboFlush, ReplaceMSHRMode.cmoFlush, ReplaceMSHRMode.cmoInval))
   io.nestedwbData := nestedwb_match && io.nestedwb.c_set_dirty &&
     (sidecarOwnsVictim || nestedReleaseNeedsReplace)
 

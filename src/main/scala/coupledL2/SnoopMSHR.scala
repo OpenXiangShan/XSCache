@@ -226,6 +226,8 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   // The snoop context never completes a demand/prefetch refill.
   io.dataRefill.valid := false.B
   io.dataRefill.bits := 0.U.asTypeOf(new DemandRefillBundle)
+  io.cmoSidecarReq := false.B
+  io.cmoSidecarMode := 0.U
 
   // A post-Grant ReleaseData proves the client no longer owns this block.
   // Waiting for a new ProbeAck would deadlock against the C release path.
