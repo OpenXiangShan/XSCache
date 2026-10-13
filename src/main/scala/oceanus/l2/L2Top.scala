@@ -59,9 +59,33 @@ class L2Configuration(
   val nodeId: Int,
   val eSAM: Boolean,
   val slices: Seq[Int],
-  val upstream: L2UpstreamTable = L2UpstreamTable.defaults
+  val upstream: L2UpstreamTable = L2UpstreamTable.defaults,
+  // Whole-BOP switch. Off drains bop.io.req and builds no prefetch queues, so
+  // the REQ arbiter stays single-input. On is the branch default.
+  val bopEnable: Boolean = false,
+  // Issue switch, independent of bopEnable. Off keeps training and the queues
+  // but forces every queue output invalid, so nothing reaches a slice.
+  val prefetchIssueEnable: Boolean = true,
+  // SrcID stamped on an injected prefetch. It must sit in the upstream CCHI
+  // namespace and outside the upstream NID set: the test config uses nodeId=0,
+  // which collides with upstream NID 0, so the downstream CHI nodeId cannot be
+  // reused. 1 is the smallest value the 4-bit SrcID can hold that the default
+  // upstream table (0/4/5) leaves free.
+  val pfSrcID: Int = 1,
+  // Width of the upstream SrcID pfSrcID is stamped into. Passed explicitly
+  // because L2Configuration is not a Module and cannot see paramCCHI; the
+  // default matches CCHIParameters.UpstreamNodeID_Width.
+  srcIdWidth: Int = 4,
+  // Defaults are the production OceanusBOPParameters; tests opt in and may
+  // lower roundMax or delayQueueLatency without changing production geometry.
+  val bopParams: OceanusBOPParameters = OceanusBOPParameters()
 ) {
   def sliceNum = slices.size
+
+  require(pfSrcID >= 0 && pfSrcID < (1 << srcIdWidth),
+    s"pfSrcID=$pfSrcID is outside the $srcIdWidth-bit upstream SrcID range")
+  require(!upstream.entries.map(_.nid).contains(pfSrcID),
+    s"pfSrcID=$pfSrcID collides with an upstream NID: ${upstream.entries.map(_.nid).mkString(",")}")
 }
 
 class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Module with HasL2Params {
@@ -129,14 +153,64 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   //
   val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId)))
 
-  val bop = Module(new OceanusBOP())
+  val bop = Module(new OceanusBOP(config.bopParams))
   val bopTrainArb = Module(new FastArbiter(UInt(paramL2.physicalAddrWidth.W), config.sliceNum))
   bopTrainArb.io.in.zip(slices).foreach { case (sink, source) =>
     sink.valid := source.io.bopTrain.valid
     sink.bits := source.io.bopTrain.bits
   }
   bop.io.train <> bopTrainArb.io.out
-  bop.io.req.ready := true.B
+
+  // bopEnable off: drain the request and build nothing. The REQ arbiter below
+  // then has only the external input, exactly as before prefetch injection.
+  val pfQueues: Seq[DecoupledIO[FlitREQ]] = if (!config.bopEnable) {
+    bop.io.req.ready := true.B
+    Nil
+  } else {
+    val prefetchTarget = config.sliceNum match {
+      case 1 => map1(bop.io.req.bits)
+      case 2 => map2(bop.io.req.bits)
+      case 3 => map3(bop.io.req.bits)
+      case _ => map4(bop.io.req.bits)
+    }
+    val pfQueueEnqReady = Wire(Vec(config.sliceNum, Bool()))
+    val queues = Seq.tabulate(config.sliceNum) { i =>
+      // Overwrite the oldest rather than stall: enq.ready stays high, so a full
+      // queue never backpressures BOP training. Depth two matches the freeze tag.
+      val queue = Module(new OverwriteQueue(new FlitREQ, entries = 2))
+      queue.suggestName(s"pfQueue_$i")
+      queue.io.enq.valid := bop.io.req.valid && prefetchTarget === config.slices(i).U
+      queue.io.enq.bits := 0.U.asTypeOf(new FlitREQ)
+      queue.io.enq.bits.Opcode := CCHIOpcode.StashShared.U
+      queue.io.enq.bits.Addr := bop.io.req.bits
+      queue.io.enq.bits.TgtID := config.slices(i).U
+      queue.io.enq.bits.SrcID := config.pfSrcID.U
+      // StashShared with ExpCompStash set would demand completion data, which
+      // base aliases onto ExpCompData (L2VPipeREQ.scala:204-207). Keep it clear.
+      queue.io.enq.bits.ExpCompData := false.B
+      queue.io.enq.bits.Size := CCHISize.B64.U
+      queue.io.enq.bits.TagAlias := 0.U
+      pfQueueEnqReady(i) := queue.io.enq.ready
+      // prefetchIssueEnable off: the queue still drains, but its output is held
+      // invalid so the slice arbiter grants nothing to it.
+      val issued = Wire(Decoupled(new FlitREQ))
+      issued.valid := queue.io.deq.valid && config.prefetchIssueEnable.B
+      issued.bits := queue.io.deq.bits
+      queue.io.deq.ready := issued.ready || !config.prefetchIssueEnable.B
+      issued
+    }
+    when(bop.io.req.valid) {
+      assert(PopCount(VecInit(config.slices.map(nid => prefetchTarget === nid.U))) === 1.U,
+        "BOP request must demux to exactly one prefetch queue")
+    }
+    // Ready is the selected queue's enqueue ready, not its dequeue ready:
+    // dequeue backpressure must not reject training.
+    bop.io.req.ready := Mux1H(config.slices.zip(pfQueueEnqReady).map {
+      case (sliceNID, ready) => (prefetchTarget === sliceNID.U) -> ready
+    })
+    queues
+  }
+
   XSPerfAccumulate("oceanus_bop_cross_page_drop", bop.io.crossPageDrop)
   XSPerfAccumulate("oceanus_bop_disabled_drop", bop.io.disabledDrop)
   XSPerfAccumulate("oceanus_bop_delay_queue_full_drop", bop.io.delayQueueFullDrop)
@@ -166,7 +240,8 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     fastArb(preArb_UpEVTs(i), slice.io.UpRXEVT, Some(s"UpRXEVT_$i"))
   }}
 
-  // - Upstream RXREQ routing (Including local loop-back)
+  // - Upstream RXREQ routing. Local loop-back goes through the EVB channel,
+  // not this arbiter; the second input, when bopEnable, is the injected prefetch.
   val postSAM_UpREQs = postSAM_t1p.map(_.UpREQ).toSeq ++ postSAM_t4p.map(_.UpREQ).toSeq
   val preArb_UpREQs = Wire(Vec(config.sliceNum, Vec(postSAM_UpREQs.size, Decoupled(new FlitREQ))))
 
@@ -181,7 +256,10 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     }}
     val slice_io_UpRXREQ_remote = Wire(Decoupled(new FlitREQ))
     fastArb(preArb_UpREQs(i), slice_io_UpRXREQ_remote, Some(s"UpRXREQ_remote_$i"))
-    arb(Seq(slice_io_UpRXREQ_remote), slice.io.UpRXREQ, Some(s"UpRXREQ_$i"))
+    // External traffic takes the first, higher-priority input; the prefetch is
+    // second and only present when bopEnable built the queues.
+    val reqInputs = slice_io_UpRXREQ_remote +: pfQueues.lift(i).toSeq
+    arb(reqInputs, slice.io.UpRXREQ, Some(s"UpRXREQ_$i"))
   }}
 
   // - Upstream RXRSP routing
@@ -255,6 +333,10 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     postSAM_DnSNPs.zipWithIndex.foreach { case (postSAM_DnSNP, j) => {
       preArb_DnSNPs(i)(j).bits := postSAM_DnSNP.bits
       preArb_DnSNPs(i)(j).valid := postSAM_DnSNP.valid && postSAM_DnSNP.bits.TgtID === port._2.U
+      when(postSAM_DnSNP.valid) {
+        assert(postSAM_DnSNP.bits.TgtID =/= config.pfSrcID.U,
+          "slice snoop TgtID must not be the prefetch SrcID")
+      }
     }}
     fastArb(preArb_DnSNPs(i), port._1, Some(s"DnSNP_$i"))
   }}
@@ -273,6 +355,10 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     postSAM_DnRSPs.zipWithIndex.foreach { case (postSAM_DnRSP, j) => {
       preArb_DnRSPs(i)(j).bits := postSAM_DnRSP.bits
       preArb_DnRSPs(i)(j).valid := postSAM_DnRSP.valid && postSAM_DnRSP.bits.TgtID === port._2.U
+      when(postSAM_DnRSP.valid) {
+        assert(postSAM_DnRSP.bits.TgtID =/= config.pfSrcID.U,
+          "slice response TgtID must not be the prefetch SrcID")
+      }
     }}
     fastArb(preArb_DnRSPs(i), port._1, Some(s"DnRSP_$i"))
   }}
@@ -301,6 +387,10 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     postSAM_DnDATs.zipWithIndex.foreach { case (postSAM_DnDAT, j) => {
       preArb_DnDATs(i)(j).bits := postSAM_DnDAT.bits
       preArb_DnDATs(i)(j).valid := postSAM_DnDAT.valid && postSAM_DnDAT.bits.TgtID === port._2.U
+      when(postSAM_DnDAT.valid) {
+        assert(postSAM_DnDAT.bits.TgtID =/= config.pfSrcID.U,
+          "slice data TgtID must not be the prefetch SrcID")
+      }
     }}
     fastArb(preArb_DnDATs(i), port._1, Some(s"DnDAT_$i"))
   }}
