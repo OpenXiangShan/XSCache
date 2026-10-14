@@ -320,6 +320,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   io.status_s1.aCandidateValid := io.sinkA.valid
   io.status_s1.aCandidateSet := A_task.set
   io.status_s1.aCandidateTag := A_task.tag
+  io.status_s1.bCandidateValid := io.sinkB.valid
   io.status_s1.bValid := io.sinkB.valid && !block_B
   io.status_s1.bToN := io.sinkB.valid && isSnpToN(B_task.chiOpcode.get)
   io.status_s1.bFire := io.sinkB.fire
