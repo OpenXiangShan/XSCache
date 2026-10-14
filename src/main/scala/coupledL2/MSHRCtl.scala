@@ -288,8 +288,21 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     PopCount(replaceReservedSlotOH) === PopCount(replaceReserveValid.asUInt),
     "each pending replacer lookup must own one unique S/R reservation"
   )
+  // Keep the S/R candidate view independent from RequestArb's S1 handshake.
+  // A B request may complete directly in MainPipe, so reserving a physical
+  // slot for every (or every toN) B perturbs ReplaceMSHR selection.
+  val snoopBaseEligibleOH = VecInit(refillMshrs.zip(snoopMshrs).zipWithIndex.map {
+    case ((refill, snoop), i) =>
+      !snoop.io.status.valid && !replaceMshrs(i).io.info.valid &&
+        !replaceReservedSlotOH(i) &&
+        (!refill.io.status.valid ||
+          !refill.io.status.bits.isCmo &&
+            !refill.io.status.bits.w_c_resp &&
+            !refill.io.status.bits.releaseDataWindow)
+  }).asUInt
   val replaceSlotUnreservedOH = VecInit((0 until mshrsAll).map { i =>
-    !snoopMshrs(i).io.status.valid && !replaceMshrs(i).io.info.valid && !replaceReservedSlotOH(i)
+    !snoopMshrs(i).io.status.valid && !replaceMshrs(i).io.info.valid &&
+      !replaceReservedSlotOH(i)
   }).asUInt
   // A B request has priority over a new replacement reservation.  The
   // reservation is registered only at the next edge, so granting it in the
@@ -297,12 +310,23 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // same ReleaseBuf slot.
   val snoopAllocRequest = io.fromMainPipe.mshr_alloc_s3.valid &&
     io.fromMainPipe.mshr_alloc_s3.bits.task.fromB
+  // A B admitted at S1 does not reveal whether it needs a SnoopMSHR until
+  // S3. Keep its capacity available across those two stages: a new Replace
+  // reservation must not consume the last slot after the S1 admission
+  // check. RXSNP's candidate can depend on same-cycle replacement ownership,
+  // so let it settle for one cycle before admitting it or fencing reserves.
+  val snoopCandidateSeen = RegNext(io.fromReqArb.status_s1.bCandidateValid, false.B)
+  val snoopEntering_s2 = RegNext(io.fromReqArb.status_s1.bFire, false.B)
+  val snoopEntering_s3 = RegNext(snoopEntering_s2, false.B)
+  val snoopEnteringCount = PopCount(Seq(snoopEntering_s2, snoopEntering_s3))
+  val snoopReservationFence = snoopCandidateSeen ||
+    snoopEntering_s2 || snoopEntering_s3
   val replaceReserveNeedParentOH = VecInit(refillMshrs.zipWithIndex.map {
     case (refill, i) => refill.io.replReadWanted && !replaceReserveValid(i)
   }).asUInt
   val replaceReserveGrantParentOH = PriorityEncoderOH(replaceReserveNeedParentOH)
   val replaceReserveGrantSlotOH = PriorityEncoderOH(replaceSlotUnreservedOH)
-  val replaceReserveGrant = !snoopAllocRequest &&
+  val replaceReserveGrant = !snoopAllocRequest && !snoopReservationFence &&
     replaceReserveNeedParentOH.orR && replaceSlotUnreservedOH.orR
   assert(
     !(snoopAllocRequest && replaceReserveGrant),
@@ -323,7 +347,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       replaceReserveSlot(parent) := OHToUInt(replaceReserveGrantSlotOH)
     }
   }
-
   // A ReplacerResult issued before an invalidating snoop can return after the
   // parent has already delegated a victim to ReplaceMSHR.  It must be retried
   // after that child completes; allocating it now would give one parent two
@@ -648,49 +671,29 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     assert(PopCount(postGrantReleaseSnoopTargetOH) <= 1.U,
       "one B snoop must match at most one post-Grant ReleaseData holder")
   }
-  // Compute snoop candidates without treating a pending reservation as an
-  // active ReplaceMSHR.  If a B task was already in MainPipe before the
-  // reservation became visible, it may have no unreserved candidate left;
-  // snoop priority then allows it to steal a reservation, and the replacer
-  // response is retried after the reservation is cancelled below.
-  val snoopEligibleNoReserveOH = VecInit(refillMshrs.zip(snoopMshrs).zipWithIndex.map {
-    case ((refill, snoop), i) =>
-      !snoop.io.status.valid &&
-        !replaceMshrs(i).io.info.valid &&
-        !(replaceAllocValid && selectedReplaceSlotOH(i)) &&
-        (!refill.io.status.valid ||
-          !refill.io.status.bits.isCmo &&
-            !refill.io.status.bits.w_c_resp &&
-            !refill.io.status.bits.releaseDataWindow)
-  }).asUInt
+  // Exclude both registered replacement reservations and the replacement
+  // allocation in this cycle. S1 admission preserves capacity through S3
+  // without fixing the snoop onto a particular physical slot.
+  val snoopEligibleNoReserveOH = snoopBaseEligibleOH &
+    ~Mux(replaceAllocValid, selectedReplaceSlotOH, 0.U(mshrsAll.W))
   val snoopUnreservedEligibleOH = snoopEligibleNoReserveOH & ~replaceReservedSlotOH
-  val snoopStealReserveOH = Mux(
-    allocIsSnoop && !snoopUnreservedEligibleOH.orR,
-    snoopEligibleNoReserveOH & replaceReservedSlotOH,
-    0.U(mshrsAll.W)
-  )
   mshrSelector.io.idle := refillMshrs.zip(snoopMshrs).zipWithIndex.map {
     case ((refill, snoop), i) =>
       Mux(
         allocIsSnoop,
-        snoopUnreservedEligibleOH(i) || snoopStealReserveOH(i),
+        snoopUnreservedEligibleOH(i),
         !refill.io.status.valid &&
           (!allocIsCmo || !snoop.io.status.valid)
       )
   }
   io.toMainPipe.mshr_alloc_ptr := OHToUInt(selectedMSHROH)
-  val snoopStealReservation = io.fromMainPipe.mshr_alloc_s3.valid &&
-    allocIsSnoop && (selectedMSHROH & replaceReservedSlotOH).orR
-  when(snoopStealReservation) {
-    replaceReserveValid.zipWithIndex.foreach { case (valid, parent) =>
-      when((replaceReserveSlotOHByParent(parent) & selectedMSHROH).orR) {
-        valid := false.B
-      }
-    }
-  }
   when(io.fromMainPipe.mshr_alloc_s3.valid) {
     assert(mshrSelector.io.out.valid, "MainPipe requested an MSHR allocation without an eligible physical slot")
   }
+  val activeSnoopOH = VecInit(snoopMshrs.map(_.io.status.valid)).asUInt
+  val activeReplaceOH = VecInit(replaceMshrs.map(_.io.info.valid)).asUInt
+  assert(!(activeSnoopOH & activeReplaceOH).orR,
+    "SnoopMSHR and ReplaceMSHR must not own the same ReleaseBuf slot")
   // A normal allocation may legally share its local index with a newly
   // allocated ReplaceMSHR because their RefillBuf/ReleaseBuf ownership is
   // disjoint. A snoop allocation is excluded above from the selected R slot.
@@ -1259,8 +1262,13 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     io.fromReqArb.status_s1.b_set === io.fromReqArb.status_s1.aCandidateSet &&
     io.fromReqArb.status_s1.b_tag === io.fromReqArb.status_s1.aCandidateTag
   io.toReqArb.blockC_s1 := io.fromReqArb.status_s1.cReleaseData && cReleaseConflictsReplacer
+  // Account for every B still in S2/S3 before admitting another potential
+  // snoop. The first candidate waits for snoopCandidateSeen so the registered
+  // reservation fence is already active when that B enters the pipeline.
   io.toReqArb.blockB_s1 := mshrFull ||
-    (io.fromReqArb.status_s1.bToN && pendingToNFull)
+    (io.fromReqArb.status_s1.bToN && pendingToNFull) ||
+    (io.fromReqArb.status_s1.bCandidateValid &&
+      (!snoopCandidateSeen || PopCount(snoopBaseEligibleOH) <= snoopEnteringCount))
   io.toReqArb.blockA_s1 := a_mshrFull || aSidecarConflict || aSnoopConflict ||
     aPendingToNConflict || aEnteringToNConflict
   io.toReqArb.blockG_s1 := false.B

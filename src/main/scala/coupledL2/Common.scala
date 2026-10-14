@@ -226,6 +226,10 @@ class PipeEntranceStatus(implicit p: Parameters) extends L2Bundle {
   // Consumers that arbitrate normal-MSHR grants need this qualifier to close
   // the S1-to-SnoopMSHR allocation window.
   val bValid = Bool()
+  // Raw RequestArb B candidate, before MSHRCtl's blockB_s1 feedback. This is
+  // used by capacity checks that must not feed the already-gated bValid back
+  // into the same combinational path.
+  val bCandidateValid = Bool()
   // B is an invalidating snoop. This lets a matching normal MSHR preserve the
   // invalidation after the transient S1 arbitration window has passed.
   val bToN = Bool()
