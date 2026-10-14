@@ -39,14 +39,23 @@ class TXRSP(implicit p: Parameters) extends CoupledL2Module {
 
     val pipeStatusVec = Flipped(Vec(5, ValidIO(new PipeStatusWithCHI)))
     val toReqArb = Output(new TXRSPBlockBundle)
+    // Metadata is kept alongside CHIRSP so sidecar completion waits for the
+    // actual external response handshake rather than queue insertion.
+    val done = ValidIO(new TaskBundle)
   })
 
   assert(!io.pipeRsp.valid || io.pipeRsp.bits.toTXRSP, "txChannel is wrong for TXRSP")
   assert(io.pipeRsp.ready, "TXRSP should never be full")
   require(chiOpt.isDefined)
 
-  // TODO: an mshrsAll-entry queue is too much, evaluate for a proper size later
-  val queue = Module(new Queue(new CHIRSP, entries = mshrsAll, flow = false))
+  // Worst-case response pressure in the multi-context MSHR design:
+  //   normal rCompAck/wCompAck                <= mshrsAll
+  //   ReplaceMSHR wCompAck + SnoopMSHR SnpResp <= mshrsAll (S/R are mutually
+  //     exclusive per slot, so these two classes sum to at most mshrsAll)
+  // The pre-split bound of mshrsAll no longer holds: independent normal and
+  // replace/snoop contexts can each hold one outstanding response.
+  val queue = Module(new Queue(new CHIRSP, entries = 2 * mshrsAll, flow = false))
+  val taskQueue = Module(new Queue(new TaskBundle, entries = 2 * mshrsAll, flow = false))
 
   // Back pressure logic from TXRSP
   val queueCnt = queue.io.count
@@ -61,10 +70,10 @@ class TXRSP(implicit p: Parameters) extends CoupledL2Module {
     PopCount(Cat(pipeStatus_s2_s3.map(s => s.valid && Mux(s.bits.mshrTask, s.bits.toTXRSP, s.bits.fromB)))) +
     queueCnt
 
-  assert(inflightCnt <= mshrsAll.U, "in-flight overflow at TXRSP")
+  assert(inflightCnt <= (2 * mshrsAll + 4).U, "in-flight overflow at TXRSP")
 
-  val noSpaceForSinkBReq = inflightCnt >= mshrsAll.U
-  val noSpaceForMSHRReq = inflightCnt >= (mshrsAll-2).U
+  val noSpaceForSinkBReq = inflightCnt >= (2 * mshrsAll).U
+  val noSpaceForMSHRReq = inflightCnt >= (2 * mshrsAll - 2).U
 
   io.toReqArb.blockSinkBReqEntrance := noSpaceForSinkBReq
   io.toReqArb.blockMSHRReqEntrance := noSpaceForMSHRReq
@@ -72,12 +81,22 @@ class TXRSP(implicit p: Parameters) extends CoupledL2Module {
   io.out.valid := queue.io.deq.valid
   io.out.bits := queue.io.deq.bits
   queue.io.deq.ready := io.out.ready
+  taskQueue.io.deq.ready := io.out.ready
 
-  queue.io.enq.valid := io.pipeRsp.valid || io.mshrRsp.valid && !noSpaceForSinkBReq && !noSpaceForMSHRReq
+  val enqValid = io.pipeRsp.valid || io.mshrRsp.valid && !noSpaceForSinkBReq && !noSpaceForMSHRReq
+  queue.io.enq.valid := enqValid
   queue.io.enq.bits := Mux(io.pipeRsp.valid, toCHIRSPBundle(io.pipeRsp.bits), io.mshrRsp.bits)
+  taskQueue.io.enq.valid := enqValid
+  taskQueue.io.enq.bits := Mux(io.pipeRsp.valid, io.pipeRsp.bits, 0.U.asTypeOf(new TaskBundle))
+  assert(queue.io.enq.ready === taskQueue.io.enq.ready,
+    "TXRSP response and task queues must remain synchronized")
+  assert(queue.io.deq.valid === taskQueue.io.deq.valid,
+    "TXRSP response and task queues must remain synchronized")
 
   io.pipeRsp.ready := true.B
   io.mshrRsp.ready := !io.pipeRsp.valid && !noSpaceForSinkBReq && !noSpaceForMSHRReq
+  io.done.valid := io.out.fire
+  io.done.bits := taskQueue.io.deq.bits
 
   def toCHIRSPBundle(task: TaskBundle): CHIRSP = {
     val rsp = WireInit(0.U.asTypeOf(new CHIRSP()))

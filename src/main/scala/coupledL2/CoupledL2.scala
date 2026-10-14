@@ -167,6 +167,8 @@ trait HasCoupledL2Parameters {
 
   def hartIdLen: Int = p(MaxHartIdBits)
 
+  // A physical entry contains one normal context, one replace context and one snoop context.
+  // All externally visible IDs and buffer depths remain physical-entry based.
   def mshrsAll = cacheParams.mshrs
   def idsAll = 256// ids of L2 //TODO: Paramterize like this: max(mshrsAll * 2, sourceIdAll * 2)
   def mshrBits = log2Up(idsAll)

@@ -60,11 +60,11 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
 
   // ==================== Hint Generation ====================
   // Hint for "MSHRTask and ReleaseAck" will fire@s1
-  def isGrantData(t: TaskBundle):  Bool = t.fromA && t.opcode === GrantData
-  def isGrant(t: TaskBundle):      Bool = t.fromA && t.opcode === Grant
-  def isMergeGrantData(t: TaskBundle): Bool = t.fromA && t.mergeA && t.aMergeTask.opcode === GrantData
-  def isMergeGrant(t: TaskBundle):     Bool = t.fromA && t.mergeA && t.aMergeTask.opcode === Grant
-  def isAccessAckData(t: TaskBundle):  Bool = t.fromA && t.opcode === AccessAckData
+  def isGrantData(t: TaskBundle):  Bool = !t.refillOnly && t.fromA && t.opcode === GrantData
+  def isGrant(t: TaskBundle):      Bool = !t.refillOnly && t.fromA && t.opcode === Grant
+  def isMergeGrantData(t: TaskBundle): Bool = !t.refillOnly && t.fromA && t.mergeA && t.aMergeTask.opcode === GrantData
+  def isMergeGrant(t: TaskBundle):     Bool = !t.refillOnly && t.fromA && t.mergeA && t.aMergeTask.opcode === Grant
+  def isAccessAckData(t: TaskBundle):  Bool = !t.refillOnly && t.fromA && t.opcode === AccessAckData
   def isCBOAck(t: TaskBundle):         Bool = t.fromA && t.opcode === CBOAck
 
   val mshr_GrantData_s1 = io.mshrHintQInfo.valid && (isGrantData(mshr_s1) || isMergeGrantData(mshr_s1))

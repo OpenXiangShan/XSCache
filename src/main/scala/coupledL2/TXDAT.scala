@@ -34,30 +34,35 @@ class TXDATBlockBundle(implicit p: Parameters) extends TXBlockBundle {
 class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   val io = IO(new Bundle() {
     val in = Flipped(DecoupledIO(new TaskWithData()))
+    // Direct ReplaceMSHR CopyBackWrData path (victim writeback data).  The
+    // mainpipe input keeps strict priority; the direct input is gated by
+    // queue pressure with margin for its in-flight read.
+    val mshrIn = Flipped(DecoupledIO(new TaskWithData()))
+    val directSpace = Output(Bool())
     val out = DecoupledIO(new CHIDAT())
 
     val pipeStatusVec = Flipped(Vec(5, ValidIO(new PipeStatusWithCHI)))
     val toReqArb = Output(new TXDATBlockBundle)
+    // Pulse only after the final data beat leaves the TXDAT channel.
+    val done = ValidIO(new TaskBundle)
   })
 
   assert(!io.in.valid || io.in.bits.task.toTXDAT, "txChannel is wrong for TXDAT")
   assert(!io.in.valid || io.in.ready, "TXDAT should never be full")
+  assert(!io.mshrIn.valid || io.mshrIn.bits.task.toTXDAT, "txChannel is wrong for direct TXDAT")
   require(chiOpt.isDefined)
   require(beatBytes * 8 == DATA_WIDTH)
 
-  // TODO: an mshrsAll-entry queue is too much, evaluate for a proper size later
+  // Worst-case data pressure in the multi-context MSHR design:
+  //   normal cbwrdata (Get-on-TRUNK/CMO paths) <= mshrsAll
+  //   ReplaceMSHR CopyBackWrData + SnoopMSHR SnpRespData <= mshrsAll
+  //     (S/R are mutually exclusive per slot)
+  // The pre-split bound of mshrsAll no longer holds; see TXREQ for details.
   // Use customized SRAM: dual_port, max 256bits:
-  val queue = Module(new Queue(new TaskBundle(), entries = mshrsAll, flow = true))
-  val queueData0 = Module(new Queue(new DSBeat(), entries = mshrsAll, flow = true))
-  val queueData1 = Module(new Queue(new DSBeat(), entries = mshrsAll, flow = true))
-  queue.io.enq.valid := io.in.valid
-  queue.io.enq.bits := io.in.bits.task
-  io.in.ready := queue.io.enq.ready
-  val enqData = io.in.bits.data.asTypeOf(Vec(beatSize, new DSBeat))
-  queueData0.io.enq.valid := io.in.valid
-  queueData0.io.enq.bits := enqData(0)
-  queueData1.io.enq.valid := io.in.valid
-  queueData1.io.enq.bits := enqData(1)
+  val queue = Module(new Queue(new TaskBundle(), entries = 2 * mshrsAll, flow = true))
+  val queueData0 = Module(new Queue(new DSBeat(), entries = 2 * mshrsAll, flow = true))
+  val queueData1 = Module(new Queue(new DSBeat(), entries = 2 * mshrsAll, flow = true))
+  val enqData = Mux(io.in.valid, io.in.bits.data, io.mshrIn.bits.data).asTypeOf(Vec(beatSize, new DSBeat))
 
   // Back pressure logic from TXDAT
   val queueCnt = queue.io.count
@@ -72,13 +77,28 @@ class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     PopCount(Cat(pipeStatus_s2_s3.map(s => s.valid && Mux(s.bits.mshrTask, s.bits.toTXDAT, s.bits.fromB)))) +
     queueCnt
 
-  assert(inflightCnt <= mshrsAll.U, "in-flight overflow at TXDAT")
+  assert(inflightCnt <= (2 * mshrsAll + 4).U, "in-flight overflow at TXDAT")
 
-  val noSpaceForSinkBReq = inflightCnt >= mshrsAll.U
-  val noSpaceForMSHRReq = inflightCnt >= (mshrsAll-2).U
+  val noSpaceForSinkBReq = inflightCnt >= (2 * mshrsAll).U
+  val noSpaceForMSHRReq = inflightCnt >= (2 * mshrsAll - 2).U
 
   io.toReqArb.blockSinkBReqEntrance := noSpaceForSinkBReq
   io.toReqArb.blockMSHRReqEntrance := noSpaceForMSHRReq
+
+  // The mainpipe input keeps strict priority and its "never full" invariant;
+  // the direct copyback input is admitted only with margin (the direct path
+  // holds at most one request between ReleaseBuf read and enqueue, which the
+  // 4-entry margin covers; see MSHRCtl).
+  val noSpaceForDirect = inflightCnt >= (2 * mshrsAll - 4).U
+  io.directSpace := !noSpaceForDirect
+  queue.io.enq.valid := io.in.valid || io.mshrIn.valid && !noSpaceForDirect
+  queue.io.enq.bits := Mux(io.in.valid, io.in.bits.task, io.mshrIn.bits.task)
+  io.in.ready := queue.io.enq.ready
+  io.mshrIn.ready := !io.in.valid && !noSpaceForDirect && queue.io.enq.ready
+  queueData0.io.enq.valid := queue.io.enq.valid
+  queueData0.io.enq.bits := enqData(0)
+  queueData1.io.enq.valid := queue.io.enq.valid
+  queueData1.io.enq.bits := enqData(1)
 
   val beatValids = RegInit(VecInit(Seq.fill(beatSize)(false.B)))
   val taskValid = beatValids.asUInt.orR
@@ -106,6 +126,8 @@ class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   when (io.out.fire) {
     beatValids := VecInit(next_beatsOH.asBools)
   }
+  io.done.valid := io.out.fire && !next_beatsOH.orR
+  io.done.bits := taskR.task
 
   def getBeat(data: UInt, beatsOH: UInt): (UInt, UInt) = {
     // get one beat from data according to beatsOH

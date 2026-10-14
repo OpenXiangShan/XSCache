@@ -61,6 +61,7 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
       val read  = ValidIO(new DSRequest())
       val write = ValidIO(new DSRequest())
       val wdata = Output(new DSBlock())
+      val writeFirst = Output(Bool())
     }
     val rdataFromDS_s6 = Input(new DSBlock())
 
@@ -378,16 +379,20 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     ).asBools
   )
   refill_s4.valid := task_s4.valid && (
-    (sharedReq_s4 || writeBackFull_s4 || writeEvictOrEvict_s4) && !self_hit_s4 ||
+    (sharedReq_s4 || writeEvictOrEvict_s4) && !self_hit_s4 ||
+    // A WriteBackFull carries the authoritative data even when this slice
+    // still has the line.  Keep a refill entry so CopyBackWrData can be
+    // matched by the DBID returned to the RN and update the local data array.
+    writeBackFull_s4 ||
     replace_snoop_s4 ||
     stashMissRefill_s4
   )
   refill_s4.bits.state.s_refill := false.B
   refill_s4.bits.state.w_datRsp := false.B
   refill_s4.bits.state.w_snpRsp := !Cat(snpVec_refill_s4).orR
+  // Keep the requester's own address. A replace snoop targets a different
+  // line that shares this reqID, so its data must not be refilled here.
   refill_s4.bits.task := req_s4
-  refill_s4.bits.task.tag := parseAddress(snp_address_s4)._1
-  refill_s4.bits.task.set := parseAddress(snp_address_s4)._2
   refill_s4.bits.task.refillTask := true.B
   refill_s4.bits.task.snpVec := snpVec_refill_s4
   refill_s4.bits.task.replSnp := replace_snoop_s4
@@ -467,10 +472,14 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   io.toDS_s4.read.valid := task_s4.valid && (dataUnready_s4 || cleanSelfDirty_s4)
   io.toDS_s4.read.bits.way := selfDirResp_s4.way
   io.toDS_s4.read.bits.set := selfDirResp_s4.set
+  io.toDS_s4.read.bits.tag := task_s4.bits.tag
   io.toDS_s4.write.valid := task_s4.valid && refill_task_s4
   io.toDS_s4.write.bits.way := selfDirResp_s4.way
   io.toDS_s4.write.bits.set := selfDirResp_s4.set
+  io.toDS_s4.write.bits.tag := task_s4.bits.tag
   io.toDS_s4.wdata := refillData_s4
+  io.toDS_s4.writeFirst := refill_task_s4 && replace_snoop_s4 &&
+    self_meta_s4.valid && selfDirty_s4
 
   val req_drop_s4 = !dataUnready_s4 && !cleanSelfDirty_s4
 
