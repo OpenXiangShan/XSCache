@@ -45,8 +45,11 @@ class ReplaceMSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   // A same-line B has handshaken into RequestArb before the sidecar released
   // its victim. B owns the first data-return opportunity in this case.
   val snoopStarted = Input(Bool())
-  // The nested snoop response has completed on TXRSP or TXDAT.
+  // The whole nested snoop has completed, including forwarded CompData.
   val snoopDone = Input(Bool())
+  // Keep the snapshot current so a later CMO commit cannot restore stale
+  // exclusive ownership after the HN response downgraded the line.
+  val snoopMeta = Flipped(ValidIO(new MetaEntry))
   // The nested invalidating snoop has actually left the L2. Its response has
   // already made the old victim invalid at the HN, so no lower release remains.
   val snoopToInvalDone = Input(Bool())
@@ -433,6 +436,9 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
       probeAckDataRecv := true.B
       victim.meta.dirty := true.B
     }
+  }
+  when (valid && io.snoopMeta.valid) {
+    victim.meta := io.snoopMeta.bits
   }
   // If MainPipe commits the queued ReleaseData in this same cycle, the
   // capture event wins: ReleaseBuf now contains the authoritative payload.
