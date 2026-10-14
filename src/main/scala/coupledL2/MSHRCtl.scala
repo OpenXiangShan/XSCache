@@ -873,15 +873,21 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       // The TxnID high bits carry the epoch of the read that was issued.  A
       // response whose epoch is not the one this context sent belongs to an
       // earlier tenant and must be dropped before it can complete the read.
-      val readTxnEpochHi = TXNID_WIDTH - bankBits - 3
-      val rxdatEpochMismatch = io.resps.rxdat.txnID(
-        readTxnEpochHi, mshrBits) =/= refill.io.readTxnEpoch
+      val readTxnEpochWidth = (TXNID_WIDTH - bankBits - 2) - mshrBits
+      val rxdatEpochMismatch = if (readTxnEpochWidth > 0) {
+        io.resps.rxdat.txnID(TXNID_WIDTH - bankBits - 3, mshrBits) =/= refill.io.readTxnEpoch
+      } else {
+        false.B
+      }
       rxdatStaleSlotOH(i) := rxdatForThisSlot && (rxdatDBIDMismatch || rxdatEpochMismatch)
       refill.io.resps.rxdat.valid := refill.io.status.valid && rxdatForThisSlot &&
         !rxdatDBIDMismatch && !rxdatEpochMismatch
       refill.io.resps.rxdat.bits := io.resps.rxdat.respInfo
-      val rxrspEpochMismatch = io.resps.rxrsp.txnID(
-        readTxnEpochHi, mshrBits) =/= refill.io.readTxnEpoch
+      val rxrspEpochMismatch = if (readTxnEpochWidth > 0) {
+        io.resps.rxrsp.txnID(TXNID_WIDTH - bankBits - 3, mshrBits) =/= refill.io.readTxnEpoch
+      } else {
+        false.B
+      }
       refill.io.resps.rxrsp.valid := refill.io.status.valid && io.resps.rxrsp.valid &&
         io.resps.rxrsp.mshrId === i.U && !rxrspEpochMismatch
       refill.io.resps.rxrsp.bits := io.resps.rxrsp.respInfo
