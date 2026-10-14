@@ -96,6 +96,9 @@ class MSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   // Replace transaction control. RefillBuf remains owned by this normal MSHR;
   // the delegated victim uses another physical slot and its ReleaseBuf.
   val replaceActive = Input(Bool())
+  // Accepted child ownership, separate from replaceActive's same-cycle
+  // arbitration intent. Only this notification may latch delegation.
+  val replaceAccepted = Input(Bool())
   // Registered ownership marker exported for arbitration. This intentionally
   // excludes the combinational replaceActive path to avoid a SourceB gate
   // feeding back through the normal context's source_b.valid.
@@ -474,7 +477,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   val sidecarOwnsVictim = io.replaceActive || sidecarDelegatedLatched
   io.sidecarDelegated := sidecarDelegatedLatched
   io.probeIssued := sourceBProbeIssued
-  when(io.replaceActive && !io.alloc.valid) {
+  when(io.replaceAccepted && !io.alloc.valid) {
     sidecarDelegatedLatched := true.B
   }
   when(io.replaceActive && io.replaceDetached && !io.alloc.valid) {

@@ -395,9 +395,12 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // priority: it waits behind any replacement-path allocation and never
   // preempts a snoop allocation.  The parent keeps requesting until the
   // child appears, so no reservation is needed.
+  val replaceSlotIdle = replaceSlotUnreservedOH &
+    ~Mux(replaceReserveGrant, replaceReserveGrantSlotOH, 0.U(mshrsAll.W))
   val cmoSidecarReqOH = VecInit(refillMshrs.map(_.io.cmoSidecarReq)).asUInt
   val cmoSidecarAlloc = cmoSidecarReqOH.orR && !replRespNeedsReplace &&
-    !nestedReleaseNeedsReplace && !orphanReleaseData && !snoopAllocRequest
+    !nestedReleaseNeedsReplace && !orphanReleaseData && !snoopAllocRequest &&
+    replaceSlotUnreservedOH.orR
   val cmoSidecarParentOH = PriorityEncoderOH(cmoSidecarReqOH)
   val replaceNeedsAlloc = replRespNeedsReplace || nestedReleaseNeedsReplace ||
     orphanReleaseData || cmoSidecarAlloc
@@ -494,8 +497,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // index. Snoop and replace are mutually exclusive because both own
   // ReleaseBuf[i]. A ReplacerResult consumes its parent reservation; nested
   // C/orphan paths use an unreserved S/R slot.
-  val replaceSlotIdle = replaceSlotUnreservedOH &
-    ~Mux(replaceReserveGrant, replaceReserveGrantSlotOH, 0.U(mshrsAll.W))
   val selectedReplaceSlotOH = Mux(
     replRespNeedsReplace,
     replRespReservationOH,
@@ -751,6 +752,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     assert(PopCount(activeReplaceProbeAckDataOH) === 1.U, "ProbeAckData matches multiple active ReplaceMSHRs")
   }
   val replaceDelegatedForParent = Seq.tabulate(mshrsAll) { parent =>
+    // Keep arbitration intent independent of replaceAllocValid: feeding the
+    // accepted grant back into replReadWanted creates a reservation cycle.
     replaceActiveForParent(parent) || replaceNeedsAlloc && replaceParentOH(parent)
   }
 
@@ -901,6 +904,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         parentReplaceInfo := Mux1H(parentReplaceMatch, replaceMshrs.map(_.io.info.bits))
       }
       refill.io.replaceActive := replaceDelegatedForParent(i)
+      // A full pool (or a same-cycle reservation taking its last free slot)
+      // can reject an intent. The parent must keep requesting until accepted.
+      refill.io.replaceAccepted := replaceActiveForParent(i) ||
+        replaceAllocValid && !orphanReleaseData && replaceParentOH(i)
       // A nested B request reaches MainPipe S3 two cycles before its
       // SnoopMSHR becomes valid. Treat the S1 B candidate as a transient
       // snoop owner until allocation has caught up, so SourceD is deferred
@@ -994,6 +1001,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       refill.io.grantSent := io.fromMainPipe.grantSent.valid &&
       io.fromMainPipe.grantSent.bits === i.U
       snoop.io.replaceActive := false.B
+      snoop.io.replaceAccepted := false.B
       snoop.io.replaceDetached := false.B
       snoop.io.replaceRefillReady := false.B
       snoop.io.replaceDone := false.B
@@ -1085,13 +1093,29 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       replaceMshrs(i).io.info.valid &&
       replaceMshrs(i).io.info.bits.set === io.fromReqArb.status_s1.b_set &&
       replaceMshrs(i).io.info.bits.tag === io.fromReqArb.status_s1.b_tag
-      val snoopDone = Seq(io.txdatDone, io.txrspDone).map { done =>
+      val snoopResponseMatches = Seq(io.txdatDone, io.txrspDone).map { done =>
         done.valid && done.bits.fromB && done.bits.snpHitRelease &&
+        done.bits.chiOpcode.get =/= CompData &&
         done.bits.snpHitReleaseIdx === i.U
+      }
+      replaceMshrs(i).io.snoopMeta.valid := snoopResponseMatches.reduce(_ || _)
+      replaceMshrs(i).io.snoopMeta.bits := Mux1H(snoopResponseMatches,
+        Seq(io.txdatDone.bits.meta, io.txrspDone.bits.meta))
+      // A forwarding snoop owns both its HN response and requester CompData.
+      // Count its context retirement once, after both terminal handshakes.
+      val contextSnoopDone = snoopMshrs.map { snoop =>
+        snoop.io.msInfo.valid && snoop.io.msInfo.bits.willFree &&
+        snoop.io.msInfo.bits.set === replaceMshrs(i).io.info.bits.set &&
+        snoop.io.msInfo.bits.reqTag === replaceMshrs(i).io.info.bits.tag
       }.reduce(_ || _)
-      replaceMshrs(i).io.snoopDone := snoopDone
+      val directSnoopDone = Seq(io.txdatDone, io.txrspDone).zip(snoopResponseMatches).map {
+        case (done, matches) => matches && !done.bits.mshrTask
+      }.reduce(_ || _)
+      replaceMshrs(i).io.snoopDone := directSnoopDone ||
+        replaceMshrs(i).io.info.valid && contextSnoopDone
       val snoopToInvalDone = Seq(io.txdatDone, io.txrspDone).map { done =>
         done.valid && done.bits.fromB && done.bits.snpHitRelease &&
+        done.bits.chiOpcode.get =/= CompData &&
         // A clean sidecar can also lose the line to an invalidating snoop.
         // The response state (I or I_PD) records that outcome; the release
         // mode alone only describes the state before the snoop.
