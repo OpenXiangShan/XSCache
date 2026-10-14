@@ -406,9 +406,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val need_pprobe_s3_b_snpNDERR = req_s3.fromB && (io.errOnSnp_s3 || io.metaOnHit_s3.tagErr) && dirResult_s3.hit
   val need_pprobe_s3_b = need_pprobe_s3_b_snpStable || need_pprobe_s3_b_snpToB ||
     need_pprobe_s3_b_snpToN || need_pprobe_s3_b_snpNDERR
-  // no-client fwd snoops are served by the direct path (DS data at s5), so the
-  // SnoopMSHR only ever sees lines with clients -- align with need_pprobe_s3_b
-  val need_dct_s3_b = doFwd && metaOnHit_has_clients_s3 // DCT
+  // Forwarding requires both the snoop response to the HN and CompData to
+  // the requesting RN. The direct path emits only one task, so even a hit
+  // with no L1 clients needs a SnoopMSHR to schedule both completions.
+  val need_dct_s3_b = doFwd // DCT
   // A post-Grant TtoN ReleaseData has left the newest line in the matching
   // normal RefillBuf. Directory correctly reports no client, but the direct
   // B path has no access to that buffer and would incorrectly send SnpResp
@@ -548,7 +549,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val fwdPassDirty = WireInit(false.B)
   when (nestable_dirResult_s3.hit) {
     when (isSnpToBFwd(req_s3.chiOpcode.get)) {
-      fwdCacheState := Mux(req_s3.snpHitReleaseToInval, I, SC)
+      // FwdState describes the requesting RN, not this evicting snoopee.
+      fwdCacheState := SC
     }
     when (req_s3.chiOpcode.get === SnpUniqueFwd || req_s3.chiOpcode.get === SnpPreferUniqueFwd) {
       when (nestable_meta_s3.state === TIP && nestable_meta_s3.dirty) {
@@ -578,12 +580,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     sink_resp_s3.bits.opcode := 0.U
     sink_resp_s3.bits.param := 0.U
 
-    // no-client fwd snoops are served by the direct path (see need_dct_s3_b):
-    // their single response is the data delivery to the fwd node, mirroring the
-    // SnoopMSHR's dctTask (tgtID=fwdNID, txnID=fwdTxnID, opcode=CompData)
-    sink_resp_s3.bits.tgtID.foreach(_ := Mux(doFwd, task_s3.bits.fwdNID.get, task_s3.bits.srcID.get))
+    // This response targets the snooping HN. A forwarding hit uses the
+    // SnoopMSHR's separate dctTask for data delivery to the requesting RN.
+    sink_resp_s3.bits.tgtID.foreach(_ := task_s3.bits.srcID.get)
     sink_resp_s3.bits.srcID.foreach(_ := task_s3.bits.tgtID.get) // TODO: srcID should be fixed. FIX THIS!!!
-    sink_resp_s3.bits.txnID.foreach(_ := Mux(doFwd, task_s3.bits.fwdTxnID.get, task_s3.bits.txnID.get))
+    sink_resp_s3.bits.txnID.foreach(_ := task_s3.bits.txnID.get)
     sink_resp_s3.bits.dbID.foreach(_ := 0.U)
     sink_resp_s3.bits.pCrdType.foreach(_ := 0.U) // TODO
     sink_resp_s3.bits.chiOpcode.foreach(_ := MuxLookup(
@@ -591,13 +592,13 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       SnpResp
     )(Seq(
       Cat(false.B, false.B) -> SnpResp,
-      Cat(true.B, false.B)  -> CompData,
+      Cat(true.B, false.B)  -> SnpRespFwded,
       Cat(false.B, true.B)  -> SnpRespData, // ignore SnpRespDataPtl for now
-      Cat(true.B, true.B)   -> CompData
+      Cat(true.B, true.B)   -> SnpRespDataFwded
     )))
     sink_resp_s3.bits.resp.foreach(_ := setPD(respCacheState, respPassDirty && doRespData))
     sink_resp_s3.bits.fwdState.foreach(_ := setPD(fwdCacheState, fwdPassDirty))
-    sink_resp_s3.bits.txChannel := Cat(doRespData || doFwd, !(doRespData || doFwd), false.B) // TODO: parameterize this
+    sink_resp_s3.bits.txChannel := Cat(doRespData, !doRespData, false.B) // TODO: parameterize this
     sink_resp_s3.bits.size := log2Ceil(blockBytes).U
     sink_resp_s3.bits.meta := sink_resp_s3_b_meta
     sink_resp_s3.bits.metaWen := sink_resp_s3_b_metaWen

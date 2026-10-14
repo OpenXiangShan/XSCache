@@ -217,7 +217,8 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
       reqOpcode === SnpCleanShared || reqOpcode === SnpCleanInvalid || reqOpcode === SnpPreferUnique
   )
   val fwdCacheState = Mux(tagErr, I, Mux(isSnpToBFwd(reqOpcode),
-    Mux(req.snpHitReleaseToInval, I, SC), Mux(isSnpToNFwd(reqOpcode), UC, I)))
+    // The snoopee can return I while the forwarded requester receives SC.
+    SC, Mux(isSnpToNFwd(reqOpcode), UC, I)))
   val fwdPassDirty = isSnpToNFwd(reqOpcode) &&
     (hitDirtyOrWriteDirty || normalRefillPayload) && !tagErr
 
