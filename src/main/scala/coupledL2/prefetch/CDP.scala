@@ -1553,7 +1553,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   val sendUnit = Module(new SentUnit)
   sendUnit.io.tlbReq <> io.tlbReq
   if (useFilterTable) {
-    val ftQueryArb = Module(new RRArbiter(new FtQueryReq, 2))
+    val ftQueryArb = Module(new RRArbiterInit(new FtQueryReq, 2))
     ftQueryArb.io.in(0) <> ftTrainPipe.get.io.queryReq
     ftQueryArb.io.in(1) <> sendUnit.io.ftQueryReq
     filterTable.get.io.queryReq <> ftQueryArb.io.out

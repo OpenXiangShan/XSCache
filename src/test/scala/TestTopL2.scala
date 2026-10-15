@@ -230,7 +230,7 @@ object TestTopCHIHelper {
         FPGAPlatform        = onFPGAPlatform,
 
         // prefetch
-        prefetch            = Seq(BOPParameters()),
+        prefetch            = Seq(BOPParameters(), CDPParameters()),
 
         // data check
         dataCheck           = Some("oddparity"),
