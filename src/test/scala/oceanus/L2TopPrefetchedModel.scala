@@ -18,6 +18,8 @@ object TestTop_L2Prefetched extends App with ChiselSim {
   val caseNames = if (selectedName == "bop-2c-all") {
     for (fill <- Seq("sc", "uc"); variant <- Seq("readshared", "readunique", "makeunique", "makeunique-miss", "external-stash", "replacement"))
       yield s"bop-2c-$variant-$fill"
+  } else if (selectedName == "bop-stash-all") {
+    Seq("stashunique-hit", "stashshared-hit", "stashunique-dirty").map(v => s"bop-2c-$v-sc")
   } else Seq(selectedName)
   // These directed cases require internal fills; opt in despite base's off default.
   val l2cfg = new L2Configuration(8, true, Seq(0), bopEnable = true, pfSrcID = 3, bopParams = OceanusBOPParameters(badScore = 0))
@@ -37,7 +39,10 @@ object TestTop_L2Prefetched extends App with ChiselSim {
       println(s"BOP_2C_RESET case=$name")
       val fillUC = name.endsWith("-uc")
       val variant = name.stripPrefix("bop-2c-").stripSuffix(if (fillUC) "-uc" else "-sc")
-      require(Set("readshared", "readunique", "makeunique", "makeunique-miss", "external-stash", "replacement").contains(variant))
+      require(Set("readshared", "readunique", "makeunique", "makeunique-miss", "external-stash", "replacement", "stashunique-hit", "stashshared-hit", "stashunique-dirty").contains(variant))
+      val stashPreserve = variant.startsWith("stash")
+      val stashUpgrade = stashPreserve && variant != "stashshared-hit"
+      val dirtyUpgrade = variant == "stashunique-dirty"
       val demand = BigInt("10000", 16)
       val target = demand + 0x80
       val replacement = BigInt("18080", 16)
@@ -54,6 +59,12 @@ object TestTop_L2Prefetched extends App with ChiselSim {
         // only. Expected total train=1, internal fills={P}, no upstream data.
         case "makeunique-miss" => Seq(req(demand, hitOpcode), req(demand, hitOpcode),
           req(demand, CCHIOpcode.StashShared.opcode))
+        case "stashunique-hit" | "stashshared-hit" | "stashunique-dirty" =>
+          Seq(req(demand, CCHIOpcode.ReadShared.opcode),
+            req(target, if (stashUpgrade) CCHIOpcode.StashUnique.opcode else CCHIOpcode.StashShared.opcode),
+            req(target, CCHIOpcode.StashShared.opcode),
+            req(target, CCHIOpcode.ReadShared.opcode),
+            req(target, CCHIOpcode.StashShared.opcode))
         case "external-stash" => Seq.fill(2)(req(target, CCHIOpcode.StashShared.opcode))
         case "replacement" => Seq(req(demand, CCHIOpcode.ReadShared.opcode)) ++
           Seq("12080", "14080", "16080").map(a => req(BigInt(a, 16), CCHIOpcode.StashShared.opcode)) ++
@@ -62,7 +73,7 @@ object TestTop_L2Prefetched extends App with ChiselSim {
           req(target, hitOpcode), req(target, CCHIOpcode.StashShared.opcode))
       }
       val requests = rawRequests.zipWithIndex.map { case (r, i) =>
-        r.copy(txnId = i, expCompData = r.opcode != CCHIOpcode.StashShared.opcode)
+        r.copy(txnId = i, expCompData = r.opcode != CCHIOpcode.StashShared.opcode && r.opcode != CCHIOpcode.StashUnique.opcode)
       }
       val fillResp = BigInt(if (fillUC) CHIFieldResp.CompData_UC else CHIFieldResp.CompData_SC)
       val spec = CaseSpec(name, UpConfig(Seq(MasterId.t1p0), ExplicitRequestStream(requests,
@@ -88,6 +99,17 @@ object TestTop_L2Prefetched extends App with ChiselSim {
       // P with SRAM victim bit=1 and install a NEW tag with bit=0 AND mask=1.
       // Final external StashShared hit on 0x18080 must read bit=0 from SRAM.
       // Total train=2 (D + replacement miss); two BOP prefetch fills use sets 2,4.
+      // Stash independence expectations, written before running:
+      // Internal P fills S/clean/prefetched=1. External SrcID=0 StashUnique
+      // hits S and issues ReadUnique (0x07); its UC response upgrades to UU
+      // while the prefetched write mask stays CLOSED. External StashShared
+      // hits silently and keeps the bit. A fresh SRAM readback StashShared
+      // still sees 1, no BOP train/useful increment. Following demand RS sees
+      // old bit=1, trains exactly once (useful +1), clears, and creates P+0x80.
+      // Final Stash reads 0. Total train=2, useful=1, internal fills=2.
+      // stashunique-dirty returns UD_PD on the upgrade ONLY: expected resulting
+      // combination prefetched=1, dirty=1, state=UU. This is a known combination
+      // for later silent-evict work; external Stash must preserve the BOP mark.
       val up = new L2TopUpstreamModel(dut, spec)
       val dn = new L2TopDownstreamModel(dut, spec)
       val dataQ = mutable.Queue.empty[PendingDnComp]
@@ -101,6 +123,10 @@ object TestTop_L2Prefetched extends App with ChiselSim {
       var current = -1
       var accepted = false
       var trainCount = 0
+      var usefulCount = 0
+      var downstreamCount = 0
+      var dirtyPreserveObserved = false
+      var externalPrefetchMaskWrites = 0
       var dataCount = 0
       var compCount = 0
       val reads = mutable.ArrayBuffer.empty[(Boolean, Boolean)]
@@ -135,9 +161,15 @@ object TestTop_L2Prefetched extends App with ChiselSim {
           trainCount += 1
           println(s"BOP_2C_TRAIN cycle=$cycle addr=0x${value(dut.observation.bopTrainAddr).toString(16)}")
         }
+        usefulCount += value(dut.observation.prefetchedHitTrainCount).toInt
         dut.observation.dirProbeBySlice(0).foreach { d =>
           val addr = value(d.tshrPaddr)
           if (flag(d.dirWbLand)) landed(addr) = (value(d.dirResultState), flag(d.dirResultPrefetched))
+          if (stashPreserve && current == 1 && addr == target) {
+            if (flag(d.metaWrReqPrefetched)) externalPrefetchMaskWrites += 1
+            if (flag(d.dirWbLand) && flag(d.dirResultPrefetched) && flag(d.dirResultDirty))
+              dirtyPreserveObserved = true
+          }
           if (flag(d.tagWrite)) {
             installed += ((addr, flag(d.metaWrReqPrefetched), flag(d.metaWrReqMetaPrefetched)))
             assert(flag(d.metaWrReqPrefetched), "every new tag must overwrite prefetched, even for data=0")
@@ -155,12 +187,13 @@ object TestTop_L2Prefetched extends App with ChiselSim {
           val txn = DnTxnID(value(dut.io.chi.txreq.flit.TxnID.get))
           val src = value(dut.io.chi.txreq.flit.SrcID.get)
           val op = value(dut.io.chi.txreq.flit.Opcode.get)
+          downstreamCount += 1
           dn.noteRequest(txn)
           if (dn.isEvictReq(op) || op == 0x0c) {
             val response = if (op == 0x0c) BigInt(L2TopDownstreamOpcodes.Comp) else dn.downstreamEvictRspOpcode(op)
             rspQ.enqueue(PendingDnRsp(txn, src, cycle + 12, response))
           } else {
-            val resp = if (op == L2TopDownstreamOpcodes.ReadNotSharedDirty) fillResp else BigInt(CHIFieldResp.CompData_UC)
+            val resp = if (op == L2TopDownstreamOpcodes.ReadNotSharedDirty) fillResp else BigInt(if (dirtyUpgrade && current == 1) CHIFieldResp.CompData_UD_PD else CHIFieldResp.CompData_UC)
             dataQ.enqueue(PendingDnComp(txn, src, cycle + 12, 0, resp), PendingDnComp(txn, src, cycle + 13, 1, resp))
           }
         }
@@ -196,18 +229,37 @@ object TestTop_L2Prefetched extends App with ChiselSim {
         val beforeTrain = trainCount
         val beforeData = dataCount
         val beforeComp = compCount
+        val beforeUseful = usefulCount
+        val beforeDownstream = downstreamCount
         up.driveRead(index)
         while (!accepted) tick()
         up.clearUpReq()
         var drained = 0
         while (drained < 16) { tick(); drained = if (quiet) drained + 1 else 0 }
         val r = requests(index)
-        val stash = r.opcode == CCHIOpcode.StashShared.opcode
+        val stash = r.opcode == CCHIOpcode.StashShared.opcode || r.opcode == CCHIOpcode.StashUnique.opcode
         assert(dataCount - beforeData == (if (stash || r.opcode == CCHIOpcode.MakeUnique.opcode) 0 else 2))
         assert(compCount - beforeComp == (if (r.opcode == CCHIOpcode.MakeUnique.opcode) 1 else 0))
         if (variant == "external-stash") {
           assert(trainCount == 0 && landed(target)._2 == false)
           assert(reads.toSeq == Seq((index != 0, false)), s"external Stash SRAM reads=$reads")
+        } else if (stashPreserve) {
+          val consumes = index == 3
+          assert(trainCount - beforeTrain == (if (index == 0 || consumes) 1 else 0))
+          assert(usefulCount - beforeUseful == (if (consumes) 1 else 0))
+          assert(externalPrefetchMaskWrites == 0, "external Stash hit must never write prefetched")
+          if (index == 0) {
+            assert(landed(target) == ((BigInt(1), true)))
+          } else {
+            assert(reads.toSeq == Seq((true, index <= 3)), s"Stash preservation SRAM reads=$reads")
+            // Silent Stash has no DirWb; inspect its independent SRAM read.
+            if (index == 1 && stashUpgrade) {
+              assert(downstreamCount - beforeDownstream == 1)
+              assert(landed(target) == ((BigInt(3), true)))
+              if (dirtyUpgrade) assert(dirtyPreserveObserved)
+            } else if (stash) assert(downstreamCount == beforeDownstream)
+            if (index >= 3) assert(!landed(target)._2)
+          }
         } else if (variant == "makeunique-miss") {
           assert(reads.toSeq == Seq((index != 0, false)))
           assert(trainCount - beforeTrain == (if (index == 0) 1 else 0))
@@ -241,6 +293,11 @@ object TestTop_L2Prefetched extends App with ChiselSim {
       assert(internalFills.size == expectedTrains)
       if (variant != "external-stash" && variant != "makeunique-miss") assert(internalFills.toSet == Set(target,
         (if (variant == "replacement") replacement else target) + 0x80))
+      if (stashPreserve) {
+        assert(usefulCount == 1)
+        println(s"BOP_STASH_RESULT pass=true case=$name useful=$usefulCount externalMaskWrites=$externalPrefetchMaskWrites " +
+          s"upgrade=$stashUpgrade dirtyPreserve=$dirtyPreserveObserved")
+      }
       println(s"BOP_2C_RESULT pass=true case=$name train=$trainCount internalFills=${internalFills.size} pending=0 active=0 SRAM_READBACK=true")
     }
   }
