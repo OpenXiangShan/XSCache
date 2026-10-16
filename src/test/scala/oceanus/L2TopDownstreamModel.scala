@@ -14,7 +14,7 @@ case class DnTxnInfo(
   origin: UpstreamOrigin,
   dnOpcode: BigInt
 )
-case class PendingDnComp(dnTxnID: DnTxnID, srcId: BigInt, due: Int, beat: Int, resp: BigInt)
+case class PendingDnComp(dnTxnID: DnTxnID, srcId: BigInt, due: Int, beat: Int, resp: BigInt, addr: BigInt = BigInt(-1))
 case class PendingDnRsp(dnTxnID: DnTxnID, srcId: BigInt, due: Int, opcode: BigInt)
 
 object L2TopDownstreamOpcodes {
@@ -155,8 +155,15 @@ class L2TopDownstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim
     dut.io.chi.rxsnp.flitpend.poke(false.B)
   }
 
+  // Concurrent directed cases use an immutable line-addressed reference
+  // memory.  Legacy cases retain the transaction-id payload so their frozen
+  // eviction-data assertions remain byte-for-byte compatible.
+  def referenceData(addr: BigInt, beat: Int): BigInt =
+    L2TopReferenceMemory.beat(addr, beat)
+
   def dnDataValue(p: PendingDnComp): BigInt =
-    BigInt("10000000000000000000000000000000", 16) + p.dnTxnID.v + p.beat
+    if (p.addr >= 0) referenceData(p.addr, p.beat)
+    else BigInt("10000000000000000000000000000000", 16) + p.dnTxnID.v + p.beat
 
   def driveDnData(p: PendingDnComp): Unit = {
     val data = dnDataValue(p)

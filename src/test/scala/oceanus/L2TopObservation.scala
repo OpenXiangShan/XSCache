@@ -295,6 +295,11 @@ class L2TopObservationIO(entries: Int, sliceCount: Int)(implicit val p: Paramete
   val bopTrainFire = Output(Bool())
   val bopTrainFireCount = Output(UInt(64.W))
   val sliceTrainPulseCount = Output(Vec(sliceCount, UInt(64.W)))
+  val sliceTrainValid = Output(Vec(sliceCount, Bool()))
+  val sliceTrainAddr = Output(Vec(sliceCount, UInt(48.W)))
+  val prefetchQueueValid = Output(Vec(sliceCount, Bool()))
+  val prefetchQueueReady = Output(Vec(sliceCount, Bool()))
+  val prefetchQueueOverwrite = Output(Vec(sliceCount, Bool()))
   val bopTrainReceiveCount = Output(UInt(64.W))
   val bopTrainAddr = Output(UInt(48.W))
   val bopReqAddr = Output(UInt(48.W))
@@ -363,6 +368,13 @@ object L2TopObservation {
   private val bop = privateField[OceanusBOP](module, "bop")
   private val slices = privateField[Seq[L2TSHRCtrl]](module, "slices")
   private val pfQueues = privateField[Seq[DecoupledIO[FlitREQ]]](module, "pfQueues")
+  // The production queue instances are local to the enabled construction
+  // block. Inspect the elaborated direct-child IDs, then bore the actual
+  // overwrite pulse; do not infer the observed counter from a shadow FIFO.
+  private val moduleIds = module.getClass.getMethods.find(_.getName == "getIds").get
+    .invoke(module).asInstanceOf[scala.collection.Seq[AnyRef]]
+  private val productionPfQueues = moduleIds.collect { case q: OverwriteQueue[_] => q }
+  require(productionPfQueues.size == pfQueues.size, "prefetch overwrite probe must cover every queue")
   require(pfQueues.size == (if (module.config.bopEnable) module.config.sliceNum else 0),
     "prefetch observation must cover every production queue")
   private val tshrs = privateField[Seq[L2TSHR]](slice0, "tshrs")
@@ -546,6 +558,8 @@ object L2TopObservation {
   io.beProbe.sEvictCbWrData2 := sEvictCbWrData2
 
   slices.zipWithIndex.foreach { case (slice, sliceIdx) =>
+    io.sliceTrainValid(sliceIdx) := boreRead(slice.io.bopTrain.valid)
+    io.sliceTrainAddr(sliceIdx) := boreRead(slice.io.bopTrain.bits)
     val sliceTshrSet = sliceTshrs(sliceIdx)
     val sliceProxyDirs = sliceTshrSet.map(privateField[L2TSHRDirectoryProxy](_, "proxyDir"))
     sliceProxyDirs.zip(sliceTshrSet).zip(allDirProbes(sliceIdx)).foreach { case ((proxyDir, tshr), probe) =>
@@ -913,6 +927,10 @@ object L2TopObservation {
   // Observe the production queue's issued flit, after the issue-enable gate.
   // Every per-slice event remains visible when multiple slices issue together.
   slices.indices.foreach { i =>
+    io.prefetchQueueOverwrite(i) := productionPfQueues.lift(i)
+      .map(q => boreRead(privateBool(q, "overwrite"))).getOrElse(false.B)
+    io.prefetchQueueValid(i) := pfQueues.lift(i).map(q => boreRead(q.valid)).getOrElse(false.B)
+    io.prefetchQueueReady(i) := pfQueues.lift(i).map(q => boreRead(q.ready)).getOrElse(false.B)
     io.bopPrefetchIssueBySlice(i) := pfQueues.lift(i).map(q => boreRead(q.valid) && boreRead(q.ready)).getOrElse(false.B)
     io.bopPrefetchIssueAddrBySlice(i) := pfQueues.lift(i).map(q => boreRead(q.bits.Addr)).getOrElse(0.U)
   }
