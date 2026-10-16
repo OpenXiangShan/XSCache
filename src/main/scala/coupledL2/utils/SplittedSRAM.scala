@@ -77,7 +77,9 @@ class SplittedSRAM[T <: Data]
   }
 
   val ren_vec_0 = VecInit((0 until setSplit).map(i => i.U === r_bankSel))
-  val ren_vec_1 = RegNext(ren_vec_0, 0.U.asTypeOf(ren_vec_0))
+  // Idle request bits may be unknown. Keep the last accepted read's bank so
+  // invalid or stalled requests cannot corrupt response selection or holdRead.
+  val ren_vec_1 = RegEnable(ren_vec_0, 0.U.asTypeOf(ren_vec_0), io.r.req.fire)
   val ren_vec = if(clkDivBy2){
     RegNext(ren_vec_1, 0.U.asTypeOf(ren_vec_0))
   } else ren_vec_1
