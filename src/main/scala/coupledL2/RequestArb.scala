@@ -176,7 +176,10 @@ class RequestArb(implicit p: Parameters) extends L2Module
   /* Meta read request */
   // ^ only sinkA/B/C tasks need to read directory
   io.dirRead_s1.valid := s2_ready && (chnl_task_s1.valid && !mshr_task_s1.valid || s1_needs_replRead && !io.fromMainPipe.blockG_s1)
-  io.dirRead_s1.bits.set := task_s1.bits.set
+  // Directory ready depends on the candidate's bank. Use candidate presence,
+  // which is independent of ready, to keep idle addresses known without a loop.
+  val haveDirCandidate = mshr_task_s1.valid || sinkValids.orR
+  io.dirRead_s1.bits.set := Mux(haveDirCandidate, task_s1.bits.set, 0.U)
   io.dirRead_s1.bits.tag := task_s1.bits.tag
   // invalid way which causes mshr_retry
   // TODO: random waymask can be used to avoid multi-way conflict
