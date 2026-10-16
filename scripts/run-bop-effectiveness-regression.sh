@@ -3,7 +3,7 @@ set -euo pipefail
 # Run from the worktree root. Compile only an approved Mill target, then use
 # the resulting Java classes; never invoke Mill in /data or alter its symlinks.
 stage=${1:-all}
-case "$stage" in baseline|smoke|single|collision|directed|multi|all) ;; *) exit 2 ;; esac
+case "$stage" in baseline|issue-off|smoke|single|collision|directed|multi|all) ;; *) exit 2 ;; esac
 test -f build.sc
 repo_name=${PWD##*/}
 if test -d /data/zhuy; then
@@ -66,6 +66,16 @@ if [[ "$stage" == baseline || "$stage" == all ]]; then
   for slices in 1 2 4; do
     run_case load-miss "$slices" --no-bop
     run_case dirty-victim "$slices" --no-bop
+  done
+fi
+# Fresh current-HEAD A/B supplement: baseline is queue-free (--no-bop),
+# issue-off retains BOP training/queues while disabling prefetch injection.
+# Before simulation, expect the six demand/count summaries to match each
+# other and the frozen historical A/B controls; no prefetch may enter L2.
+if [[ "$stage" == issue-off || "$stage" == all ]]; then
+  for slices in 1 2 4; do
+    run_case load-miss "$slices" --no-prefetch-issue
+    run_case dirty-victim "$slices" --no-prefetch-issue
   done
 fi
 if [[ "$stage" == smoke || "$stage" == all ]]; then

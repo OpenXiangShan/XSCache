@@ -40,7 +40,7 @@ object L2TopConcurrentSimulation extends ChiselSim {
     })
     implicit val simulator: HasSimulator = HasSimulator.default
     val all = plan.batches.flatMap(_._2)
-    val spec = CaseSpec(plan.name, UpConfig(Seq(MasterId.t1p0, MasterId.t4p0, MasterId.t4p1),
+    val spec = CaseSpec(plan.name, UpConfig(all.map(_.master).distinct,
       ExplicitRequestStream(all, Seq.fill(all.size)(BigInt(CHIFieldResp.CompData_SC))), SnoopPolicy.SnpRespI),
       DnConfig(FixedLatency(plan.latency), FixedOutstanding(64), ImmediateCreditPolicy()), plan.watchdog, (0, plan.watchdog), Seq.empty)
     simulate(new TestTop_L2Top(cfg)(params)) { dut =>
@@ -80,6 +80,10 @@ object L2TopConcurrentSimulation extends ChiselSim {
         dn.clearResponses(); up.clearResponses()
         plan.batches.filter(_._1 == cycle).foreach(b => driver.enqueue(b._2))
         driver.drive(cycle)
+        if (all.forall(_.master == MasterId.t1p0)) {
+          assert(dut.io.t4p.forall(p => !p.UpREQ.valid.peek().litToBoolean),
+            "Type-4 request driven in a t1p0-only plan")
+        }
         val external = dut.io.t1p(0).UpREQ.valid.peek().litToBoolean
         // Starvation has a single batch at cycle 0 on t1p0. The snapshot is
         // taken before the first edge without external valid, not from data
