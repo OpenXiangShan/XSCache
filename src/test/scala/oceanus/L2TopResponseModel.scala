@@ -646,6 +646,18 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
         var closedLoopBopReqStalls = 0
         var closedLoopBopReqFirstValidCycle: Option[Int] = None
         var closedLoopPrefetchedHitTrains = 0
+        def bopPerfBySlice: Seq[Seq[BigInt]] = dut.observation.bopPerfCountBySlice.map(_.map(_.peek().litValue).toSeq).toSeq
+        def bopPerfTotals: Seq[BigInt] = L2BOPPerf.names.indices.map(i => bopPerfBySlice.map(_(i)).sum)
+        def checkBopPerf(expected: Seq[Int], label: String): Unit = {
+          val actual = bopPerfTotals
+          println(s"BOP_PERF_RESULT case=$selectedCase phase=$label " +
+            L2BOPPerf.names.zip(actual).map { case (n, v) => s"$n=$v" }.mkString(" ") +
+            s" bySlice=$bopPerfBySlice")
+          assert(actual == expected.map(BigInt(_)), s"BOP effectiveness differs: actual=$actual expected=$expected")
+          assert(actual(L2BOPPerf.Redundant) == actual(L2BOPPerf.RedundantAfterDemand) + actual(L2BOPPerf.RedundantResident))
+          assert(actual(L2BOPPerf.Late) <= actual(L2BOPPerf.Useful))
+        }
+        val bopCommittedPrefetched = scala.collection.mutable.Map.empty[(Int, BigInt), Boolean]
         var closedLoopBopQueueOverwrites = 0
         var overwriteReadyViolations = 0
         var overwriteObservedOverwrites = 0
@@ -1224,6 +1236,9 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
             (0 until totalTshrs).foreach { i =>
               val d = probe(i)
               val addr = d.tshrPaddr.peek().litValue
+              if (d.dirWbLand.peek().litToBoolean)
+                bopCommittedPrefetched((i / testMshrSize, addr)) = d.dirResultState.peek().litValue != 0 &&
+                  d.dirResultPrefetched.peek().litToBoolean
               if (bopCollision && d.reqAlloc.peek().litToBoolean &&
                   d.reqAllocPaddr.peek().litValue == collisionAddress) collisionTargetAllocations += "alloc"
               if (bopCollision && d.reqReuse.peek().litToBoolean &&
@@ -1298,6 +1313,7 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
               completed == closedLoopStageARequests && cycle >= nextClosedLoopCycle + 500) {
             assert(closedLoopMeasuredOffset.contains(BigInt(10 * 64)),
               s"Stage-A must learn +10 before collision: measured=$closedLoopMeasuredOffset")
+            checkBopPerf(Seq(2, 0, 0, 0, 0, 12, 0, 0), "stage-a")
             collisionBaseline = Some((closedLoopTrainEvents, closedLoopPrefetchedHitTrains,
               dnTxReqCount, completed, evictBackHandles.size))
             collisionBaseDrops = Some((closedLoopCrossPageDrops, closedLoopDisabledDrops))
@@ -1886,6 +1902,8 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
                 s"prefetches=${smokePrefetches.size} prefetchDn=${smokePrefetches.map(_.dnRequests).sum} " +
                 s"demandDn=$dnTxReqCount upTxDat=$upTxDatCount completed=$completed TRAIN_FIRE=$closedLoopTrainEvents " +
                 s"crossPageDrops=$closedLoopCrossPageDrops evict=0/0/0/0 pending=$smokePending active=$smokeActive")
+              // Eight disjoint cold +2 targets, no demand consumers or losses.
+              checkBopPerf(Seq(0, 0, 0, 0, 0, 8, 0, 0), "smoke-final")
               assert(pass, "BOP prefetch smoke aggregate checks failed")
             } else if (bopCollision) {
               val (baseTrain, basePrefetchedHit, baseDnReq, baseCompleted, baseEvict) = collisionBaseline.getOrElse(
@@ -1974,6 +1992,10 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
                 s"evict=${evictTuple._1}/${evictTuple._2}/${evictTuple._3}/${evictTuple._4} " +
                 s"evictCreatedDelta=${evictBackHandles.size - baseEvict} heldTxn=${heldDnTxn.map(_.v)} " +
                 s"prefetchIssue=$collisionPrefetchIssueCycle")
+              checkBopPerf(if (caseC3) Seq(3, 0, 1, 1, 0, 13, 0, 0) else Seq(4, 1, 0, 0, 0, 14, 0, 0), "collision-final")
+              assert(bopCommittedPrefetched.count(_._2) == 10)
+              println(s"BOP_PERF_ACCOUNTING issued=${bopPerfTotals(L2BOPPerf.IssuedDownstream)} " +
+                s"usefulFromDownstream=${bopPerfTotals(L2BOPPerf.Useful)} evict=0 snoop=0 resident=10")
               assert(pass, "BOP concurrent collision checks failed")
             } else if (bopClosedLoop) {
               println(s"EVICTBACK_COUNTS created=${evictBackHandles.size} completed=${completedEvictBackHandles.size} " +
@@ -2053,6 +2075,18 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
                 s"predictedOffset=${predictedOffset.map(v => s"+$v").getOrElse("none")} " +
                 s"measuredOffset=${closedLoopMeasuredOffset.map(_ / 64).map(v => s"+$v").getOrElse("none")} " +
                 s"measuredT=${measuredT.map(_.toString).getOrElse("none")}")
+              checkBopPerf(Seq(110, 0, 0, 0, 0, 120, 0, 0), "closed-final")
+              val expectedResident = expectedPrefetchAddressSet -- expectedBOP.trains(288)
+              val actualResident = bopCommittedPrefetched.collect { case ((_, addr), true) => addr }.toSet
+              assert(expectedResident == (288 until 298).map(expectedBOP.address).toSet)
+              assert(actualResident == expectedResident, s"committed residence=$actualResident expected=$expectedResident")
+              bopPerfBySlice.zipWithIndex.foreach { case (counts, slice) =>
+                assert(counts(L2BOPPerf.Useful) == expectedHitsBySlice(slice))
+                assert(counts(L2BOPPerf.IssuedDownstream) == expectedBOP.bySlice(expectedPrefetchAddressSet, numSlices)(slice))
+              }
+              println(s"BOP_PERF_ACCOUNTING issued=120 usefulFromDownstream=110 evict=0 snoop=0 resident=${actualResident.size} " +
+                s"residentBySlice=${expectedBOP.bySlice(actualResident, numSlices)} " +
+                s"addresses=${actualResident.toSeq.sorted.map(hex).mkString(",")}")
               assert(closedLoopPass, "BOP closed-loop checks failed")
             } else if (bopOverwriteQueue) {
               // Independent pre-run arithmetic: depth=2, no dequeue during block.
@@ -2118,6 +2152,9 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
               } else {
                 assert(dnTxReqCount == 1 && upTxDatCount == 2 && dnTxDatCount == 0)
               }
+              // No injected BOP request and no prefetch-marked line: all
+              // effectiveness events must remain zero even on dirty eviction.
+              checkBopPerf(Seq.fill(L2BOPPerf.names.size)(0), "issue-off-final")
               println(s"BOP_ISSUE_OFF_BASELINE pass=true case=$selectedCase slices=$numSlices")
             }
             println(s"SLICE_EVICTBACK_FIRE counts=${dut.observation.sliceEvictBackFireCount.map(_.peek().litValue).mkString(",")}")

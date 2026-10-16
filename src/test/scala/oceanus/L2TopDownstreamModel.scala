@@ -286,6 +286,7 @@ class L2TopDownstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim
     }
   }
 
+  def canDriveRxSnp: Boolean = rxsnpCredits.canSend(hnRxLinkRun)
   def canDriveRxDat: Boolean = rxdatCredits.canSend(hnRxLinkRun)
   def canDriveRxRsp: Boolean = rxrspCredits.canSend(hnRxLinkRun)
 }

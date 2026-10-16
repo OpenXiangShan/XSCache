@@ -305,6 +305,7 @@ class L2TopObservationIO(entries: Int, sliceCount: Int)(implicit val p: Paramete
   val bopReqFire = Output(Bool())
   val bopTrainValid = Output(Bool())
   val bopTrainReady = Output(Bool())
+  val bopPerfCountBySlice = Output(Vec(sliceCount, Vec(L2BOPPerf.names.size, UInt(64.W))))
   val prefetchedHitTrainCount = Output(UInt(8.W))
   val prefetchedHitTrainAddr = Output(UInt(48.W))
   val prefetchedHitTrainValidBySlice = Output(Vec(sliceCount, Bool()))
@@ -380,6 +381,17 @@ object L2TopObservation {
     try BoringUtils.bore(data) catch { case _: NoSuchElementException => data }
   }
 
+
+  // Existing hierarchical observation: mirror the exact numeric XSPerf input,
+  // including multiple TSHRs in one cycle, without adding production top IO.
+  slices.zipWithIndex.foreach { case (slice, s) =>
+    val pulses = boreRead(slice.bopPerf)
+    L2BOPPerf.names.indices.foreach { i =>
+      val count = RegInit(0.U(64.W))
+      count := count + pulses(i)
+      io.bopPerfCountBySlice(s)(i) := count
+    }
+  }
 
   io.sliceNum := module.config.sliceNum.U
   io.bankBits := log2Ceil(module.config.sliceNum).U

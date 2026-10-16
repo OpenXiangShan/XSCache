@@ -26,6 +26,17 @@ import oceanus.l2.OceanusBOPParameters
   * are their intersection with 0..287: 158..191,202..255,266..287 (110).
   * All 288 distinct demands train once: 178 misses + 110 prefetched hits.
   * Cross-page target indices: 64..65,128..129,192..201,256..265 (24).
+  * Effectiveness: every issued target is cold at its arrival; +10 leads its
+  * consumer by 330 cycles versus a 12-cycle downstream latency. Hence useful=110,
+  * late=0, timely=110, issued_downstream=120, redundant=after_demand=resident=0.
+  * No snoops or valid-victim replacements: useless_evict=useless_snoop=0.
+  * Ten untouched targets D288..297 remain prefetched. Independently derive them
+  * as issues(288) -- trains(288), and verify the final committed Directory
+  * ledger, rather than deriving residence only by subtracting counter values.
+  * Accounting: 120 = 110 downstream-prefetch useful + 0 evict + 0 snoop + 10
+  * resident. Slice hash partitions every address, so all slice sums are equal
+  * to the single-slice totals (per-slice expectations use those address sets).
+  *
   * Disabled target indices: 2..63,66..127,130..149 (144).
   *
   * Count EvictBack per first installation, by (slice,set), where set=(addr>>6)
@@ -46,6 +57,14 @@ import oceanus.l2.OceanusBOPParameters
   * is disabled; C2 UC is satisfied from UU and has zero demandDn increment.
   * C3 holds demand D170 first; its later queued Stash hits that fill, so
   * only D180 issues a prefetch downstream read, hitDelta=1, demandDnDelta=1.
+  * Effectiveness Stage-A baseline: useful=2, issued_downstream=12, all other
+  * metrics=0, ten prefetched lines remain. C1/C2 add useful=2, late=1 and
+  * issued_downstream=2; the held internal prefetch is active when the target
+  * demand reuses its TSHR. C3 adds useful=1, late=0, issued_downstream=1,
+  * redundant_after_demand=1 and redundant_resident=0. That +1 useful is D160
+  * only; the queued D170 prefetch contributes zero useful. The held demand is
+  * active at the prefetch's allocator reuse; the queued hint later hits it.
+  * Each collision ends with ten unused prefetched lines and zero useless loss.
   * All cases: trainDelta=2, completedDelta=3 including the final D170 readback,
   * crossPageDelta=disabledDelta=0. Readback allocates a fresh TSHR (no reuse),
   * reads SRAM prefetched=0, and does not train. D0..170 plus D180 gives at

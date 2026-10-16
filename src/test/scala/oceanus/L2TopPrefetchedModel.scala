@@ -18,6 +18,8 @@ object TestTop_L2Prefetched extends App with ChiselSim {
   val caseNames = if (selectedName == "bop-2c-all") {
     for (fill <- Seq("sc", "uc"); variant <- Seq("readshared", "readunique", "makeunique", "makeunique-miss", "external-stash", "replacement"))
       yield s"bop-2c-$variant-$fill"
+  } else if (selectedName == "bop-useless-all") {
+    Seq("useless-evict", "useless-snoop", "redundant-resident").map(v => s"bop-2c-$v-sc")
   } else if (selectedName == "bop-stash-all") {
     Seq("stashunique-hit", "stashshared-hit", "stashunique-dirty").map(v => s"bop-2c-$v-sc")
   } else Seq(selectedName)
@@ -39,7 +41,7 @@ object TestTop_L2Prefetched extends App with ChiselSim {
       println(s"BOP_2C_RESET case=$name")
       val fillUC = name.endsWith("-uc")
       val variant = name.stripPrefix("bop-2c-").stripSuffix(if (fillUC) "-uc" else "-sc")
-      require(Set("readshared", "readunique", "makeunique", "makeunique-miss", "external-stash", "replacement", "stashunique-hit", "stashshared-hit", "stashunique-dirty").contains(variant))
+      require(Set("readshared", "readunique", "makeunique", "makeunique-miss", "external-stash", "replacement", "stashunique-hit", "stashshared-hit", "stashunique-dirty", "useless-evict", "useless-snoop", "redundant-resident").contains(variant))
       val stashPreserve = variant.startsWith("stash")
       val stashUpgrade = stashPreserve && variant != "stashshared-hit"
       val dirtyUpgrade = variant == "stashunique-dirty"
@@ -59,6 +61,11 @@ object TestTop_L2Prefetched extends App with ChiselSim {
         // only. Expected total train=1, internal fills={P}, no upstream data.
         case "makeunique-miss" => Seq(req(demand, hitOpcode), req(demand, hitOpcode),
           req(demand, CCHIOpcode.StashShared.opcode))
+        case "redundant-resident" => Seq(req(target, CCHIOpcode.StashShared.opcode),
+          req(demand, CCHIOpcode.ReadShared.opcode), req(target, CCHIOpcode.StashShared.opcode))
+        case "useless-evict" =>
+          Seq("10000", "12000", "14000", "16000", "18080", "1a080").map(a => req(BigInt(a, 16), CCHIOpcode.ReadShared.opcode))
+        case "useless-snoop" => Seq(req(demand, CCHIOpcode.ReadShared.opcode))
         case "stashunique-hit" | "stashshared-hit" | "stashunique-dirty" =>
           Seq(req(demand, CCHIOpcode.ReadShared.opcode),
             req(target, if (stashUpgrade) CCHIOpcode.StashUnique.opcode else CCHIOpcode.StashShared.opcode),
@@ -110,6 +117,21 @@ object TestTop_L2Prefetched extends App with ChiselSim {
       // stashunique-dirty returns UD_PD on the upgrade ONLY: expected resulting
       // combination prefetched=1, dirty=1, state=UU. This is a known combination
       // for later silent-evict work; external Stash must preserve the BOP mark.
+      // Resident redundancy: external Stash first installs P with bit=0 and
+      // frees its TSHR. Demand D subsequently generates internal +2 hint P;
+      // it hits the resident line: redundant_resident=1, after_demand=0,
+      // issued_downstream=0, useful=0. Its silent hit must not re-mark P.
+      // Useless eviction: four cold demands D=0x10000/12000/14000/16000
+      // produce internal P=D+0x80 in the SAME set 2, prefetched=1, S, no clients.
+      // Four empty ways fill, PLRU order 0,1,2,3 => victim 0. Demand misses
+      // 0x18080 and 0x1a080 then replace prefetched ways 0 and 2 respectively.
+      // Each replacement counts once at the victim host's actual valid->I
+      // REQ meta write: useless_evict=2, not at ReplRd or EVB acceptance.
+      // Six trains produce six downstream internal prefetches; none is useful.
+      // Four prefetched lines remain: 6 = 0 useful + 2 evict + 0 snoop + 4 resident.
+      // Useless snoop: D produces P=S/prefetched=1; downstream SnpUnique P
+      // (RetToSrc=0) invalidates it: useless_snoop=1, useless_evict=0, useful=0.
+      // Repeat SnpUnique on now-invalid P: no further valid->I, still count=1.
       val up = new L2TopUpstreamModel(dut, spec)
       val dn = new L2TopDownstreamModel(dut, spec)
       val dataQ = mutable.Queue.empty[PendingDnComp]
@@ -127,6 +149,12 @@ object TestTop_L2Prefetched extends App with ChiselSim {
       var downstreamCount = 0
       var dirtyPreserveObserved = false
       var externalPrefetchMaskWrites = 0
+      var injectSnoop = false
+      var snoopSent = false
+      var snoopResponses = 0
+      var nextSnoopTxn = 1
+      val resident = mutable.Map.empty[BigInt, Boolean]
+      def perf: Seq[BigInt] = dut.observation.bopPerfCountBySlice(0).map(_.peek().litValue).toSeq
       var dataCount = 0
       var compCount = 0
       val reads = mutable.ArrayBuffer.empty[(Boolean, Boolean)]
@@ -139,6 +167,22 @@ object TestTop_L2Prefetched extends App with ChiselSim {
       def tick(): Unit = {
         up.clearResponses()
         dn.clearResponses()
+        if (injectSnoop && dn.canDriveRxSnp) {
+          dut.io.chi.rxsnp.flitv.poke(true.B)
+          dut.io.chi.rxsnp.flitpend.poke(true.B)
+          dut.io.chi.rxsnp.flit.poke(0.U.asTypeOf(dut.io.chi.rxsnp.flit))
+          dut.io.chi.rxsnp.flit.Opcode.get.poke(0x07.U) // CHI SnpUnique
+          // SnpUnique requires DoNotGoToSD=1 in this base protocol path.
+          // Poke the packed storage field; the accessor methods elaborate a
+          // slice and cannot be called from the simulator thread.
+          dut.io.chi.rxsnp.flit.DoNotGoToSD_DoNotDataPull.get.poke(3.U)
+          dut.io.chi.rxsnp.flit.Addr.get.poke((target >> 3).U)
+          dut.io.chi.rxsnp.flit.TxnID.get.poke(nextSnoopTxn.U)
+          dut.io.chi.rxsnp.flit.SrcID.get.poke(0.U)
+          injectSnoop = false; snoopSent = true
+        }
+        if (flag(dut.io.chi.txrsp.flitv) && value(dut.io.chi.txrsp.flit.Opcode.get) == 0x01)
+          snoopResponses += 1 // SnpResp, one per non-forward SnpUnique
         var upRspDriven = false
         ackQ.headOption.filter(_.due <= cycle).foreach { a =>
           up.driveUpCompAck(a.upDBID, 0); ackQ.dequeue(); upRspDriven = true
@@ -164,6 +208,11 @@ object TestTop_L2Prefetched extends App with ChiselSim {
         usefulCount += value(dut.observation.prefetchedHitTrainCount).toInt
         dut.observation.dirProbeBySlice(0).foreach { d =>
           val addr = value(d.tshrPaddr)
+          // Eviction invalidation may cancel Directory writeback because the
+          // refiller overwrites that physical way. Remove the old tag on the
+          // actual local invalidating write as well as tracking committed rows.
+          if (flag(d.metaWrReqState) && value(d.metaWrReqMetaState) == 0) resident(addr) = false
+          if (flag(d.dirWbLand)) resident(addr) = value(d.dirResultState) != 0 && flag(d.dirResultPrefetched)
           if (flag(d.dirWbLand)) landed(addr) = (value(d.dirResultState), flag(d.dirResultPrefetched))
           if (stashPreserve && current == 1 && addr == target) {
             if (flag(d.metaWrReqPrefetched)) externalPrefetchMaskWrites += 1
@@ -243,6 +292,25 @@ object TestTop_L2Prefetched extends App with ChiselSim {
         if (variant == "external-stash") {
           assert(trainCount == 0 && landed(target)._2 == false)
           assert(reads.toSeq == Seq((index != 0, false)), s"external Stash SRAM reads=$reads")
+        } else if (variant == "redundant-resident") {
+          assert(trainCount == (if (index == 0) 0 else 1) && usefulCount == 0)
+          if (index != 1) assert(reads.toSeq == Seq((index == 2, false)))
+          assert(!landed(target)._2)
+        } else if (variant == "useless-evict") {
+          assert(trainCount - beforeTrain == 1 && usefulCount == 0)
+          if (index < 4) {
+            assert(perf(L2BOPPerf.UselessEvict) == 0)
+            assert(resident.count(_._2) == index + 1)
+          } else {
+            val expectedVictim = if (index == 4) target else BigInt("14080", 16)
+            assert(victims.toSeq == Seq((expectedVictim, true)), s"prefetched victim=$victims expected=$expectedVictim")
+            assert(perf(L2BOPPerf.UselessEvict) == index - 3)
+            assert(resident.count(_._2) == 4)
+          }
+          assert(perf(L2BOPPerf.UselessSnoop) == 0)
+        } else if (variant == "useless-snoop") {
+          assert(index == 0 && landed(target) == ((BigInt(1), true)))
+          assert(usefulCount == 0)
         } else if (stashPreserve) {
           val consumes = index == 3
           assert(trainCount - beforeTrain == (if (index == 0 || consumes) 1 else 0))
@@ -288,11 +356,39 @@ object TestTop_L2Prefetched extends App with ChiselSim {
         println(s"BOP_2C_PHASE pass=true case=$name index=$index trainDelta=${trainCount - beforeTrain} dataDelta=${dataCount - beforeData} compDelta=${compCount - beforeComp}")
       }
       assert(quiet)
-      val expectedTrains = if (variant == "external-stash") 0 else if (variant == "makeunique-miss") 1 else 2
+      if (variant == "useless-snoop") {
+        for (_ <- 0 until 2) {
+          injectSnoop = true; snoopSent = false
+          val previousResponses = snoopResponses
+          while (!snoopSent || snoopResponses == previousResponses) tick()
+          var drained = 0
+          while (drained < 16) { tick(); drained = if (quiet) drained + 1 else 0 }
+          assert(perf(L2BOPPerf.UselessSnoop) == 1)
+          nextSnoopTxn += 1
+        }
+        assert(landed(target) == ((BigInt(0), true)), "SNP invalidation preserves stale bit but state=I")
+      }
+      val expectedTrains = if (variant == "useless-evict") 6 else if (variant == "useless-snoop" || variant == "redundant-resident") 1 else if (variant == "external-stash") 0 else if (variant == "makeunique-miss") 1 else 2
       assert(trainCount == expectedTrains)
-      assert(internalFills.size == expectedTrains)
-      if (variant != "external-stash" && variant != "makeunique-miss") assert(internalFills.toSet == Set(target,
+      assert(internalFills.size == (if (variant == "redundant-resident") 0 else expectedTrains))
+      if (!variant.startsWith("useless") && variant != "redundant-resident" && variant != "external-stash" && variant != "makeunique-miss") assert(internalFills.toSet == Set(target,
         (if (variant == "replacement") replacement else target) + 0x80))
+      if (variant == "redundant-resident") {
+        assert(perf == Seq(0,0,1,0,1,0,0,0).map(BigInt(_)))
+        println("BOP_RESIDENT_RESULT pass=true redundant=1 redundant_after_demand=0 redundant_resident=1 issued_downstream=0 useful=0")
+      }
+      if (variant.startsWith("useless")) {
+        val expected = if (variant == "useless-evict") Seq(0,0,0,0,0,6,2,0) else Seq(0,0,0,0,0,1,0,1)
+        assert(perf == expected.map(BigInt(_)), s"useless metrics=$perf expected=$expected")
+        assert(resident.count(_._2) == (if (variant == "useless-evict") 4 else 0))
+        if (variant == "useless-evict") {
+          assert(resident.collect { case (a, true) => a }.toSet ==
+            Seq("12080", "16080", "18100", "1a100").map(BigInt(_, 16)).toSet)
+        }
+        println(s"BOP_USELESS_RESULT pass=true case=$name " + L2BOPPerf.names.zip(perf).map { case (n,v) => s"$n=$v" }.mkString(" ") +
+          s" resident=${resident.count(_._2)} snoopResponses=$snoopResponses")
+      }
+      assert(perf(L2BOPPerf.Useful) == usefulCount)
       if (stashPreserve) {
         assert(usefulCount == 1)
         println(s"BOP_STASH_RESULT pass=true case=$name useful=$usefulCount externalMaskWrites=$externalPrefetchMaskWrites " +
