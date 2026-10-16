@@ -106,6 +106,8 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
     val valid = Output(Bool())
 
+    val bopPerf = Output(Vec(L2BOPPerf.names.size, Bool()))
+
     val bopTrain = Valid(UInt(paramL2.physicalAddrWidth.W))
   })
 
@@ -535,6 +537,33 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   vPipeREQ.io.UpRXREQ := rbeREQ.io.out
   vPipeREQ.io.UpRXEVB := rbeEVB.io.out
   io.bopTrain := vPipeREQ.io.bopTrain
+
+  // Count late once at allocator acceptance into an existing TSHR, with the
+  // internal StashShared REQ vPipe still active. Waiting before allocator
+  // acceptance is outside this metric. Only RS/RU/MU are BOP demand consumers.
+  val bopDemandEnter = io.UpRXREQ.SrcID =/= io.consts.pfSrcID &&
+    (io.UpRXREQ.Opcode === ReadShared.U || io.UpRXREQ.Opcode === ReadUnique.U ||
+      io.UpRXREQ.Opcode === MakeUnique.U)
+  val bopLate = tshr_enter_REQ && io.fromAlloc.reuse.REQ && bopDemandEnter &&
+    vPipeREQ.io.bopPerf.activePrefetch
+  // C3's symmetric qualifier is captured beside the ONE-entry, non-flow,
+  // non-pipe REQ RBE. It belongs to that queued request until REQ execution;
+  // subsequent entries always overwrite it, including ordinary allocations.
+  // A prefetch arriving after the demand TSHR was freed is resident instead.
+  val bopQueuedAfterDemand = RegInit(false.B)
+  when (tshr_enter_REQ) {
+    bopQueuedAfterDemand := io.fromAlloc.reuse.REQ &&
+      io.UpRXREQ.SrcID === io.consts.pfSrcID && io.UpRXREQ.Opcode === StashShared.U &&
+      vPipeREQ.io.bopPerf.activeDemand
+  }
+  io.bopPerf(L2BOPPerf.Useful) := vPipeREQ.io.bopPerf.useful
+  io.bopPerf(L2BOPPerf.Late) := bopLate
+  io.bopPerf(L2BOPPerf.Redundant) := vPipeREQ.io.bopPerf.redundant
+  io.bopPerf(L2BOPPerf.RedundantAfterDemand) := vPipeREQ.io.bopPerf.redundant && bopQueuedAfterDemand
+  io.bopPerf(L2BOPPerf.RedundantResident) := vPipeREQ.io.bopPerf.redundant && !bopQueuedAfterDemand
+  io.bopPerf(L2BOPPerf.IssuedDownstream) := vPipeREQ.io.bopPerf.issuedDownstream
+  io.bopPerf(L2BOPPerf.UselessEvict) := vPipeREQ.io.bopPerf.uselessEvict
+  io.bopPerf(L2BOPPerf.UselessSnoop) := vPipeSNP.io.bopUselessSnoop
 
   vPipeREQ.io.DnRXRSP := io.DnRXRSP
   vPipeREQ.io.DnRXDAT := io.DnRXDAT

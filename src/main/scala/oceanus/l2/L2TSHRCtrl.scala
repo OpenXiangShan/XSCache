@@ -114,6 +114,16 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   io.bopTrain.bits := PriorityMux(tshrs.map(t => t.io.bopTrain.valid -> t.io.bopTrain.bits))
   // ----------------------------------------------------------------
 
+  // Per-slice BOP effectiveness. Sum EVERY TSHR event: OR would lose
+  // simultaneous completions. Each metric has one counting boundary only;
+  // REQ/TSHR/SNP provide pulses, and XSPerf accumulates only here. Nested
+  // eviction/snoop ownership follows the first actual valid -> I local write.
+  val bopPerf = Wire(Vec(L2BOPPerf.names.size, UInt(log2Ceil(paramL2.mshrSize + 1).W)))
+  L2BOPPerf.names.zipWithIndex.foreach { case (name, i) =>
+    bopPerf(i) := PopCount(tshrs.map(_.io.bopPerf(i)))
+    XSPerfAccumulate(s"bop_$name", bopPerf(i))
+  }
+
   // -- TSHR Allocation connections
   val tshrAlloc = Module(new L2TSHRAlloc(new L2TSHRAllocConfig(
     cluster = Seq(Seq(L2TSHRAllocTarget.EVT), Seq(L2TSHRAllocTarget.SNP, L2TSHRAllocTarget.EVB, L2TSHRAllocTarget.REQ)), // TODO: parameterize clustering

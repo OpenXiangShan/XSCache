@@ -18,6 +18,8 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
     with HasL2Params {
 
   val io = IO(new Bundle {
+    val bopUselessSnoop = Output(Bool())
+
     val consts = Input(new L2TSHRConsts(sliceNum))
 
     val DnRXSNP = Flipped(Valid(new CHIBundleSNP))
@@ -273,6 +275,12 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
                             !w_snpresp0 && !w_snpresp2 && !w_ds_read && need_dct_txdat && no_tx_inflight
 
   val do_meta_write = s_meta_write && (io.DnTXRSP.fire || fire_home_data0)
+  // Only an actual valid -> I write consumes an unused prefetch. A snoop
+  // arrival or a downgrade to S does not. Sample LIVE local meta before this
+  // write; a nested eviction/snoop is charged to whichever invalidates first.
+  io.bopUselessSnoop := do_meta_write && rxsnp_meta_write_en.state &&
+    rxsnp_meta_write_meta.state === L2Directory.MetaState.I && io.tshr_dirResult.hit &&
+    io.tshr_dirResult.state =/= L2Directory.MetaState.I && io.tshr_dirResult.prefetched
   val do_sa_snpcompack = s_snpcompack && !(w_snpresp0 || w_snpresp2 || w_ds_read || s_home_resp0 || s_home_resp2 ||
                          s_dct_resp0 || s_dct_resp2)
 

@@ -35,6 +35,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     with HasCCHIParameters {
 
   val io = IO(new Bundle {
+    val bopPerf = Output(new L2BOPReqPerf)
+
     val consts = Input(new L2TSHRConsts(sliceNum))
 
     val UpRXREQ = Flipped(Valid(new FlitREQStripped))
@@ -1958,4 +1960,22 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   assert(!(rxevb_unsatisfied_evictback && active), 
     "TSHR @ %m REQ vPipe passed unsatisfied EvictBack on active non-replace non-invalid transaction")
   // ----------------------------------------------------------------
+  // BOP effectiveness boundaries (observation only). useful is exactly the
+  // existing prefetchedHitTrain: first RS/RU/MU consumption of the OLD bit,
+  // including permission upgrades. Late consumption is included in useful;
+  // timely is useful - late (allocator-side late is defined in L2TSHR).
+  io.bopPerf.activePrefetch := active && p_rxreq_stashshared && p_rxreq.SrcID === io.consts.pfSrcID
+  io.bopPerf.activeDemand := active && p_rxreq.SrcID =/= io.consts.pfSrcID &&
+    (p_rxreq_readshared || p_rxreq_readunique || p_rxreq_makeunique)
+  io.bopPerf.useful := prefetched_hit_train
+  // Count redundant only at REQ execution, never at allocation/queue issue.
+  io.bopPerf.redundant := rxreq_fire && rxreq.SrcID === io.consts.pfSrcID && rxreq_satisfied_stashshared
+  // First downstream send only; RetryAck/PCrdGrant reissues are excluded.
+  io.bopPerf.issuedDownstream := io.DnTXREQ.fire && io.bopPerf.activePrefetch && !p_txreq_reissue
+  // Count the victim host's actual valid -> I local meta write. Never use the
+  // replacer's victim snapshot or the number of loopback EvictBack requests.
+  io.bopPerf.uselessEvict := meta_wr_state_evictback_I && io.tshr_meta_write_en.state &&
+    io.tshr_meta_write_meta.state === MetaState.I && dirResult.hit &&
+    dirResult.state =/= MetaState.I && dirResult.prefetched
+
 }
