@@ -29,6 +29,45 @@ class HintQueueEntry(implicit p: Parameters) extends L2Bundle {
   val isGrantData = Bool()
   val isKeyword = Bool()
   val hasData = Bool()
+  val cancelled = Bool()
+}
+
+// Keep cancellation with each stored hint, including hints behind the queue head.
+// A later transaction using the same source must not revive an old hint.
+class HintQueue(entries: Int, pipe: Boolean = false)(implicit p: Parameters) extends L2Module {
+  require(entries > 0)
+  val io = IO(new Bundle {
+    val enq = Flipped(Decoupled(new HintQueueEntry))
+    val deq = Decoupled(new HintQueueEntry)
+    val count = Output(UInt(log2Ceil(entries + 1).W))
+    val cancel = Flipped(Valid(UInt(sourceIdBits.W)))
+  })
+
+  val hints = Reg(Vec(entries, new HintQueueEntry))
+  val enqPtr = Counter(entries)
+  val deqPtr = Counter(entries)
+  val count = RegInit(0.U(log2Ceil(entries + 1).W))
+  io.enq.ready := count =/= entries.U || (pipe.B && io.deq.ready)
+  io.deq.valid := count =/= 0.U
+  io.deq.bits := hints(deqPtr.value)
+  io.count := count
+
+  def matchesCancel(hint: HintQueueEntry): Bool =
+    io.cancel.valid && hint.isGrantData && hint.source === io.cancel.bits
+
+  for (i <- 0 until entries) {
+    when(io.enq.fire && enqPtr.value === i.U) {
+      hints(i) := io.enq.bits
+      hints(i).cancelled := io.enq.bits.cancelled || matchesCancel(io.enq.bits)
+    }.elsewhen(matchesCancel(hints(i))) {
+      hints(i).cancelled := true.B
+    }
+  }
+  when(io.enq.fire) { enqPtr.inc() }
+  when(io.deq.fire) { deqPtr.inc() }
+  when(io.enq.fire =/= io.deq.fire) {
+    count := Mux(io.enq.fire, count + 1.U, count - 1.U)
+  }
 }
 
 class CustomL1HintIOBundle(implicit p: Parameters) extends L2Bundle {
@@ -36,6 +75,7 @@ class CustomL1HintIOBundle(implicit p: Parameters) extends L2Bundle {
   val mshrHintQInfo = Flipped(ValidIO(new TaskBundle()))
   val sinkCHintQInfo = Flipped(ValidIO(new TaskBundle()))
   val retry_s2 = Input(Bool())
+  val hintCancel = Flipped(Valid(UInt(sourceIdBits.W)))
 
   val s3 = new L2Bundle {
       val task      = Flipped(ValidIO(new TaskBundle()))
@@ -88,6 +128,7 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   enqBits_s1.isKeyword := Mux(mshr_s1.mergeA, mshrMerge_s1.isKeyword.getOrElse(false.B), mshr_s1.isKeyword.getOrElse(false.B)) 
   enqBits_s1.isGrantData := mshr_GrantData_s1
   enqBits_s1.hasData := mshr_GrantData_s1 || mshr_AccessAckData_s1
+  enqBits_s1.cancelled := false.B
 
   // Hint for "chnTask Hit" will fire@s3
   val chn_Grant_s3     = task_s3.valid && !mshrReq_s3 && !need_mshr_s3 && task_s3.bits.fromA && task_s3.bits.opcode === Grant
@@ -99,11 +140,13 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   enqBits_s3.isKeyword := task_s3.bits.isKeyword.getOrElse(false.B)
   enqBits_s3.isGrantData := chn_GrantData_s3
   enqBits_s3.hasData := chn_GrantData_s3 || chn_AccessAckData_s3
+  enqBits_s3.cancelled := false.B
 
   // ==================== Hint Queue ====================
   val hintEntries = mshrsAll
   val hintEntriesWidth = log2Ceil(hintEntries)
-  val hintQueue = Module(new Queue(new HintQueueEntry, hintEntries))
+  val hintQueue = Module(new HintQueue(hintEntries))
+  hintQueue.io.cancel := io.hintCancel
   val canFlow_s1 = !hintQueue.io.deq.valid || hintQueue.io.count === 1.U && hintQueue.io.deq.fire
   val valid_s1 = mshr_GrantData_s1 || mshr_Grant_s1 || mshr_AccessAckData_s1 || mshr_CBOAck_s1 || chn_Release_s1
   val flow_s1, drop_s1, enq_s3 = Wire(Decoupled(new HintQueueEntry))
@@ -114,7 +157,8 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   // staging FIFO between the s1 hint event and hintQueue; depth 2 absorbs
   // back-to-back s1 hint events, and RequestArb blocks hint-generating fires
   // when full, so a hint event always has a place to go (see assert below)
-  val hint_s1Queue = Module(new Queue(new HintQueueEntry, 2))
+  val hint_s1Queue = Module(new HintQueue(2))
+  hint_s1Queue.io.cancel := io.hintCancel
   hint_s1Queue.io.enq.valid := valid_s1 && (!canFlow_s1 || !flow_s1.ready)
   hint_s1Queue.io.enq.bits  := enqBits_s1
   assert(!valid_s1 || hint_s1Queue.io.enq.ready || flow_s1.ready)
@@ -131,9 +175,10 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   enq_s3.bits := enqBits_s3
   arb(Seq(enq_s3, drop_s1, flow_s1), hintQueue.io.enq, Some("Hint"))
   val respWithDataFire = io.l1Hint.fire && io.l1Hint.bits.hasData
-  hintQueue.io.deq.ready := io.l1Hint.ready && !RegNext(respWithDataFire, false.B)
+  val headCancelled = hintQueue.io.deq.bits.cancelled
+  hintQueue.io.deq.ready := headCancelled || (io.l1Hint.ready && !RegNext(respWithDataFire, false.B))
 
-  io.l1Hint.valid := hintQueue.io.deq.valid && !(io.retry_s2 && !hint_s1Queue.io.deq.valid) && !RegNext(respWithDataFire, false.B)
+  io.l1Hint.valid := hintQueue.io.deq.valid && !headCancelled && !(io.retry_s2 && !hint_s1Queue.io.deq.valid) && !RegNext(respWithDataFire, false.B)
   io.l1Hint.bits.sourceId := hintQueue.io.deq.bits.source - dcacheClient.sourceId.start.U
   io.l1Hint.bits.isKeyword := hintQueue.io.deq.bits.isKeyword
   io.l1Hint.bits.hasData := hintQueue.io.deq.bits.hasData

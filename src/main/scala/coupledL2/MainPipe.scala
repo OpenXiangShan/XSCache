@@ -110,6 +110,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
     /* l2 refill hint */
     val l1Hint = DecoupledIO(new L2ToL1HintInsideL2())
+    val hintCancel = Flipped(Valid(UInt(sourceIdBits.W)))
 
     /* send prefetchTrain to Prefetch to trigger a prefetch req */
     val prefetchTrain = prefetchOpt.map(_ => DecoupledIO(new PrefetchTrain))
@@ -881,6 +882,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   customL1Hint.io.sinkCHintQInfo := io.sinkCHintQInfo
   customL1Hint.io.retry_s2 := io.retryFastFwd_s2 && task_s2.valid
   io.hint_s1QueueFull := customL1Hint.io.hint_s1QueueFull
+  customL1Hint.io.hintCancel := io.hintCancel
 
   customL1Hint.io.s3.task      := task_s3
   // overwrite opcode: if sinkReq can respond, use sink_resp_s3.bits.opcode = Grant/GrantData
