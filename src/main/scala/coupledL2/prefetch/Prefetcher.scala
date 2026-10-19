@@ -384,8 +384,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   // Packed 4x5-bit minimum scores for normal/moderate/high/critical pressure:
   // 0, 12, 20, 28, matching the GEM5 HistoryEvent512 controller.
   val event512MinScore = Constantin.createRecord(s"l2pf_event512MinScore$confHartId", initValue = 737536)
-  // Optional source-level SMS accuracy observation. The score uses the L2 SMS
-  // outcome trainer and is independent of NoC pressure; it is report-only.
+  // Optional source-level SMS accuracy gate. The score uses the L2 SMS outcome
+  // trainer and is independent of NoC pressure.
   val smsAccuracyEnable = Constantin.createRecord(s"l2pf_smsAccuracyEnable$confHartId", initValue = 0)
   val smsAccuracyMinScore = Constantin.createRecord(s"l2pf_smsAccuracyMinScore$confHartId", initValue = 8)
   // L2-native sources use Event512 after their source-level history is ready;
@@ -415,7 +415,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     smsAccuracyEnable =/= 0.U && pfSource === MemReqSource.Prefetch2L2SMS.id.U
 
   def smsAccuracyWouldDrop(pfSource: UInt, event512Score: UInt, event512Valid: Bool): Bool =
-    !smsAccuracyActive(pfSource) || !event512Valid || event512Score >= smsAccuracyMinScore
+    smsAccuracyActive(pfSource) && event512Valid && event512Score < smsAccuracyMinScore
   def policyAdmit(
     pfSource: UInt,
     pfConf: UInt,
