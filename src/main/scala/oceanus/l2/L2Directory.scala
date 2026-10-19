@@ -17,11 +17,15 @@ object L2DirectoryBlockRefillFaultMode {
 
 object L2Directory {
 
-  class BlockRefillEntry(implicit val p: Parameters) extends Bundle with HasL2Params {
-    val locked = Bool()
-    val dirWbDone = Bool()
-    val owner = UInt(mshrIndexWidth.W)
-    val reqTag = UInt(tagWidth.W) // refill (requestor) tag of the in-flight refill owning this lock
+  // Refill lock table entry: one slot per TSHR (indexed by TSHR ID), holding the
+  // victim (set,way) picked by that TSHR's in-flight refill until its fill
+  // commit lands. A TSHR holds at most one outstanding lock by construction
+  // (repl_reset = rxreq_fire: the replace FSM resets only when a new request
+  // enters the TSHR, after the previous refill committed).
+  class RefillLockEntry(implicit val p: Parameters) extends Bundle with HasL2Params {
+    val valid = Bool()
+    val set = UInt(setBits.W)
+    val way = UInt(wayBits.W)
   }
 
   object MetaState {
@@ -274,12 +278,14 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     singlePort = true, useBitmask = true, hasMbist = paramL2.hasMbist
   ))
   val plruRegs = RegInit(VecInit(Seq.fill(sets)(0.U(PLRU4.nBits.W))))
-  val blockRefill = RegInit(VecInit(Seq.fill(sets)(
-    VecInit(Seq.fill(ways)(0.U.asTypeOf(new L2Directory.BlockRefillEntry)))
-  )))
-  val blockRefillAge = RegInit(VecInit(Seq.fill(sets)(
-    VecInit(Seq.fill(ways)(0.U(6.W)))
-  )))
+  // Refill lock table: one slot per TSHR, indexed directly by TSHR ID (at most
+  // one outstanding refill lock per TSHR by construction). pendClear* is the
+  // 1-deep pending-clear register: a lock is released one cycle after the
+  // owner's fill-commit DirWb grant, keeping the victim way unpickable through
+  // the commit cycle + 1 exactly as the old per-(set,way) design did.
+  val lockTable = RegInit(VecInit(Seq.fill(nMSHR)(0.U.asTypeOf(new L2Directory.RefillLockEntry))))
+  val pendClearValid = RegInit(false.B)
+  val pendClearIdx = RegInit(0.U(idxW.W))
   val initActive = RegInit(true.B)
   val initSet = RegInit(0.U(setBits.W))
   val initMeta = Wire(new L2Directory.Meta)
@@ -458,7 +464,9 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val hit_s3   = hitVec.asUInt.orR
   val hitWay   = PriorityEncoder(hitVec)
   val blockRefillMask_s2 = Wire(UInt(ways.W))
-  blockRefillMask_s2 := VecInit(blockRefill(s2_set).map(_.locked)).asUInt
+  blockRefillMask_s2 := VecInit((0 until ways).map { w =>
+    VecInit(lockTable.map(e => e.valid && e.set === s2_set && e.way === w.U)).asUInt.orR
+  }).asUInt
   val freeWayMask_s2 = Wire(UInt(ways.W))
   freeWayMask_s2 := (~blockRefillMask_s2)(ways - 1, 0)
   val freeWayMask_s3 = RegInit(((BigInt(1) << ways) - 1).U(ways.W))
@@ -479,15 +487,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val plruWay    = PLRU4.getReplaceWay(s3_plru)
   val chosenWay  = Mux(hasInvalid, invalidWay, plruWay)
 
-  // A way whose (stale) tag equals another in-flight refill's requestor tag must not be
-  // victimized: the resulting EvictBack would be forced to nest into that refill's TSHR,
-  // which cannot drain it before its own commit (blockRBE.EVB Clause A) — the Class-B
-  // circular wait. The requestor's own PA is never recorded at its pick (single-TSHR-per-PA
-  // + record written only at this S3 edge), so self-alias picks stay available.
-  val refillTagBlockVec = VecInit((0 until ways).map { w =>
-    VecInit(blockRefill(s3_set).map(e => e.locked && (e.reqTag === dirData_s3(w).tag))).asUInt.orR
-  })
-  val victimMask_s3 = freeWayMask_s3 & (~refillTagBlockVec.asUInt)(ways - 1, 0)
+  val victimMask_s3 = freeWayMask_s3
 
   val victimWay  = Mux(victimMask_s3(chosenWay), chosenWay, PriorityEncoder(victimMask_s3))
   val replRetry  = s3_valid && s3_isRepl && !victimMask_s3.orR
@@ -510,45 +510,48 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     plruRegs(s3_set) := PLRU4.getNextState(s3_plru, way_s3)
   }
 
+  // Pending-clear application (one cycle after the release grant): the ONLY
+  // per-cycle lock-table maintenance. Listed first so that a same-cycle lock
+  // set wins over the clear on the vacated slot, and a same-cycle release
+  // grant re-registers pendClearValid below (Chisel last-wins).
+  when(pendClearValid) {
+    when(blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U) {
+      lockTable(pendClearIdx).valid := false.B
+    }
+    pendClearValid := false.B
+  }
+
   when(s3_valid && s3_isRepl && !hit_s3 && !replRetry) {
-    blockRefill(s3_set)(way_s3).locked := true.B
-    blockRefill(s3_set)(way_s3).dirWbDone := false.B
-    blockRefill(s3_set)(way_s3).owner := s3_tshr
-    blockRefill(s3_set)(way_s3).reqTag := s3_tag
-    blockRefillAge(s3_set)(way_s3) := 0.U
-    assert(!VecInit(blockRefill(s3_set).zipWithIndex.map { case (e, w) =>
-      w.U =/= way_s3 && e.locked && e.reqTag === dirData_s3(way_s3).tag
-    }).asUInt.orR,
-      "Directory: ReplRd victimized a way whose tag aliases an in-flight refill PA")
+    // a TSHR may only (re)take its slot once the previous lock is gone; the
+    // slot being vacated at this same edge counts as available
+    val selfClearing = pendClearValid &&
+      blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U &&
+      pendClearIdx === s3_tshr(idxW - 1, 0)
+    assert(!lockTable(s3_tshr).valid || selfClearing,
+      "Directory: TSHR took a second refill lock while one is still held")
+    assert(!VecInit(lockTable.map(e => e.valid && e.set === s3_set && e.way === way_s3)).asUInt.orR,
+      "Directory: double refill lock on (set,way)")
+    lockTable(s3_tshr).valid := true.B
+    lockTable(s3_tshr).set := s3_set
+    lockTable(s3_tshr).way := way_s3
   }
 
-  when(grantDirWb) {
-    val entry = blockRefill(reqSet)(winReq.WAY(wayBits - 1, 0))
-    // Release only on the lock owner's own fill-commit (tag+meta write):
-    // an eviction invalidate (meta-only) or any non-owner write to the same
-    // way must not drop the lock while the owner's fill commit is pending.
-    when(entry.locked && entry.owner === winReq.TSHRID && winReq.TAG_WEN) {
-      entry.dirWbDone := true.B
-    }
+  // Release mark at the owner's fill-commit DirWb grant: the TSHR ID indexes
+  // the locker's slot directly, so ownership is structural — a non-owner's
+  // DirWb indexes its own slot and is rejected by the valid+set+way gate; an
+  // eviction invalidate (meta-only, TAG_WEN=0) never releases. The clear lands
+  // one cycle later via pendClear, so the way stays unpickable through the
+  // grant cycle + 1.
+  val relEntry = lockTable(winReq.TSHRID(idxW - 1, 0))
+  when(grantDirWb && winReq.TAG_WEN && relEntry.valid &&
+       relEntry.set === reqSet && relEntry.way === winReq.WAY(wayBits - 1, 0)) {
+    pendClearValid := true.B
+    pendClearIdx := winReq.TSHRID(idxW - 1, 0)
   }
 
-  for (setIdx <- 0 until sets) {
-    for (wayIdx <- 0 until ways) {
-      val entry = blockRefill(setIdx)(wayIdx)
-      val age = blockRefillAge(setIdx)(wayIdx)
-      when(entry.locked) {
-        age := age + 1.U
-        when(entry.dirWbDone &&
-             blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U) {
-          entry := 0.U.asTypeOf(new L2Directory.BlockRefillEntry)
-          age := 0.U
-        }
-      }.otherwise {
-        age := 0.U
-      }
-      assert(!(entry.locked && io.tshrIdle(entry.owner(idxW - 1, 0))),
-        s"Directory: blockRefill leaked after owner MSHR retired at set=$setIdx way=$wayIdx")
-    }
+  lockTable.zipWithIndex.foreach { case (e, i) =>
+    assert(!(e.valid && io.tshrIdle(i)),
+      s"Directory: blockRefill leaked after owner MSHR retired at TSHR $i")
   }
 
   if (enableDirPlruProbe) {
@@ -584,9 +587,12 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     io.debugRetry.get.dirWbDone := grantDirWb
     io.debugRetry.get.dirWbDoneSet := reqSet
     io.debugRetry.get.dirWbDoneWay := winReq.WAY(wayBits - 1, 0)
-    io.debugRetry.get.blockRefillLocked := VecInit(blockRefill.map(setLocks =>
-      VecInit(setLocks.map(_.locked)).asUInt
-    ))
+    // re-synthesized per-(set,way) view of the CAM lock table (probe-only, default off)
+    io.debugRetry.get.blockRefillLocked := VecInit((0 until sets).map { s =>
+      VecInit((0 until ways).map { w =>
+        VecInit(lockTable.map(e => e.valid && e.set === s.U && e.way === w.U)).asUInt.orR
+      }).asUInt
+    })
     io.debugRetry.get.ageWb := ageWb
     io.debugRetry.get.ageRd := ageRd
     io.debugRetry.get.rrReplRd := rrReplRd
@@ -652,8 +658,6 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     "Directory: multiple grants in one cycle")
   assert(!(grantReplRd && replStall),
     "Directory: ReplRd granted while replStall (PLRU hazard)")
-  assert(PopCount(blockRefill.flatten.map(_.locked)) <= nMSHR.U,
-    "Directory: blockRefill lock count exceeds TSHR count")
   // Functional requests ARE allowed at the directory ports during the power-on
   // init sweep; they are masked out of arbitration (anyReplRd/anyDirWb/anyDirRd
   // are qualified with !initActive) and simply wait until the sweep completes.
@@ -675,9 +679,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   XSPerfAccumulate("grant_dirWb",   grantDirWb)
   XSPerfAccumulate("replStall",     replStall)
   XSPerfAccumulate("replRetry",     replRetry)
-  XSPerfAccumulate("replRetry_refillTag", s3_valid && s3_isRepl && freeWayMask_s3.orR && !victimMask_s3.orR)
-  XSPerfAccumulate("replDivert_refillTag", s3_valid && s3_isRepl && !replRetry && !victimMask_s3(chosenWay))
-  XSPerfAccumulate("blockRefill_locked", PopCount(blockRefill.flatten.map(_.locked)))
+  XSPerfAccumulate("blockRefill_locked", PopCount(lockTable.map(_.valid)))
   XSPerfAccumulate("dirRd_hit",     s3_valid && s3_isDirRd && hit_s3)
   XSPerfAccumulate("dirRd_miss",    s3_valid && s3_isDirRd && !hit_s3)
   XSPerfAccumulate("plru_upd",      plruWen)
