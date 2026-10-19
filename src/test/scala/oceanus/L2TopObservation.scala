@@ -303,6 +303,10 @@ class L2TopObservationIO(entries: Int, sliceCount: Int)(implicit val p: Paramete
   val sliceTrainPulseCount = Output(Vec(sliceCount, UInt(64.W)))
   val sliceTrainValid = Output(Vec(sliceCount, Bool()))
   val sliceTrainAddr = Output(Vec(sliceCount, UInt(48.W)))
+  // Observe Recv admission and the selected payload without adding production IO.
+  // Directed tests compare Recv/BOP at the actual per-slice arbitration boundary.
+  val recvIssue = Output(Vec(sliceCount, Bool()))
+  val recvTxnID = Output(Vec(sliceCount, UInt(32.W)))
   val prefetchQueueValid = Output(Vec(sliceCount, Bool()))
   val prefetchQueueReady = Output(Vec(sliceCount, Bool()))
   val prefetchQueueOverwrite = Output(Vec(sliceCount, Bool()))
@@ -937,6 +941,8 @@ object L2TopObservation {
   // Observe the production queue's issued flit, after the issue-enable gate.
   // Every per-slice event remains visible when multiple slices issue together.
   slices.indices.foreach { i =>
+    io.recvIssue(i) := module.pfRecvReqs.lift(i).map(q => boreRead(q.valid) && boreRead(q.ready)).getOrElse(false.B)
+    io.recvTxnID(i) := module.pfRecvReqs.lift(i).map(q => boreRead(q.bits.TxnID)).getOrElse(0.U)
     io.prefetchQueueOverwrite(i) := productionPfQueues.lift(i)
       .map(q => boreRead(privateBool(q, "overwrite"))).getOrElse(false.B)
     io.prefetchQueueValid(i) := pfQueues.lift(i).map(q => boreRead(q.valid)).getOrElse(false.B)
