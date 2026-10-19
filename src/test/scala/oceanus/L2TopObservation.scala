@@ -175,6 +175,8 @@ class L2TopDirTimingProbeEntry extends Bundle {
   val reqReuse = Bool()
   val reqAllocPaddr = UInt(48.W)
   val pRxReqIsPrefetch = Bool()
+  // Observe decoded request provenance without imposing a fixed CCHI TxnID width.
+  val pRxReqPfSource = UInt(4.W)
   val pRxReqSrcID = UInt(8.W)
   val pRxReqExpCompData = Bool()
   val pRxReqSize = UInt(3.W)
@@ -669,6 +671,7 @@ object L2TopObservation {
     probe.pRxReqIsPrefetch := pRxReqSrcID === module.config.pfSrcID.U &&
       pRxReqOpcode === CCHIOpcode.StashShared.U
     probe.pRxReqOpcode := pRxReqOpcode
+    probe.pRxReqPfSource := L2PrefetchTxnID.decode(boreRead(pRxReq.TxnID))
     probe.pRxReqSrcID := pRxReqSrcID
     probe.pRxReqExpCompData := boreRead(pRxReq.ExpCompData)
     probe.pRxReqSize := boreRead(pRxReq.Size)

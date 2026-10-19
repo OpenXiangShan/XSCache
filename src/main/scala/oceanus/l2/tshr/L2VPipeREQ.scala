@@ -1394,8 +1394,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   when (prefill_meta_wr_alias) {
     p_prefill_meta.alias := p_rxreq.TagAlias
   }
+  // Recover the request source for both frozen prefill and direct metadata writes.
+  // Existing set/clear enables keep external L1 Stash independent of BOP.
+  val requestPfSource = L2PrefetchTxnID.decode(p_rxreq.TxnID)
   when (p_prefill && meta_wr_prefetched_set) {
-    p_prefill_meta.pfSource := L2PfSource.PBOP.U
+    p_prefill_meta.pfSource := requestPfSource
   }
 
   // --------------------------------
@@ -1460,9 +1463,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // in Directory's bitmask SRAM. ReplRd victim meta is never the refill base.
   io.tshr_meta_write_en.pfSource := repl_tshr_meta_wr ||
     (!p_prefill && (meta_wr_prefetched_set || meta_wr_prefetched_clear))
-  // Exactly the old set/clear decision: PBOP on set, NoWhere on clear.
+  // Retain the set/clear decision: carried source on set, NoWhere on clear.
   io.tshr_meta_write_meta.pfSource := Mux(p_prefill, p_prefill_meta.pfSource,
-    Mux(meta_wr_prefetched_set, L2PfSource.PBOP.U(L2PfSource.Width.W), L2PfSource.NoWhere.U(L2PfSource.Width.W)))
+    Mux(meta_wr_prefetched_set, requestPfSource, L2PfSource.NoWhere.U(L2PfSource.Width.W)))
   // ----------------------------------------------------------------
 
   // -- Interactions with TSHR local data and Data Storage Read

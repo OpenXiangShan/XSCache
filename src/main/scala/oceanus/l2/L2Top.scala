@@ -163,10 +163,16 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
 
   // bopEnable off: drain the request and build nothing. The REQ arbiter below
   // then has only the external input, exactly as before prefetch injection.
+  // Carry source in the high four TxnID bits, with a free wrapping sequence below.
+  // Internal Stash has no upstream completion; downstream IDs remain TSHR/slice IDs.
   val pfQueues: Seq[DecoupledIO[FlitREQ]] = if (!config.bopEnable) {
     bop.io.req.ready := true.B
     Nil
   } else {
+    val pfTxnWidth = (new FlitREQ).TxnID.getWidth
+    val pfSeqWidth = L2PrefetchTxnID.sequenceWidth(pfTxnWidth)
+    val pfSequence = RegInit(0.U((pfSeqWidth max 1).W))
+    when (bop.io.req.fire) { pfSequence := pfSequence + 1.U }
     val prefetchTarget = config.sliceNum match {
       case 1 => map1(bop.io.req.bits)
       case 2 => map2(bop.io.req.bits)
@@ -185,6 +191,8 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       queue.io.enq.bits.Addr := bop.io.req.bits
       queue.io.enq.bits.TgtID := config.slices(i).U
       queue.io.enq.bits.SrcID := config.pfSrcID.U
+      queue.io.enq.bits.TxnID := L2PrefetchTxnID.encode(
+        L2PfSource.PBOP.U(L2PfSource.Width.W), pfSequence, pfTxnWidth)
       // StashShared with ExpCompStash set would demand completion data, which
       // base aliases onto ExpCompData (L2VPipeREQ.scala:204-207). Keep it clear.
       queue.io.enq.bits.ExpCompData := false.B

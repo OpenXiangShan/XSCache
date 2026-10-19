@@ -138,6 +138,10 @@ object TestTop_L2Prefetched extends App with ChiselSim {
       val rspQ = mutable.Queue.empty[PendingDnRsp]
       val ackQ = mutable.Queue.empty[PendingUpAck]
       val snpQ = mutable.Queue.empty[PendingSnpRsp]
+      // Check exact raw source at committed fills, first demand consumption,
+      // and external Stash SRAM readbacks, preserving the existing stimulus.
+      val landedSource = mutable.Map.empty[BigInt, BigInt]
+      val sourceReads = mutable.ArrayBuffer.empty[(Boolean, BigInt)]
       val landed = mutable.Map.empty[BigInt, (BigInt, Boolean)]
       val installed = mutable.ArrayBuffer.empty[(BigInt, Boolean, Boolean)]
       val internalFills = mutable.Set.empty[BigInt]
@@ -218,6 +222,11 @@ object TestTop_L2Prefetched extends App with ChiselSim {
           // refiller overwrites that physical way. Remove the old tag on the
           // actual local invalidating write as well as tracking committed rows.
           if (flag(d.metaWrReqState) && value(d.metaWrReqMetaState) == 0) resident(addr) = false
+          if (flag(d.reqActive) && flag(d.pRxReqIsPrefetch)) {
+            assert(value(d.pRxReqPfSource) == 3, "BOP request must carry source=3")
+            assert(!flag(d.upTxRspFire) && !flag(d.upTxDatFire), "internal Stash must have no upstream return consumer")
+          }
+          if (flag(d.dirWbLand)) landedSource(addr) = value(d.dirResultPfSource)
           if (flag(d.dirWbLand)) resident(addr) = value(d.dirResultState) != 0 && flag(d.dirResultPrefetched)
           if (flag(d.dirWbLand)) landed(addr) = (value(d.dirResultState), flag(d.dirResultPrefetched))
           if (stashPreserve && current == 1 && addr == target) {
@@ -228,10 +237,14 @@ object TestTop_L2Prefetched extends App with ChiselSim {
           if (flag(d.tagWrite)) {
             installed += ((addr, flag(d.metaWrReqPrefetched), flag(d.metaWrReqMetaPrefetched)))
             assert(flag(d.metaWrReqPrefetched), "every new tag must overwrite prefetched, even for data=0")
-            if (flag(d.pRxReqIsPrefetch)) internalFills += addr
+            if (flag(d.pRxReqIsPrefetch)) {
+              assert(value(d.metaWrReqMetaPfSource) == 3, "BOP refill metadata must be source=3")
+              internalFills += addr
+            }
           }
           if (current >= 0 && addr == requests(current).addr) {
             if (flag(d.dirRdResp)) {
+              sourceReads += ((flag(d.fromDirMetaHit), value(d.fromDirMetaPfSource)))
               reads += ((flag(d.fromDirMetaHit), flag(d.fromDirMetaPrefetched)))
               println(s"BOP_2C_SRAM index=$current hit=${flag(d.fromDirMetaHit)} prefetched=${flag(d.fromDirMetaPrefetched)}")
             }
@@ -280,7 +293,8 @@ object TestTop_L2Prefetched extends App with ChiselSim {
       dut.reset.poke(false.B); dn.activateRxLink()
       for (i <- 0 until 300) dn.stepWithCredits(i - 300)
       requests.indices.foreach { index =>
-        current = index; accepted = false; reads.clear(); victims.clear()
+        current = index; accepted = false; reads.clear(); victims.clear(); sourceReads.clear()
+        val sourceBefore = landedSource.getOrElse(requests(index).addr, BigInt(0))
         val beforeTrain = trainCount
         val beforeData = dataCount
         val beforeComp = compCount
@@ -359,6 +373,24 @@ object TestTop_L2Prefetched extends App with ChiselSim {
           assert(trainCount - beforeTrain == (if (index == 1) 1 else 0))
           assert(landed(target)._2 == false)
         }
+        // Literal source expectations independently strengthen the Boolean lifecycle oracle.
+        assert(sourceReads.toSeq == reads.map { case (hit, prefetched) => (hit, if (prefetched) BigInt(3) else BigInt(0)) }.toSeq)
+        landed.foreach { case (a, (_, prefetched)) =>
+          assert(landedSource(a) == (if (prefetched) 3 else 0), s"committed source mismatch at $a")
+        }
+        if (index == 0 && variant != "external-stash" && variant != "redundant-resident")
+          assert(landedSource(target) == 3, "BOP refill must commit source=3")
+        if ((Set("readshared", "readunique", "makeunique").contains(variant) && index == 1) ||
+            (stashPreserve && index == 3)) {
+          assert(sourceReads.toSeq == Seq((true, BigInt(3))))
+          assert(landedSource(target) == 0, "first demand hit must consume source to zero")
+        }
+        if (stash) {
+          assert(landedSource.getOrElse(r.addr, BigInt(0)) == sourceBefore,
+            "external Stash hit/refill must preserve the line source, including zero")
+          if (sourceReads.exists(_._1)) assert(sourceReads.toSeq == Seq((true, sourceBefore)))
+        }
+        println(s"PF_SOURCE_PHASE pass=true case=$name index=$index reads=${sourceReads.toSeq} stash=$stash sourceBefore=$sourceBefore")
         println(s"BOP_2C_PHASE pass=true case=$name index=$index trainDelta=${trainCount - beforeTrain} dataDelta=${dataCount - beforeData} compDelta=${compCount - beforeComp}")
       }
       assert(quiet)
