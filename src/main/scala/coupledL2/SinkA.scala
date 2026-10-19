@@ -24,7 +24,7 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLHints._
 import xscache.coupledL2.prefetch.PrefetchReq
-import utility.{MemReqSource, XSPerfAccumulate}
+import utility.{GTimer, MemReqSource, XSPerfAccumulate}
 import xscache.common.{AliasKey, PrefetchKey}
 
 class SinkA(implicit p: Parameters) extends L2Module {
@@ -50,6 +50,8 @@ class SinkA(implicit p: Parameters) extends L2Module {
   val cmoAllBlock = stateVal === sCMOREQ || stateVal === sWAITLINE
   io.cmoAll.foreach { cmoAll => cmoAll.l2FlushDone := stateVal === sDONE }
   io.cmoAll.foreach { cmoAll => cmoAll.cmoAllBlock := cmoAllBlock }
+
+  val requestPerfTime = Option.when(cacheParams.enablePerf)(GTimer())
 
   def fromTLAtoTaskBundle(a: TLBundleA): TaskBundle = {
     val task = Wire(new TaskBundle)
@@ -90,6 +92,10 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task.mergeA := false.B
     task.aMergeTask := 0.U.asTypeOf(new MergeTaskBundle)
     task.cmoAll := cmoAllValid
+    task.reqPerf.foreach { perf =>
+      perf.valid := !cmoAllValid && (a.opcode === AcquireBlock || a.opcode === AcquirePerm || a.opcode === Get)
+      perf.startTime := requestPerfTime.get
+    }
     task
   }
   def fromPrefetchReqtoTaskBundle(req: PrefetchReq): TaskBundle = {
@@ -115,6 +121,8 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task.fromL2pft.foreach(_ := req.needAck)
     task.pfConf.foreach(_ := req.pfConf)
     task.pfConfValid.foreach(_ := req.pfConfValid)
+    task.pfRawScore.foreach(_ := req.pfRawScore)
+    task.pfPolicyScores.foreach(_ := req.pfPolicyScores)
     task.pfEvent512Valid.foreach(_ := req.pfEvent512Valid)
     task.cdpPfDepth.foreach(_ := req.cdpPfDepth.getOrElse(0.U))
     task.mshrRetry := false.B

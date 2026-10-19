@@ -57,7 +57,7 @@ class PrefetchControllerIO(implicit p: Parameters) extends PrefetchBundle {
   val l2PfFbCtrl = Output(new L2PfFeedbackCtrl)
   // Per-engine accuracy tier, 5 levels: 0 <25%, 1 <50%, 2 <75%, 3 <90%, 4 >=90%.
   // Engines stay at the max tier until enough events settle a real ratio.
-  val confTier = Output(Vec(7, UInt(3.W)))
+  val confTier = Output(Vec(8, UInt(3.W)))
 }
 
 class PrefetchController(implicit p: Parameters) extends PrefetchModule {

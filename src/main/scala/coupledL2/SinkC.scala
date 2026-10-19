@@ -22,7 +22,7 @@ import chisel3.util._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tilelink.TLMessages._
 import org.chipsalliance.cde.config.Parameters
-import utility.{MemReqSource, XSPerfAccumulate, TwoLevelRRArbiter, ArbPerf}
+import utility.{GTimer, MemReqSource, XSPerfAccumulate, TwoLevelRRArbiter, ArbPerf}
 import xscache.coupledL2.utils._
 
 class PipeBufferResp(implicit p: Parameters) extends L2Bundle {
@@ -66,6 +66,14 @@ class SinkC(implicit p: Parameters) extends L2Module {
   // in other words, different addresses will not interleave
   val nextPtrReg = RegEnable(nextPtr, 0.U.asTypeOf(nextPtr), io.c.fire && isRelease && first && hasData)
 
+  val requestPerfTime = Option.when(cacheParams.enablePerf)(GTimer())
+  val releaseStartTime = Option.when(cacheParams.enablePerf)(RegInit(0.U(64.W)))
+  releaseStartTime.foreach { start =>
+    when (io.c.fire && isRelease && first) {
+      start := requestPerfTime.get
+    }
+  }
+
   def toTaskBundle(c: TLBundleC): TaskBundle = {
     val task = Wire(new TaskBundle)
     task := 0.U.asTypeOf(new TaskBundle)
@@ -103,6 +111,10 @@ class SinkC(implicit p: Parameters) extends L2Module {
     task.replTask := false.B
     task.mergeA := false.B
     task.aMergeTask := 0.U.asTypeOf(new MergeTaskBundle)
+    task.reqPerf.foreach { perf =>
+      perf.valid := isRelease
+      perf.startTime := Mux(first, requestPerfTime.get, releaseStartTime.get)
+    }
     task
   }
 

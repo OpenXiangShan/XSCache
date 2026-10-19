@@ -155,6 +155,7 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   mergeAtask.reqSource := io.d_task.bits.task.reqSource
   mergeAtask.mergeA := false.B
   mergeAtask.aMergeTask := 0.U.asTypeOf(new MergeTaskBundle)
+  mergeAtask.reqPerf.foreach(_ := io.d_task.bits.task.aMergeTask.reqPerf.get)
   val inflight_insertIdx = PriorityEncoder(inflightGrant.map(!_.valid))
   val grantQueue_enq_isKeyword = Mux(io.d_task.bits.task.mergeA, mergeAtask.isKeyword.getOrElse(false.B), io.d_task.bits.task.isKeyword.getOrElse(false.B))
   // The following is organized in the order of data flow
@@ -216,6 +217,19 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
     toTLBundleD(deqTask, Mux(deqTask.isKeyword.getOrElse(false.B),deqData(1).data,deqData(0).data), deqId)
   )
 
+
+  if (cacheParams.enablePerf) {
+    val requestPerfTime = GTimer()
+    val responseTask = Mux(grantBufValid, grantBuf.task, deqTask)
+    val perf = responseTask.reqPerf.get
+    val (_, responseLast, _, _) = edgeIn.count(io.d)
+    val completion = io.d.fire && responseLast && perf.valid && perf.classified
+    for ((name, kind) <- L2RequestPerfKind.names.zipWithIndex) {
+      XSPerfRequestLatency(s"l2_${name}_processing_time",
+        perf.startTime, requestPerfTime, perf.allocTime, perf.hasMshr,
+        completion && perf.kind === kind.U)
+    }
+  }
 
   XSPerfAccumulate("toTLBundleD_valid", deqValid)
   XSPerfAccumulate("toTLBundleD_valid_isKeyword", deqValid && deqTask.isKeyword.getOrElse(false.B))

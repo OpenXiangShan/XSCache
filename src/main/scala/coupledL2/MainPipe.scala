@@ -315,6 +315,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
   val need_mshr_s3 = need_mshr_s3_a || need_mshr_s3_b
 
+  val requestPerfTime = Option.when(cacheParams.enablePerf)(GTimer())
+  val requestPerfKind = Mux(req_s3.fromC,
+    Mux(dirResult_s3.hit, L2RequestPerfKind.writeHit.U, L2RequestPerfKind.writeMiss.U),
+    Mux(dirResult_s3.hit, L2RequestPerfKind.readHit.U, L2RequestPerfKind.readMiss.U))
+
   /* Signals to MSHR Ctl */
   val alloc_state = WireInit(0.U.asTypeOf(new FSMState()))
   alloc_state.elements.foreach(_._2 := true.B)
@@ -327,6 +332,12 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     task.mshrTask := false.B
     task.aliasTask.foreach(_ := cache_alias)
     task.wayMask := 0.U(cacheParams.ways.W)
+    task.reqPerf.foreach { perf =>
+      perf.classified := req_s3.reqPerf.get.valid
+      perf.kind := requestPerfKind
+      perf.hasMshr := true.B
+      perf.allocTime := requestPerfTime.get
+    }
     // TODO
   }
 
@@ -485,6 +496,13 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val source_req_s3 = Wire(new TaskBundle)
   source_req_s3 := Mux(sink_resp_s3.valid, sink_resp_s3.bits, req_s3)
   source_req_s3.isKeyword.foreach(_ := req_s3.isKeyword.getOrElse(false.B))
+  source_req_s3.reqPerf.foreach { perf =>
+    perf := req_s3.reqPerf.get
+    when (!mshr_req_s3 && req_s3.reqPerf.get.valid) {
+      perf.classified := true.B
+      perf.kind := requestPerfKind
+    }
+  }
 
   /* ======== Interact with DS ======== */
   val data_s3 = Mux(io.releaseBufResp_s3.valid, io.releaseBufResp_s3.bits.data, io.refillBufResp_s3.bits.data)
@@ -756,7 +774,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // Exact valid-line replacements, counted only when the refill commits its new tag.
   val lineReplacementExact = io.tagWReq.valid && need_repl && req_s3.fromA
   XSPerfAccumulate("l2_line_replacement_exact", lineReplacementExact)
-  val replacementSetStep = math.max(1, (cacheParams.sets + 63) / 64)
+  val replacementSetStep = 1
   XSPerfHistogram("l2_line_replacement_set_region", perfCnt = io.replResp.bits.set,
     enable = lineReplacementExact, start = 0, stop = cacheParams.sets, step = replacementSetStep)
 
@@ -1223,57 +1241,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   XSPerfAccumulate("l2_write_hit", l2_write_hit_s3)
   XSPerfAccumulate("l2_write_miss", l2_write_miss_s3)
 
-  // Measure local MainPipe service latency. Hit requests end when their D
-  // response fires; miss requests end when an MSHR is allocated. The stage
-  // timestamp follows the same S3/S4/S5 path as the task.
-  val l2ServiceStartS3 = RegEnable(GTimer(), task_s2.valid && !task_s2.bits.mshrTask)
-  val l2ServiceValidS3 = RegEnable(task_s2.valid && !task_s2.bits.mshrTask, task_s2.valid)
-  val l2ServiceStartS4 = RegEnable(l2ServiceStartS3, task_s3.valid && !req_drop_s3)
-  val l2ServiceValidS4 = RegEnable(l2ServiceValidS3, task_s3.valid && !req_drop_s3)
-  val l2ServiceStartS5 = RegEnable(l2ServiceStartS4, task_s4.valid && !req_drop_s4)
-  val l2ServiceValidS5 = RegEnable(l2ServiceValidS4, task_s4.valid && !req_drop_s4)
-
-  val readHitS4 = RegEnable(l2_read_hit_s3, task_s3.valid && !req_drop_s3)
-  val readHitS5 = RegEnable(readHitS4, task_s4.valid && !req_drop_s4)
-  val readMissS4 = RegEnable(l2_read_miss_s3, task_s3.valid && !req_drop_s3)
-  val readMissS5 = RegEnable(readMissS4, task_s4.valid && !req_drop_s4)
-  val writeHitS4 = RegEnable(l2_write_hit_s3, task_s3.valid && !req_drop_s3)
-  val writeHitS5 = RegEnable(writeHitS4, task_s4.valid && !req_drop_s4)
-  val writeMissS4 = RegEnable(l2_write_miss_s3, task_s3.valid && !req_drop_s3)
-  val writeMissS5 = RegEnable(writeMissS4, task_s4.valid && !req_drop_s4)
-
-  val readHitS3Fire = d_s3.fire && l2_read_hit_s3 && l2ServiceValidS3
-  val readHitS4Fire = d_s4.fire && readHitS4 && l2ServiceValidS4
-  val readHitS5Fire = d_s5.fire && readHitS5 && l2ServiceValidS5
-  val writeHitS3Fire = d_s3.fire && l2_write_hit_s3 && l2ServiceValidS3
-  val writeHitS4Fire = d_s4.fire && writeHitS4 && l2ServiceValidS4
-  val writeHitS5Fire = d_s5.fire && writeHitS5 && l2ServiceValidS5
-  val readMissFire = io.toMSHRCtl.mshr_alloc_s3.valid && l2_read_miss_s3 && l2ServiceValidS3
-  val writeMissFire = io.toMSHRCtl.mshr_alloc_s3.valid && l2_write_miss_s3 && l2ServiceValidS3
-
-  val readHitLatency = MuxCase(0.U(64.W), Seq(
-    readHitS3Fire -> (GTimer() - l2ServiceStartS3),
-    readHitS4Fire -> (GTimer() - l2ServiceStartS4),
-    readHitS5Fire -> (GTimer() - l2ServiceStartS5)
-  ))
-  val writeHitLatency = MuxCase(0.U(64.W), Seq(
-    writeHitS3Fire -> (GTimer() - l2ServiceStartS3),
-    writeHitS4Fire -> (GTimer() - l2ServiceStartS4),
-    writeHitS5Fire -> (GTimer() - l2ServiceStartS5)
-  ))
-  val readMissLatency = GTimer() - l2ServiceStartS3
-  val writeMissLatency = GTimer() - l2ServiceStartS3
-  val readHitSample = readHitS3Fire || readHitS4Fire || readHitS5Fire
-  val writeHitSample = writeHitS3Fire || writeHitS4Fire || writeHitS5Fire
-
-  XSPerfAccumulate("l2_read_hit_processing_time_sum", Mux(readHitSample, readHitLatency, 0.U))
-  XSPerfAccumulate("l2_read_hit_processing_time_cnt", readHitSample)
-  XSPerfAccumulate("l2_read_miss_processing_time_sum", Mux(readMissFire, readMissLatency, 0.U))
-  XSPerfAccumulate("l2_read_miss_processing_time_cnt", readMissFire)
-  XSPerfAccumulate("l2_write_hit_processing_time_sum", Mux(writeHitSample, writeHitLatency, 0.U))
-  XSPerfAccumulate("l2_write_hit_processing_time_cnt", writeHitSample)
-  XSPerfAccumulate("l2_write_miss_processing_time_sum", Mux(writeMissFire, writeMissLatency, 0.U))
-  XSPerfAccumulate("l2_write_miss_processing_time_cnt", writeMissFire)
+  // Full request service time is counted once at the final upstream D beat in GrantBuffer.
 
   // Separate fixed hits from demand hits covered by a prefetched line. These
   // set histograms make a fixHitRate anomaly attributable to hot set ranges.

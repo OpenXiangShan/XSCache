@@ -41,7 +41,26 @@ trait HasTLChannelBits { this: Bundle =>
   def fromC = channel(2).asBool
 }
 
+object L2RequestPerfKind {
+  val readHit = 0
+  val readMiss = 1
+  val writeHit = 2
+  val writeMiss = 3
+  val readHitMshr = 4
+  val names = Seq("read_hit", "read_miss", "write_hit", "write_miss", "read_hitmshr")
+}
+
+class L2RequestPerf extends Bundle {
+  val valid = Bool()
+  val classified = Bool()
+  val kind = UInt(3.W)
+  val startTime = UInt(64.W)
+  val hasMshr = Bool()
+  val allocTime = UInt(64.W)
+}
+
 class MergeTaskBundle(implicit p: Parameters) extends L2Bundle {
+  val reqPerf = Option.when(cacheParams.enablePerf)(new L2RequestPerf)
   val off = UInt(offsetBits.W)
   val alias = aliasBitsOpt.map(_ => UInt(aliasBitsOpt.get.W)) // color bits in cache-alias issue
   val vaddr = vaddrBitsOpt.map(_ => UInt(vaddrBitsOpt.get.W)) // vaddr passed by client cache, for prefetcher train
@@ -120,6 +139,7 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
 
   // for TopDown Monitor (# TopDown)
   val reqSource = UInt(MemReqSource.reqSourceBits.W)
+  val reqPerf = Option.when(cacheParams.enablePerf)(new L2RequestPerf)
 
   def hasData = opcode(0)
 

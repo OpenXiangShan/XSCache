@@ -737,6 +737,7 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     mergeA := false.B
   }
   val mp_grant_task = {
+    mp_grant.reqPerf.foreach(_ := req.reqPerf.get)
     mp_grant.channel := req.channel
     mp_grant.tag := req.tag
     mp_grant.set := req.set
@@ -843,6 +844,14 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
       )
     )
     mp_grant.aMergeTask.sourceId := merge_task.sourceId
+    mp_grant.aMergeTask.reqPerf.foreach { perf =>
+      perf := merge_task.reqPerf.get
+      perf.classified := merge_task.reqPerf.get.valid
+      perf.kind := L2RequestPerfKind.readHitMshr.U
+      perf.hasMshr := true.B
+      // A merged demand starts its MSHR segment at its own accepted arrival.
+      perf.allocTime := merge_task.reqPerf.get.startTime
+    }
     mp_grant.aMergeTask.meta := MetaEntry(
       dirty = gotDirty || dirResult.hit && meta.dirty,
       state = Mux( // Acquire
@@ -1338,6 +1347,21 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     state.s_reissue.getOrElse(true.B) && state.s_retry &&
     state.w_replResp &&
     pfTierBlockedSel
+  val abandonSources = Seq(
+    MemReqSource.Prefetch2L2Stream.id.U -> "stream",
+    MemReqSource.Prefetch2L2Stride.id.U -> "stride",
+    MemReqSource.Prefetch2L2Berti.id.U -> "berti",
+    MemReqSource.Prefetch2L2SMS.id.U -> "sms",
+    MemReqSource.Prefetch2L2BOP.id.U -> "vbop",
+    MemReqSource.Prefetch2L2PBOP.id.U -> "pbop",
+    MemReqSource.Prefetch2L2TP.id.U -> "tp"
+  )
+  for ((source, sourceName) <- abandonSources; tier <- 0 to PfConfidence.TIER_MAX) {
+    XSPerfAccumulate(
+      s"l2pf_mshr_abandon_${sourceName}_t$tier",
+      pfAbandon && req.reqSource === source && req.pfConf.getOrElse(0.U) === tier.U
+    )
+  }
   pfAbandonWire := pfAbandon
   io.pfAbandon := pfAbandon
   when (pfAbandon) {
