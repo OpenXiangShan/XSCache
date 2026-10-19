@@ -56,9 +56,9 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task := 0.U.asTypeOf(new TaskBundle)
     task.channel := "b001".U
     task.txChannel := 0.U
-    task.tag := parseAddress(a.address)._1
-    task.set := Mux(cmoAllValid, setVal, parseAddress(a.address)._2)
-    task.off := parseAddress(a.address)._3
+    task.tag := parseAddress(a.address)._1 // tag
+    task.set := Mux(cmoAllValid, setVal, parseAddress(a.address)._2) // index
+    task.off := parseAddress(a.address)._3 // offset
     task.alias.foreach(_ := a.user.lift(AliasKey).getOrElse(0.U))
     task.opcode := Mux(cmoAllValid, CBOFlush, a.opcode)
     task.param := a.param

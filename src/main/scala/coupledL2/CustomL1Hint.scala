@@ -44,6 +44,8 @@ class CustomL1HintIOBundle(implicit p: Parameters) extends L2Bundle {
 
   // output hint
   val l1Hint = DecoupledIO(new L2ToL1HintInsideL2())
+  // backpressure to RequestArb: hint-generating fires at s1 must be blocked when full
+  val hint_s1QueueFull = Output(Bool())
 }
 
 // grantData hint interface
@@ -109,14 +111,18 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   // noSpaceForSinkReq in GrantBuffer may ensure that these queues will not overflow
   assert(enq_s3.ready || !enq_s3.valid)
 
-  val hint_s1Queue = Module(new Pipeline(new HintQueueEntry))
-  hint_s1Queue.io.in.valid := valid_s1 && (!canFlow_s1 || !flow_s1.ready)
-  hint_s1Queue.io.in.bits  := enqBits_s1
-  assert(!valid_s1 || hint_s1Queue.io.in.ready || flow_s1.ready)
+  // staging FIFO between the s1 hint event and hintQueue; depth 2 absorbs
+  // back-to-back s1 hint events, and RequestArb blocks hint-generating fires
+  // when full, so a hint event always has a place to go (see assert below)
+  val hint_s1Queue = Module(new Queue(new HintQueueEntry, 2))
+  hint_s1Queue.io.enq.valid := valid_s1 && (!canFlow_s1 || !flow_s1.ready)
+  hint_s1Queue.io.enq.bits  := enqBits_s1
+  assert(!valid_s1 || hint_s1Queue.io.enq.ready || flow_s1.ready)
+  io.hint_s1QueueFull := hint_s1Queue.io.count === 2.U
 
-  drop_s1.valid := hint_s1Queue.io.out.valid && !io.retry_s2
-  drop_s1.bits := hint_s1Queue.io.out.bits
-  hint_s1Queue.io.out.ready := drop_s1.ready || io.retry_s2
+  drop_s1.valid := hint_s1Queue.io.deq.valid && !io.retry_s2
+  drop_s1.bits := hint_s1Queue.io.deq.bits
+  hint_s1Queue.io.deq.ready := drop_s1.ready || io.retry_s2
 
   flow_s1.valid := valid_s1 && canFlow_s1
   flow_s1.bits := enqBits_s1
@@ -127,7 +133,7 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   val respWithDataFire = io.l1Hint.fire && io.l1Hint.bits.hasData
   hintQueue.io.deq.ready := io.l1Hint.ready && !RegNext(respWithDataFire, false.B)
 
-  io.l1Hint.valid := hintQueue.io.deq.valid && !(io.retry_s2 && !hint_s1Queue.io.out.valid) && !RegNext(respWithDataFire, false.B)
+  io.l1Hint.valid := hintQueue.io.deq.valid && !(io.retry_s2 && !hint_s1Queue.io.deq.valid) && !RegNext(respWithDataFire, false.B)
   io.l1Hint.bits.sourceId := hintQueue.io.deq.bits.source - dcacheClient.sourceId.start.U
   io.l1Hint.bits.isKeyword := hintQueue.io.deq.bits.isKeyword
   io.l1Hint.bits.hasData := hintQueue.io.deq.bits.hasData
