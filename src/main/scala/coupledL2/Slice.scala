@@ -25,6 +25,7 @@ import xscache.coupledL2._
 import xscache.coupledL2.prefetch.{PrefetchIO, CDPDetectTask, CDPParameters, PfSource}
 import utility.MemReqSource
 import xscache.chi.{DecoupledPortIO, HasCHIMsgParameters}
+import freechips.rocketchip.tilelink.TLMessages.GrantData
 
 class OuterBundle(implicit p: Parameters) extends DecoupledPortIO with BaseOuterBundle
 
@@ -250,6 +251,13 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   io.in.b <> inBuf.b(mshrCtl.io.toSourceB)
   sinkC.io.c <> inBuf.c(io.in.c)
   io.in.d <> inBuf.d(grantBuf.io.d)
+  // Cancel queued hints after the actual first data beat leaves this slice.
+  // Both the event and each slot's cancelled bit are registered: a D first beat
+  // in cycle C invalidates remaining hints in C+2, before MissEntry source reuse.
+  // Already arbitrated hints, including hints sent alongside D, may proceed.
+  val grantDataFirstFire = io.in.d.fire && edgeIn.first(io.in.d) && io.in.d.bits.opcode === GrantData
+  mainPipe.io.hintCancel.valid := RegNext(grantDataFirstFire, false.B)
+  mainPipe.io.hintCancel.bits := RegEnable(io.in.d.bits.source, grantDataFirstFire)
   grantBuf.io.e <> inBuf.e(io.in.e)
   io.error.valid := RegNext(mainPipe.io.error.valid, false.B)
   io.error.bits := RegNext(mainPipe.io.error.bits)
