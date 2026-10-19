@@ -208,13 +208,20 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // coupledL2 MainPipe:173 includes AcquirePerm in req_acquire_s3; :759-766
   // trains eligible misses/prefetched hits (plus mergeA). MakeUnique is its
   // base counterpart. Train RS/RU/MU misses and prefetched hits alike.
+  // Recv requests themselves are excluded by rxreq_demand. A later demand hit
+  // on any prefetched row still trains BOP, matching coupledL2's is_other_train;
+  // only PBOP rows contribute to the physical-BOP effect counters.
+  val dirResultFromPBOP = dirResult.pfSource === L2PfSource.PBOP.U
+  val requestFromPBOP = L2PrefetchTxnID.decode(rxreq.TxnID) === L2PfSource.PBOP.U
+  val prefetched_hit_consume = rxreq_fire && rxreq_demand && dirResult.hit && (dirResult.pfSource =/= 0.U) &&
+    (rxreq_readshared || rxreq_readunique || rxreq_makeunique)
   // dirResult is the OLD registered meta: training and clear sample it before
   // the same edge, even if the lossy training receiver is not ready.
-  val prefetched_hit_train = rxreq_fire && rxreq_demand && dirResult.hit && (dirResult.pfSource =/= 0.U) &&
-    (rxreq_readshared || rxreq_readunique || rxreq_makeunique)
+  val prefetched_hit_train = prefetched_hit_consume
+  val prefetched_hit_pbop = prefetched_hit_consume && dirResultFromPBOP
   io.bopTrain.valid := rxreq_fire && rxreq_demand &&
     (((rxreq_readshared || rxreq_readunique || rxreq_makeunique) && !dirResult.hit) ||
-      (dirResult.hit && (dirResult.pfSource =/= 0.U) && (rxreq_readshared || rxreq_readunique || rxreq_makeunique)))
+      prefetched_hit_train)
   io.bopTrain.bits := io.tshr_paddr
   XSPerfAccumulate("prefetchedHitTrain", prefetched_hit_train)
 
@@ -1356,7 +1363,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // A-hit MetaEntry defaults prefetch=false (MainPipe:538,557; Directory:56).
   // Its MSHR hit refill retains meta_pft (MSHR:795); base has no corresponding
   // MSHR pipeline and consumes even hits requiring a downstream permission upgrade.
-  val meta_wr_prefetched_clear = prefetched_hit_train
+  // Consumption clears every prefetch source and trains BOP; effect counts use PBOP only.
+  val meta_wr_prefetched_clear = prefetched_hit_consume
 
   // --------------------------------
   val prefill_meta_wr_state = p_prefill && (meta_wr_state_UU || 
@@ -1965,22 +1973,24 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   assert(!(rxevb_unsatisfied_evictback && active), 
     "TSHR @ %m REQ vPipe passed unsatisfied EvictBack on active non-replace non-invalid transaction")
   // ----------------------------------------------------------------
-  // BOP effectiveness boundaries (observation only). useful is exactly the
-  // existing prefetchedHitTrain: first RS/RU/MU consumption of the OLD bit,
+  // BOP effectiveness boundaries (observation only). useful counts PBOP's
+  // first RS/RU/MU consumption of the OLD source,
   // including permission upgrades. Late consumption is included in useful;
   // timely is useful - late (allocator-side late is defined in L2TSHR).
-  io.bopPerf.activePrefetch := active && p_rxreq_stashshared && p_rxreq.SrcID === io.consts.pfSrcID
+  io.bopPerf.activePrefetch := active && p_rxreq_stashshared && p_rxreq.SrcID === io.consts.pfSrcID &&
+    L2PrefetchTxnID.decode(p_rxreq.TxnID) === L2PfSource.PBOP.U
   io.bopPerf.activeDemand := active && p_rxreq.SrcID =/= io.consts.pfSrcID &&
     (p_rxreq_readshared || p_rxreq_readunique || p_rxreq_makeunique)
-  io.bopPerf.useful := prefetched_hit_train
+  io.bopPerf.useful := prefetched_hit_pbop
   // Count redundant only at REQ execution, never at allocation/queue issue.
-  io.bopPerf.redundant := rxreq_fire && rxreq.SrcID === io.consts.pfSrcID && rxreq_satisfied_stashshared
+  io.bopPerf.redundant := rxreq_fire && rxreq.SrcID === io.consts.pfSrcID &&
+    requestFromPBOP && rxreq_satisfied_stashshared
   // First downstream send only; RetryAck/PCrdGrant reissues are excluded.
   io.bopPerf.issuedDownstream := io.DnTXREQ.fire && io.bopPerf.activePrefetch && !p_txreq_reissue
   // Count the victim host's actual valid -> I local meta write. Never use the
   // replacer's victim snapshot or the number of loopback EvictBack requests.
   io.bopPerf.uselessEvict := meta_wr_state_evictback_I && io.tshr_meta_write_en.state &&
     io.tshr_meta_write_meta.state === MetaState.I && dirResult.hit &&
-    dirResult.state =/= MetaState.I && (dirResult.pfSource =/= 0.U)
+    dirResult.state =/= MetaState.I && dirResult.pfSource === L2PfSource.PBOP.U
 
 }

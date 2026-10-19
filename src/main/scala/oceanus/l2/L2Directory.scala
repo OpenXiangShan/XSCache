@@ -15,11 +15,36 @@ object L2DirectoryBlockRefillFaultMode {
   val NeverUnlock = 2
 }
 
-// Fixed IDs from coupledL2 PfSource: this stage retains only the existing PBOP producer.
+// Keep the coupledL2 5-bit request-source to 4-bit prefetch-source mapping local
+// so both internal Stash producers write the same provenance encoding into Meta.
 object L2PfSource {
   val Width = 4
   val NoWhere = 0
+  val SMS = 1
+  val BOP = 2
   val PBOP = 3
+  val Stream = 4
+  val Stride = 5
+  val TP = 6
+  val Berti = 7
+  val NL = 8
+  val CDP = 9
+
+  def fromMemReqSource(source: UInt): UInt = {
+    val mapped = WireInit(NoWhere.U(Width.W))
+    switch (source) {
+      is (MemReqSource.Prefetch2L2BOP.id.U) { mapped := BOP.U }
+      is (MemReqSource.Prefetch2L2PBOP.id.U) { mapped := PBOP.U }
+      is (MemReqSource.Prefetch2L2SMS.id.U) { mapped := SMS.U }
+      is (MemReqSource.Prefetch2L2TP.id.U) { mapped := TP.U }
+      is (MemReqSource.Prefetch2L2Stream.id.U) { mapped := Stream.U }
+      is (MemReqSource.Prefetch2L2Stride.id.U) { mapped := Stride.U }
+      is (MemReqSource.Prefetch2L2Berti.id.U) { mapped := Berti.U }
+      is (MemReqSource.Prefetch2L2NL.id.U) { mapped := NL.U }
+      is (MemReqSource.Prefetch2L2CDP.id.U) { mapped := CDP.U }
+    }
+    mapped
+  }
 }
 
 object L2Directory {

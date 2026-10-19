@@ -15,6 +15,7 @@ import freechips.rocketchip.util.SeqToAugmentedSeq
 import oceanus.compactchi.CCHIOpcode._
 import oceanus.chi.intf.CHIRNFInterface
 import oceanus.chi.intf.CHIRNFRawInterface
+import xscache.coupledL2.{PrefetchCtrlFromCore, PrefetchRecv}
 
 
 sealed trait L2UpstreamPortType
@@ -78,7 +79,11 @@ class L2Configuration(
   srcIdWidth: Int = 4,
   // Defaults are the production OceanusBOPParameters; tests opt in and may
   // lower roundMax or delayQueueLatency without changing production geometry.
-  val bopParams: OceanusBOPParameters = OceanusBOPParameters()
+  val bopParams: OceanusBOPParameters = OceanusBOPParameters(),
+  // Optional L1-to-L2 receiver and control ports. Keeping both absent by
+  // default preserves the existing BOP-only top-level interface.
+  val pfRecvEnable: Boolean = false,
+  val pfCtrlEnable: Boolean = false
 ) {
   def sliceNum = slices.size
 
@@ -96,6 +101,9 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   val io = IO(new Bundle {
     val t1p = Vec(t1NIDs.size, new CCHIInterfaceType1)
     val t4p = Vec(t4NIDs.size, new CCHIInterfaceType4)
+
+    val pfRecv = if (config.pfRecvEnable) Some(Input(new PrefetchRecv)) else None
+    val pfCtrl = if (config.pfCtrlEnable) Some(Input(new PrefetchCtrlFromCore)) else None
 
     val chi = new CHIRNFInterface
   })
@@ -153,6 +161,53 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   //
   val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId)))
 
+  // The control bundle gates source issue only; the delay-latency field is
+  // intentionally recorded here for the later queue-control slice.
+  val pfMasterEnable = if (config.pfCtrlEnable) io.pfCtrl.get.l2_pf_master_en else true.B
+  val recvControlEnable = if (config.pfCtrlEnable) {
+    pfMasterEnable && io.pfCtrl.get.l2_pf_recv_en
+  } else true.B
+  val bopControlEnable = if (config.pfCtrlEnable) {
+    pfMasterEnable && io.pfCtrl.get.l2_pbop_en
+  } else true.B
+  // dontTouch requires a signal even when the optional control port is absent.
+  val delayLatency = WireDefault(if (config.pfCtrlEnable) io.pfCtrl.get.l2_pf_delay_latency else 0.U(10.W))
+  dontTouch(delayLatency) // delay_latency is reserved for slice 4 queue control.
+
+  val pfTxnWidth = (new FlitREQ).TxnID.getWidth
+  val pfSeqWidth = L2PrefetchTxnID.sequenceWidth(pfTxnWidth)
+  val pfSequence = RegInit(0.U((pfSeqWidth max 1).W))
+
+  // Recv is a one-cycle, fire-and-forget request. There is deliberately no
+  // extra queue in this slice; Recv wins over BOP when both target one slice.
+  val pfRecvReqs: Seq[DecoupledIO[FlitREQ]] = if (config.pfRecvEnable) {
+    val recvAddr = io.pfRecv.get.addr(47, 0)
+    val recvTarget = config.sliceNum match {
+      case 1 => map1(recvAddr)
+      case 2 => map2(recvAddr)
+      case 3 => map3(recvAddr)
+      case _ => map4(recvAddr)
+    }
+    val recvSource = L2PfSource.fromMemReqSource(io.pfRecv.get.pf_source)
+    val recvReq = WireInit(0.U.asTypeOf(new FlitREQ))
+    recvReq.Opcode := CCHIOpcode.StashShared.U
+    recvReq.Addr := recvAddr
+    recvReq.TgtID := recvTarget
+    recvReq.SrcID := config.pfSrcID.U
+    recvReq.TxnID := L2PrefetchTxnID.encode(recvSource, pfSequence, pfTxnWidth)
+    recvReq.ExpCompData := false.B
+    recvReq.Size := CCHISize.B64.U
+    recvReq.TagAlias := 0.U
+    val recvValid = io.pfRecv.get.addr_valid && io.pfRecv.get.pf_en && recvControlEnable
+    Seq.tabulate(config.sliceNum) { i =>
+      val req = Wire(Decoupled(new FlitREQ))
+      req.bits := recvReq
+      req.valid := recvValid && recvTarget === config.slices(i).U
+      req
+    }
+  } else Nil
+  val recvReqFire = pfRecvReqs.map(_.fire).reduceOption(_ || _).getOrElse(false.B)
+
   val bop = Module(new OceanusBOP(config.bopParams))
   val bopTrainArb = Module(new FastArbiter(UInt(paramL2.physicalAddrWidth.W), config.sliceNum))
   bopTrainArb.io.in.zip(slices).foreach { case (sink, source) =>
@@ -169,10 +224,6 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     bop.io.req.ready := true.B
     Nil
   } else {
-    val pfTxnWidth = (new FlitREQ).TxnID.getWidth
-    val pfSeqWidth = L2PrefetchTxnID.sequenceWidth(pfTxnWidth)
-    val pfSequence = RegInit(0.U((pfSeqWidth max 1).W))
-    when (bop.io.req.fire) { pfSequence := pfSequence + 1.U }
     val prefetchTarget = config.sliceNum match {
       case 1 => map1(bop.io.req.bits)
       case 2 => map2(bop.io.req.bits)
@@ -202,9 +253,9 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       // prefetchIssueEnable off: the queue still drains, but its output is held
       // invalid so the slice arbiter grants nothing to it.
       val issued = Wire(Decoupled(new FlitREQ))
-      issued.valid := queue.io.deq.valid && config.prefetchIssueEnable.B
+      issued.valid := queue.io.deq.valid && config.prefetchIssueEnable.B && bopControlEnable
       issued.bits := queue.io.deq.bits
-      queue.io.deq.ready := issued.ready || !config.prefetchIssueEnable.B
+      queue.io.deq.ready := issued.ready || !config.prefetchIssueEnable.B || !bopControlEnable
       issued
     }
     when(bop.io.req.valid) {
@@ -217,6 +268,10 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       case (sliceNID, ready) => (prefetchTarget === sliceNID.U) -> ready
     })
     queues
+  }
+
+  when (bop.io.req.fire || recvReqFire) {
+    pfSequence := pfSequence + 1.U
   }
 
   XSPerfAccumulate("oceanus_bop_cross_page_drop", bop.io.crossPageDrop)
@@ -250,7 +305,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   }}
 
   // - Upstream RXREQ routing. Local loop-back goes through the EVB channel,
-  // not this arbiter; the second input, when bopEnable, is the injected prefetch.
+  // not this arbiter. External demand wins; among prefetch sources Recv wins BOP.
   val postSAM_UpREQs = postSAM_t1p.map(_.UpREQ).toSeq ++ postSAM_t4p.map(_.UpREQ).toSeq
   val preArb_UpREQs = Wire(Vec(config.sliceNum, Vec(postSAM_UpREQs.size, Decoupled(new FlitREQ))))
 
@@ -265,9 +320,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     }}
     val slice_io_UpRXREQ_remote = Wire(Decoupled(new FlitREQ))
     fastArb(preArb_UpREQs(i), slice_io_UpRXREQ_remote, Some(s"UpRXREQ_remote_$i"))
-    // External traffic takes the first, higher-priority input; the prefetch is
-    // second and only present when bopEnable built the queues.
-    val reqInputs = slice_io_UpRXREQ_remote +: pfQueues.lift(i).toSeq
+    val reqInputs = slice_io_UpRXREQ_remote +: (pfRecvReqs.lift(i).toSeq ++ pfQueues.lift(i).toSeq)
     arb(reqInputs, slice.io.UpRXREQ, Some(s"UpRXREQ_$i"))
   }}
 
