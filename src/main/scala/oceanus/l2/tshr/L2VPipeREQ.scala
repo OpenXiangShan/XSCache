@@ -210,11 +210,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // base counterpart. Train RS/RU/MU misses and prefetched hits alike.
   // dirResult is the OLD registered meta: training and clear sample it before
   // the same edge, even if the lossy training receiver is not ready.
-  val prefetched_hit_train = rxreq_fire && rxreq_demand && dirResult.hit && dirResult.prefetched &&
+  val prefetched_hit_train = rxreq_fire && rxreq_demand && dirResult.hit && (dirResult.pfSource =/= 0.U) &&
     (rxreq_readshared || rxreq_readunique || rxreq_makeunique)
   io.bopTrain.valid := rxreq_fire && rxreq_demand &&
     (((rxreq_readshared || rxreq_readunique || rxreq_makeunique) && !dirResult.hit) ||
-      (dirResult.hit && dirResult.prefetched && (rxreq_readshared || rxreq_readunique || rxreq_makeunique)))
+      (dirResult.hit && (dirResult.pfSource =/= 0.U) && (rxreq_readshared || rxreq_readunique || rxreq_makeunique)))
   io.bopTrain.bits := io.tshr_paddr
   XSPerfAccumulate("prefetchedHitTrain", prefetched_hit_train)
 
@@ -1395,7 +1395,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     p_prefill_meta.alias := p_rxreq.TagAlias
   }
   when (p_prefill && meta_wr_prefetched_set) {
-    p_prefill_meta.prefetched := meta_wr_prefetched_set
+    p_prefill_meta.pfSource := L2PfSource.PBOP.U
   }
 
   // --------------------------------
@@ -1458,9 +1458,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // Every new tag overwrites this bit, including demand/external Stash fills
   // with value zero. A zero data bit with mask=0 would retain the victim's bit
   // in Directory's bitmask SRAM. ReplRd victim meta is never the refill base.
-  io.tshr_meta_write_en.prefetched := repl_tshr_meta_wr ||
+  io.tshr_meta_write_en.pfSource := repl_tshr_meta_wr ||
     (!p_prefill && (meta_wr_prefetched_set || meta_wr_prefetched_clear))
-  io.tshr_meta_write_meta.prefetched := Mux(p_prefill, p_prefill_meta.prefetched, meta_wr_prefetched_set)
+  // Exactly the old set/clear decision: PBOP on set, NoWhere on clear.
+  io.tshr_meta_write_meta.pfSource := Mux(p_prefill, p_prefill_meta.pfSource,
+    Mux(meta_wr_prefetched_set, L2PfSource.PBOP.U(L2PfSource.Width.W), L2PfSource.NoWhere.U(L2PfSource.Width.W)))
   // ----------------------------------------------------------------
 
   // -- Interactions with TSHR local data and Data Storage Read
@@ -1976,6 +1978,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // replacer's victim snapshot or the number of loopback EvictBack requests.
   io.bopPerf.uselessEvict := meta_wr_state_evictback_I && io.tshr_meta_write_en.state &&
     io.tshr_meta_write_meta.state === MetaState.I && dirResult.hit &&
-    dirResult.state =/= MetaState.I && dirResult.prefetched
+    dirResult.state =/= MetaState.I && (dirResult.pfSource =/= 0.U)
 
 }

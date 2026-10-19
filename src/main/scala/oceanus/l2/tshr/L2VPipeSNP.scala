@@ -280,7 +280,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
   // write; a nested eviction/snoop is charged to whichever invalidates first.
   io.bopUselessSnoop := do_meta_write && rxsnp_meta_write_en.state &&
     rxsnp_meta_write_meta.state === L2Directory.MetaState.I && io.tshr_dirResult.hit &&
-    io.tshr_dirResult.state =/= L2Directory.MetaState.I && io.tshr_dirResult.prefetched
+    io.tshr_dirResult.state =/= L2Directory.MetaState.I && (io.tshr_dirResult.pfSource =/= 0.U)
   val do_sa_snpcompack = s_snpcompack && !(w_snpresp0 || w_snpresp2 || w_ds_read || s_home_resp0 || s_home_resp2 ||
                          s_dct_resp0 || s_dct_resp2)
 

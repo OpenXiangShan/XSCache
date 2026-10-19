@@ -208,6 +208,12 @@ object TestTop_L2Prefetched extends App with ChiselSim {
         usefulCount += value(dut.observation.prefetchedHitTrainCount).toInt
         dut.observation.dirProbeBySlice(0).foreach { d =>
           val addr = value(d.tshrPaddr)
+          // Keep the existing lifecycle oracle and independently check the widened encoding.
+          def checkSource(source: BigInt): Unit =
+            assert(source == 0 || source == 3, s"pfSource must be NoWhere=0 or PBOP=3, got $source")
+          if (flag(d.dirWbLand)) checkSource(value(d.dirResultPfSource))
+          if (flag(d.dirRdResp) || flag(d.replRdResp)) checkSource(value(d.fromDirMetaPfSource))
+          if (flag(d.metaWrReqPrefetched)) checkSource(value(d.metaWrReqMetaPfSource))
           // Eviction invalidation may cancel Directory writeback because the
           // refiller overwrites that physical way. Remove the old tag on the
           // actual local invalidating write as well as tracking committed rows.

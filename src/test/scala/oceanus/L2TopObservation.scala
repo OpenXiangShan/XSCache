@@ -203,6 +203,10 @@ class L2TopDirTimingProbeEntry extends Bundle {
   val dirResultState = UInt(2.W)
   val dirResultDirty = Bool()
   val dirResultHit = Bool()
+  // Preserve the Boolean baseline probes and expose raw SRAM/write payloads for encoding checks.
+  val dirResultPfSource = UInt(4.W)
+  val fromDirMetaPfSource = UInt(4.W)
+  val metaWrReqMetaPfSource = UInt(4.W)
   val dirResultPrefetched = Bool()
   val fromDirMetaPrefetched = Bool()
   val fromDirReplPaddr = UInt(48.W)
@@ -703,12 +707,15 @@ object L2TopObservation {
     probe.dirResultState := boreRead(dirResult.state)
     probe.dirResultDirty := boreRead(dirResult.dirty)
     probe.dirResultHit := boreRead(dirResult.hit)
-    probe.dirResultPrefetched := boreRead(dirResult.prefetched)
-    probe.fromDirMetaPrefetched := boreRead(proxyDir.io.fromDir.META.prefetched)
+    probe.dirResultPfSource := boreRead(dirResult.pfSource)
+    probe.fromDirMetaPfSource := boreRead(proxyDir.io.fromDir.META.pfSource)
+    probe.dirResultPrefetched := probe.dirResultPfSource =/= 0.U
+    probe.fromDirMetaPrefetched := probe.fromDirMetaPfSource =/= 0.U
     probe.fromDirReplPaddr := boreRead(proxyDir.io.fromDir.REPL.paddr)
     probe.tagWrite := boreRead(vPipeREQ.io.tshr_tag_write_en)
-    probe.metaWrReqPrefetched := boreRead(metaWriteREQMask.prefetched)
-    probe.metaWrReqMetaPrefetched := boreRead(metaWriteREQMeta.prefetched)
+    probe.metaWrReqPrefetched := boreRead(metaWriteREQMask.pfSource)
+    probe.metaWrReqMetaPfSource := boreRead(metaWriteREQMeta.pfSource)
+    probe.metaWrReqMetaPrefetched := probe.metaWrReqMetaPfSource =/= 0.U
     probe.dirResultWay := boreRead(dirResult.way)
     probe.rdDone := boreRead(proxyDir.io.rd_done)
     probe.replRdResp := boreRead(fromDirReplRdResp)

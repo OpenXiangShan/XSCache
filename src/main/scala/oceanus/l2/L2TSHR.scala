@@ -275,8 +275,8 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
     "TSHR @ %m multiple active write on meta.state")
   assert(PopCount(Seq(meta_write_SA_mask, meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.dirty)) <= 1.U, 
     "TSHR @ %m multiple active write on meta.dirty")
-  assert(PopCount(Seq(meta_write_SA_mask, meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.prefetched)) <= 1.U,
-    "TSHR @ %m multiple active write on meta.prefetched")
+  assert(PopCount(Seq(meta_write_SA_mask, meta_write_EVT_mask, meta_write_SNP_mask, meta_write_REQ_mask).map(_.pfSource)) <= 1.U,
+    "TSHR @ %m multiple active write on meta.pfSource")
 
   assert(!(tshr_dealloc && meta_modified.asUInt.orR), "TSHR @ %m deallocated with un-committed modified meta")
 
