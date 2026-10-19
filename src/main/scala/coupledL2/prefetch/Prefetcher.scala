@@ -384,8 +384,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   // Packed 4x5-bit minimum scores for normal/moderate/high/critical pressure:
   // 0, 12, 20, 28, matching the GEM5 HistoryEvent512 controller.
   val event512MinScore = Constantin.createRecord(s"l2pf_event512MinScore$confHartId", initValue = 737536)
-  // Optional source-level accuracy gate for L1-generated SMS requests. The
-  // score uses the L2 SMS outcome trainer and is independent of NoC pressure.
+  // Optional source-level SMS accuracy observation. The score uses the L2 SMS
+  // outcome trainer and is independent of NoC pressure; it is report-only.
   val smsAccuracyEnable = Constantin.createRecord(s"l2pf_smsAccuracyEnable$confHartId", initValue = 0)
   val smsAccuracyMinScore = Constantin.createRecord(s"l2pf_smsAccuracyMinScore$confHartId", initValue = 8)
   // L2-native sources use Event512 after their source-level history is ready;
@@ -414,7 +414,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   def smsAccuracyActive(pfSource: UInt): Bool =
     smsAccuracyEnable =/= 0.U && pfSource === MemReqSource.Prefetch2L2SMS.id.U
 
-  def smsAccuracyAdmit(pfSource: UInt, event512Score: UInt, event512Valid: Bool): Bool =
+  def smsAccuracyWouldDrop(pfSource: UInt, event512Score: UInt, event512Valid: Bool): Bool =
     !smsAccuracyActive(pfSource) || !event512Valid || event512Score >= smsAccuracyMinScore
   def policyAdmit(
     pfSource: UInt,
@@ -428,8 +428,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     val calibrated = PfPolicy.event512Admit(
       pfSource, event512Score, event512Valid, nocTier(bank), event512MinScore, true.B
     )
-    val smsAccuracy = smsAccuracyAdmit(pfSource, event512Score, event512Valid)
-    Mux(event512Ready(pfSource, event512Valid), calibrated && smsAccuracy, fallback && smsAccuracy)
+    Mux(event512Ready(pfSource, event512Valid), calibrated, fallback)
   }
   for (i <- 0 until banks) {
     val legacyMask = Cat(
@@ -862,7 +861,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     val smsAccuracyDrop = reqsValid.zip(reqsSetAddr).zip(reqsAllowed).zip(policyReqsBits).map {
       case (((valid, addr), allowed), req) =>
         valid && allowed && smsAccuracyActive(req.pfSource) && req.pfEvent512Valid &&
-          !smsAccuracyAdmit(req.pfSource, req.pfEvent512Score, req.pfEvent512Valid) &&
+          smsAccuracyWouldDrop(req.pfSource, req.pfEvent512Score, req.pfEvent512Valid) &&
           bank_eq(addr, i, bankBits)
     }
     XSPerfAccumulate("pftq_sms_accuracy_valid_enq", PopCount(reqsValid.zip(policyReqsBits).map {
@@ -939,7 +938,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     val headEventDrop = headValid && headEvent512Ready && !headEvent512Admit
     val headSmsAccuracyDrop = headValid && smsAccuracyActive(headBits.req.pfSource) &&
       headBits.req.pfEvent512Valid &&
-      !smsAccuracyAdmit(headBits.req.pfSource, headBits.req.pfEvent512Score, headBits.req.pfEvent512Valid)
+      smsAccuracyWouldDrop(headBits.req.pfSource, headBits.req.pfEvent512Score, headBits.req.pfEvent512Valid)
     XSPerfAccumulate("pftq_sms_accuracy_valid_deq", headValid && smsAccuracyActive(headBits.req.pfSource) && headBits.req.pfEvent512Valid)
     XSPerfAccumulate("pftq_sms_accuracy_drop_deq", headSmsAccuracyDrop)
     XSPerfHistogram("pftq_sms_accuracy_drop_score_deq", headBits.req.pfEvent512Score, headSmsAccuracyDrop, 0, 32, 1)
