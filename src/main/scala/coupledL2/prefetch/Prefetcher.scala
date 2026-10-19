@@ -414,8 +414,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   def smsAccuracyActive(pfSource: UInt): Bool =
     smsAccuracyEnable =/= 0.U && pfSource === MemReqSource.Prefetch2L2SMS.id.U
 
-  def smsAccuracyWouldDrop(pfSource: UInt, event512Score: UInt, event512Valid: Bool): Bool =
-    smsAccuracyActive(pfSource) && event512Valid && event512Score < smsAccuracyMinScore
+  def smsAccuracyAdmit(pfSource: UInt, event512Score: UInt, event512Valid: Bool): Bool =
+    !smsAccuracyActive(pfSource) || !event512Valid || event512Score >= smsAccuracyMinScore
   def policyAdmit(
     pfSource: UInt,
     pfConf: UInt,
@@ -428,7 +428,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     val calibrated = PfPolicy.event512Admit(
       pfSource, event512Score, event512Valid, nocTier(bank), event512MinScore, true.B
     )
-    Mux(event512Ready(pfSource, event512Valid), calibrated, fallback)
+    val baseAdmit = Mux(event512Ready(pfSource, event512Valid), calibrated, fallback)
+    baseAdmit && smsAccuracyAdmit(pfSource, event512Score, event512Valid)
   }
   for (i <- 0 until banks) {
     val legacyMask = Cat(
@@ -861,7 +862,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     val smsAccuracyDrop = reqsValid.zip(reqsSetAddr).zip(reqsAllowed).zip(policyReqsBits).map {
       case (((valid, addr), allowed), req) =>
         valid && allowed && smsAccuracyActive(req.pfSource) && req.pfEvent512Valid &&
-          smsAccuracyWouldDrop(req.pfSource, req.pfEvent512Score, req.pfEvent512Valid) &&
+          !smsAccuracyAdmit(req.pfSource, req.pfEvent512Score, req.pfEvent512Valid) &&
           bank_eq(addr, i, bankBits)
     }
     XSPerfAccumulate("pftq_sms_accuracy_valid_enq", PopCount(reqsValid.zip(policyReqsBits).map {
@@ -938,7 +939,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     val headEventDrop = headValid && headEvent512Ready && !headEvent512Admit
     val headSmsAccuracyDrop = headValid && smsAccuracyActive(headBits.req.pfSource) &&
       headBits.req.pfEvent512Valid &&
-      smsAccuracyWouldDrop(headBits.req.pfSource, headBits.req.pfEvent512Score, headBits.req.pfEvent512Valid)
+      !smsAccuracyAdmit(headBits.req.pfSource, headBits.req.pfEvent512Score, headBits.req.pfEvent512Valid)
     XSPerfAccumulate("pftq_sms_accuracy_valid_deq", headValid && smsAccuracyActive(headBits.req.pfSource) && headBits.req.pfEvent512Valid)
     XSPerfAccumulate("pftq_sms_accuracy_drop_deq", headSmsAccuracyDrop)
     XSPerfHistogram("pftq_sms_accuracy_drop_score_deq", headBits.req.pfEvent512Score, headSmsAccuracyDrop, 0, 32, 1)
