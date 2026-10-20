@@ -210,9 +210,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // base counterpart. Train RS/RU/MU misses and prefetched hits alike.
   // Recv requests themselves are excluded by rxreq_demand. A later demand hit
   // on any prefetched row still trains BOP, matching coupledL2's is_other_train;
-  // only PBOP rows contribute to the physical-BOP effect counters.
+  // Every nonzero source now contributes to the source-qualified effect
+  // counters; the historic aggregate remains named BOP for compatibility.
   val dirResultFromPBOP = dirResult.pfSource === L2PfSource.PBOP.U
-  val requestFromPBOP = L2PrefetchTxnID.decode(rxreq.TxnID) === L2PfSource.PBOP.U
+  val rxreqPfSource = L2PrefetchTxnID.decode(rxreq.TxnID)
+  val requestFromPrefetch = rxreq.SrcID === io.consts.pfSrcID && rxreqPfSource =/= L2PfSource.NoWhere.U
+  val requestFromPBOP = rxreqPfSource === L2PfSource.PBOP.U
   val prefetched_hit_consume = rxreq_fire && rxreq_demand && dirResult.hit && (dirResult.pfSource =/= 0.U) &&
     (rxreq_readshared || rxreq_readunique || rxreq_makeunique)
   // dirResult is the OLD registered meta: training and clear sample it before
@@ -1363,7 +1366,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // A-hit MetaEntry defaults prefetch=false (MainPipe:538,557; Directory:56).
   // Its MSHR hit refill retains meta_pft (MSHR:795); base has no corresponding
   // MSHR pipeline and consumes even hits requiring a downstream permission upgrade.
-  // Consumption clears every prefetch source and trains BOP; effect counts use PBOP only.
+  // Consumption clears every prefetch source and trains BOP; source-qualified
+  // effect counts retain the original provenance.
   val meta_wr_prefetched_clear = prefetched_hit_consume
 
   // --------------------------------
@@ -1973,24 +1977,31 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   assert(!(rxevb_unsatisfied_evictback && active), 
     "TSHR @ %m REQ vPipe passed unsatisfied EvictBack on active non-replace non-invalid transaction")
   // ----------------------------------------------------------------
-  // BOP effectiveness boundaries (observation only). useful counts PBOP's
+  // Prefetch effectiveness boundaries (observation only). useful counts the
   // first RS/RU/MU consumption of the OLD source,
   // including permission upgrades. Late consumption is included in useful;
   // timely is useful - late (allocator-side late is defined in L2TSHR).
   io.bopPerf.activePrefetch := active && p_rxreq_stashshared && p_rxreq.SrcID === io.consts.pfSrcID &&
-    L2PrefetchTxnID.decode(p_rxreq.TxnID) === L2PfSource.PBOP.U
+    L2PrefetchTxnID.decode(p_rxreq.TxnID) =/= L2PfSource.NoWhere.U
+  io.bopPerf.activePrefetchSource := Mux(io.bopPerf.activePrefetch,
+    L2PrefetchTxnID.decode(p_rxreq.TxnID), L2PfSource.NoWhere.U)
   io.bopPerf.activeDemand := active && p_rxreq.SrcID =/= io.consts.pfSrcID &&
     (p_rxreq_readshared || p_rxreq_readunique || p_rxreq_makeunique)
-  io.bopPerf.useful := prefetched_hit_pbop
+  io.bopPerf.useful := prefetched_hit_consume
   // Count redundant only at REQ execution, never at allocation/queue issue.
-  io.bopPerf.redundant := rxreq_fire && rxreq.SrcID === io.consts.pfSrcID &&
-    requestFromPBOP && rxreq_satisfied_stashshared
+  io.bopPerf.redundant := rxreq_fire && requestFromPrefetch && rxreq_satisfied_stashshared
   // First downstream send only; RetryAck/PCrdGrant reissues are excluded.
   io.bopPerf.issuedDownstream := io.DnTXREQ.fire && io.bopPerf.activePrefetch && !p_txreq_reissue
   // Count the victim host's actual valid -> I local meta write. Never use the
   // replacer's victim snapshot or the number of loopback EvictBack requests.
   io.bopPerf.uselessEvict := meta_wr_state_evictback_I && io.tshr_meta_write_en.state &&
     io.tshr_meta_write_meta.state === MetaState.I && dirResult.hit &&
-    dirResult.state =/= MetaState.I && dirResult.pfSource === L2PfSource.PBOP.U
+    dirResult.state =/= MetaState.I && dirResult.pfSource =/= L2PfSource.NoWhere.U
+
+  io.bopPerf.source := L2PfSource.NoWhere.U
+  when (io.bopPerf.useful) { io.bopPerf.source := dirResult.pfSource }
+  when (io.bopPerf.redundant) { io.bopPerf.source := rxreqPfSource }
+  when (io.bopPerf.issuedDownstream) { io.bopPerf.source := io.bopPerf.activePrefetchSource }
+  when (io.bopPerf.uselessEvict) { io.bopPerf.source := dirResult.pfSource }
 
 }

@@ -107,6 +107,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
     val valid = Output(Bool())
 
     val bopPerf = Output(Vec(L2BOPPerf.names.size, Bool()))
+    val bopPerfSource = Output(Vec(L2BOPPerf.names.size, UInt(L2PfSource.Width.W)))
 
     val bopTrain = Valid(UInt(paramL2.physicalAddrWidth.W))
   })
@@ -564,6 +565,25 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   io.bopPerf(L2BOPPerf.IssuedDownstream) := vPipeREQ.io.bopPerf.issuedDownstream
   io.bopPerf(L2BOPPerf.UselessEvict) := vPipeREQ.io.bopPerf.uselessEvict
   io.bopPerf(L2BOPPerf.UselessSnoop) := vPipeSNP.io.bopUselessSnoop
+
+  // Each pulse carries one source; inactive metrics use NoWhere so the
+  // observation layer can accumulate per-source counters without guessing.
+  io.bopPerfSource.foreach(_ := L2PfSource.NoWhere.U)
+  io.bopPerfSource(L2BOPPerf.Useful) := Mux(vPipeREQ.io.bopPerf.useful,
+    vPipeREQ.io.bopPerf.source, L2PfSource.NoWhere.U)
+  io.bopPerfSource(L2BOPPerf.Late) := Mux(bopLate,
+    vPipeREQ.io.bopPerf.activePrefetchSource, L2PfSource.NoWhere.U)
+  io.bopPerfSource(L2BOPPerf.Redundant) := Mux(vPipeREQ.io.bopPerf.redundant,
+    vPipeREQ.io.bopPerf.source, L2PfSource.NoWhere.U)
+  io.bopPerfSource(L2BOPPerf.RedundantAfterDemand) := Mux(vPipeREQ.io.bopPerf.redundant && bopQueuedAfterDemand,
+    vPipeREQ.io.bopPerf.source, L2PfSource.NoWhere.U)
+  io.bopPerfSource(L2BOPPerf.RedundantResident) := Mux(vPipeREQ.io.bopPerf.redundant && !bopQueuedAfterDemand,
+    vPipeREQ.io.bopPerf.source, L2PfSource.NoWhere.U)
+  io.bopPerfSource(L2BOPPerf.IssuedDownstream) := Mux(vPipeREQ.io.bopPerf.issuedDownstream,
+    vPipeREQ.io.bopPerf.source, L2PfSource.NoWhere.U)
+  io.bopPerfSource(L2BOPPerf.UselessEvict) := Mux(vPipeREQ.io.bopPerf.uselessEvict,
+    vPipeREQ.io.bopPerf.source, L2PfSource.NoWhere.U)
+  io.bopPerfSource(L2BOPPerf.UselessSnoop) := vPipeSNP.io.bopUselessSnoopSource
 
   vPipeREQ.io.DnRXRSP := io.DnRXRSP
   vPipeREQ.io.DnRXDAT := io.DnRXDAT

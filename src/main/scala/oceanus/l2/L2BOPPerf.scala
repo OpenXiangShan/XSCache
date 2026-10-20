@@ -24,4 +24,8 @@ class L2BOPReqPerf extends Bundle {
   val redundant = Bool()
   val issuedDownstream = Bool()
   val uselessEvict = Bool()
+  // Provenance of the event. Zero means that the corresponding pulse is
+  // inactive; nonzero values use L2PfSource's coupledL2 encoding.
+  val source = UInt(L2PfSource.Width.W)
+  val activePrefetchSource = UInt(L2PfSource.Width.W)
 }

@@ -83,7 +83,12 @@ class L2Configuration(
   // Optional L1-to-L2 receiver and control ports. Keeping both absent by
   // default preserves the existing BOP-only top-level interface.
   val pfRecvEnable: Boolean = false,
-  val pfCtrlEnable: Boolean = false
+  val pfCtrlEnable: Boolean = false,
+  // CoupledL2 defaults: PBOP/BOP output buffering is 16 entries while L1
+  // receiver sources use 32.  These are source queues, so the values remain
+  // explicit configuration knobs for later VBOP/CDP integration.
+  val pfBopQueueEntries: Int = 16,
+  val pfRecvQueueEntries: Int = 32
 ) {
   def sliceNum = slices.size
 
@@ -91,6 +96,8 @@ class L2Configuration(
     s"pfSrcID=$pfSrcID is outside the $srcIdWidth-bit upstream SrcID range")
   require(!upstream.entries.map(_.nid).contains(pfSrcID),
     s"pfSrcID=$pfSrcID collides with an upstream NID: ${upstream.entries.map(_.nid).mkString(",")}")
+  require(pfBopQueueEntries > 1 && (pfBopQueueEntries & (pfBopQueueEntries - 1)) == 0)
+  require(pfRecvQueueEntries > 1 && (pfRecvQueueEntries & (pfRecvQueueEntries - 1)) == 0)
 }
 
 class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Module with HasL2Params {
@@ -178,8 +185,9 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   val pfSeqWidth = L2PrefetchTxnID.sequenceWidth(pfTxnWidth)
   val pfSequence = RegInit(0.U((pfSeqWidth max 1).W))
 
-  // Recv is a one-cycle, fire-and-forget request. There is deliberately no
-  // extra queue in this slice; Recv wins over BOP when both target one slice.
+  // Recv is a one-cycle, fire-and-forget request. The request is offered to the
+  // slice directly first; only a request that the slice arbiter does not fire
+  // may enter its source queue, so one Recv flit cannot be injected twice.
   val pfRecvReqs: Seq[DecoupledIO[FlitREQ]] = if (config.pfRecvEnable) {
     val recvAddr = io.pfRecv.get.addr(47, 0)
     val recvTarget = config.sliceNum match {
@@ -216,11 +224,21 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   }
   bop.io.train <> bopTrainArb.io.out
 
-  // bopEnable off: drain the request and build nothing. The REQ arbiter below
-  // then has only the external input, exactly as before prefetch injection.
-  // Carry source in the high four TxnID bits, with a free wrapping sequence below.
   // Internal Stash has no upstream completion; downstream IDs remain TSHR/slice IDs.
-  val pfQueues: Seq[DecoupledIO[FlitREQ]] = if (!config.bopEnable) {
+  // Source order is the policy boundary: receiver encodings precede PBOP/BOP,
+  // and remaining slots leave room for VBOP/CDP. A later aging policy can
+  // replace this order without changing queue or slice wiring.
+  val pfSourceSlots = Seq(L2PfSource.SMS, L2PfSource.BOP, L2PfSource.PBOP,
+    L2PfSource.Stream, L2PfSource.Stride, L2PfSource.TP, L2PfSource.Berti,
+    L2PfSource.NL, L2PfSource.CDP)
+  val pfSourcePriority = Seq(L2PfSource.SMS, L2PfSource.Stream, L2PfSource.Stride,
+    L2PfSource.Berti, L2PfSource.BOP, L2PfSource.PBOP, L2PfSource.TP,
+    L2PfSource.NL, L2PfSource.CDP)
+  // Internal observation hook: one overwrite pulse per slice/source. It is
+  // intentionally not part of the CCHI-facing IO bundle.
+  val pfQueueOverwriteBySource = Wire(Vec(config.sliceNum, Vec(pfSourceSlots.size, Bool())))
+  pfQueueOverwriteBySource.foreach(_.foreach(_ := false.B))
+  val pfQueues: Seq[DecoupledIO[FlitREQ]] = if (!config.bopEnable && !config.pfRecvEnable) {
     bop.io.req.ready := true.B
     Nil
   } else {
@@ -230,43 +248,77 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       case 3 => map3(bop.io.req.bits)
       case _ => map4(bop.io.req.bits)
     }
-    val pfQueueEnqReady = Wire(Vec(config.sliceNum, Bool()))
     val queues = Seq.tabulate(config.sliceNum) { i =>
-      // Overwrite the oldest rather than stall: enq.ready stays high, so a full
-      // queue never backpressures BOP training. Depth two matches the freeze tag.
-      val queue = Module(new OverwriteQueue(new FlitREQ, entries = 2))
-      queue.suggestName(s"pfQueue_$i")
-      queue.io.enq.valid := bop.io.req.valid && prefetchTarget === config.slices(i).U
-      queue.io.enq.bits := 0.U.asTypeOf(new FlitREQ)
-      queue.io.enq.bits.Opcode := CCHIOpcode.StashShared.U
-      queue.io.enq.bits.Addr := bop.io.req.bits
-      queue.io.enq.bits.TgtID := config.slices(i).U
-      queue.io.enq.bits.SrcID := config.pfSrcID.U
-      queue.io.enq.bits.TxnID := L2PrefetchTxnID.encode(
-        L2PfSource.PBOP.U(L2PfSource.Width.W), pfSequence, pfTxnWidth)
-      // StashShared with ExpCompStash set would demand completion data, which
-      // base aliases onto ExpCompData (L2VPipeREQ.scala:204-207). Keep it clear.
-      queue.io.enq.bits.ExpCompData := false.B
-      queue.io.enq.bits.Size := CCHISize.B64.U
-      queue.io.enq.bits.TagAlias := 0.U
-      pfQueueEnqReady(i) := queue.io.enq.ready
-      // prefetchIssueEnable off: the queue still drains, but its output is held
-      // invalid so the slice arbiter grants nothing to it.
+      val sourceQueues = pfSourceSlots.zipWithIndex.map { case (source, sourceIdx) =>
+        val entries = if (source == L2PfSource.BOP || source == L2PfSource.PBOP)
+          config.pfBopQueueEntries else config.pfRecvQueueEntries
+        val queue = Module(new OverwriteQueue(new FlitREQ, entries = entries))
+        queue.suggestName(s"pfQueue_${i}_src${source}")
+        pfQueueOverwriteBySource(i)(sourceIdx) := queue.io.overwrite
+        val fromBop = (source == L2PfSource.PBOP).B && bop.io.req.valid && prefetchTarget === config.slices(i).U
+        val fromRecv = if (config.pfRecvEnable) {
+          // pfRecvReqs.ready is driven by the slice REQ arbiter below. A direct
+          // fire owns the flit; queue admission is the fallback route only.
+          pfRecvReqs(i).valid && !pfRecvReqs(i).ready &&
+            L2PfSource.fromMemReqSource(io.pfRecv.get.pf_source) === source.U
+        } else false.B
+        queue.io.enq.valid := fromBop || fromRecv
+        val bopBits = WireInit(0.U.asTypeOf(new FlitREQ))
+        bopBits.Opcode := CCHIOpcode.StashShared.U
+        bopBits.Addr := bop.io.req.bits
+        bopBits.TgtID := config.slices(i).U
+        bopBits.SrcID := config.pfSrcID.U
+        bopBits.TxnID := L2PrefetchTxnID.encode(
+          L2PfSource.PBOP.U(L2PfSource.Width.W), pfSequence, pfTxnWidth)
+        bopBits.ExpCompData := false.B
+        bopBits.Size := CCHISize.B64.U
+        bopBits.TagAlias := 0.U
+        val recvBits = if (config.pfRecvEnable) pfRecvReqs(i).bits else 0.U.asTypeOf(new FlitREQ)
+        queue.io.enq.bits := Mux(fromBop, bopBits, recvBits)
+        (source, queue)
+      }
+      // Boundary history compares only lastIssuedAddr, not an outstanding CAM.
+      // Duplicates missed here are serialized by the slice's paddr hit check
+      // (L2TSHRAlloc.scala:207-212) and counted as redundant at REQ execution.
+      // This limited history costs efficiency, not correctness.
+      val lastIssuedValid = RegInit(false.B)
+      val lastIssuedAddr = Reg(UInt(paramL2.physicalAddrWidth.W))
+      val candidates = pfSourcePriority.map { source =>
+        val q = sourceQueues.find(_._1 == source).get._2
+        q.io.deq.valid && !(lastIssuedValid && q.io.deq.bits.Addr === lastIssuedAddr)
+      }
+      val chosen = PriorityEncoderOH(VecInit(candidates).asUInt)
       val issued = Wire(Decoupled(new FlitREQ))
-      issued.valid := queue.io.deq.valid && config.prefetchIssueEnable.B && bopControlEnable
-      issued.bits := queue.io.deq.bits
-      queue.io.deq.ready := issued.ready || !config.prefetchIssueEnable.B || !bopControlEnable
+      issued.valid := candidates.reduce(_ || _) && config.prefetchIssueEnable.B && bopControlEnable
+      issued.bits := Mux1H(pfSourcePriority.zip(chosen.asBools).map { case (source, hit) =>
+        hit -> sourceQueues.find(_._1 == source).get._2.io.deq.bits
+      })
+      val chosenFire = issued.valid && issued.ready
+      sourceQueues.foreach { case (source, queue) =>
+        val idx = pfSourcePriority.indexOf(source)
+        val isChosen = if (idx >= 0) chosen.asBools(idx) else false.B
+        val stale = queue.io.deq.valid && lastIssuedValid && queue.io.deq.bits.Addr === lastIssuedAddr
+        val sameAsChosen = queue.io.deq.valid && chosenFire && issued.bits.Addr === queue.io.deq.bits.Addr && !isChosen
+        // A static issue-off configuration drains for backward-compatible
+        // training-only runs; a runtime control gate holds entries so queue
+        // overflow remains observable per source.
+        queue.io.deq.ready := !config.prefetchIssueEnable.B || stale ||
+          (isChosen && chosenFire) || sameAsChosen
+      }
+      when (chosenFire) {
+        lastIssuedValid := true.B
+        lastIssuedAddr := issued.bits.Addr
+      }
       issued
     }
     when(bop.io.req.valid) {
       assert(PopCount(VecInit(config.slices.map(nid => prefetchTarget === nid.U))) === 1.U,
         "BOP request must demux to exactly one prefetch queue")
     }
-    // Ready is the selected queue's enqueue ready, not its dequeue ready:
-    // dequeue backpressure must not reject training.
-    bop.io.req.ready := Mux1H(config.slices.zip(pfQueueEnqReady).map {
-      case (sliceNID, ready) => (prefetchTarget === sliceNID.U) -> ready
-    })
+    // Ready is the selected source queue's enqueue ready, not dequeue ready:
+    // dequeue backpressure must not reject training. OverwriteQueue itself is
+    // always ready, so this remains a source-local admission boundary.
+    bop.io.req.ready := true.B
     queues
   }
 
@@ -320,6 +372,9 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     }}
     val slice_io_UpRXREQ_remote = Wire(Decoupled(new FlitREQ))
     fastArb(preArb_UpREQs(i), slice_io_UpRXREQ_remote, Some(s"UpRXREQ_remote_$i"))
+    // Recv is input 1 and therefore wins over queued sources when the slice
+    // accepts it. Its ready signal also selects the mutually exclusive queue
+    // fallback in the source-queue logic above.
     val reqInputs = slice_io_UpRXREQ_remote +: (pfRecvReqs.lift(i).toSeq ++ pfQueues.lift(i).toSeq)
     arb(reqInputs, slice.io.UpRXREQ, Some(s"UpRXREQ_$i"))
   }}

@@ -12,6 +12,9 @@ class OverwriteQueue[T <: Data](gen: T, entries: Int)(implicit p: Parameters) ex
   val io = IO(new Bundle {
     val enq = Flipped(Decoupled(gen))
     val deq = Decoupled(gen)
+    // Expose the exact overwrite pulse for per-source accounting.  The
+    // queue's ready/flow semantics remain unchanged.
+    val overwrite = Output(Bool())
   })
 
   private def wrapInc(ptr: UInt): UInt = Mux(ptr === (entries - 1).U, 0.U, ptr + 1.U)
@@ -30,6 +33,7 @@ class OverwriteQueue[T <: Data](gen: T, entries: Int)(implicit p: Parameters) ex
   io.enq.ready := true.B
   io.deq.valid := !empty
   io.deq.bits := data(head)
+  io.overwrite := overwrite
   XSPerfAccumulate("overwrite", overwrite)
 
   when (enqueue) {

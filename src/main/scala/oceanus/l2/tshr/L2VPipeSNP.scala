@@ -19,6 +19,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
 
   val io = IO(new Bundle {
     val bopUselessSnoop = Output(Bool())
+    val bopUselessSnoopSource = Output(UInt(L2PfSource.Width.W))
 
     val consts = Input(new L2TSHRConsts(sliceNum))
 
@@ -281,7 +282,8 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
   io.bopUselessSnoop := do_meta_write && rxsnp_meta_write_en.state &&
     rxsnp_meta_write_meta.state === L2Directory.MetaState.I && io.tshr_dirResult.hit &&
     io.tshr_dirResult.state =/= L2Directory.MetaState.I &&
-    io.tshr_dirResult.pfSource === L2PfSource.PBOP.U
+    io.tshr_dirResult.pfSource =/= L2PfSource.NoWhere.U
+  io.bopUselessSnoopSource := Mux(io.bopUselessSnoop, io.tshr_dirResult.pfSource, L2PfSource.NoWhere.U)
   val do_sa_snpcompack = s_snpcompack && !(w_snpresp0 || w_snpresp2 || w_ds_read || s_home_resp0 || s_home_resp2 ||
                          s_dct_resp0 || s_dct_resp2)
 
