@@ -22,6 +22,8 @@ class TestTop_L2Top(val l2cfg: L2Configuration)(implicit val p: Parameters) exte
 
   val module = Module(new L2Top(l2cfg))
   val observation = L2TopObservation.attach(module, nMSHR)
+  // Phase 1b optional end-to-end probes disappear with the sideband parameter.
+  val trainObservation = L2TopTrainObservation.attach(module, nMSHR)
 
   val io = IO(module.io.cloneType)
 

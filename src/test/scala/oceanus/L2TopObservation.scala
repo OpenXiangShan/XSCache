@@ -607,7 +607,7 @@ object L2TopObservation {
 
   slices.zipWithIndex.foreach { case (slice, sliceIdx) =>
     io.sliceTrainValid(sliceIdx) := boreRead(slice.io.bopTrain.valid)
-    io.sliceTrainAddr(sliceIdx) := boreRead(slice.io.bopTrain.bits)
+    io.sliceTrainAddr(sliceIdx) := boreRead(slice.io.bopTrain.bits.paddr)
     val sliceTshrSet = sliceTshrs(sliceIdx)
     val sliceProxyDirs = sliceTshrSet.map(privateField[L2TSHRDirectoryProxy](_, "proxyDir"))
     sliceProxyDirs.zip(sliceTshrSet).zip(allDirProbes(sliceIdx)).foreach { case ((proxyDir, tshr), probe) =>
@@ -967,7 +967,7 @@ object L2TopObservation {
   // REQ as XSPerfAccumulate and acquire no cross-module observation IO.
   val hitTrains = sliceTshrs.map(_.map { tshr =>
     val req = privateField[L2VPipeREQ](tshr, "vPipeREQ")
-    (boreRead(privateBool(req, "prefetched_hit_train")), boreRead(req.io.bopTrain.bits))
+    (boreRead(privateBool(req, "prefetched_hit_train")), boreRead(req.io.bopTrain.bits.paddr))
   })
   io.prefetchedHitTrainCount := PopCount(VecInit(hitTrains.flatten.map(_._1)))
   io.prefetchedHitTrainAddr := Mux1H(hitTrains.flatten)

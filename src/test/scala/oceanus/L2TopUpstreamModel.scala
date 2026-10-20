@@ -83,6 +83,10 @@ class L2TopUpstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim {
     port.bits.Excl.poke(req.excl.B)
     port.bits.ExpCompData.poke(req.expCompData.B)
     port.bits.Addr.poke(req.addr.U)
+    // Phase 1b driven regression: vary VPN/source/enable per live request while
+    // preserving all existing requests and timing. Default remains idle.
+    if (L2TopTrainStimulus.driven && req.master == MasterId.T1P0)
+      dut.io.pfTrain.foreach(p => L2TopTrainStimulus.poke(p(0), req.addr, req.srcId, req.txnId))
   }
 
   def driveUpCompAck(upDBID: UpDBID, sliceIdx: Int = 0): Unit = {

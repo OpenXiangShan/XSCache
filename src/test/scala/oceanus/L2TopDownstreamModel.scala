@@ -30,6 +30,8 @@ object L2TopDownstreamOpcodes {
 }
 
 class L2TopDownstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim {
+  // Sample the actual exported REQ handshake before each simulation edge.
+  val trainChecker = new L2TopTrainChecker(dut)
   private val credit = spec.dn.creditPolicy
   private val maxTxLCredits = credit.maxTxLCredits
   private val maxRxRspLCredits = credit.maxRxRspLCredits
@@ -282,6 +284,7 @@ class L2TopDownstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim
     try {
       advanceTxLCredits(cycle)
       advanceRxLCredits(cycle)
+      trainChecker.sample(cycle)
       dut.clock.step(1)
     } catch {
       case t: Throwable =>
