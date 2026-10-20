@@ -1442,6 +1442,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   io.tshr_tag_write_en := tshr_tag_wr
 
+  // Phase 1a keeps the reserved CDP depth zero on the REQ metadata output;
+  // depth has no producer, consumer or write-enable in this stage.
+  io.tshr_meta_write_meta.cdpPfDepth := 0.U
   io.tshr_meta_write_en.state := tshr_meta_wr_state
   io.tshr_meta_write_meta.state := Mux(
     p_prefill, 

@@ -15,7 +15,7 @@ import freechips.rocketchip.util.SeqToAugmentedSeq
 import oceanus.compactchi.CCHIOpcode._
 import oceanus.chi.intf.CHIRNFInterface
 import oceanus.chi.intf.CHIRNFRawInterface
-import xscache.coupledL2.{PrefetchCtrlFromCore, PrefetchRecv}
+import xscache.coupledL2.{PrefetchCtrlFromCore, PrefetchRecv, L2TlbReq, L2TlbResp, PMPRespBundle}
 
 
 sealed trait L2UpstreamPortType
@@ -56,6 +56,32 @@ object L2UpstreamTable {
   ))
 }
 
+// Sibling of each Type-1 UpREQ, with the same valid/ready/fire. TL user.vaddr
+// is a block VA (VA[49:6]); user.reqSource is the 5-bit MemReqSource enum;
+// user.PrefetchKey is trainEnable (coupledL2 SinkA.scala:76-86). These fields
+// describe demand training, not the 4-bit directory prefetch-source encoding.
+class L2PrefetchTrainSideband extends Bundle {
+  val vaddrBlock = UInt(44.W)
+  val reqSource = UInt(5.W)
+  val trainEnable = Bool()
+}
+
+// The fork derives TLB widths from a negotiated TileLink edge. Oceanus has
+// CCHI instead: reuse the fork field definitions, overriding only their width
+// accessors (full VA50 and configured physical address width), without a TL node.
+class L2PrefetchTlbIO(implicit val p: Parameters) extends Bundle {
+  val req = Decoupled(new L2TlbReq {
+    override def fullVAddrBits: Int = 50
+  })
+  val req_kill = Output(Bool())
+  val resp = Flipped(Decoupled(new L2TlbResp {
+    override def fullAddressBits: Int = p(L2ParamsKey).physicalAddrWidth
+  }))
+  val pmp_resp = Flipped(new PMPRespBundle)
+}
+
+// Phase 1a reserves optional fork-compatible TLB/PMP and per-Type-1 training
+// ports. Translation stays idle; training is sampled on REQ fire only. 阶段 1c 接入.
 class L2Configuration(
   val nodeId: Int,
   val eSAM: Boolean,
@@ -88,7 +114,9 @@ class L2Configuration(
   // receiver sources use 32.  These are source queues, so the values remain
   // explicit configuration knobs for later VBOP/CDP integration.
   val pfBopQueueEntries: Int = 16,
-  val pfRecvQueueEntries: Int = 32
+  val pfRecvQueueEntries: Int = 32,
+  val pfTlbEnable: Boolean = false,
+  val pfTrainEnable: Boolean = false
 ) {
   def sliceNum = slices.size
 
@@ -112,8 +140,29 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     val pfRecv = if (config.pfRecvEnable) Some(Input(new PrefetchRecv)) else None
     val pfCtrl = if (config.pfCtrlEnable) Some(Input(new PrefetchCtrlFromCore)) else None
 
+    val pfTlb = if (config.pfTlbEnable) Some(new L2PrefetchTlbIO) else None
+    val pfTrain = if (config.pfTrainEnable) Some(Input(Vec(t1NIDs.size, new L2PrefetchTrainSideband))) else None
+
     val chi = new CHIRNFInterface
   })
+
+  // 阶段 1c 接入: expose the exact fork bundle, with no translation producer
+  // yet. Accept and discard responses/PMP; idle requests have defined payload.
+  io.pfTlb.foreach { tlb =>
+    tlb.req.valid := false.B
+    tlb.req.bits := 0.U.asTypeOf(tlb.req.bits)
+    tlb.req_kill := false.B
+    tlb.resp.ready := true.B
+  }
+  // Phase 1a samples each sibling sideband only when its own REQ is accepted.
+  // Preserve these port-local samples for integration inspection; no slice,
+  // allocator, TSHR or prefetch-training path consumes them in this stage.
+  val pfTrainSample = io.pfTrain.map { ports =>
+    VecInit(ports.zip(io.t1p).map { case (train, port) =>
+      RegEnable(train, 0.U.asTypeOf(new L2PrefetchTrainSideband), port.UpREQ.fire)
+    })
+  }
+  pfTrainSample.foreach(dontTouch(_))
 
   // ----------------------------------------------------------------
 
