@@ -34,17 +34,20 @@ trait L2SliceLocatable {
   def getTxnIDFromTSHRId(tshrId: Int) = (tshrId.U << log2Ceil(sliceNum)) | sliceIdx.U(log2Ceil(sliceNum).W)
 }
 
-class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val nodeId: Int)(implicit val p: Parameters) extends Module 
+class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val nodeId: Int, val pfTrainEnable: Boolean = false)(implicit val p: Parameters) extends Module
     with HasL2Params 
     with L2SliceLocatable
     with HasCCHIParameters {
 
+  // Phase 1b: broadcast context beside REQ; only the allocator-selected RBE
+  // accepts it, using exactly the existing alloc/reuse REQ pulse.
   val io = IO(new Bundle {
     val consts = Input(new L2SliceConsts(sliceNum))
 
     val UpRXEVT = Flipped(Decoupled(new FlitEVT))
     val DnRXSNP = Flipped(Decoupled(new CHIBundleSNP))
     val UpRXREQ = Flipped(Decoupled(new FlitREQ))
+    val UpRXREQTrain = if (pfTrainEnable) Some(Input(new L2PrefetchTrainContext)) else None
 
     val UpTXSNP = Decoupled(new FlitSNP)
 
@@ -69,14 +72,14 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
     val toClientTableEVT = Output(Vec(paramL2.mshrSize, UInt(paramCCHI.UpstreamNodeID_Width.W)))
     val fromClientTableEVT = Input(Vec(paramL2.mshrSize, Vec(1, Bool()))) // TODO: parameterize with coherent l2 client count
 
-    val bopTrain = Valid(UInt(paramL2.physicalAddrWidth.W))
+    val bopTrain = Valid(new L2PrefetchTrain(pfTrainEnable))
   })
 
   //
   val EVB = Wire(Decoupled(new L2VPipeREQ.FlitEVB))
 
   // -- RX channel connections
-  val tshrs = Seq.tabulate(paramL2.mshrSize)(i => Module(new L2TSHR(sliceNum, i)))
+  val tshrs = Seq.tabulate(paramL2.mshrSize)(i => Module(new L2TSHR(sliceNum, i, pfTrainEnable)))
 
   tshrs.zipWithIndex.foreach { case (t, i) =>
     t.io.consts.tshrId := i.U
@@ -92,6 +95,7 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
     t.io.DnRXSNP := io.DnRXSNP.bits
     t.io.UpRXEVB := EVB.bits
     t.io.UpRXREQ := io.UpRXREQ.bits
+    t.io.UpRXREQTrain.foreach(_ := io.UpRXREQTrain.get)
 
     t.io.UpRXRSP.valid := io.UpRXRSP.valid && getTSHRIdFromUpTxnID(io.UpRXRSP.bits.TxnID) === t.tshrId.U 
     t.io.UpRXRSP.bits := io.UpRXRSP.bits

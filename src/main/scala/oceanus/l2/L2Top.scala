@@ -81,7 +81,7 @@ class L2PrefetchTlbIO(implicit val p: Parameters) extends Bundle {
 }
 
 // Phase 1a reserves optional fork-compatible TLB/PMP and per-Type-1 training
-// ports. Translation stays idle; training is sampled on REQ fire only. 阶段 1c 接入.
+// ports. Translation stays idle (阶段 1c 接入); training context follows REQ.
 class L2Configuration(
   val nodeId: Int,
   val eSAM: Boolean,
@@ -154,16 +154,8 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     tlb.req_kill := false.B
     tlb.resp.ready := true.B
   }
-  // Phase 1a samples each sibling sideband only when its own REQ is accepted.
-  // Preserve these port-local samples for integration inspection; no slice,
-  // allocator, TSHR or prefetch-training path consumes them in this stage.
-  val pfTrainSample = io.pfTrain.map { ports =>
-    VecInit(ports.zip(io.t1p).map { case (train, port) =>
-      RegEnable(train, 0.U.asTypeOf(new L2PrefetchTrainSideband), port.UpREQ.fire)
-    })
-  }
-  pfTrainSample.foreach(dontTouch(_))
-
+  // Phase 1b: select the context from the same fired remote input as REQ;
+  // the destination RBE samples it on that handshake without a port register.
   // ----------------------------------------------------------------
 
   //
@@ -215,7 +207,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   // ----------------------------------------------------------------
 
   //
-  val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId)))
+  val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId, config.pfTrainEnable)))
 
   // The control bundle gates source issue only; the delay-latency field is
   // intentionally recorded here for the later queue-control slice.
@@ -266,12 +258,14 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   val recvReqFire = pfRecvReqs.map(_.fire).reduceOption(_ || _).getOrElse(false.B)
 
   val bop = Module(new OceanusBOP(config.bopParams))
-  val bopTrainArb = Module(new FastArbiter(UInt(paramL2.physicalAddrWidth.W), config.sliceNum))
+  val bopTrainArb = Module(new FastArbiter(new L2PrefetchTrain(config.pfTrainEnable), config.sliceNum))
   bopTrainArb.io.in.zip(slices).foreach { case (sink, source) =>
     sink.valid := source.io.bopTrain.valid
     sink.bits := source.io.bopTrain.bits
   }
-  bop.io.train <> bopTrainArb.io.out
+  bop.io.train.valid := bopTrainArb.io.out.valid
+  bop.io.train.bits := bopTrainArb.io.out.bits.paddr
+  bopTrainArb.io.out.ready := bop.io.train.ready
 
   // Internal Stash has no upstream completion; downstream IDs remain TSHR/slice IDs.
   // Source order is the policy boundary: receiver encodings precede PBOP/BOP,
@@ -426,6 +420,21 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     // fallback in the source-queue logic above.
     val reqInputs = slice_io_UpRXREQ_remote +: (pfRecvReqs.lift(i).toSeq ++ pfQueues.lift(i).toSeq)
     arb(reqInputs, slice.io.UpRXREQ, Some(s"UpRXREQ_$i"))
+    slice.io.UpRXREQTrain.foreach { context =>
+      // fire includes both routing arbiters and the allocator acceptance.
+      // Internal Recv/BOP and Type-4 inputs have no training VA/context.
+      val candidates = io.pfTrain.get.zipWithIndex.map { case (train, j) =>
+        val compact = Wire(new L2PrefetchTrainContext)
+        compact.vpn := train.vaddrBlock(43, 6)
+        compact.reqSource := train.reqSource
+        compact.trainEnable := train.trainEnable
+        preArb_UpREQs(i)(j).fire -> compact
+      }
+      // A one-input Mux1H may collapse to its payload; explicitly zero the
+      // entire context when no Type-1 request fires (including internal hints).
+      context := Mux(candidates.map(_._1).reduce(_ || _), Mux1H(candidates),
+        0.U.asTypeOf(context))
+    }
   }}
 
   // - Upstream RXRSP routing

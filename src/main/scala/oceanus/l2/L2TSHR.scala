@@ -33,7 +33,7 @@ class L2TSHRConsts(sliceNum: Int)(implicit p: Parameters) extends L2SliceConsts(
   val tshrId = UInt(mshrIndexWidth.W)
 }
 
-class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) extends Module 
+class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = false)(implicit val p: Parameters) extends Module
     with HasL2Params
     with HasCCHIParameters {
 
@@ -66,6 +66,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
     val UpRXEVT = Input(new FlitEVT)                    // L1 EVT
     val DnRXSNP = Input(new CHIBundleSNP)               // HN SNP
     val UpRXEVB = Input(new L2VPipeREQ.FlitEVB)         // L2 EVB
+    val UpRXREQTrain = if (pfTrainEnable) Some(Input(new L2PrefetchTrainContext)) else None
     val UpRXREQ = Input(new FlitREQ)                    // L1/L2 REQ
 
     val DnTXREQ = Decoupled(new CHIBundleREQ)           // HN REQ
@@ -109,7 +110,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
     val bopPerf = Output(Vec(L2BOPPerf.names.size, Bool()))
     val bopPerfSource = Output(Vec(L2BOPPerf.names.size, UInt(L2PfSource.Width.W)))
 
-    val bopTrain = Valid(UInt(paramL2.physicalAddrWidth.W))
+    val bopTrain = Valid(new L2PrefetchTrain(pfTrainEnable))
   })
 
   // TSHR valid
@@ -422,11 +423,13 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   assert(!(tshr_buffer_wen_DnRXDAT_2 && tshr_buffer_halfWritten_UpRXDAT_2_q), "multiple source write on buffer from UpRXDAT then DnRXDAT (2, 2)")
   
 
+  // Phase 1b: request and optional context share one RBE Queue entry.
+  // A demand queued behind active prefetch keeps its own VPN until execution.
   // RBEs
   val rbeEVT = Module(new L2RBE(new FlitEVT /*TODO: strip PA here*/))
   val rbeSNP = Module(new L2RBE(new CHIBundleSNP /*TODO: strip PA here*/))
   val rbeEVB = Module(new L2RBE(new L2VPipeREQ.FlitEVB))
-  val rbeREQ = Module(new L2RBE(new FlitREQStripped))
+  val rbeREQ = Module(new L2RBE(new L2BufferedREQ(pfTrainEnable)))
 
   io.toAlloc.busy.EVT := !rbeEVT.io.in.ready
   io.toAlloc.busy.SNP := !rbeSNP.io.in.ready
@@ -448,7 +451,8 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   rbeEVT.io.in.bits := io.UpRXEVT
   rbeSNP.io.in.bits := io.DnRXSNP
   rbeEVB.io.in.bits := io.UpRXEVB
-  rbeREQ.io.in.bits := io.UpRXREQ
+  rbeREQ.io.in.bits.req := io.UpRXREQ
+  rbeREQ.io.in.bits.train.foreach(_ := io.UpRXREQTrain.get)
 
   rbeEVT.io.in.valid := tshr_enter_EVT
   rbeSNP.io.in.valid := tshr_enter_SNP
@@ -479,7 +483,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   // -- vPipes and TSHR local modules
   val vPipeEVT = Module(new L2VPipeEVT(Seq(/*TODO: client devices*/), sliceNum))
   val vPipeSNP = Module(new L2VPipeSNP(Seq(/*TODO: client devices*/), sliceNum))
-  val vPipeREQ = Module(new L2VPipeREQ(Seq(/*TODO: client devices*/), sliceNum))
+  val vPipeREQ = Module(new L2VPipeREQ(Seq(/*TODO: client devices*/), sliceNum, pfTrainEnable))
   val snoopAgent = Module(new L2SnoopAgent(sliceNum))
 
   vPipeEVT.io.consts := io.consts
@@ -535,7 +539,9 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   rbeEVB.io.blockFromVPipe.REQ := vPipeREQ.io.blockRBE.EVB
   rbeREQ.io.blockFromVPipe.REQ := vPipeREQ.io.blockRBE.REQ
 
-  vPipeREQ.io.UpRXREQ := rbeREQ.io.out
+  vPipeREQ.io.UpRXREQ.valid := rbeREQ.io.out.valid
+  vPipeREQ.io.UpRXREQ.bits := rbeREQ.io.out.bits.req
+  vPipeREQ.io.UpRXREQTrain.foreach(_ := rbeREQ.io.out.bits.train.get)
   vPipeREQ.io.UpRXEVB := rbeEVB.io.out
   io.bopTrain := vPipeREQ.io.bopTrain
 

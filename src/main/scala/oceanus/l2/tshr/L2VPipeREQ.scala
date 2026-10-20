@@ -26,7 +26,7 @@ object L2VPipeREQ {
 }
 
 class L2VPipeREQ(clientComponents: Seq[CCHIComponent], 
-                 val sliceNum: Int)(implicit val p: Parameters) 
+                 val sliceNum: Int, val pfTrainEnable: Boolean = false)(implicit val p: Parameters)
     extends Module 
     with CHIRNFOpcodesREQ 
     with CHIRNFOpcodesRSP
@@ -40,6 +40,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     val consts = Input(new L2TSHRConsts(sliceNum))
 
     val UpRXREQ = Flipped(Valid(new FlitREQStripped))
+    val UpRXREQTrain = if (pfTrainEnable) Some(Input(new L2PrefetchTrainContext)) else None
     val UpRXEVB = Flipped(Valid(new L2VPipeREQ.FlitEVB))
 
     val DnTXREQ = Decoupled(new CHIBundleREQ)
@@ -138,7 +139,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
     val L2EVT_opcode = Valid(UInt(paramCHI.reqOpcodeWidth.W))
 
-    val bopTrain = Valid(UInt(paramL2.physicalAddrWidth.W))
+    val bopTrain = Valid(new L2PrefetchTrain(pfTrainEnable))
   })
 
   val dirResult = io.tshr_dirResult
@@ -222,10 +223,20 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // the same edge, even if the lossy training receiver is not ready.
   val prefetched_hit_train = prefetched_hit_consume
   val prefetched_hit_pbop = prefetched_hit_consume && dirResultFromPBOP
+  // Phase 1b: reconstruct block VA only at this execution/old-meta boundary.
+  // Preserve the existing BOP valid expression, regardless of trainEnable.
   io.bopTrain.valid := rxreq_fire && rxreq_demand &&
     (((rxreq_readshared || rxreq_readunique || rxreq_makeunique) && !dirResult.hit) ||
       prefetched_hit_train)
-  io.bopTrain.bits := io.tshr_paddr
+  io.bopTrain.bits.paddr := io.tshr_paddr
+  io.UpRXREQTrain.foreach { context =>
+    // Zero context stays all zero even when the internal request PA has a
+    // nonzero page offset; only external Type-1 demands own a block VA.
+    io.bopTrain.bits.vaddr.get := Mux(rxreq_demand,
+      Cat(context.vpn, io.tshr_paddr(11, 6)), 0.U)
+    io.bopTrain.bits.reqSource.get := context.reqSource
+    io.bopTrain.bits.trainEnable.get := context.trainEnable
+  }
   XSPerfAccumulate("prefetchedHitTrain", prefetched_hit_train)
 
   // CCHI Stash is supported only as a fire-and-forget prefetch hint: with ExpCompStash=1 the
