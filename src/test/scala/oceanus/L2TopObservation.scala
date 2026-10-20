@@ -307,10 +307,19 @@ class L2TopObservationIO(entries: Int, sliceCount: Int)(implicit val p: Paramete
   // Directed tests compare Recv/BOP at the actual per-slice arbitration boundary.
   val recvIssue = Output(Vec(sliceCount, Bool()))
   val recvTxnID = Output(Vec(sliceCount, UInt(32.W)))
+  // Count Recv input presentation and actual slice handshakes independently;
+  // the queue ledger alone cannot detect a second direct injection.
+  val recvAcceptedBySource = Output(Vec(sliceCount, Vec(L2PfSource.CDP + 1, UInt(64.W))))
+  val prefetchSliceEnteredBySource = Output(Vec(sliceCount, Vec(L2PfSource.CDP + 1, UInt(64.W))))
   val prefetchQueueValid = Output(Vec(sliceCount, Bool()))
   val prefetchQueueReady = Output(Vec(sliceCount, Bool()))
   val prefetchQueueOverwrite = Output(Vec(sliceCount, Bool()))
   val prefetchQueueOverwriteBySource = Output(Vec(sliceCount, Vec(L2PfSource.CDP + 1, UInt(64.W))))
+  // Queue-boundary events and actual slice acceptance are separate ledgers.
+  val prefetchEnqueueBySource = Output(Vec(sliceCount, Vec(L2PfSource.CDP + 1, UInt(64.W))))
+  val prefetchDedupBySource = Output(Vec(sliceCount, Vec(L2PfSource.CDP + 1, UInt(64.W))))
+  val prefetchEnterBySource = Output(Vec(sliceCount, Vec(L2PfSource.CDP + 1, UInt(64.W))))
+  val prefetchPendingBySource = Output(Vec(sliceCount, Vec(L2PfSource.CDP + 1, UInt(64.W))))
   val bopTrainReceiveCount = Output(UInt(64.W))
   val bopTrainAddr = Output(UInt(48.W))
   val bopReqAddr = Output(UInt(48.W))
@@ -393,8 +402,10 @@ object L2TopObservation {
   private val productionPfQueues = moduleIds.collect { case q: OverwriteQueue[_] => q }
   require(productionPfQueues.size >= pfQueues.size,
     "prefetch overwrite probe must cover every merged queue output")
-  require(pfQueues.size == module.config.sliceNum,
-    "prefetch observation must cover every slice output")
+  private val expectedPfOutputs = if (module.config.bopEnable || module.config.pfRecvEnable)
+    module.config.sliceNum else 0
+  require(pfQueues.size == expectedPfOutputs,
+    "prefetch observation must cover every enabled slice output; disabled tops have no queues")
   private val tshrs = privateField[Seq[L2TSHR]](slice0, "tshrs")
   private val sliceTshrs = slices.map(slice => privateField[Seq[L2TSHR]](slice, "tshrs"))
   private val tshrAllocator = slice0.tshrAlloc
@@ -970,12 +981,20 @@ object L2TopObservation {
   slices.indices.foreach { i =>
     io.recvIssue(i) := module.pfRecvReqs.lift(i).map(q => boreRead(q.valid) && boreRead(q.ready)).getOrElse(false.B)
     io.recvTxnID(i) := module.pfRecvReqs.lift(i).map(q => boreRead(q.bits.TxnID)).getOrElse(0.U)
-    val sourceQueueStart = i * (if (module.config.bopEnable) 9 else 0)
+    val sourceQueueStart = i * module.pfSourceSlots.size
     val sourceQueueEnd = math.min(sourceQueueStart + 9, productionPfQueues.size)
     val overwrites = productionPfQueues.slice(sourceQueueStart, sourceQueueEnd)
       .map(q => boreRead(privateBool(q, "overwrite")))
     io.prefetchQueueOverwrite(i) := (if (overwrites.nonEmpty) overwrites.reduce(_ || _) else false.B)
     (0 to L2PfSource.CDP).foreach { source =>
+      val recvAccepted = module.pfRecvReqs.lift(i).map(q => boreRead(q.valid) &&
+        L2PrefetchTxnID.decode(boreRead(q.bits.TxnID)) === source.U).getOrElse(false.B)
+      io.recvAcceptedBySource(i)(source) := accumulate(recvAccepted)
+      val sliceReq = slices(i).io.UpRXREQ
+      io.prefetchSliceEnteredBySource(i)(source) := accumulate(
+        boreRead(sliceReq.valid) && boreRead(sliceReq.ready) &&
+          boreRead(sliceReq.bits.SrcID) === module.config.pfSrcID.U &&
+          L2PrefetchTxnID.decode(boreRead(sliceReq.bits.TxnID)) === source.U)
       val queueIdx = Seq(L2PfSource.SMS, L2PfSource.BOP, L2PfSource.PBOP,
         L2PfSource.Stream, L2PfSource.Stride, L2PfSource.TP, L2PfSource.Berti,
         L2PfSource.NL, L2PfSource.CDP).indexOf(source)
@@ -983,6 +1002,25 @@ object L2TopObservation {
       val pulse = if (queueIdx >= 0) boreRead(pfQueueOverwriteBySource(i)(queueIdx)) else false.B
       count := count + pulse
       io.prefetchQueueOverwriteBySource(i)(source) := count
+      val accepted = pfQueues.lift(i).map(q => boreRead(q.valid) && boreRead(q.ready) &&
+        L2PrefetchTxnID.decode(boreRead(q.bits.TxnID)) === source.U).getOrElse(false.B)
+      val sourceQueue = if (queueIdx >= 0) productionPfQueues.lift(sourceQueueStart + queueIdx) else None
+      val enqueued = sourceQueue.map(q => boreRead(q.io.enq.valid) && boreRead(q.io.enq.ready)).getOrElse(false.B)
+      val dequeued = sourceQueue.map(q => boreRead(q.io.deq.valid) && boreRead(q.io.deq.ready)).getOrElse(false.B)
+      io.prefetchEnqueueBySource(i)(source) := accumulate(enqueued)
+      io.prefetchDedupBySource(i)(source) := accumulate(dequeued && !accepted)
+      io.prefetchEnterBySource(i)(source) := accumulate(accepted)
+      // Read the real FIFO pointers/full flag independently of event totals.
+      io.prefetchPendingBySource(i)(source) := sourceQueue.map { q =>
+        val head = boreRead(privateField[UInt](q, "head"))
+        val tail = boreRead(privateField[UInt](q, "tail"))
+        val full = boreRead(privateBool(q, "full"))
+        val entries = if (source == L2PfSource.BOP || source == L2PfSource.PBOP)
+          module.config.pfBopQueueEntries else module.config.pfRecvQueueEntries
+        val distance = Wire(UInt(head.getWidth.W))
+        distance := tail - head
+        Mux(full, entries.U, distance)
+      }.getOrElse(0.U)
     }
     io.prefetchQueueValid(i) := pfQueues.lift(i).map(q => boreRead(q.valid)).getOrElse(false.B)
     io.prefetchQueueReady(i) := pfQueues.lift(i).map(q => boreRead(q.ready)).getOrElse(false.B)

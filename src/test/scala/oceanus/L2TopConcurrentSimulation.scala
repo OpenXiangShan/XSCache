@@ -13,7 +13,8 @@ import scala.collection.mutable
 
 case class L2TopConcurrentPlan(name: String, slices: Int,
   batches: Seq[(Int, Seq[UpRequestSpec])], latency: Int = 80,
-  bopParams: OceanusBOPParameters = OceanusBOPParameters(), watchdog: Int = 6000)
+  bopParams: OceanusBOPParameters = OceanusBOPParameters(), watchdog: Int = 6000,
+  bopQueueEntries: Int = 16)
 case class L2TopConcurrentTrace(
   accepts: Seq[(Int, UpRequestSpec)], trains: Seq[(Int, Int, BigInt)],
   received: Seq[(Int, BigInt)], enqueues: Seq[(Int, BigInt)], issues: Seq[(Int, Int, BigInt)],
@@ -28,7 +29,7 @@ case class L2TopConcurrentTrace(
 object L2TopConcurrentSimulation extends ChiselSim {
   def run(plan: L2TopConcurrentPlan)(verify: L2TopConcurrentTrace => Unit): Unit = {
     val cfg = new L2Configuration(8, true, 0 until plan.slices,
-      bopEnable = true, bopParams = plan.bopParams)
+      bopEnable = true, bopParams = plan.bopParams, pfBopQueueEntries = plan.bopQueueEntries)
     val params = new Config((_, _, _) => {
       case L2ParamsKey => L2Params(mshrSize = 8, ways = 4, sets = 128,
         blockBytes = 64, dataSRAMSplit = 8, enableDataECC = false,
@@ -156,7 +157,7 @@ object L2TopConcurrentSimulation extends ChiselSim {
           val s = L2TopBOPExpectations.slice(addr, plan.slices)
           enqueues += ((cycle, addr))
           if (plan.slices == 1 && external) blockedEnqueues += addr
-          if (queueModel(s).size == 2) { queueModel(s).dequeue(); overwrites += 1 }
+          if (queueModel(s).size == plan.bopQueueEntries) { queueModel(s).dequeue(); overwrites += 1 }
           queueModel(s).enqueue(addr)
         }
         driver.sample(cycle)

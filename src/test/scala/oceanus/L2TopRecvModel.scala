@@ -20,6 +20,8 @@ object TestTop_L2Recv extends App with ChiselSim {
   val slices = args.collectFirst { case a if a.startsWith("--slices=") => a.drop(9).toInt }.getOrElse(1)
   require(Set(1, 2, 4)(slices))
   val selectedCase = args.collectFirst { case a if a.startsWith("--case=") => a.drop(7) }
+  val recvCycles = args.collectFirst { case a if a.startsWith("--recv-cycles=") => a.drop(14).toInt }.getOrElse(200)
+  require(recvCycles > 0, "--recv-cycles must be positive")
   val cfg = new L2Configuration(8, true, 0 until slices, bopEnable = true, pfSrcID = 3,
     bopParams = OceanusBOPParameters(badScore = 0), pfRecvEnable = true, pfCtrlEnable = true)
   val config = new Config((_, _, _) => {
@@ -32,7 +34,7 @@ object TestTop_L2Recv extends App with ChiselSim {
   })
   implicit val simulator: HasSimulator = HasSimulator.default
   simulate(new TestTop_L2Top(cfg)(config)) { dut =>
-    Seq("single", "disabled", "mixed", "resident", "dedup", "overflow").filter(name => selectedCase.forall(_ == name)).foreach { name =>
+    Seq("single", "disabled", "mixed", "resident", "dedup", "overflow", "sustained").filter(name => selectedCase.forall(_ == name)).foreach { name =>
       val requests = (0 until 64).map(i => UpRequestSpec(MasterId.t1p0, i, 0, 0,
         CCHIOpcode.ReadShared.opcode, BigInt(0), expCompData = true))
       val spec = CaseSpec("recv-" + name,
@@ -55,6 +57,7 @@ object TestTop_L2Recv extends App with ChiselSim {
       var txn = 0
       var dataCount = 0
       var recvCount = 0
+      val recvDirectEnteredBySlice = Array.fill(slices)(0)
       var collision = false
       def flag(b: Bool): Boolean = b.peek().litToBoolean
       def value(u: UInt): BigInt = u.peek().litValue
@@ -91,6 +94,7 @@ object TestTop_L2Recv extends App with ChiselSim {
           if (flag(dut.observation.sliceTrainValid(s))) trains += value(dut.observation.sliceTrainAddr(s))
           if (flag(dut.observation.recvIssue(s))) {
             recvCount += 1
+            recvDirectEnteredBySlice(s) += 1
             val addr = value(dut.io.pfRecv.get.addr)
             val source = value(dut.observation.recvTxnID(s)) >> 4
             admissions += ((addr, source, s))
@@ -130,7 +134,7 @@ object TestTop_L2Recv extends App with ChiselSim {
           snpQ.enqueue(PendingSnpRsp(SnpTxnID(value(dut.io.t1p(0).DnSNP.bits.TxnID)),
             value(dut.io.t1p(0).DnSNP.bits.SrcID), cycle + 1))
         dn.stepWithCredits(cycle); cycle += 1
-        assert(cycle < 10000, s"Recv watchdog case=$name")
+        assert(cycle < 10000L + recvCycles.toLong * 20, s"Recv watchdog case=$name")
       }
       def drain(): Unit = {
         var n = 0
@@ -208,8 +212,8 @@ object TestTop_L2Recv extends App with ChiselSim {
           assert(collision && recvCount == 1 && trains.toSeq == Seq(demand))
           assert(landed(recvAddr) == 1 && landed(bopAddr) == 3)
           assert(downstream.map(_._1).toSet == Set(demand, recvAddr, bopAddr) && downstream.size == 3)
-          val issuedBySource = (0 until slices).flatMap(s =>
-            (0 to L2PfSource.CDP).map(src => value(dut.observation.bopPerfCountBySliceSource(s)(src)(L2BOPPerf.IssuedDownstream))))
+          val issuedBySource = (0 to L2PfSource.CDP).map(src =>
+            (0 until slices).map(s => value(dut.observation.bopPerfCountBySliceSource(s)(src)(L2BOPPerf.IssuedDownstream))).sum)
           assert(issuedBySource.sum == perf(L2BOPPerf.IssuedDownstream), s"issued source ledger=$issuedBySource perf=$perf")
           assert(issuedBySource(1) >= 1 && issuedBySource(3) >= 1, s"Recv/BOP source issue=$issuedBySource")
           ctrl.l2_pbop_en.poke(false.B)
@@ -217,8 +221,8 @@ object TestTop_L2Recv extends App with ChiselSim {
           request(recvAddr); request(bopAddr)
           assert(trains.toSeq == Seq(demand, recvAddr, bopAddr))
           readback(recvAddr, 0); readback(bopAddr, 0)
-          val usefulBySource = (0 until slices).flatMap(s =>
-            (0 to L2PfSource.CDP).map(src => value(dut.observation.bopPerfCountBySliceSource(s)(src)(L2BOPPerf.Useful))))
+          val usefulBySource = (0 to L2PfSource.CDP).map(src =>
+            (0 until slices).map(s => value(dut.observation.bopPerfCountBySliceSource(s)(src)(L2BOPPerf.Useful))).sum)
           assert(usefulBySource.sum == perf(L2BOPPerf.Useful), s"useful source ledger=$usefulBySource perf=$perf")
           assert(landed.values.forall(_ == 0))
           println("RECV_ACCOUNTING pass=true recv=1 recvUseful=1 recvResident=0 bopIssued=1 bopUseful=1 bopResident=0 pending=0")
@@ -249,12 +253,115 @@ object TestTop_L2Recv extends App with ChiselSim {
           // overwrite accounting without suppressing admission.
           ctrl.l2_pbop_en.poke(false.B)
           val base = BigInt("38000", 16)
-          (0 until 40).foreach(i => request(base + i * 0x100, waitDrain = false))
+          // Forty trains spread across four banks cannot fill a 16-entry
+          // source queue. Keep this overflow fixture in one demand bank;
+          // the initial +0x80 PBOP offset maps all hints to one bank too.
+          val overflowAddresses = Iterator.from(0).map(i => base + i * 0x100)
+            .filter(addr => bank(addr) == bank(base)).take(40).toVector
+          overflowAddresses.foreach(addr => request(addr, waitDrain = false))
           (0 until 800).foreach(_ => tick())
           val held = (0 until slices).map(s => value(dut.observation.prefetchQueueOverwriteBySource(s)(3))).sum
           assert(held > 0, s"PBOP source queue overwrite counter did not rise: $held")
           ctrl.l2_pbop_en.poke(true.B); drain()
           println(s"RECV_OVERFLOW_RESULT pass=true source=3 overwrites=$held")
+        case "sustained" =>
+          // Build a real PBOP backlog with ordinary demand training, then
+          // overlap continuous Recv with fresh demand refills in the window.
+          // Snapshot pre-existing stock separately from window event deltas;
+          // no training signal or production connection is overridden.
+          val base = BigInt("48000", 16)
+          (0 until 39).foreach(i => request(base + i * 0x100, waitDrain = false))
+          (0 until 800).foreach(_ => tick())
+          request(base + 39 * 0x100, waitDrain = false)
+          while (!flag(dut.observation.bopTrainValid)) tick()
+          val demandStopped = txn
+          val trainBefore = value(dut.observation.bopTrainFireCount)
+          val admissionBefore = recvCount
+          def sum(counter: Vec[Vec[UInt]], source: Int): BigInt =
+            (0 until slices).map(s => value(counter(s)(source))).sum
+          def ledger(source: Int): Seq[BigInt] = Seq(
+            sum(dut.observation.prefetchEnqueueBySource, source),
+            sum(dut.observation.prefetchQueueOverwriteBySource, source),
+            sum(dut.observation.prefetchEnterBySource, source),
+            sum(dut.observation.prefetchDedupBySource, source),
+            sum(dut.observation.prefetchPendingBySource, source))
+          def checkLedger(): Unit = (0 until slices).foreach { s =>
+            (0 to L2PfSource.CDP).foreach { source =>
+              val enq = value(dut.observation.prefetchEnqueueBySource(s)(source))
+              val overwrite = value(dut.observation.prefetchQueueOverwriteBySource(s)(source))
+              val entered = value(dut.observation.prefetchEnterBySource(s)(source))
+              val dedup = value(dut.observation.prefetchDedupBySource(s)(source))
+              val pending = value(dut.observation.prefetchPendingBySource(s)(source))
+              assert(enq == overwrite + entered + dedup + pending,
+                s"queue ledger slice=$s source=$source enq=$enq overwrite=$overwrite entered=$entered dedup=$dedup pending=$pending")
+            }
+          }
+          val before = ledger(3)
+          val recvBefore = ledger(1)
+          val acceptedBefore = sum(dut.observation.recvAcceptedBySource, 1)
+          val enteredBefore = sum(dut.observation.prefetchSliceEnteredBySource, 1)
+          val acceptedBeforeBySlice = (0 until slices).map(s => value(dut.observation.recvAcceptedBySource(s)(1)))
+          val enteredBeforeBySlice = (0 until slices).map(s => value(dut.observation.prefetchSliceEnteredBySource(s)(1)))
+          val directBeforeBySlice = recvDirectEnteredBySlice.clone()
+          ctrl.l2_pbop_en.poke(true.B)
+          // Keep Recv continuous while 24 fresh demand misses enter the same
+          // production path. Their real refills/train pulses must create at
+          // least twenty BOP queue admissions inside this measurement window.
+          val windowDemands = (0 until 24).map(i => requests((demandStopped + i) % requests.size)
+            .copy(addr = BigInt("70000", 16) + i * 0x100))
+          var windowDemandIdx = 0
+          (0 until recvCycles).foreach { i =>
+            if (windowDemandIdx < windowDemands.size) up.driveRead(windowDemands(windowDemandIdx))
+            dut.io.pfRecv.get.addr.poke((BigInt("60000", 16) + (i % 64) * 64).U)
+            dut.io.pfRecv.get.pf_source.poke(10.U); dut.io.pfRecv.get.pf_en.poke(true.B)
+            dut.io.pfRecv.get.addr_valid.poke(true.B)
+            val demandFire = flag(dut.io.t1p(0).UpREQ.valid) && flag(dut.io.t1p(0).UpREQ.ready)
+            tick()
+            if (demandFire) { up.clearUpReq(); txn += 1; windowDemandIdx += 1 }
+            dut.io.pfRecv.get.addr_valid.poke(false.B)
+            checkLedger()
+          }
+          up.clearUpReq()
+          val bopTotal = ledger(3); val bop = bopTotal.zip(before).map { case (now, old) => now - old }
+          val receiverTotal = ledger(1); val receiver = receiverTotal.zip(recvBefore).map { case (now, old) => now - old }
+          val trainDuring = value(dut.observation.bopTrainFireCount) - trainBefore
+          val directEntered = recvCount - admissionBefore
+          assert(receiver(0) + directEntered == recvCycles,
+            s"continuous Recv acceptance must equal N=$recvCycles, got queue=${receiver(0)} direct=$directEntered")
+          assert(bop(0) >= 20, s"BOP must enqueue at least 20 times in the Recv window, got ${bop(0)}")
+          assert(trainDuring > 0, "real in-flight demand training must overlap Recv")
+          // The accepted-input and slice-entry counters are independent probes
+          // of the two ends of the production path, including the direct route.
+          // This equality would fail on the old duplicate-injection wiring.
+          val directBySlice = recvDirectEnteredBySlice.zip(directBeforeBySlice).map { case (now, old) => now - old }
+          val accepted = sum(dut.observation.recvAcceptedBySource, 1) - acceptedBefore
+          val entered = sum(dut.observation.prefetchSliceEnteredBySource, 1) - enteredBefore
+          assert(accepted == recvCycles && accepted == directEntered + receiver(0))
+          assert(accepted + recvBefore(4) == entered + receiver(3) + receiver(1) + receiverTotal(4),
+            s"Recv conservation accepted=$accepted entered=$entered dropped=${receiver(3)} overwritten=${receiver(1)} pending=${receiverTotal(4)}")
+          assert(before(4) + bop(0) == bop(1) + bop(2) + bop(3) + bopTotal(4))
+          (0 until slices).foreach { s =>
+            val direct = directBySlice(s)
+            val enqueued = value(dut.observation.prefetchEnqueueBySource(s)(1))
+            val overwritten = value(dut.observation.prefetchQueueOverwriteBySource(s)(1))
+            val dropped = value(dut.observation.prefetchDedupBySource(s)(1))
+            val pending = value(dut.observation.prefetchPendingBySource(s)(1))
+            val inputCount = value(dut.observation.recvAcceptedBySource(s)(1)) - acceptedBeforeBySlice(s)
+            val sliceCount = value(dut.observation.prefetchSliceEnteredBySource(s)(1)) - enteredBeforeBySlice(s)
+            assert(inputCount == direct + enqueued)
+            assert(inputCount == sliceCount + dropped + overwritten + pending,
+              s"Recv conservation slice=$s accepted=$inputCount entered=$sliceCount dropped=$dropped overwritten=$overwritten pending=$pending")
+          }
+          println(s"RECV_SUSTAINED_RESULT pass=true slices=$slices N=$recvCycles bopEnqueued=${bop(0)} bopOverwritten=${bop(1)} bopEntered=${bop(2)} recvEntered=$entered " +
+            s"bopPendingAtWindowStart=${before(4)} recvPendingAtWindowStart=${recvBefore(4)} bopDedup=${bop(3)} bopPendingAtWindowEnd=${bopTotal(4)} recvEnqueued=${receiver(0)} recvOverwritten=${receiver(1)} recvDedup=${receiver(3)} recvPending=${receiverTotal(4)} recvDirectEntered=$directEntered recvQueueEntered=${receiver(2)} trainDuring=$trainDuring windowDemands=$windowDemandIdx")
+          println(s"RECV_CONSERVATION pass=true slices=$slices accepted=$accepted entered=$entered dropped=${receiver(3)} overwritten=${receiver(1)} pending=${receiverTotal(4)}")
+          drain(); checkLedger()
+          assert(ledger(3)(4) == 0 && ledger(1)(4) == 0)
+          assert(ledger(3)(0) == value(dut.observation.bopTrainFireCount), "all accepted training enqueued in this address range")
+          assert(ledger(1)(0) + (recvCount - admissionBefore) == recvCycles)
+          val drainedEntered = sum(dut.observation.prefetchSliceEnteredBySource, 1) - enteredBefore
+          assert(accepted == drainedEntered + ledger(1)(1) + ledger(1)(3))
+          println(s"RECV_SUSTAINED_DRAIN pass=true slices=$slices bop=${ledger(3).mkString(",")} recv=${ledger(1).mkString(",")} recvDirectEntered=${recvCount-admissionBefore} order=enqueued,overwritten,entered,dedup,pending")
       }
       drain()
       L2BOPPerf.names.indices.foreach { metric =>
@@ -262,8 +369,25 @@ object TestTop_L2Recv extends App with ChiselSim {
           (0 to L2PfSource.CDP).map(src => value(dut.observation.bopPerfCountBySliceSource(s)(src)(metric))))
         assert(bySource.sum == perf(metric), s"source ledger metric=${L2BOPPerf.names(metric)} bySource=$bySource total=${perf(metric)}")
       }
-      assert(dataCount == (if (name == "single") 40 else if (name == "mixed") 6 else if (name == "overflow") 80 else 0))
-      println(s"RECV_RESULT pass=true case=$name slices=$slices admissions=$recvCount downstream=${downstream.size} train=${trains.size} pending=0")
+      assert(dataCount == (if (name == "single") 40 else if (name == "mixed") 6 else if (name == "dedup") 2 else if (name == "overflow") 80 else if (name == "sustained") 128 else 0))
+      val queuePending = (0 until slices).flatMap(s => (0 to L2PfSource.CDP).map(source =>
+        value(dut.observation.prefetchPendingBySource(s)(source)))).sum
+      // Non-PBOP sources originate exclusively in Recv, so their end-to-end
+      // input/entry balance also covers all mapping/control/dedup fixtures.
+      // PBOP shares its source with the autonomous producer; its queue balance
+      // is checked independently in the sustained fixture above.
+      (0 until slices).foreach { s =>
+        (0 to L2PfSource.CDP).filter(_ != L2PfSource.PBOP).foreach { source =>
+          val accepted = value(dut.observation.recvAcceptedBySource(s)(source))
+          val entered = value(dut.observation.prefetchSliceEnteredBySource(s)(source))
+          val dropped = value(dut.observation.prefetchDedupBySource(s)(source))
+          val overwritten = value(dut.observation.prefetchQueueOverwriteBySource(s)(source))
+          val pending = value(dut.observation.prefetchPendingBySource(s)(source))
+          assert(accepted == entered + dropped + overwritten + pending,
+            s"Recv end-to-end balance case=$name slice=$s source=$source accepted=$accepted entered=$entered dropped=$dropped overwritten=$overwritten pending=$pending")
+        }
+      }
+      println(s"RECV_RESULT pass=true case=$name slices=$slices admissions=$recvCount downstream=${downstream.size} train=${trains.size} pending=$queuePending")
     }
   }
 }

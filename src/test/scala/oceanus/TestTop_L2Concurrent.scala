@@ -7,6 +7,8 @@ import oceanus.l2.OceanusBOPParameters
   * Random stress is deliberately a separate follow-up. */
 object TestTop_L2Concurrent extends App {
   val selected = args.collectFirst { case s if s.startsWith("--case=") => s.stripPrefix("--case=") }.getOrElse("all")
+  val queueDepth = args.collectFirst { case s if s.startsWith("--queue-depth=") => s.stripPrefix("--queue-depth=").toInt }.getOrElse(16)
+  require(queueDepth > 1 && (queueDepth & (queueDepth - 1)) == 0)
   def read(master: MasterId, addr: BigInt): UpRequestSpec =
     UpRequestSpec(master, 0, 0, 0, CCHIOpcode.ReadShared.opcode, addr)
   // Type-4 ReadShared legality and its CompAck contract are unresolved.
@@ -95,24 +97,34 @@ object TestTop_L2Concurrent extends App {
       // External REQ is arbiter input0 and queue is input1, so it cannot issue
       // on ANY external-valid cycle, even when external-ready=0.
       // Let M be BOP enqueues before external valid falls. Queue starts empty,
-      // depth=2, no dequeue -> overwrites=max(0,M-2), retained=last two P.
+      // depth=Q, no dequeue -> overwrites=max(0,M-Q), retained=last Q hints.
       // Each post-stop enqueue/dequeue updates an independent FIFO ledger;
       // overwritten hints need not issue. Final retained hints must issue,
       // every issued address must match FIFO order, and all TSHRs must drain.
       val requests = (0 until 64).map(i => read(MasterId.t1p0, BigInt("40000", 16) + i * 0x100))
-      println("CONCURRENT_EXPECTED case=prefetch-starvation requests=64 checkedBeats=128 offset=+2 blockedIssues=0 overwrites=max(0,M-2) retained=last2")
+      // The historical oracle is checked with --queue-depth=2. The default
+      // production geometry is 16 entries; its retained suffix and overwrite
+      // count necessarily change with the queue capacity.
+      println(s"CONCURRENT_EXPECTED case=prefetch-starvation requests=64 checkedBeats=128 offset=+2 blockedIssues=0 overwrites=max(0,M-$queueDepth) retained=last$queueDepth")
       L2TopConcurrentSimulation.run(L2TopConcurrentPlan("prefetch-starvation", 1, Seq(0 -> requests),
-        bopParams = OceanusBOPParameters(badScore = 0, roundMax = 100000))) { t =>
+        bopParams = OceanusBOPParameters(badScore = 0, roundMax = 100000), bopQueueEntries = queueDepth)) { t =>
         assert(t.completed == 64 && t.checkedBeats == 128)
         assert(t.accepts.map(_._2.master).toSet == Set(MasterId.t1p0))
         assert(t.trains.size == 64 && t.received.size == 64 && t.priorityDrops == 0)
         assert(t.enqueues.map(_._2) == t.received.map(_._2 + 0x80))
-        assert(t.blockedEnqueues.size > 2 && t.releasedAt.nonEmpty)
-        assert(t.retained == t.blockedEnqueues.takeRight(2))
-        assert(t.blockedOverwrites == t.blockedEnqueues.size - 2)
+        assert(t.blockedEnqueues.size > queueDepth && t.releasedAt.nonEmpty)
+        assert(t.retained == t.blockedEnqueues.takeRight(queueDepth))
+        assert(t.blockedOverwrites == t.blockedEnqueues.size - queueDepth)
         assert(t.issues.forall(_._1 >= t.releasedAt.get))
-        assert(t.issues.takeRight(2).map(_._3) == t.enqueues.takeRight(2).map(_._2))
-        println(s"STARVATION_RESULT blockedEnqueues=${t.blockedEnqueues.size} expectedBlockedOverwrites=${t.blockedEnqueues.size - 2} totalOverwrites=${t.overwrites} retained=${t.retained.map(_.toString(16))} issues=${t.issues.size} releasedAt=${t.releasedAt.get}")
+        assert(t.issues.takeRight(queueDepth).map(_._3) == t.enqueues.takeRight(queueDepth).map(_._2))
+        // Capacity 2 -> 16 preserves the demand schedule but retains fourteen
+        // additional hints: overwrites 61 -> 47 and slice issues 3 -> 17.
+        if (Set(2, 16)(queueDepth)) {
+          assert(t.blockedEnqueues.size == 62 && t.releasedAt.contains(1185))
+          assert(t.overwrites == 63 - queueDepth && t.issues.size == queueDepth + 1)
+          assert(t.retained == (62 - queueDepth until 62).map(i => BigInt("40080", 16) + i * 0x100))
+        }
+        println(s"STARVATION_RESULT blockedEnqueues=${t.blockedEnqueues.size} expectedBlockedOverwrites=${t.blockedEnqueues.size - queueDepth} totalOverwrites=${t.overwrites} retained=${t.retained.map(_.toString(16))} issues=${t.issues.size} releasedAt=${t.releasedAt.get}")
       }
   }
 }
