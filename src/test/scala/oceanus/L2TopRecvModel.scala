@@ -19,6 +19,7 @@ import scala.collection.mutable
 object TestTop_L2Recv extends App with ChiselSim {
   val slices = args.collectFirst { case a if a.startsWith("--slices=") => a.drop(9).toInt }.getOrElse(1)
   require(Set(1, 2, 4)(slices))
+  val selectedCase = args.collectFirst { case a if a.startsWith("--case=") => a.drop(7) }
   val cfg = new L2Configuration(8, true, 0 until slices, bopEnable = true, pfSrcID = 3,
     bopParams = OceanusBOPParameters(badScore = 0), pfRecvEnable = true, pfCtrlEnable = true)
   val config = new Config((_, _, _) => {
@@ -31,7 +32,7 @@ object TestTop_L2Recv extends App with ChiselSim {
   })
   implicit val simulator: HasSimulator = HasSimulator.default
   simulate(new TestTop_L2Top(cfg)(config)) { dut =>
-    Seq("single", "disabled", "mixed", "resident").foreach { name =>
+    Seq("single", "disabled", "mixed", "resident", "dedup", "overflow").filter(name => selectedCase.forall(_ == name)).foreach { name =>
       val requests = (0 until 64).map(i => UpRequestSpec(MasterId.t1p0, i, 0, 0,
         CCHIOpcode.ReadShared.opcode, BigInt(0), expCompData = true))
       val spec = CaseSpec("recv-" + name,
@@ -183,7 +184,10 @@ object TestTop_L2Recv extends App with ChiselSim {
               readback(addr, 0); request(addr)
               assert(trains.size - t == (if (mapped == 0) 0 else 1), "only first demand trains")
               val delta = perf.zip(p).map { case (a,b) => a-b }
-              assert(delta == Seq(if (mapped == 3) 1 else 0,0,0,0,0,if (mapped == 3) 1 else 0,0,0).map(BigInt(_)))
+              assert(delta == Seq(if (mapped != 0) 1 else 0,0,0,0,0,if (mapped != 0) 1 else 0,0,0).map(BigInt(_)))
+              val sourceUseful = (0 until slices).flatMap(s =>
+                (0 to L2PfSource.CDP).map(src => value(dut.observation.bopPerfCountBySliceSource(s)(src)(L2BOPPerf.Useful))))
+              assert(sourceUseful.sum == perf(L2BOPPerf.Useful), "useful source ledger must close")
               println(s"RECV_SOURCE_PHASE pass=true raw=$raw mapped=$mapped slices=$slices")
           }
         case "disabled" =>
@@ -204,13 +208,18 @@ object TestTop_L2Recv extends App with ChiselSim {
           assert(collision && recvCount == 1 && trains.toSeq == Seq(demand))
           assert(landed(recvAddr) == 1 && landed(bopAddr) == 3)
           assert(downstream.map(_._1).toSet == Set(demand, recvAddr, bopAddr) && downstream.size == 3)
-          assert(perf == Seq(0,0,0,0,0,1,0,0).map(BigInt(_)))
+          val issuedBySource = (0 until slices).flatMap(s =>
+            (0 to L2PfSource.CDP).map(src => value(dut.observation.bopPerfCountBySliceSource(s)(src)(L2BOPPerf.IssuedDownstream))))
+          assert(issuedBySource.sum == perf(L2BOPPerf.IssuedDownstream), s"issued source ledger=$issuedBySource perf=$perf")
+          assert(issuedBySource(1) >= 1 && issuedBySource(3) >= 1, s"Recv/BOP source issue=$issuedBySource")
           ctrl.l2_pbop_en.poke(false.B)
           readback(recvAddr, 1); readback(bopAddr, 3)
           request(recvAddr); request(bopAddr)
           assert(trains.toSeq == Seq(demand, recvAddr, bopAddr))
           readback(recvAddr, 0); readback(bopAddr, 0)
-          assert(perf == Seq(1,0,0,0,0,1,0,0).map(BigInt(_)))
+          val usefulBySource = (0 until slices).flatMap(s =>
+            (0 to L2PfSource.CDP).map(src => value(dut.observation.bopPerfCountBySliceSource(s)(src)(L2BOPPerf.Useful))))
+          assert(usefulBySource.sum == perf(L2BOPPerf.Useful), s"useful source ledger=$usefulBySource perf=$perf")
           assert(landed.values.forall(_ == 0))
           println("RECV_ACCOUNTING pass=true recv=1 recvUseful=1 recvResident=0 bopIssued=1 bopUseful=1 bopResident=0 pending=0")
         case "resident" =>
@@ -221,10 +230,39 @@ object TestTop_L2Recv extends App with ChiselSim {
           recv(target + 0x100, raw = 11); drain(); readback(target + 0x100, 4)
           recv(target + 0x100, raw = 10); drain(); readback(target + 0x100, 4)
           assert(downstream.size == d + 1 && trains.isEmpty)
-          assert(perf.forall(_ == 0), "non-PBOP resident Recv cannot charge BOP redundancy")
+          val redundantBySource = (0 until slices).flatMap(s =>
+            (0 to L2PfSource.CDP).map(src => value(dut.observation.bopPerfCountBySliceSource(s)(src)(L2BOPPerf.Redundant))))
+          assert(redundantBySource.sum == perf(L2BOPPerf.Redundant), s"redundant source ledger=$redundantBySource perf=$perf")
+        case "dedup" =>
+          ctrl.l2_pbop_en.poke(true.B)
+          val demand = BigInt("30000", 16); val duplicate = demand + 0x80
+          request(demand, waitDrain = false)
+          while (!dut.observation.prefetchQueueValid.exists(flag)) tick()
+          val before = downstream.size
+          recv(duplicate, raw = 10); drain()
+          assert(downstream.drop(before).count(_._1 == duplicate) == 1,
+            s"cross-source duplicate issued more than once: ${downstream.drop(before)}")
+          println("RECV_DEDUP_RESULT pass=true duplicateIssued=1")
+        case "overflow" =>
+          // Hold only the PBOP issue path while still allowing demand training;
+          // this fills the 16-entry PBOP queue and exercises source-local
+          // overwrite accounting without suppressing admission.
+          ctrl.l2_pbop_en.poke(false.B)
+          val base = BigInt("38000", 16)
+          (0 until 40).foreach(i => request(base + i * 0x100, waitDrain = false))
+          (0 until 800).foreach(_ => tick())
+          val held = (0 until slices).map(s => value(dut.observation.prefetchQueueOverwriteBySource(s)(3))).sum
+          assert(held > 0, s"PBOP source queue overwrite counter did not rise: $held")
+          ctrl.l2_pbop_en.poke(true.B); drain()
+          println(s"RECV_OVERFLOW_RESULT pass=true source=3 overwrites=$held")
       }
       drain()
-      assert(dataCount == (if (name == "single") 40 else if (name == "mixed") 6 else 0))
+      L2BOPPerf.names.indices.foreach { metric =>
+        val bySource = (0 until slices).flatMap(s =>
+          (0 to L2PfSource.CDP).map(src => value(dut.observation.bopPerfCountBySliceSource(s)(src)(metric))))
+        assert(bySource.sum == perf(metric), s"source ledger metric=${L2BOPPerf.names(metric)} bySource=$bySource total=${perf(metric)}")
+      }
+      assert(dataCount == (if (name == "single") 40 else if (name == "mixed") 6 else if (name == "overflow") 80 else 0))
       println(s"RECV_RESULT pass=true case=$name slices=$slices admissions=$recvCount downstream=${downstream.size} train=${trains.size} pending=0")
     }
   }

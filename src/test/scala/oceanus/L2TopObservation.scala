@@ -310,6 +310,7 @@ class L2TopObservationIO(entries: Int, sliceCount: Int)(implicit val p: Paramete
   val prefetchQueueValid = Output(Vec(sliceCount, Bool()))
   val prefetchQueueReady = Output(Vec(sliceCount, Bool()))
   val prefetchQueueOverwrite = Output(Vec(sliceCount, Bool()))
+  val prefetchQueueOverwriteBySource = Output(Vec(sliceCount, Vec(L2PfSource.CDP + 1, UInt(64.W))))
   val bopTrainReceiveCount = Output(UInt(64.W))
   val bopTrainAddr = Output(UInt(48.W))
   val bopReqAddr = Output(UInt(48.W))
@@ -321,6 +322,11 @@ class L2TopObservationIO(entries: Int, sliceCount: Int)(implicit val p: Paramete
   val bopTrainValid = Output(Bool())
   val bopTrainReady = Output(Bool())
   val bopPerfCountBySlice = Output(Vec(sliceCount, Vec(L2BOPPerf.names.size, UInt(64.W))))
+  // Per-source effectiveness counters. The first dimension is the slice,
+  // the second is the coupledL2 source encoding (NoWhere is excluded from
+  // accounting), and the third retains the historic eight metrics.
+  val bopPerfCountBySliceSource = Output(Vec(sliceCount,
+    Vec(L2PfSource.CDP + 1, Vec(L2BOPPerf.names.size, UInt(64.W)))))
   val prefetchedHitTrainCount = Output(UInt(8.W))
   val prefetchedHitTrainAddr = Output(UInt(48.W))
   val prefetchedHitTrainValidBySlice = Output(Vec(sliceCount, Bool()))
@@ -378,15 +384,17 @@ object L2TopObservation {
   private val bop = privateField[OceanusBOP](module, "bop")
   private val slices = privateField[Seq[L2TSHRCtrl]](module, "slices")
   private val pfQueues = privateField[Seq[DecoupledIO[FlitREQ]]](module, "pfQueues")
+  private val pfQueueOverwriteBySource = privateField[Vec[Vec[Bool]]](module, "pfQueueOverwriteBySource")
   // The production queue instances are local to the enabled construction
   // block. Inspect the elaborated direct-child IDs, then bore the actual
   // overwrite pulse; do not infer the observed counter from a shadow FIFO.
   private val moduleIds = module.getClass.getMethods.find(_.getName == "getIds").get
     .invoke(module).asInstanceOf[scala.collection.Seq[AnyRef]]
   private val productionPfQueues = moduleIds.collect { case q: OverwriteQueue[_] => q }
-  require(productionPfQueues.size == pfQueues.size, "prefetch overwrite probe must cover every queue")
-  require(pfQueues.size == (if (module.config.bopEnable) module.config.sliceNum else 0),
-    "prefetch observation must cover every production queue")
+  require(productionPfQueues.size >= pfQueues.size,
+    "prefetch overwrite probe must cover every merged queue output")
+  require(pfQueues.size == module.config.sliceNum,
+    "prefetch observation must cover every slice output")
   private val tshrs = privateField[Seq[L2TSHR]](slice0, "tshrs")
   private val sliceTshrs = slices.map(slice => privateField[Seq[L2TSHR]](slice, "tshrs"))
   private val tshrAllocator = slice0.tshrAlloc
@@ -412,6 +420,25 @@ object L2TopObservation {
       val count = RegInit(0.U(64.W))
       count := count + pulses(i)
       io.bopPerfCountBySlice(s)(i) := count
+    }
+    val sourcePulses = sliceTshrs(s)
+    (0 to L2PfSource.CDP).foreach { source =>
+      L2BOPPerf.names.indices.foreach { metric =>
+        val count = RegInit(0.U(64.W))
+        val pulse = sourcePulses.map { tshr =>
+          val perf = boreRead(tshr.io.bopPerf(metric))
+          val pfSource = boreRead(tshr.io.bopPerfSource(metric))
+          perf && pfSource === source.U
+        }.reduce(_ || _)
+        // Count all matching TSHRs, including simultaneous completions.
+        val increment = PopCount(sourcePulses.map { tshr =>
+          val perf = boreRead(tshr.io.bopPerf(metric))
+          val pfSource = boreRead(tshr.io.bopPerfSource(metric))
+          perf && pfSource === source.U
+        })
+        count := count + increment
+        io.bopPerfCountBySliceSource(s)(source)(metric) := count
+      }
     }
   }
 
@@ -943,8 +970,20 @@ object L2TopObservation {
   slices.indices.foreach { i =>
     io.recvIssue(i) := module.pfRecvReqs.lift(i).map(q => boreRead(q.valid) && boreRead(q.ready)).getOrElse(false.B)
     io.recvTxnID(i) := module.pfRecvReqs.lift(i).map(q => boreRead(q.bits.TxnID)).getOrElse(0.U)
-    io.prefetchQueueOverwrite(i) := productionPfQueues.lift(i)
-      .map(q => boreRead(privateBool(q, "overwrite"))).getOrElse(false.B)
+    val sourceQueueStart = i * (if (module.config.bopEnable) 9 else 0)
+    val sourceQueueEnd = math.min(sourceQueueStart + 9, productionPfQueues.size)
+    val overwrites = productionPfQueues.slice(sourceQueueStart, sourceQueueEnd)
+      .map(q => boreRead(privateBool(q, "overwrite")))
+    io.prefetchQueueOverwrite(i) := (if (overwrites.nonEmpty) overwrites.reduce(_ || _) else false.B)
+    (0 to L2PfSource.CDP).foreach { source =>
+      val queueIdx = Seq(L2PfSource.SMS, L2PfSource.BOP, L2PfSource.PBOP,
+        L2PfSource.Stream, L2PfSource.Stride, L2PfSource.TP, L2PfSource.Berti,
+        L2PfSource.NL, L2PfSource.CDP).indexOf(source)
+      val count = RegInit(0.U(64.W))
+      val pulse = if (queueIdx >= 0) boreRead(pfQueueOverwriteBySource(i)(queueIdx)) else false.B
+      count := count + pulse
+      io.prefetchQueueOverwriteBySource(i)(source) := count
+    }
     io.prefetchQueueValid(i) := pfQueues.lift(i).map(q => boreRead(q.valid)).getOrElse(false.B)
     io.prefetchQueueReady(i) := pfQueues.lift(i).map(q => boreRead(q.ready)).getOrElse(false.B)
     io.bopPrefetchIssueBySlice(i) := pfQueues.lift(i).map(q => boreRead(q.valid) && boreRead(q.ready)).getOrElse(false.B)
