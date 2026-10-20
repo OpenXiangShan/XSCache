@@ -22,8 +22,10 @@ object TestTop_L2Recv extends App with ChiselSim {
   val selectedCase = args.collectFirst { case a if a.startsWith("--case=") => a.drop(7) }
   val recvCycles = args.collectFirst { case a if a.startsWith("--recv-cycles=") => a.drop(14).toInt }.getOrElse(200)
   require(recvCycles > 0, "--recv-cycles must be positive")
+  // Phase 1a: run the same oracle with optional ports absent or present and idle.
   val cfg = new L2Configuration(8, true, 0 until slices, bopEnable = true, pfSrcID = 3,
-    bopParams = OceanusBOPParameters(badScore = 0), pfRecvEnable = true, pfCtrlEnable = true)
+    bopParams = OceanusBOPParameters(badScore = 0), pfRecvEnable = true, pfCtrlEnable = true,
+    pfTlbEnable = L2TopPhase1aPorts.enabled, pfTrainEnable = L2TopPhase1aPorts.enabled)
   val config = new Config((_, _, _) => {
     case L2ParamsKey => L2Params(mshrSize = 8)
     case CHIParametersKey => CHIParameters(issue = EnumCHIIssue.E, nodeIdWidth = 11, reqAddrWidth = 48, dataWidth = 256)

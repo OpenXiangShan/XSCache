@@ -186,6 +186,7 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
       "prefetch smoke requires issue enabled and 1/2/4 slices")
     require(testMshrSize >= 2, s"--mshr-size=$testMshrSize is too small for this test")
 
+    // Phase 1a: run the same oracle with optional ports absent or present and idle.
     val l2cfg = new L2Configuration(
       nodeId = 8,
       eSAM = true,
@@ -193,7 +194,9 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
       // Explicit opt-in for BOP cases; --no-bop keeps the A/B queue-free baseline.
       bopEnable = !noBop,
       prefetchIssueEnable = !noPrefetchIssue,
-      bopParams = bopParams
+      bopParams = bopParams,
+      pfTlbEnable = L2TopPhase1aPorts.enabled,
+      pfTrainEnable = L2TopPhase1aPorts.enabled
     )
 
     val config = new Config((_, _, _) => {

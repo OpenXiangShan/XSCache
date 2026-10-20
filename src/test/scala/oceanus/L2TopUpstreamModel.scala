@@ -18,7 +18,16 @@ case class PendingSnpRsp(snpTxnID: SnpTxnID, tgtId: BigInt, due: Int)
 case class PendingSnpData(snpTxnID: SnpTxnID, tgtId: BigInt, due: Int, beat: Int, resp: BigInt)
 
 class L2TopUpstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim {
+  // Phase 1a optional ports have no upstream producer yet. Initialize their
+  // inputs to deterministic idle values for both acceptance configurations.
   def initInputs(): Unit = {
+    dut.io.pfTlb.foreach { tlb =>
+      tlb.req.ready.poke(false.B)
+      tlb.resp.valid.poke(false.B)
+      tlb.resp.bits.poke(0.U.asTypeOf(tlb.resp.bits))
+      tlb.pmp_resp.poke(0.U.asTypeOf(tlb.pmp_resp))
+    }
+    dut.io.pfTrain.foreach(_.foreach(train => train.poke(0.U.asTypeOf(train))))
     dut.io.t1p(0).UpEVT.valid.poke(false.B)
     dut.io.t1p(0).UpEVT.bits.poke(0.U.asTypeOf(dut.io.t1p(0).UpEVT.bits))
     dut.io.t1p(0).UpREQ.valid.poke(false.B)

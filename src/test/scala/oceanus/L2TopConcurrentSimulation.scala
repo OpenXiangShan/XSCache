@@ -28,8 +28,10 @@ case class L2TopConcurrentTrace(
   */
 object L2TopConcurrentSimulation extends ChiselSim {
   def run(plan: L2TopConcurrentPlan)(verify: L2TopConcurrentTrace => Unit): Unit = {
+    // Phase 1a: run the same oracle with optional ports absent or present and idle.
     val cfg = new L2Configuration(8, true, 0 until plan.slices,
-      bopEnable = true, bopParams = plan.bopParams, pfBopQueueEntries = plan.bopQueueEntries)
+      bopEnable = true, bopParams = plan.bopParams, pfBopQueueEntries = plan.bopQueueEntries,
+      pfTlbEnable = L2TopPhase1aPorts.enabled, pfTrainEnable = L2TopPhase1aPorts.enabled)
     val params = new Config((_, _, _) => {
       case L2ParamsKey => L2Params(mshrSize = 8, ways = 4, sets = 128,
         blockBytes = 64, dataSRAMSplit = 8, enableDataECC = false,

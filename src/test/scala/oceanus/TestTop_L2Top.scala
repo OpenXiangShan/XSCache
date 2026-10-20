@@ -11,6 +11,13 @@ import oceanus.chi._
 import xscache.oceanus.compactchi.{CCHIParameters, CCHIParametersKey}
 import scala.collection.mutable.ArrayBuffer
 
+object L2TopPhase1aPorts {
+  def enabled: Boolean = sys.props.get("oceanus.phase1a.ports").contains("true")
+}
+
+// Phase 1a acceptance uses a test-only JVM property to elaborate both optional
+// interfaces in every existing production-path harness. Inputs remain idle;
+// test assertions check the exposed translation interface throughout each run.
 class TestTop_L2Top(val l2cfg: L2Configuration)(implicit val p: Parameters) extends Module with HasL2Params {
 
   val module = Module(new L2Top(l2cfg))
@@ -19,6 +26,20 @@ class TestTop_L2Top(val l2cfg: L2Configuration)(implicit val p: Parameters) exte
   val io = IO(module.io.cloneType)
 
   io <> module.io
+
+  require(l2cfg.pfTlbEnable == L2TopPhase1aPorts.enabled)
+  require(l2cfg.pfTrainEnable == L2TopPhase1aPorts.enabled)
+  println(s"PHASE1A_PORTS tlb=${io.pfTlb.nonEmpty} train=${io.pfTrain.nonEmpty} type1=${io.t1p.size}")
+  io.pfTlb.foreach { tlb =>
+    assert(!tlb.req.valid && !tlb.req_kill && tlb.resp.ready,
+      "Phase 1a TLB must remain idle and discard responses")
+  }
+  io.pfTrain.foreach { ports =>
+    require(ports.size == io.t1p.size)
+    ports.foreach { train =>
+      require(train.vaddrBlock.getWidth == 44 && train.reqSource.getWidth == 5 && train.trainEnable.getWidth == 1)
+    }
+  }
 
   //
   val log = IO(new Bundle {
@@ -83,7 +104,9 @@ Usage: TestTop_L2Top [<--option> <values>]
     eSAM = true,
     slices = 0 until numSlices,
     // This BOP observation harness preserves its enabled elaboration configuration.
-    bopEnable = true
+    bopEnable = true,
+    pfTlbEnable = L2TopPhase1aPorts.enabled,
+    pfTrainEnable = L2TopPhase1aPorts.enabled
   )
 
   val config = new Config((_, _, _) => {

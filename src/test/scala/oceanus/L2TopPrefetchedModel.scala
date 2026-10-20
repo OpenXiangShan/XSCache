@@ -24,7 +24,9 @@ object TestTop_L2Prefetched extends App with ChiselSim {
     Seq("stashunique-hit", "stashshared-hit", "stashunique-dirty").map(v => s"bop-2c-$v-sc")
   } else Seq(selectedName)
   // These directed cases require internal fills; opt in despite base's off default.
-  val l2cfg = new L2Configuration(8, true, Seq(0), bopEnable = true, pfSrcID = 3, bopParams = OceanusBOPParameters(badScore = 0))
+  // Phase 1a: run the same oracle with optional ports absent or present and idle.
+  val l2cfg = new L2Configuration(8, true, Seq(0), bopEnable = true, pfSrcID = 3, bopParams = OceanusBOPParameters(badScore = 0),
+    pfTlbEnable = L2TopPhase1aPorts.enabled, pfTrainEnable = L2TopPhase1aPorts.enabled)
   val config = new Config((_, _, _) => {
     case L2ParamsKey => L2Params(mshrSize = 8)
     case CHIParametersKey => CHIParameters(issue = EnumCHIIssue.E, nodeIdWidth = 11, reqAddrWidth = 48, dataWidth = 256)
