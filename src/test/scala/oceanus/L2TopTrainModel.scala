@@ -11,6 +11,10 @@ import scala.collection.mutable
 // Phase 1b intent: observe actual upstream acceptance and actual RBE dequeue,
 // then compare against a host transaction scoreboard. Never force RTL state.
 class L2TrainProbe(implicit p: Parameters) extends Bundle {
+  // Intent (3a): independently verify permission/source identity from the
+  // accepted CCHI opcode, alongside the existing VA/source/enable scoreboard.
+  val inOpcode = UInt(6.W)
+  val opcode = UInt(6.W)
   val accept = Bool()
   val inAddr = UInt(48.W)
   val inSrc = UInt(4.W)
@@ -55,11 +59,13 @@ object L2TopTrainObservation {
           probe.inAddr := read(t.io.UpRXREQ.Addr)
           probe.inSrc := read(t.io.UpRXREQ.SrcID)
           probe.inTxn := read(t.io.UpRXREQ.TxnID)
+          probe.inOpcode := read(t.io.UpRXREQ.Opcode)
           probe.inContext := read(q.io.in.bits.train.get)
           probe.execute := read(v.io.UpRXREQ.valid)
           probe.addr := read(v.io.tshr_paddr)
           probe.src := read(v.io.UpRXREQ.bits.SrcID)
           probe.txn := read(v.io.UpRXREQ.bits.TxnID)
+          probe.opcode := read(v.io.UpRXREQ.bits.Opcode)
           probe.context := read(v.io.UpRXREQTrain.get)
           probe.activePrefetch := read(v.active) && read(v.p_rxreq.SrcID) === top.config.pfSrcID.U
           probe.hit := read(v.io.tshr_dirResult.hit)
@@ -92,7 +98,7 @@ object L2TopTrainStimulus extends ChiselSim {
 // Expectations originate at the exported port's handshake, not from any
 // internal context. Queue residence is tracked by transaction identity and PA.
 class L2TopTrainChecker(dut: TestTop_L2Top) extends ChiselSim {
-  case class Expected(addr: BigInt, src: BigInt, txn: BigInt, vpn: BigInt, source: BigInt, enable: Boolean, at: Int, late: Boolean)
+  case class Expected(addr: BigInt, src: BigInt, txn: BigInt, vpn: BigInt, source: BigInt, enable: Boolean, at: Int, late: Boolean, opcode: BigInt)
   private val waiting = mutable.Map.empty[(Int, Int), Expected]
   var accepts = 0; var executions = 0; var misses = 0; var hits = 0
   var disabled = 0; var internal = 0; var lateHits = 0; var simultaneousAccepts = 0; var simultaneousTrains = 0
@@ -115,6 +121,11 @@ class L2TopTrainChecker(dut: TestTop_L2Top) extends ChiselSim {
             (value(train.vaddrBlock) >> 6, value(train.reqSource), flag(train.trainEnable)))
         } else None
       }.toMap
+      val acceptedOpcodes = dut.io.t1p.flatMap { port =>
+        if(flag(port.UpREQ.valid) && flag(port.UpREQ.ready))
+          Some((value(port.UpREQ.bits.SrcID), value(port.UpREQ.bits.TxnID), value(port.UpREQ.bits.Addr)) -> value(port.UpREQ.bits.Opcode))
+        else None
+      }.toMap
       if (accepted.size > 1) simultaneousAccepts += 1
       val local = mutable.ArrayBuffer.empty[(BigInt, BigInt, BigInt, Boolean)]
       obs.req.zipWithIndex.foreach { case (row, s) =>
@@ -123,7 +134,12 @@ class L2TopTrainChecker(dut: TestTop_L2Top) extends ChiselSim {
           if (flag(r.execute)) {
             val e = waiting.remove((s, t)).getOrElse(throw new AssertionError(s"unmatched REQ execution slice=$s tshr=$t cycle=$cycle"))
             assert((value(r.addr), value(r.src), value(r.txn)) == ((e.addr & ~BigInt(63)), e.src, e.txn))
+            assert(value(r.opcode) == e.opcode, "CCHI opcode changed while buffered")
             assert(context(r.context) == ((e.vpn, e.source, e.enable)), s"context changed in RBE: $e cycle=$cycle")
+            val unique = Set(oceanus.compactchi.CCHIOpcode.ReadUnique.opcode,
+              oceanus.compactchi.CCHIOpcode.MakeUnique.opcode)(e.opcode.toInt)
+            assert(flag(r.event.needT.get) == unique)
+            assert(value(r.event.sourceId.get) == ((e.src << 8) | e.txn))
             executions += 1
             if (e.src == dut.l2cfg.pfSrcID) {
               assert(context(r.context) == ((BigInt(0), BigInt(0), false)))
@@ -142,9 +158,10 @@ class L2TopTrainChecker(dut: TestTop_L2Top) extends ChiselSim {
           if (flag(r.accept)) {
             val addr = value(r.inAddr); val src = value(r.inSrc); val txn = value(r.inTxn)
             val expected = accepted.getOrElse((src, txn, addr), (BigInt(0), BigInt(0), false))
+            acceptedOpcodes.get((src, txn, addr)).foreach(op => assert(value(r.inOpcode) == op))
             assert(context(r.inContext) == expected, s"upstream-to-RBE mismatch src=$src txn=$txn addr=$addr cycle=$cycle")
             assert(!waiting.contains((s, t)), s"occupied REQ RBE overwritten slice=$s tshr=$t")
-            waiting((s, t)) = Expected(addr, src, txn, expected._1, expected._2, expected._3, cycle, flag(r.activePrefetch) && src != dut.l2cfg.pfSrcID)
+            waiting((s, t)) = Expected(addr, src, txn, expected._1, expected._2, expected._3, cycle, flag(r.activePrefetch) && src != dut.l2cfg.pfSrcID, value(r.inOpcode))
             accepts += 1
           }
         }

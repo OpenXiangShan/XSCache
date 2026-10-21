@@ -1,5 +1,9 @@
 package oceanus
 
+// Intent (3a): run these real cache/translation/useful checks with OceanusVBOP;
+// select badScore=0 to allow the initial reference +2 prediction immediately,
+// and explicitly opt into same-page bypass only for the existing fast-path case.
+
 // Intent (phase2): use real demand/refill/Meta paths with a fixed-page TLB model.
 // Check addresses, provenance/depth, useful attribution, disabled controls and
 // every source queue against a host FIFO; test four-way contention separately
@@ -38,6 +42,9 @@ class Phase2WriteProbe extends Bundle {
   val depth = UInt(2.W)
 }
 class Phase2Observation(implicit val p: Parameters) extends Bundle {
+  // Intent (3a): prove the downgrade counter from an actual ReadUnique event
+  // and inspect the resulting CCHI opcode at the real slice admission.
+  val needTDowngraded = UInt(64.W)
   val queues = Vec(10, new Phase2QueueProbe)
   val enter = Valid(new FlitREQ)
   val issue = Valid(new FlitREQ)
@@ -84,6 +91,7 @@ object Phase2Observation {
     obs.evictions := read(top.cdpStub.get.evictions)
     obs.evictPulses := PopCount(top.slices.flatMap(_.io.cdpEvict.map(e => read(e.valid))))
     obs.vbopOverflow := read(top.vbopStub.get.overwritten)
+    obs.needTDowngraded := read(top.vbopStub.get.needTDowngraded)
     obs.cdpOverflow := read(top.cdpStub.get.overwritten)
     obs.generated.foreach(_ := false.B)
     obs.generated(1) := read(top.pfRecvReqs.head.valid)
@@ -99,11 +107,16 @@ class TestTopPhase2(cfg: L2Configuration)(implicit p: Parameters) extends TestTo
 }
 
 object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
+  Constantin.init(false) // reference VBOP constants use their declared defaults
   require(L2TopPhase1aPorts.enabled)
+  // Intent: exercise the production default (all predictions translate) as
+  // well as the opt-in legacy same-page optimization through the real cache.
+  val fastPath = !args.contains("--no-fast-path")
   val cfg = new L2Configuration(8, true, 0 until 1, bopEnable = true,
     pfRecvEnable = true, pfCtrlEnable = true, pfTrainEnable = true, pfTlbEnable = true,
     vbopStubEnable = true, cdpStubEnable = true,
-    bopParams = OceanusBOPParameters(badScore = 0, roundMax = 100000))
+    bopParams = OceanusBOPParameters(badScore = 0, roundMax = 100000),
+    vbopParams = OceanusVBOPParameters(badScore = 0, roundMax = 100000, samePagePA = fastPath))
   val params = new Config((_, _, _) => {
     case L2ParamsKey => L2Params(mshrSize = 8)
     case CHIParametersKey => CHIParameters(issue = EnumCHIIssue.E, nodeIdWidth = 11, reqAddrWidth = 48, dataWidth = 256)
@@ -130,7 +143,8 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
     val pointers = mutable.Map.empty[BigInt, BigInt]
     // Literal fixed page table; no PA is derived from a DUT decoder.
     val pages = Seq(0x110 -> 0x51, 0x120 -> 0x52, 0x130 -> 0x53,
-      0x210 -> 0x61, 0x220 -> 0x62, 0x230 -> 0x63, 0x310 -> 0x71)
+      0x210 -> 0x61, 0x220 -> 0x62, 0x230 -> 0x63, 0x310 -> 0x71,
+      0x100 -> 0x20, 0x600 -> 0x74, 0x700 -> 0x46, 0x800 -> 0x90)
       .map { case (v, p) => BigInt(v) -> BigInt(p) }.toMap
     val misses = mutable.Map.empty[BigInt, Int].withDefaultValue(0)
     val faults = mutable.Set.empty[BigInt]
@@ -188,7 +202,8 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
         dn.noteRequest(id)
         if (dn.isEvictReq(op)) rspQ.enqueue(PendingDnRsp(id, src, cycle + 25, dn.downstreamEvictRspOpcode(op)))
         else { downstream += addr
-          (0 until 2).foreach(b => dataQ.enqueue(PendingDnComp(id, src, cycle + 25 + b, b, BigInt(CHIFieldResp.CompData_SC), addr)))
+          val resp = if(op == 0x07) CHIFieldResp.CompData_UC else CHIFieldResp.CompData_SC
+          (0 until 2).foreach(b => dataQ.enqueue(PendingDnComp(id, src, cycle + 25 + b, b, BigInt(resp), addr)))
         }
       }
       val port = dut.io.t1p.head
@@ -209,6 +224,8 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
         assert(value(o.prefetchPendingBySource(0)(s)) == queueModels(q).size)
       }
       if (flag(obs.enter.valid) && value(obs.enter.bits.SrcID) == 1) {
+        if(source(obs.enter.bits) == 2)
+          assert(value(obs.enter.bits.Opcode) == CCHIOpcode.StashShared.opcode)
         entered += ((value(obs.enter.bits.Addr), source(obs.enter.bits), depth(obs.enter.bits)))
         enteredBySource(source(obs.enter.bits)) += 1
       }
@@ -254,9 +271,10 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
         quiet = if (idle) quiet + 1 else 0
       }
     }
-    def request(pa: BigInt, va: BigInt, train: Boolean = true): Unit = {
+    def request(pa: BigInt, va: BigInt, train: Boolean = true, unique: Boolean = false): Unit = {
       activeAddr = pa
-      up.driveRead(requests(txn).copy(addr = pa))
+      up.driveRead(requests(txn).copy(addr = pa,
+        opcode = if(unique) CCHIOpcode.ReadUnique.opcode else CCHIOpcode.ReadShared.opcode))
       dut.io.pfTrain.get.head.vaddrBlock.poke((va >> 6).U)
       dut.io.pfTrain.get.head.trainEnable.poke(train.B)
       while (!flag(dut.io.t1p.head.UpREQ.ready)) tick()
@@ -277,8 +295,8 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
 
     controls(v = true)
     request(0x20040, 0x100040)
-    assert(attempts.isEmpty && entered.contains((BigInt(0x200c0), 2, 0)) && writes.contains((BigInt(0x200c0), 2, 0)))
-    println("PHASE2_VBOP_SAME_PAGE pass=true tlb=0 PA=200c0 source=2")
+    assert((if(fastPath) attempts.isEmpty else attempts(BigInt(0x1000c0)) == 1) && entered.contains((BigInt(0x200c0), 2, 0)) && writes.contains((BigInt(0x200c0), 2, 0)))
+    println(s"PHASE2_VBOP_SAME_PAGE pass=true tlb=${if(fastPath) 0 else 1} PA=200c0 source=2 fastPath=$fastPath")
     controls(); val beforeUsefulV = useful(2); val beforeDn = downstream.size
     request(0x200c0, 0x1000c0, train = false)
     assert(useful(2) == beforeUsefulV + 1 && downstream.size == beforeDn)
@@ -322,7 +340,7 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
     pointers(BigInt(0x46040)) = BigInt(0x310080)
     val cdpBeforeOff = entered.count(_._2 == 9)
     request(0x46040, 0x700040)
-    assert(entered.count(_._2 == 9) == cdpBeforeOff && attempts.values.sum == startTlb)
+    assert(entered.count(_._2 == 9) == cdpBeforeOff && attempts.values.sum == startTlb + (if(fastPath) 0 else 1))
     println("PHASE2_CONTROLS pass=true vbopOff=0 cdpOff=0 masterOff=0")
 
     // Accumulate each real producer behind the test-only issue pause. PBOP's
@@ -350,6 +368,12 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
     assert(order == Seq(1, 2, 3, 9), s"four source priority $order")
     println("PHASE2_ARBITRATION pass=true order=Recv,VBOP,PBOP,CDP sources=1,2,3,9")
     assert(queueModels.forall(_.isEmpty))
+    controls(v = true)
+    val beforeDowngrade = value(dut.phase2.needTDowngraded)
+    request(0x90040, 0x800040, unique = true)
+    assert(entered.contains((BigInt(0x900c0), 2, 0)))
+    assert(value(dut.phase2.needTDowngraded) == beforeDowngrade + 1)
+    println("PHASE3A_NEEDT pass=true training=ReadUnique emitted=StashShared downgraded=1 deviation=D2")
     for (i <- Seq(9, 1, 2, 8)) {
       assert(enqueues(i) > 0 && issued(i) > 0)
       println(s"PHASE2_SOURCE_ACCOUNT pass=true source=${if (i == 9) 1 else Seq(1,2,3,4,5,6,7,8,9)(i)} enqueued=${enqueues(i)} overwritten=${overwrites(i)} issued=${issued(i)} dedup=${drops(i)} pending=${queueModels(i).size}")
@@ -367,6 +391,7 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
 // Intent: elaborate each independent parameter combination in a fresh JVM,
 // checking generated modules directly, including stub-only configurations.
 object TestTop_L2StubParameters extends App {
+  Constantin.init(false)
   val mode = args.head
   val cfg = new L2Configuration(8, true, 0 until 2, pfTrainEnable = true, pfTlbEnable = true,
     vbopStubEnable = mode == "vbop" || mode == "both", cdpStubEnable = mode == "cdp" || mode == "both")
@@ -379,7 +404,7 @@ object TestTop_L2StubParameters extends App {
   })
   // emitCHIRRTL returns a string for inspection and writes no RTL artifact.
   val fir = _root_.circt.stage.ChiselStage.emitCHIRRTL(new L2Top(cfg)(params))
-  assert(fir.contains("module L2VBOPStub") == cfg.vbopStubEnable)
+  assert(fir.contains("module OceanusVBOP :") == cfg.vbopStubEnable)
   assert(fir.contains("module L2CDPStub") == cfg.cdpStubEnable)
   println(s"PHASE2_PARAMETERS pass=true mode=$mode vbop=${cfg.vbopStubEnable} cdp=${cfg.cdpStubEnable} slices=2")
 }
