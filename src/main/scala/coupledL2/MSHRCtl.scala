@@ -1008,7 +1008,13 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       // A normal MSHR owns its request line only.  `metaTag` is a ReplaceMSHR
       // victim while `needsRepl` is set, so a B.toN for that victim must stay
       // on the replacement/snoop path and must not cancel this normal refill.
-      val pendingSnoopForRefill = io.fromReqArb.status_s1.bValid &&
+      // Use the raw B candidate, not the already-gated bValid: bValid depends
+      // on MSHRCtl's blockB_s1, which itself depends on the B's toN status, so
+      // feeding it back here closes a long MSHRCtl<->RequestArb cone.  A B
+      // candidate blocked only by the snoop/replace pool defers this grant
+      // conservatively; that pool drains independently of this normal's
+      // commit, so the extra deferral cannot deadlock.
+      val pendingSnoopForRefill = io.fromReqArb.status_s1.bCandidateValid &&
         refill.io.status.valid &&
         refill.io.status.bits.set === io.fromReqArb.status_s1.b_set &&
         refill.io.status.bits.reqTag === io.fromReqArb.status_s1.b_tag
