@@ -69,7 +69,7 @@ import xscache.oceanus.compactchi.{CCHIParameters, CCHIParametersKey}
  *              with no remapping.
  *    compat:   l2chi_rn{i}_* / l2chi_mon_rn{i}_* — collision-free, for the
  *              CURRENT unmodified cohestra_v3 harness (use for smokes).
- *  The current /mnt/c CHIron cohestra_v3 CHI pin path has three independent
+ *  The current CHIron cohestra_v3 CHI pin path has three independent
  *  bugs that prevent it from compiling against ANY Verilator DUT (its
  *  top_dummy.sv has no CHI pins, so the path was never compiled):
  *    1. Macro bug: V3_CHI_{REQ,RSP,DAT,SNP}_FIELD_PTR(name) reference PORT,
