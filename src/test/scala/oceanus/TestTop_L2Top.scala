@@ -15,15 +15,39 @@ object L2TopPhase1aPorts {
   def enabled: Boolean = sys.props.get("oceanus.phase1a.ports").contains("true")
 }
 
+// Intent (1c-2): make the internal request-depth test hook explicit and keep
+// its IO absent unless the dedicated depth simulation requests it.
+class L2TopDepthHarness(config: L2Configuration, inject: Boolean)(implicit p: Parameters) extends L2Top(config) {
+  val testDepth = if (inject) Some(IO(Input(UInt(2.W)))) else None
+  testDepth.foreach { depth =>
+    pfRecvReqs.foreach { req =>
+      req.bits.TxnID := L2PrefetchTxnID.encode(
+        L2PfSource.fromMemReqSource(this.io.pfRecv.get.pf_source), depth, pfSequence, pfTxnWidth)
+    }
+  }
+}
+
 // Phase 1a acceptance uses a test-only JVM property to elaborate both optional
 // interfaces in every existing production-path harness. Inputs remain idle;
 // test assertions check the exposed translation interface throughout each run.
 class TestTop_L2Top(val l2cfg: L2Configuration)(implicit val p: Parameters) extends Module with HasL2Params {
 
-  val module = Module(new L2Top(l2cfg))
+  // Intent (1c-2): a test-only subclass can inject depth into real internal
+  // prefetch flits; normal Recv/BOP producers and every regression stay zero.
+  val depthInjection = sys.props.get("oceanus.phase1c2.depth").contains("true")
+  val module: L2Top = if (depthInjection) Module(new L2TopDepthHarness(l2cfg, true)) else Module(new L2Top(l2cfg))
+  val testDepth = if (depthInjection) Some(IO(Input(UInt(2.W)))) else None
+  module match {
+    case injected: L2TopDepthHarness => injected.testDepth.foreach(_ := testDepth.get)
+    case _ =>
+  }
   val observation = L2TopObservation.attach(module, nMSHR)
   // Phase 1b optional end-to-end probes disappear with the sideband parameter.
   val trainObservation = L2TopTrainObservation.attach(module, nMSHR)
+  // Intent (1c-2): observe the production data/Meta boundary and global stub
+  // only in directed runs, without changing any cache input or timing.
+  val cdpObservation = if (sys.props.get("oceanus.phase1c2.check").contains("true"))
+    Some(L2TopCDPObservation.attach(module, nMSHR)) else None
 
   val io = IO(module.io.cloneType)
 

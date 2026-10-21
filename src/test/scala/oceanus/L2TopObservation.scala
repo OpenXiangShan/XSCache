@@ -371,9 +371,19 @@ object L2TopObservation {
 
   private class Connector(module: L2Top, io: L2TopObservationIO)(implicit val p: Parameters) extends HasL2Params {
   private def privateField[T](owner: AnyRef, name: String): T = {
-    val field = owner.getClass.getDeclaredField(name)
-    field.setAccessible(true)
-    field.get(owner).asInstanceOf[T]
+    // Intent (1c-2): the depth-injection test subclasses L2Top; its existing
+    // production fields remain in the superclass. Missing probes still fail.
+    var declaringClass: Class[_] = owner.getClass
+    while (declaringClass != null) {
+      try {
+        val field = declaringClass.getDeclaredField(name)
+        field.setAccessible(true)
+        return field.get(owner).asInstanceOf[T]
+      } catch {
+        case _: NoSuchFieldException => declaringClass = declaringClass.getSuperclass
+      }
+    }
+    throw new NoSuchFieldException(s"${owner.getClass.getName}.$name")
   }
   // A missing field is a stale probe, not an absent signal: the freeze-tag
   // harness used to swallow NoSuchFieldException as false.B, which made

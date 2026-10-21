@@ -39,6 +39,9 @@ object TestTop_L2Train extends App with ChiselSim {
       DnConfig(FixedLatency(100), FixedOutstanding(64), ImmediateCreditPolicy()), 6000, (0, 6000), Seq.empty)
     val up = new L2TopUpstreamModel(dut, spec)
     val dn = new L2TopDownstreamModel(dut, spec)
+    // Intent (1c-2): run independent line/FIFO/Meta checks on these real
+    // simultaneous-slice requests and the demand queued behind a prefetch.
+    val cdp = new L2TopCDPChecker(dut)
     val dataQ = mutable.Queue.empty[PendingDnComp]
     val rspQ = mutable.Queue.empty[PendingDnRsp]
     case class Req(addr: BigInt, txn: Int)
@@ -127,6 +130,7 @@ object TestTop_L2Train extends App with ChiselSim {
       rspQ.dequeueFirst(p => p.due <= cycle && dn.canDriveRxRsp).foreach { p =>
         dn.driveDnRsp(p); dn.noteResponse(p.dnTxnID, true, cycle)
       }
+      cdp.sample()
       dn.stepWithCredits(cycle); cycle += 1
     }
     def drain(): Unit = {
@@ -174,6 +178,10 @@ object TestTop_L2Train extends App with ChiselSim {
     assert(c.pending == 0 && c.accepts == c.executions)
     assert(completed == 2 * count + 2 && checkedBeats == completed * 2)
     c.report()
+    if (dut.cdpObservation.nonEmpty) {
+      assert(cdp.lines > 0 && cdp.forwarded > 0 && cdp.hits > 0 && cdp.disabled > 0)
+      cdp.report()
+    }
     // Intent (1c-1): require both enabled and disabled events at the actual BOP
     // boundary; the unchanged VA/RBE checker supplies independent expectations.
     assert(c.gatedGlobal > 0 && c.acceptedByBop > 0)
