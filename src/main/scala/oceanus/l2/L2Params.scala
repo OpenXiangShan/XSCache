@@ -17,6 +17,7 @@ case class L2Params(
     hasMbist: Boolean = false,
     hasSramCtl: Boolean = false,
     dataECC: Option[String] = Some("secded"),
+    replacement: String = "plru",
 )
 
 case object L2ParamsKey extends Field[L2Params](L2Params())

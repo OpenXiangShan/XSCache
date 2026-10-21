@@ -16,7 +16,7 @@ import oceanus.chi.bundle.{CHIBundleDAT, CHIBundleREQ, CHIBundleRSP, CHIBundleSN
 import oceanus.chi.link.OceanusChannelAdapter
 import xscache.chi.{ChannelIO, CHIIssue, HasCHIMsgParameters, Issue}
 import xscache.coupledL2.L2Param
-import xscache.openLLC.{OpenLLC, OpenLLCParam, OpenLLCParamKey, OpenNCB}
+import xscache.openLLC.{OpenLLC, OpenLLCParam, OpenLLCParamKey, OpenNCB, ResourceConfig}
 import cc.xiangshan.openncb.{EnumAXIMasterOrder, EnumCHIDataCheck, NCBParameters, NCBParametersKey}
 
 /*  Oceanus L2 (CCHI upstream / CHI RN-F downstream) -> OpenLLC -> OpenNCB -> AXI4.
@@ -53,6 +53,16 @@ import cc.xiangshan.openncb.{EnumAXIMasterOrder, EnumCHIDataCheck, NCBParameters
  *    clock / reset (high-active)
  *  Internal CCHI channel names (UpEVT/DnSNP/...) intentionally do not appear
  *  in the emitted port names.
+ *
+ *  Known boundary: every L2 here keeps L2UpstreamTable.defaults, i.e. a single
+ *  Type-1 port with nid 0. L2Top demuxes upstream-bound RSP/DAT by
+ *  TgtID == port nid, and response TgtID echoes the client's SrcID, so the
+ *  harness contract is FIXED: upstream.type1.nodeid must be all zeros
+ *  (one zero per L2). Any distinct harness node ID masks that L2's responses
+ *  at the demux and deadlocks (verified 2026-10: VL + VCS, l3, watchdog on the
+ *  first dataless upstream response). TestTop_L2Avocado/Cornetto/Biscotto/
+ *  ZhuJiang instead parameterize per-L2 Type-1 nids and require distinct
+ *  harness node IDs — do not mix the two contracts.
  */
 class TestTop_L2OpenLLC(val numL2: Int, val numSlices: Int)(implicit p: Parameters) extends LazyModule
   with HasCHIMsgParameters {
@@ -79,6 +89,8 @@ class TestTop_L2OpenLLC(val numL2: Int, val numSlices: Int)(implicit p: Paramete
     // Each L2 instance takes its own CHI node ID (0 until numL2) as SrcID on
     // the RN-F link toward OpenLLC; OpenLLC itself is node numL2 (l3.io.nodeID)
     // and learns each RN's ID per port (rnID), so IDs must be distinct per L2.
+    // NOTE: upstream Type-1 nids stay at the default 0 for every L2 (see the
+    // header "Known boundary"); harness upstream.type1.nodeid must be all zeros.
     val l2s = Seq.tabulate(numL2)(i => Module(new L2Top(
       new L2Configuration(nodeId = i, eSAM = true, slices = 0 until numSlices))))
     val l3 = Module(new OpenLLC())
@@ -250,6 +262,19 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       --l2 <l2_num>             specify the number of Oceanus L2 instances, 1 by default
       --slices <slice_num>      specify the number of slices per L2, 2 by default;
                                 external SAM supports 1 to 4 slices
+      --tshrs <n>               TSHR entries per slice (L2 MSHR equivalent), 16 by default;
+                                the last 3 entries are reserved (EVB/L1EVT/L3SNP)
+      --l2-sets <n>             L2 sets per slice, 32 by default (power of two)
+      --l2-ways <n>             L2 ways per slice, 4 by default (power of two)
+      --l2-replacement <pol>    L2 replacement policy, plru by default;
+                                plru is hardwired for 4 ways, drrip supports
+                                any power-of-two way count
+      --llc-sets <n>            OpenLLC sets per bank, 64 by default (power of two)
+      --llc-ways <n>            OpenLLC ways per bank, 4 by default (power of two)
+      --llc-banks <n>           OpenLLC banks, 1 by default (power of two)
+      --llc-mshr-memory <n>     OpenLLC memory-class MSHRs, 16 by default; size to
+                                >= slices * (tshrs - 3) to absorb L2 parallelism
+      --llc-mshr-refill <n>     OpenLLC refill-class MSHRs, 16 by default
       --noperf                  disable all DUT performance counters (drops the
                                 LogPerfEndpoint bulk; much faster firtool/verilation)
   """
@@ -263,6 +288,15 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
   var numL2 = 1
   var numSlices = 2
   var noPerf = false
+  var tshrs = 16
+  var l2Sets = 32
+  var l2Ways = 4
+  var l2Replacement = "plru"
+  var llcSets = 64
+  var llcWays = 4
+  var llcBanks = 1
+  var llcMshrMemory = 16
+  var llcMshrRefill = 16
 
   val varArgs = ArrayBuffer[String]()
   var i = 0
@@ -271,6 +305,15 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       case "--l2"     => numL2 = args(i + 1).toInt; i += 2
       case "--slices" => numSlices = args(i + 1).toInt; i += 2
       case "--noperf" => noPerf = true; i += 1
+      case "--tshrs"  => tshrs = args(i + 1).toInt; i += 2
+      case "--l2-sets"  => l2Sets = args(i + 1).toInt; i += 2
+      case "--l2-ways"  => l2Ways = args(i + 1).toInt; i += 2
+      case "--l2-replacement" => l2Replacement = args(i + 1); i += 2
+      case "--llc-sets" => llcSets = args(i + 1).toInt; i += 2
+      case "--llc-ways" => llcWays = args(i + 1).toInt; i += 2
+      case "--llc-banks" => llcBanks = args(i + 1).toInt; i += 2
+      case "--llc-mshr-memory" => llcMshrMemory = args(i + 1).toInt; i += 2
+      case "--llc-mshr-refill" => llcMshrRefill = args(i + 1).toInt; i += 2
       case other      => varArgs += other; i += 1
     }
   }
@@ -278,13 +321,22 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
 
   require(numL2 >= 1, s"Unsupported L2 count $numL2")
   require(numSlices >= 1 && numSlices <= 4, s"Unsupported slice count $numSlices under eSAM")
+  require(tshrs >= 4, s"Unsupported TSHR count $tshrs (3 entries are reserved)")
+  require(isPow2(l2Sets) && isPow2(l2Ways), s"L2 sets/ways must be powers of two: $l2Sets/$l2Ways")
+  require(l2Replacement == "plru" || l2Replacement == "drrip",
+    s"L2 replacement must be plru or drrip: $l2Replacement")
+  require(isPow2(llcSets) && isPow2(llcWays) && isPow2(llcBanks),
+    s"LLC sets/ways/banks must be powers of two: $llcSets/$llcWays/$llcBanks")
+  require(llcMshrMemory >= 1 && llcMshrRefill >= 1,
+    s"LLC MSHR counts must be positive: memory=$llcMshrMemory refill=$llcMshrRefill")
 
   val config = new Config((_, _, _) => {
     case L2ParamsKey => L2Params (
       physicalAddrWidth = 48,
-      mshrSize = 16,
-      ways = 4,
-      sets = 32
+      mshrSize = tshrs,
+      ways = l2Ways,
+      sets = l2Sets,
+      replacement = l2Replacement
     )
     case CHIParametersKey => CHIParameters (
       issue = EnumCHIIssue.E,
@@ -302,10 +354,16 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
     // CHIAddrWidthKey / CHIDataCheckKey / CHIPoisonKey defaults (48 / oddparity / true)
     // already match the oceanus CHIParameters above.
     case OpenLLCParamKey => OpenLLCParam(
-      ways = 4,
-      sets = 64,
-      banks = 1,
-      clientCaches = Seq.fill(numL2)(L2Param(ways = 4, sets = 32)),
+      ways = llcWays,
+      sets = llcSets,
+      banks = llcBanks,
+      mshrs = ResourceConfig(
+        refill = llcMshrRefill,
+        response = 16,
+        snoop = 16,
+        memory = llcMshrMemory
+      ),
+      clientCaches = Seq.fill(numL2)(L2Param(ways = l2Ways, sets = l2Sets)),
       fullAddressBits = 48,
       hartIds = 0 until numL2,
       enableRollingDB = false,

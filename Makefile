@@ -88,7 +88,7 @@ test-top-l2top:
 	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2Top -td $(BUILD_DIR_L2TOP) --slices $(NUM_SLICE) --target systemverilog --split-verilog
 	if [ -f "$(BUILD_DIR_L2TOP)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2TOP)/TestTop.sv.conf" "$(BUILD_DIR_L2TOP)"; fi
 
-BUILD_DIR_L2OPENLLC = ./build/l2openllc
+BUILD_DIR_L2OPENLLC = ./build/l2openllc$(if $(TAG),_$(TAG),)
 
 # set NO_PERF=1 to strip all DUT performance counters from the generated RTL
 # (removes the LogPerfEndpoint bulk: much faster firtool/verilation/compile)
@@ -96,11 +96,36 @@ NO_PERF ?= 0
 PERF_ARGS = $(if $(filter 1,$(NO_PERF)),--noperf,)
 
 # defaults to 1 L2 x 2 slices; override with NUM_L2=<n> / NUM_SLICE=<1-4>
+# geometry/parallelism knobs (defaults reproduce the original test-top RTL):
+#   NUM_TSHR        TSHR entries per slice (L2 MSHR equivalent; last 3 reserved)
+#   L2_SETS/L2_WAYS L2 sets/ways per slice
+#   L2_REPLACEMENT  L2 replacement policy (plru: 4 ways only; drrip: any
+#                   power-of-two ways)
+#   LLC_SETS/LLC_WAYS/LLC_BANKS  OpenLLC sets/ways per bank / bank count
+#   LLC_MSHR_MEMORY/LLC_MSHR_REFILL  OpenLLC MSHRs; size memory/refill to
+#                   >= NUM_SLICE * (NUM_TSHR - 3) to absorb L2 parallelism
 NUM_L2 ?= 1
+NUM_TSHR ?= 16
+L2_SETS ?= 32
+L2_WAYS ?= 4
+L2_REPLACEMENT ?= plru
+LLC_SETS ?= 64
+LLC_WAYS ?= 4
+LLC_BANKS ?= 1
+LLC_MSHR_MEMORY ?= 16
+LLC_MSHR_REFILL ?= 16
 test-top-l2openllc: NUM_SLICE = 2
 test-top-l2openllc:
-	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2OpenLLC -td $(BUILD_DIR_L2OPENLLC) --l2 $(NUM_L2) --slices $(NUM_SLICE) $(PERF_ARGS) --target systemverilog --split-verilog
+	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2OpenLLC -td $(BUILD_DIR_L2OPENLLC) --l2 $(NUM_L2) --slices $(NUM_SLICE) --tshrs $(NUM_TSHR) --l2-sets $(L2_SETS) --l2-ways $(L2_WAYS) --l2-replacement $(L2_REPLACEMENT) --llc-sets $(LLC_SETS) --llc-ways $(LLC_WAYS) --llc-banks $(LLC_BANKS) --llc-mshr-memory $(LLC_MSHR_MEMORY) --llc-mshr-refill $(LLC_MSHR_REFILL) $(PERF_ARGS) --target systemverilog --split-verilog
 	if [ -f "$(BUILD_DIR_L2OPENLLC)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2OPENLLC)/TestTop.sv.conf" "$(BUILD_DIR_L2OPENLLC)"; fi
+
+# CHIRRTL (.fir) emission for the gsim backend (same knobs as above).
+# gsim compiles mem/smem natively, so no repl-seq-mem / mem_gen step here.
+BUILD_DIR_L2OPENLLC_FIR = ./build/l2openllc$(if $(TAG),_$(TAG),)_fir
+
+test-top-l2openllc-fir: NUM_SLICE = 2
+test-top-l2openllc-fir:
+	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2OpenLLC -td $(BUILD_DIR_L2OPENLLC_FIR) --l2 $(NUM_L2) --slices $(NUM_SLICE) --tshrs $(NUM_TSHR) --l2-sets $(L2_SETS) --l2-ways $(L2_WAYS) --l2-replacement $(L2_REPLACEMENT) --llc-sets $(LLC_SETS) --llc-ways $(LLC_WAYS) --llc-banks $(LLC_BANKS) --llc-mshr-memory $(LLC_MSHR_MEMORY) --llc-mshr-refill $(LLC_MSHR_REFILL) $(PERF_ARGS) --target chirrtl
 
 # per-L2 node IDs; CHI_NIDS is a comma list with one value per L2 (default
 # 0,1,2,...); CCHI_UPSTREAM is the per-L2 upstream CCHI port table spec

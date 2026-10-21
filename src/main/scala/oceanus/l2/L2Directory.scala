@@ -3,7 +3,7 @@ package oceanus.l2
 import chisel3._
 import chisel3.util._
 import utility._
-import utility.sram.SRAMTemplate
+import utility.sram.{SRAMTemplate, SramBroadcastBundle}
 import oceanus.l2._
 import oceanus.compactchi._
 import org.chipsalliance.cde.config.{Field, Parameters}
@@ -175,6 +175,54 @@ object PLRU4 {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// DRRIP: 2-bit RRPV per way, generic way count (selected by
+// L2Params.replacement = "drrip"). Mirrors coupledL2's StaticRRIP
+// (coupledL2/utils/Replacer.scala) collapsed onto this directory's two
+// update events (DirRd hit / successful ReplRd refill): coupledL2's
+// SRRIP/BRRIP differ only on release-type updates, which do not exist at
+// this interface, so its PSEL/SDM dueling collapses away — a demand refill
+// inserts at RRPV 0 exactly as coupledL2's non-prefetch refill does.
+// ══════════════════════════════════════════════════════════════════════
+
+object DRRIP {
+  def nBits(ways: Int) = 2 * ways
+
+  // Victim: way with the maximum RRPV (least re-referenced); ties break to
+  // the lowest way index (mirrors coupledL2 get_replace_OH + MaskToOH).
+  def getReplaceWay(state: UInt, ways: Int): UInt = {
+    val rrpv = VecInit((0 until ways).map(i => state(2 * i + 1, 2 * i)))
+    val isMax = VecInit(rrpv.map(e => !VecInit(rrpv.map(o => o > e)).asUInt.orR))
+    PriorityEncoder(isMax.asUInt)
+  }
+
+  // DirRd hit: promote the hit way to MRU (RRPV 0); other ways unchanged.
+  def getNextStateHit(state: UInt, way: UInt, ways: Int): UInt = {
+    val next = Wire(Vec(ways, UInt(2.W)))
+    next := state.asTypeOf(Vec(ways, UInt(2.W)))
+    next(way) := 0.U
+    next.asUInt
+  }
+
+  // Successful refill: insert the new line at RRPV 0 (coupledL2's
+  // non-prefetch refill insertion). When the victim held a valid line (a
+  // real eviction, not a fill of an Invalid slot), age all other ways by
+  // (3 - victim's old RRPV) — coupledL2's `increcement` rule. In the
+  // undiverted path the victim is always the RRPV-max way, so other ways
+  // (all <= max) saturate at exactly 3 and never wrap. Corner: when the
+  // lock mask diverts the victim to a non-max way, a true-max way can
+  // wrap 3->small (upstream-identical formula; rare — needs same-set
+  // concurrent refills; see OCEANUS_L2_DRRIP_REVIEW.md T-3).
+  def getNextStateRefill(state: UInt, way: UInt, victimValid: Bool, ways: Int): UInt = {
+    val cur = VecInit((0 until ways).map(i => state(2 * i + 1, 2 * i)))
+    val inc = 3.U(2.W) - cur(way)
+    val next = Wire(Vec(ways, UInt(2.W)))
+    for (i <- 0 until ways)
+      next(i) := Mux(i.U === way, 0.U, Mux(victimValid, cur(i) + inc, cur(i)))
+    next.asUInt
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // Directory (with integrated arbiter)
 // ══════════════════════════════════════════════════════════════════════
 //
@@ -189,12 +237,14 @@ object PLRU4 {
 //   cycle (N+1) so the bitmask write has landed and later reads will hit.
 // Resp: driven at S3, routed one-to-one to fromDir(s3_tshr).
 //
-// replStall (internal): any in-flight PLRU writer blocks new ReplRd
-//   grants, closing the PLRU register S3-write/S1-read RAW window.
+// replStall (internal): any in-flight replacement-state writer blocks new
+//   ReplRd grants, closing the replRegs S3-write/S1-read RAW window.
 
 class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val MAX_AGE = 15.U(4.W)
   val idxW    = log2Ceil(nMSHR)
+  // Replacement state width: 2 bits/way RRPV under DRRIP; PLRU uses the low 3.
+  val replBits = DRRIP.nBits(paramL2.ways) // >= 4 for ways >= 2; covers PLRU4.nBits
   private val enableDirStateProbe = p(L2SliceDirStateProbeEnableKey)
   private val enableDirPlruProbe = p(L2SliceDirPlruProbeEnableKey)
   private val blockRefillFaultMode = p(L2DirectoryBlockRefillFaultModeKey).U(2.W)
@@ -215,18 +265,18 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     } else {
       None
     }
-    val debugPlru = if (enableDirPlruProbe) {
+    val debugRrip = if (enableDirPlruProbe) {
       Some(Output(new Bundle {
         val valid = Bool()
         val set = UInt(setBits.W)
-        val state = UInt(PLRU4.nBits.W)
+        val state = UInt(replBits.W)
         val s3Valid = Bool()
         val s3Tshr = UInt(mshrIndexWidth.W)
         val s3IsDirRd = Bool()
         val s3IsRepl = Bool()
         val wayS3 = UInt(wayBits.W)
-        val s3Plru = UInt(PLRU4.nBits.W)
-        val currentSetPlru = UInt(PLRU4.nBits.W)
+        val s3Rrip = UInt(replBits.W)
+        val currentSetRrip = UInt(replBits.W)
       }))
     } else {
       None
@@ -247,7 +297,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
         val hasInvalid = Bool()
         val invalidWay = UInt(wayBits.W)
         val hitWay = UInt(wayBits.W)
-        val plruWay = UInt(wayBits.W)
+        val replWay = UInt(wayBits.W)
         val chosenWay = UInt(wayBits.W)
         val victimWay = UInt(wayBits.W)
         val blockRefillMaskS2 = UInt(paramL2.ways.W)
@@ -261,7 +311,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
         val rrReplRd = UInt(log2Ceil(paramL2.mshrSize).W)
         val rrDirWb = UInt(log2Ceil(paramL2.mshrSize).W)
         val rrDirRd = UInt(log2Ceil(paramL2.mshrSize).W)
-        val plruRegs = Vec(paramL2.sets, UInt(PLRU4.nBits.W))
+        val replRegs = Vec(paramL2.sets, UInt(replBits.W))
       }))
     } else {
       None
@@ -270,14 +320,24 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
 
   val sets = paramL2.sets
   val ways = paramL2.ways
-  require(ways == 4, "Directory uses PLRU4 hardwired for 4 ways")
+  val useDRRIP = paramL2.replacement == "drrip"
+  require(paramL2.replacement == "plru" || useDRRIP,
+    s"Directory: unknown replacement policy '${paramL2.replacement}'")
+  require(isPow2(ways) && ways >= 2,
+    s"Directory: ways must be a power of two >= 2, got $ways")
+  require(useDRRIP || ways == 4,
+    "Directory: PLRU policy is hardwired for 4 ways (use replacement=\"drrip\" for other way counts)")
 
-  // ── SRAM + PLRU ───────────────────────────────────────────────────
+  // ── SRAM + replacement state ────────────────────────────────────────
   val dirArray = Module(new SRAMTemplate(
     gen = new L2Directory.DirEntry, set = sets, way = ways,
     singlePort = true, useBitmask = true, hasMbist = paramL2.hasMbist
   ))
-  val plruRegs = RegInit(VecInit(Seq.fill(sets)(0.U(PLRU4.nBits.W))))
+  // No top-level broadcast source in a standalone L2; tie off the mbist
+  // broadcast IO that SRAMTemplate exposes when hasMbist is set.
+  dirArray.io.broadcast.foreach(_ := 0.U.asTypeOf(new SramBroadcastBundle))
+  // Replacement state registers (see replBits above).
+  val replRegs = RegInit(VecInit(Seq.fill(sets)(0.U(replBits.W))))
   // Refill lock table: one slot per TSHR, indexed directly by TSHR ID (at most
   // one outstanding refill lock per TSHR by construction). pendClear* is the
   // 1-deep pending-clear register: a lock is released one cycle after the
@@ -392,7 +452,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val reqTag = winReq.PADDR(paramL2.physicalAddrWidth - 1, offsetBits + setBits)
 
   val dirReadData_s2 = dirArray.io.r(isRead, reqSet).resp.data
-  val plruState_s1   = plruRegs(reqSet)
+  val replState_s1   = replRegs(reqSet)
 
   // ── S1 → S2 ───────────────────────────────────────────────────────
   val s2_valid   = RegNext(isRead,        false.B)
@@ -401,7 +461,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val s2_tshr    = RegNext(winReq.TSHRID, 0.U)
   val s2_set     = RegNext(reqSet,        0.U)
   val s2_tag     = RegNext(reqTag,        0.U)
-  val s2_plru    = RegNext(plruState_s1,  0.U)
+  val s2_repl    = RegNext(replState_s1,  0.U)
 
   // ── S2 → S3 ───────────────────────────────────────────────────────
   val s3_valid   = RegNext(s2_valid,   false.B)
@@ -410,7 +470,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val s3_tshr    = RegNext(s2_tshr,    0.U)
   val s3_set     = RegNext(s2_set,     0.U)
   val s3_tag     = RegNext(s2_tag,     0.U)
-  val s3_plru    = RegNext(s2_plru,    0.U)
+  val s3_repl    = RegNext(s2_repl,    0.U)
 
   // ══════════════════════════════════════════════════════════════════
   // DirWb: bitmask partial write at S1
@@ -474,7 +534,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     freeWayMask_s3 := freeWayMask_s2
   }
 
-  // replStall: any in-flight PLRU writer blocks new ReplRd grant.
+  // replStall: any in-flight replacement-state writer blocks new ReplRd grant.
   replStall :=
     (s2_valid && s2_isRepl) ||
     (s3_valid && s3_isRepl) ||
@@ -484,8 +544,9 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val invalidVec = VecInit(dirData_s3.map(_.meta.state === L2Directory.MetaState.I))
   val hasInvalid = invalidVec.asUInt.orR
   val invalidWay = PriorityEncoder(invalidVec)
-  val plruWay    = PLRU4.getReplaceWay(s3_plru)
-  val chosenWay  = Mux(hasInvalid, invalidWay, plruWay)
+  val replWay    = if (useDRRIP) DRRIP.getReplaceWay(s3_repl, ways)
+                   else            PLRU4.getReplaceWay(s3_repl(PLRU4.nBits - 1, 0))
+  val chosenWay  = Mux(hasInvalid, invalidWay, replWay)
 
   val victimMask_s3 = freeWayMask_s3
 
@@ -504,10 +565,27 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
       "Directory: read response entry is Invalid but carries client presence")
   }
 
-  val plruWen = (s3_valid && s3_isDirRd && hit_s3) ||
+  val replWen = (s3_valid && s3_isDirRd && hit_s3) ||
                 (s3_valid && s3_isRepl && !replRetry)
-  when(plruWen) {
-    plruRegs(s3_set) := PLRU4.getNextState(s3_plru, way_s3)
+  // Next replacement state, policy-selected at elaboration: DRRIP promotes
+  // on hit and inserts-at-0 with aging on valid eviction; PLRU marks the
+  // touched way MRU. A DirRd miss and a retried ReplRd never update.
+  val replNextState = Wire(UInt(replBits.W))
+  if (useDRRIP) {
+    // Aging applies only when the actually-selected victim held a valid
+    // line (a real eviction); filling an Invalid slot does not age. The
+    // actual victim entry is used (not hasInvalid): the lock-mask fallback
+    // in victimWay can divert the pick from an Invalid candidate to a
+    // valid way.
+    val victimHoldsValid = entry_s3.meta.state =/= L2Directory.MetaState.I
+    replNextState := Mux(s3_isDirRd,
+      DRRIP.getNextStateHit(s3_repl, way_s3, ways),
+      DRRIP.getNextStateRefill(s3_repl, way_s3, victimHoldsValid, ways))
+  } else {
+    replNextState := PLRU4.getNextState(s3_repl(PLRU4.nBits - 1, 0), way_s3).pad(replBits)
+  }
+  when(replWen) {
+    replRegs(s3_set) := replNextState
   }
 
   // Pending-clear application (one cycle after the release grant): the ONLY
@@ -555,16 +633,16 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   }
 
   if (enableDirPlruProbe) {
-    io.debugPlru.get.valid := plruWen
-    io.debugPlru.get.set := s3_set
-    io.debugPlru.get.state := Mux(plruWen, PLRU4.getNextState(s3_plru, way_s3), s3_plru)
-    io.debugPlru.get.s3Valid := s3_valid
-    io.debugPlru.get.s3Tshr := s3_tshr
-    io.debugPlru.get.s3IsDirRd := s3_isDirRd
-    io.debugPlru.get.s3IsRepl := s3_isRepl
-    io.debugPlru.get.wayS3 := way_s3
-    io.debugPlru.get.s3Plru := s3_plru
-    io.debugPlru.get.currentSetPlru := plruRegs(s3_set)
+    io.debugRrip.get.valid := replWen
+    io.debugRrip.get.set := s3_set
+    io.debugRrip.get.state := Mux(replWen, replNextState, s3_repl)
+    io.debugRrip.get.s3Valid := s3_valid
+    io.debugRrip.get.s3Tshr := s3_tshr
+    io.debugRrip.get.s3IsDirRd := s3_isDirRd
+    io.debugRrip.get.s3IsRepl := s3_isRepl
+    io.debugRrip.get.wayS3 := way_s3
+    io.debugRrip.get.s3Rrip := s3_repl
+    io.debugRrip.get.currentSetRrip := replRegs(s3_set)
     io.debugRetry.get.replStall := replStall
     io.debugRetry.get.s2Valid := s2_valid
     io.debugRetry.get.s2Tshr := s2_tshr
@@ -579,7 +657,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     io.debugRetry.get.hasInvalid := hasInvalid
     io.debugRetry.get.invalidWay := invalidWay
     io.debugRetry.get.hitWay := hitWay
-    io.debugRetry.get.plruWay := plruWay
+    io.debugRetry.get.replWay := replWay
     io.debugRetry.get.chosenWay := chosenWay
     io.debugRetry.get.victimWay := victimWay
     io.debugRetry.get.blockRefillMaskS2 := blockRefillMask_s2
@@ -598,7 +676,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     io.debugRetry.get.rrReplRd := rrReplRd
     io.debugRetry.get.rrDirWb := rrDirWb
     io.debugRetry.get.rrDirRd := rrDirRd
-    io.debugRetry.get.plruRegs := plruRegs
+    io.debugRetry.get.replRegs := replRegs
   }
 
 
@@ -657,7 +735,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   assert(PopCount(Seq(grantReplRd, grantDirWb, grantDirRd)) <= 1.U,
     "Directory: multiple grants in one cycle")
   assert(!(grantReplRd && replStall),
-    "Directory: ReplRd granted while replStall (PLRU hazard)")
+    "Directory: ReplRd granted while replStall (replacement-state hazard)")
   // Functional requests ARE allowed at the directory ports during the power-on
   // init sweep; they are masked out of arbitration (anyReplRd/anyDirWb/anyDirRd
   // are qualified with !initActive) and simply wait until the sweep completes.
@@ -682,7 +760,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   XSPerfAccumulate("blockRefill_locked", PopCount(lockTable.map(_.valid)))
   XSPerfAccumulate("dirRd_hit",     s3_valid && s3_isDirRd && hit_s3)
   XSPerfAccumulate("dirRd_miss",    s3_valid && s3_isDirRd && !hit_s3)
-  XSPerfAccumulate("plru_upd",      plruWen)
+  XSPerfAccumulate("repl_upd",      replWen)
   XSPerfAccumulate("dir_init_active", initActive)
   XSPerfAccumulate("starve_wb",     wbStarved)
   XSPerfAccumulate("starve_rd",     rdStarved)
