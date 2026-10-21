@@ -151,6 +151,71 @@ test-top-l2multichi-matrix:
 	  done; \
 	done
 
+# Avocado DUT top: 4x L2 fixed, one CCHI Type-1 upstream + one packed CHI RN-F
+# downstream per L2 (packed pin named ..._flit), link/SYSCO/SACTIVE tied off
+# internally per the avocado contract. CHI_NIDS defaults to the mesh render's
+# RNFEESAM LDIDs 32,64,12,44; CCHI_NIDS to 0,1,2,3. CHI_MON (shared knob,
+# off|separate|packed|both) selects the mon_chi_rn{P}_* monitor taps, packed
+# by default here. Integration/smoke driver: test/scripts/avocado/boot_avocado.sh
+CCHI_NIDS ?=
+AVOCADO_ARGS = $(if $(CHI_NIDS),--chi-nids $(CHI_NIDS),) \
+				$(if $(CCHI_NIDS),--cchi-nids $(CCHI_NIDS),) \
+				$(if $(CHI_MON),--chi-mon $(CHI_MON),)
+BUILD_DIR_L2AVOCADO = ./build/l2avocado$(if $(TAG),_$(TAG),)
+
+test-top-l2avocado: NUM_SLICE = 2
+test-top-l2avocado:
+	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2Avocado -td $(BUILD_DIR_L2AVOCADO) --slices $(NUM_SLICE) $(PERF_ARGS) $(AVOCADO_ARGS) --target systemverilog --split-verilog
+	if [ -f "$(BUILD_DIR_L2AVOCADO)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2AVOCADO)/TestTop.sv.conf" "$(BUILD_DIR_L2AVOCADO)"; fi
+
+# Cornetto DUT top: 2x L2 fixed, one CCHI Type-1 upstream + one packed CHI RN-F
+# downstream per L2 (packed pin named ..._flit), link/SYSCO/SACTIVE tied off
+# internally per the cornetto contract. CHI_NIDS defaults to the mesh render's
+# RNFEESAM LDIDs 16,20; CCHI_NIDS to 0,1. CHI_MON (shared knob,
+# off|separate|packed|both) selects the mon_chi_rn{P}_* monitor taps, packed
+# by default here. Integration/smoke driver: test/scripts/cornetto/boot_cornetto.sh
+CORNETTO_ARGS = $(if $(CHI_NIDS),--chi-nids $(CHI_NIDS),) \
+				$(if $(CCHI_NIDS),--cchi-nids $(CCHI_NIDS),) \
+				$(if $(CHI_MON),--chi-mon $(CHI_MON),)
+BUILD_DIR_L2CORNETTO = ./build/l2cornetto$(if $(TAG),_$(TAG),)
+
+test-top-l2cornetto: NUM_SLICE = 2
+test-top-l2cornetto:
+	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2Cornetto -td $(BUILD_DIR_L2CORNETTO) --slices $(NUM_SLICE) $(PERF_ARGS) $(CORNETTO_ARGS) --target systemverilog --split-verilog
+	if [ -f "$(BUILD_DIR_L2CORNETTO)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2CORNETTO)/TestTop.sv.conf" "$(BUILD_DIR_L2CORNETTO)"; fi
+
+# Biscotto DUT top: 3x L2 fixed, one CCHI Type-1 upstream + one packed CHI RN-F
+# downstream per L2 (packed pin named ..._flit), link/SYSCO/SACTIVE tied off
+# internally per the biscotto contract. CHI_NIDS defaults to the mesh render's
+# RNFEESAM LDIDs 4,12,44; CCHI_NIDS to 0,1,2. CHI_MON (shared knob,
+# off|separate|packed|both) selects the mon_chi_rn{P}_* monitor taps, packed
+# by default here. Integration/smoke driver: test/scripts/biscotto/boot_biscotto.sh
+BISCOTTO_ARGS = $(if $(CHI_NIDS),--chi-nids $(CHI_NIDS),) \
+				$(if $(CCHI_NIDS),--cchi-nids $(CCHI_NIDS),) \
+				$(if $(CHI_MON),--chi-mon $(CHI_MON),)
+BUILD_DIR_L2BISCOTTO = ./build/l2biscotto$(if $(TAG),_$(TAG),)
+
+test-top-l2biscotto: NUM_SLICE = 2
+test-top-l2biscotto:
+	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2Biscotto -td $(BUILD_DIR_L2BISCOTTO) --slices $(NUM_SLICE) $(PERF_ARGS) $(BISCOTTO_ARGS) --target systemverilog --split-verilog
+	if [ -f "$(BUILD_DIR_L2BISCOTTO)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2BISCOTTO)/TestTop.sv.conf" "$(BUILD_DIR_L2BISCOTTO)"; fi
+
+# L2 x N + ZhuJiang interconnect DUT for the cohestra_v3 ARI Fuzz (Verilator
+# flow; integration/smoke driver: test/scripts/zhujiang/boot_zhujiang.sh). Per-L2 CHI
+# downstream node IDs are fixed to the ZhuJiang CC node IDs (see
+# $(BUILD_DIR_ZHUJIANG)/zj_topology.txt next to the RTL); CCHI_NIDS defaults to
+# 0,1,2,3. NUM_L2 defaults to 4 (1..4). CHI_MON (off|separate|packed|both)
+# selects the mon_chi_rn{P}_* monitor taps, packed by default.
+ZHUJIANG_ARGS = $(if $(CCHI_NIDS),--cchi-nids $(CCHI_NIDS),) \
+				$(if $(CHI_MON),--chi-mon $(CHI_MON),)
+BUILD_DIR_ZHUJIANG = ./build/zhujiang$(if $(TAG),_$(TAG),)
+
+test-top-zhujiang: NUM_L2 = 4
+test-top-zhujiang: NUM_SLICE = 2
+test-top-zhujiang:
+	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2ZhuJiang -td $(BUILD_DIR_ZHUJIANG) --l2 $(NUM_L2) --slices $(NUM_SLICE) $(PERF_ARGS) $(ZHUJIANG_ARGS) --target systemverilog --split-verilog
+	if [ -f "$(BUILD_DIR_ZHUJIANG)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_ZHUJIANG)/TestTop.sv.conf" "$(BUILD_DIR_ZHUJIANG)"; fi
+
 clean:
 	rm -rf ./build
 

@@ -1,0 +1,31 @@
+// Lint waivers for XSCache firtool-generated RTL.
+// Passed as an extra source file to the cohestra_v3 CUSTOM build (a .vlt on the
+// simulator command line needs no harness-side changes).
+`verilator_config
+
+lint_off -rule WIDTH
+lint_off -rule WIDTHEXPAND
+lint_off -rule WIDTHTRUNC
+lint_off -rule UNDRIVEN
+lint_off -rule UNUSEDSIGNAL
+lint_off -rule UNUSEDPARAM
+lint_off -rule SYNCASYNCNET
+lint_off -rule DECLFILENAME
+lint_off -rule INITIALDLY
+lint_off -rule COMBDLY
+lint_off -rule CASEINCOMPLETE
+lint_off -rule CASEOVERLAP
+lint_off -rule PINCONNECTEMPTY
+lint_off -rule PINMISSING
+lint_off -rule IMPORTSTAR
+lint_off -rule VARHIDDEN
+lint_off -rule BLKSEQ
+lint_off -rule MULTIDRIVEN
+lint_off -rule LATCH
+lint_off -rule GENUNNAMED
+lint_off -rule EOFNEWLINE
+lint_off -rule PKGNODECL
+lint_off -rule MODDUP
+lint_off -rule SELRANGE
+lint_off -rule LITENDIAN
+lint_off -rule ASCRANGE
