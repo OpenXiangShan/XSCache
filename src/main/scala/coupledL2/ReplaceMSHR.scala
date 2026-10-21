@@ -79,6 +79,12 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   val releaseSent = RegInit(false.B)
   val releaseAck = RegInit(false.B)
   val copyBackSent = RegInit(false.B)
+  // A Comp for an outstanding WriteEvictOrEvict means the HN did not keep a
+  // copy and never wants the data.  This must outlive the transient
+  // compAckPending: once the CompAck is accepted, a non-sticky cancel would
+  // let copyBackTaskValid fire again and push the abandoned beat with a DBID
+  // the HN may already have reassigned to another transaction.
+  val compReceived = RegInit(false.B)
   val releaseNeedsData = RegInit(false.B)
   val postSnoopToInval = RegInit(false.B)
   // Several same-line snoops can be reserved simultaneously: openLLC may have
@@ -112,44 +118,56 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   val captureFromDS = RegInit(false.B)
   val releaseTgtId = RegInit(0.U(NODEID_WIDTH.W))
   val releaseDbId = RegInit(0.U(DBID_WIDTH.W))
+  // Comp for WriteEvictOrEvict cancels CopyBackWrData and owes a CompAck.
+  // Kept until that CompAck is accepted, so the sidecar cannot retire first.
+  val compAckPending = RegInit(false.B)
 
-  // A victim-mode release is always data-bearing WriteBackFull with
-  // MemAttr.allocate, mirroring the baseline MSHR's WriteEvictOrEvict: every
-  // evicted line -- clean or dirty -- is pushed into the lower-level cache,
-  // so openLLC retains victim contents and later L2 misses can hit there
-  // instead of going to DRAM.  The DS snapshot needed for this is captured
-  // unconditionally via captureFromDS.
-  //
-  // A dirty writeback is *required* when the victim directory entry is dirty,
-  // or when the L1 actually returns ProbeAckData -- the L1 may hold dirty data
-  // while the L2 directory still shows clean (a store does not notify the L2
-  // until writeback).  The baseline MSHR mirrors this by setting meta.dirty on
-  // ProbeAckData; fixating needsData at alloc time would emit Evict (no data)
-  // for such victims and silently drop the dirty data.
+  // Victim-mode writeback follows the baseline MSHR opcode split.  Only a
+  // TIP/TRUNK victim that is dirty, or whose L1 actually returned
+  // ProbeAckData, is a data-bearing WriteBackFull.  The L1 may hold dirty
+  // data while the L2 directory still shows clean (a store does not notify
+  // the L2 until writeback); the baseline mirrors this by setting meta.dirty
+  // on ProbeAckData.  Everything else is WriteEvictOrEvict once CHI issue is
+  // at least E.b, and Evict before that.  The DS snapshot is still captured
+  // unconditionally via captureFromDS: a nested snoop may need it even when
+  // the lower-level release carries no data.
   val isCmoClean = mode === ReplaceMSHRMode.cmoClean
   val isCmoFlush = mode === ReplaceMSHRMode.cmoFlush
   val isCmoInval = mode === ReplaceMSHRMode.cmoInval
-  val victimAlwaysData = mode === ReplaceMSHRMode.victim
+  val isVictim = mode === ReplaceMSHRMode.victim
   // CBO.inval always evicts without data, even for a dirty line: the
   // invalidation discards the contents (RISC-V CMO semantics), mirroring the
   // baseline's isWriteBackFull, which excludes req_cboInval.  Keeping the two
   // sides consistent is essential -- a data-bearing opcode whose
   // needsCopyBack is false would retire the sidecar before CopyBackWrData,
   // leaving the L3 refill entry waiting for beats forever.
-  val needsData = victimAlwaysData || isCmoClean ||
+  val needsData = isCmoClean ||
     (!isCmoInval && (victim.meta.dirty || probeAckDataRecv))
+  // Baseline isWriteBackFull: TIP/TRUNK (state(1)) and dirty, including data
+  // the L1 returned.  Victim mode only; CMO opcodes stay as they are.
+  val victimWriteBackFull = isVictim && isT(victim.meta.state) &&
+    (victim.meta.dirty || probeAckDataRecv)
+  val victimWriteEvictOrEvict = isVictim && afterIssueEbOrElse(!victimWriteBackFull, false.B)
   // All valid replacement victims are captured, including clean ones. The
   // snapshot may be needed only by a later nested snoop; it does not force a
   // data-bearing lower-level release.
   val releaseBufRequired = captureFromDS || needsData
+  // Comp for WriteEvictOrEvict cancels the beat outright, including one a
+  // snoop starting this cycle would otherwise have deferred and revived.
+  // Withdrawing txdat.valid is enough: MSHRCtl drops a staged beat once the
+  // selected sidecar's valid falls.
+  val copyBackCancelled = compReceived || compAckPending ||
+    io.rxrsp.valid && io.rxrsp.bits.chiOpcode.get === Comp && victimWriteEvictOrEvict
   // Preserve the release's data obligation after a snoop changes the
   // protocol-visible victim state to I. CHI still requires an outstanding
-  // CopyBack flow to finish after CompDBIDResp.
+  // CopyBack flow to finish after CompDBIDResp.  A cancelled
+  // WriteEvictOrEvict has no such flow, so nothing may wait on copyBackDone.
   val activeReleaseNeedsData = Mux(releaseSent, releaseNeedsData, needsData)
-  val needsCopyBack = Mux(isCmoInval, false.B, activeReleaseNeedsData)
+  val needsCopyBack = Mux(isCmoInval, false.B, activeReleaseNeedsData) && !copyBackCancelled
   val releaseOpcode = Mux(isCmoClean, WriteCleanFull,
     Mux(isCmoInval, Evict,
-      Mux(needsData, WriteBackFull, Evict)))
+      Mux(victimWriteBackFull, WriteBackFull,
+        Mux(victimWriteEvictOrEvict, WriteEvictOrEvict, Evict))))
 
   when (io.alloc.valid) {
     assert(!valid, "replace context allocated while still valid")
@@ -167,6 +185,8 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     probeAckDataRecv := false.B
     releaseDataPending := false.B
     donePulse := false.B
+    compAckPending := false.B
+    compReceived := false.B
     mode := io.alloc.bits.mode
     needProbe := io.alloc.bits.needProbe
     probeParam := io.alloc.bits.probeParam
@@ -287,11 +307,13 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   releaseTask.fwdState.get := 0.U
   releaseTask.pCrdType.get := 0.U
   releaseTask.retToSrc.get := false.B
-  releaseTask.likelyshared.get := false.B
-  releaseTask.expCompAck.get := false.B
+  releaseTask.likelyshared.get := victimWriteEvictOrEvict && victim.meta.state === BRANCH
+  releaseTask.expCompAck.get := victimWriteEvictOrEvict
   releaseTask.allowRetry.get := false.B
   releaseTask.memAttr.get.cacheable := true.B
-  releaseTask.memAttr.get.allocate := !isCmoClean && !isCmoFlush && !isCmoInval && needsData
+  // WriteBackFull and WriteEvictOrEvict allocate; the pre-E.b Evict fallback
+  // and every CMO release do not.
+  releaseTask.memAttr.get.allocate := victimWriteBackFull || victimWriteEvictOrEvict
   releaseTask.memAttr.get.device := false.B
   releaseTask.memAttr.get.ewa := true.B
   releaseTask.traceTag.get := false.B
@@ -356,8 +378,19 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     (releaseTaskValid && mode =/= ReplaceMSHRMode.victim)
   io.tasks.mainpipe.bits := Mux(captureTaskValid, captureTask,
     Mux(copyBackTaskValid, copyBackTask, releaseTask))
-  io.tasks.txrsp.valid := false.B
-  io.tasks.txrsp.bits := 0.U.asTypeOf(io.tasks.txrsp.bits)
+  // Comp for WriteEvictOrEvict is the only response that owes CompAck.  The
+  // flit stays valid until TXRSP accepts it; retiring earlier would drop it.
+  val compAckRsp = io.tasks.txrsp.bits
+  compAckRsp := 0.U.asTypeOf(io.tasks.txrsp.bits.cloneType)
+  compAckRsp.tgtID := releaseTgtId
+  compAckRsp.srcID := 0.U
+  compAckRsp.txnID := releaseDbId
+  compAckRsp.dbID := 0.U
+  compAckRsp.opcode := CompAck
+  compAckRsp.resp := 0.U
+  compAckRsp.fwdState := 0.U
+  compAckRsp.traceTag := false.B
+  io.tasks.txrsp.valid := valid && compAckPending
 
   when (io.tasks.source_b.fire) {
     probeSent := true.B
@@ -365,7 +398,15 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   when (io.tasks.txreq.fire) {
     // Victim-mode writeback request left on the direct TXREQ path.
     releaseSent := true.B
-    releaseNeedsData := needsData
+    // needsData only tracks a writeback the directory forces. WriteEvictOrEvict
+    // carries data too: L3 replies CompDBIDResp on a local miss and then waits
+    // for CopyBackWrData. Latching needsData here would drop that beat and
+    // leave both the sidecar and the L3 refill entry waiting forever. Comp is
+    // what cancels it, through copyBackCancelled.
+    releaseNeedsData := needsData || victimWriteEvictOrEvict
+  }
+  when (io.tasks.txrsp.fire) {
+    compAckPending := false.B
   }
   when (io.tasks.txdat.fire) {
     // Victim-mode CopyBackWrData accepted into the TXDAT queue on the direct
@@ -378,7 +419,7 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
       captureIssued := true.B
     }.elsewhen (releaseTaskValid) {
       releaseSent := true.B
-      releaseNeedsData := needsData
+      releaseNeedsData := needsData || victimWriteEvictOrEvict
     }.elsewhen (copyBackTaskValid) {
       // CMO-mode copyback still travels via MainPipe.
       copyBackSent := true.B
@@ -452,6 +493,14 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
       releaseTgtId := io.rxrsp.bits.srcID.getOrElse(0.U)
       releaseDbId := io.rxrsp.bits.dbID.getOrElse(0.U)
     }
+    // WriteEvictOrEvict's Comp means the HN kept no copy: drop the CopyBack
+    // beat (txdat.valid falls through copyBackCancelled, which also drops a
+    // beat already staged in MSHRCtl) and answer with CompAck.  CompDBIDResp
+    // still wants the data and no CompAck.
+    when (io.rxrsp.bits.chiOpcode.get === Comp && victimWriteEvictOrEvict) {
+      compAckPending := true.B
+      compReceived := true.B
+    }
   }
   // An invalidating snoop that found no release in flight consumes the sidecar.
   // Retire in the same cycle, as before, unless another reserved response is
@@ -462,7 +511,7 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     valid := false.B
     victim.valid := false.B
     donePulse := true.B
-  }.elsewhen (valid && releaseAck && (!needsCopyBack || io.copyBackDone) &&
+  }.elsewhen (valid && releaseAck && !compAckPending && (!needsCopyBack || io.copyBackDone) &&
     !snoopInFlight && !io.snoopStarted) {
     when (needsCopyBack) {
       assert(copyBackSent, "CopyBackWrData completed without being issued by ReplaceMSHR")
