@@ -80,8 +80,8 @@ class L2PrefetchTlbIO(implicit val p: Parameters) extends Bundle {
   val pmp_resp = Flipped(new PMPRespBundle)
 }
 
-// Phase 1a reserves optional fork-compatible TLB/PMP and per-Type-1 training
-// ports. Translation stays idle (阶段 1c 接入); training context follows REQ.
+// Optional fork-compatible TLB/PMP and per-Type-1 training ports. Phase 1c-1
+// reserves tracked translation clients for the later VBOP/CDP integration.
 class L2Configuration(
   val nodeId: Int,
   val eSAM: Boolean,
@@ -146,13 +146,17 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     val chi = new CHIRNFInterface
   })
 
-  // 阶段 1c 接入: expose the exact fork bundle, with no translation producer
-  // yet. Accept and discard responses/PMP; idle requests have defined payload.
-  io.pfTlb.foreach { tlb =>
-    tlb.req.valid := false.B
-    tlb.req.bits := 0.U.asTypeOf(tlb.req.bits)
-    tlb.req_kill := false.B
-    tlb.resp.ready := true.B
+  // Intent (1c-1): connect the tracked adapter; future VBOP/CDP clients stay
+  // idle here until phase 3, while harnesses exercise the same adapter directly.
+  val pfTlbAdapter = if (config.pfTlbEnable) Some(Module(new L2PrefetchTlbAdapter)) else None
+  val pfTlbClients = pfTlbAdapter.map(_.io.clients)
+  pfTlbAdapter.foreach { adapter =>
+    io.pfTlb.get <> adapter.io.tlb
+    adapter.io.clients.foreach { client =>
+      client.req.valid := false.B
+      client.req.bits := 0.U
+      client.resp.ready := true.B
+    }
   }
   // Phase 1b: select the context from the same fired remote input as REQ;
   // the destination RBE samples it on that handshake without a port register.
@@ -218,6 +222,15 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   val bopControlEnable = if (config.pfCtrlEnable) {
     pfMasterEnable && io.pfCtrl.get.l2_pbop_en
   } else true.B
+  // Intent (1c-1): expose master-qualified controls for future VBOP/CDP modules.
+  val vbopControlEnable = WireDefault(if (config.pfCtrlEnable) {
+    pfMasterEnable && io.pfCtrl.get.l2_vbop_en
+  } else true.B)
+  val cdpControlEnable = WireDefault(if (config.pfCtrlEnable) {
+    pfMasterEnable && io.pfCtrl.get.l2_cdp_en
+  } else true.B)
+  dontTouch(vbopControlEnable)
+  dontTouch(cdpControlEnable)
   // dontTouch requires a signal even when the optional control port is absent.
   val delayLatency = WireDefault(if (config.pfCtrlEnable) io.pfCtrl.get.l2_pf_delay_latency else 0.U(10.W))
   dontTouch(delayLatency) // delay_latency is reserved for slice 4 queue control.
@@ -263,9 +276,13 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     sink.valid := source.io.bopTrain.valid
     sink.bits := source.io.bopTrain.bits
   }
-  bop.io.train.valid := bopTrainArb.io.out.valid
+  // Intent (1c-1): mirror reference MainPipe.scala:750-754 and
+  // Prefetcher.scala:346-348 PBOP needHint gating; absent sideband means enabled.
+  // Disabled events must still retire from the shared training arbiter.
+  val bopTrainEnabled = bopTrainArb.io.out.bits.trainEnable.getOrElse(true.B)
+  bop.io.train.valid := bopTrainArb.io.out.valid && bopTrainEnabled
   bop.io.train.bits := bopTrainArb.io.out.bits.paddr
-  bopTrainArb.io.out.ready := bop.io.train.ready
+  bopTrainArb.io.out.ready := !bopTrainEnabled || bop.io.train.ready
 
   // Internal Stash has no upstream completion; downstream IDs remain TSHR/slice IDs.
   // Source order is the policy boundary: receiver encodings precede PBOP/BOP,
