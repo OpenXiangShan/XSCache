@@ -1558,7 +1558,21 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
    * promoted to class 0 until it fires.
    */
   val mshrTask = Wire(Decoupled(new TaskBundle()))
-  val mshrTaskSources = mshrs.map(_.io.tasks.mainpipe) ++ replaceMshrs.map(_.io.tasks.mainpipe)
+  // The three context types share one MainPipe admission port, but their
+  // payloads are independent.  Group them so each group only arbitrates
+  // mshrsAll inputs and registers its winner; the cross-group stage then
+  // only sees three candidates.  This keeps the class masks, RR and payload
+  // mux at 16 inputs instead of 48 in a single cycle.
+  val mshrTaskGroups: Seq[Seq[DecoupledIO[TaskBundle]]] = Seq(
+    refillMshrs.map(_.io.tasks.mainpipe),
+    snoopMshrs.map(_.io.tasks.mainpipe),
+    replaceMshrs.map(_.io.tasks.mainpipe)
+  )
+  require(mshrTaskGroups.map(_.size).distinct.size == 1,
+    "all MSHR context types must have the same number of slots")
+  val nMshrTaskGroups = mshrTaskGroups.size
+  val mshrTaskGroupSize = mshrTaskGroups.head.size
+  val mshrTaskSources = mshrTaskGroups.flatten
   val nMshrTaskSrc = mshrTaskSources.size
   def isGrantOp(op: UInt) = op === TLMessages.Grant || op === TLMessages.GrantData ||
     op === TLMessages.AccessAckData || op === TLMessages.HintAck
@@ -1587,35 +1601,111 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     Mux(w === 63.U, 0.U(3.W), c)
   }
   val mshrTaskSrcValids = VecInit(mshrTaskSources.map(_.valid)).asUInt
-  val mshrTaskClassMasks = VecInit((0 until 5).map { c =>
-    VecInit((0 until nMshrTaskSrc).map(i => mshrTaskSrcValids(i) && mshrTaskEffClasses(i) === c.U)).asUInt
-  })
-  val mshrTaskBestClass = PriorityEncoder(VecInit(mshrTaskClassMasks.map(_.orR)).asUInt)
-  val mshrTaskCandidates = VecInit((0 until nMshrTaskSrc).map { i =>
-    mshrTaskSrcValids(i) && mshrTaskEffClasses(i) === mshrTaskBestClass
-  }).asUInt
-  // round-robin within the best class (same scheme as FastArbiter)
-  val mshrTaskChosenOH = Wire(UInt(nMshrTaskSrc.W))
-  val mshrTaskRrGrantMask = RegInit(0.U(nMshrTaskSrc.W))
-  val mshrTaskRrCandidates = mshrTaskRrGrantMask & mshrTaskCandidates
-  val mshrTaskRrSelOH = MaskToOH(mshrTaskRrCandidates)
-  val mshrTaskFirstOneOH = MaskToOH(mshrTaskCandidates)
-  val mshrTaskRrValid = mshrTaskRrCandidates.orR
-  mshrTaskChosenOH := Mux(mshrTaskRrValid, mshrTaskRrSelOH, mshrTaskFirstOneOH)
-  when(mshrTask.fire) {
-    mshrTaskRrGrantMask := Mux(mshrTaskRrValid,
-      LowerMaskPrefix(mshrTaskRrCandidates), LowerMaskPrefix(mshrTaskCandidates))
+
+  // Per-group arbitration: best effective class, then round-robin inside it.
+  val mshrTaskGroupOffsets = mshrTaskGroups.scanLeft(0)(_ + _.size).take(nMshrTaskGroups)
+  def groupOf(g: Int) = mshrTaskGroups(g)
+  def groupValids(g: Int): UInt = {
+    val base = mshrTaskGroupOffsets(g)
+    VecInit((0 until mshrTaskGroupSize).map(i => mshrTaskSrcValids(base + i))).asUInt
   }
-  val mshrTaskChosen = OHToUInt(mshrTaskChosenOH)
-  mshrTask.valid := mshrTaskCandidates.orR
-  // The selected source is already encoded as a binary index. Using it to
-  // index a payload Vec preserves the same source choice and cycle while
-  // exposing a balanced mux structure to synthesis.
-  val mshrTaskPayloads = VecInit(mshrTaskSources.map(_.bits))
-  mshrTask.bits := Mux(mshrTask.valid, mshrTaskPayloads(mshrTaskChosen),
-    0.U.asTypeOf(new TaskBundle))
-  mshrTaskSources.zip(mshrTaskChosenOH.asBools).foreach { case (s, g) =>
-    s.ready := g && mshrTask.ready
+  def groupClasses(g: Int): Vec[UInt] = {
+    val base = mshrTaskGroupOffsets(g)
+    VecInit((0 until mshrTaskGroupSize).map(i => mshrTaskEffClasses(base + i)))
+  }
+  def groupBestClass(g: Int): UInt = {
+    val v = groupValids(g)
+    val cs = groupClasses(g)
+    PriorityEncoder(VecInit((0 until 5).map(c =>
+      (v & VecInit(cs.map(_ === c.U)).asUInt).orR)).asUInt)
+  }
+  def groupCandidates(g: Int): UInt = {
+    val v = groupValids(g)
+    val cs = groupClasses(g)
+    val bc = groupBestClass(g)
+    v & VecInit(cs.map(_ === bc)).asUInt
+  }
+  val mshrTaskGroupRrMask = Seq.fill(nMshrTaskGroups)(RegInit(0.U(mshrTaskGroupSize.W)))
+  val mshrTaskGroupRrCand = (0 until nMshrTaskGroups).map(g => mshrTaskGroupRrMask(g) & groupCandidates(g))
+  val mshrTaskGroupSelOH = (0 until nMshrTaskGroups).map { g =>
+    Mux(mshrTaskGroupRrCand(g).orR, MaskToOH(mshrTaskGroupRrCand(g)),
+      MaskToOH(groupCandidates(g)))
+  }
+  val mshrTaskGroupSelIdx = mshrTaskGroupSelOH.map(OHToUInt(_))
+  // Registered arbitration decision.  The choice is made from this cycle's
+  // valids and classes, but the source is consumed only when mshrTask
+  // actually fires, so every MSHR evaluates its ordering guards in the same
+  // cycle the task leaves.  A source that withdraws before the grant
+  // invalidates the decision instead of issuing a stale task.
+  val mshrTaskGroupValid = Seq.fill(nMshrTaskGroups)(RegInit(false.B))
+  val mshrTaskGroupClass = Seq.fill(nMshrTaskGroups)(RegInit(0.U(3.W)))
+  val mshrTaskGroupIdx = Seq.fill(nMshrTaskGroups)(RegInit(0.U(log2Up(mshrTaskGroupSize).W)))
+  // A held decision blocks its group until the cross-group stage drains it.
+  // Promote it after the same 63-cycle bound as a source so a low-class
+  // decision cannot hold back a promoted source behind it.
+  val mshrTaskGroupWait = Seq.fill(nMshrTaskGroups)(RegInit(0.U(6.W)))
+  val mshrTaskGroupClassEff = (0 until nMshrTaskGroups).map { g =>
+    Mux(mshrTaskGroupWait(g) === 63.U, 0.U(3.W), mshrTaskGroupClass(g))
+  }
+  val mshrTaskGroupSrcValid = (0 until nMshrTaskGroups).map { g =>
+    VecInit(groupOf(g).map(_.valid))(mshrTaskGroupIdx(g))
+  }
+  val mshrTaskGroupReady = (0 until nMshrTaskGroups).map { g =>
+    mshrTaskGroupValid(g) && mshrTaskGroupSrcValid(g)
+  }
+
+  // Cross-group arbitration over the three held decisions.
+  val mshrTaskFinalClassMasks = (0 until 5).map { c =>
+    VecInit((0 until nMshrTaskGroups).map(g => mshrTaskGroupReady(g) && mshrTaskGroupClassEff(g) === c.U)).asUInt
+  }
+  val mshrTaskFinalBestClass = PriorityEncoder(VecInit(mshrTaskFinalClassMasks.map(_.orR)).asUInt)
+  val mshrTaskFinalCandidates = VecInit((0 until nMshrTaskGroups).map(g =>
+    mshrTaskGroupReady(g) && mshrTaskGroupClassEff(g) === mshrTaskFinalBestClass)).asUInt
+  val mshrTaskFinalRrMask = RegInit(0.U(nMshrTaskGroups.W))
+  val mshrTaskFinalRrCand = mshrTaskFinalRrMask & mshrTaskFinalCandidates
+  val mshrTaskFinalSelOH = Mux(mshrTaskFinalRrCand.orR, MaskToOH(mshrTaskFinalRrCand),
+    MaskToOH(mshrTaskFinalCandidates))
+  val mshrTaskGroupSelBits = mshrTaskGroups.zip(mshrTaskGroupIdx).map { case (srcs, idx) =>
+    VecInit(srcs.map(_.bits))(idx)
+  }
+  mshrTask.valid := mshrTaskFinalCandidates.orR
+  mshrTask.bits := Mux(mshrTask.valid,
+    Mux1H(mshrTaskFinalSelOH, mshrTaskGroupSelBits),
+    0.U.asTypeOf(new TaskBundle()))
+  // Every group has mshrsAll slots, so the decided index is the physical
+  // MSHR id for refill, snoop and replace alike.
+  mshrTask.bits.mshrId := Mux1H(mshrTaskFinalSelOH, mshrTaskGroupIdx)
+  mshrTask.bits.qosClass := mshrTaskFinalBestClass
+  assert(!mshrTask.valid ||
+    mshrTaskFinalBestClass === Mux1H(mshrTaskFinalSelOH, mshrTaskGroupClassEff),
+    "selected task must belong to the best effective QoS class")
+
+  (0 until nMshrTaskGroups).foreach { g =>
+    val load = (!mshrTaskGroupValid(g) || (mshrTask.fire && mshrTaskFinalSelOH(g))) &&
+      groupCandidates(g).orR
+    when(load) {
+      mshrTaskGroupValid(g) := true.B
+      mshrTaskGroupClass(g) := groupBestClass(g)
+      mshrTaskGroupIdx(g) := mshrTaskGroupSelIdx(g)
+      mshrTaskGroupWait(g) := 0.U
+      mshrTaskGroupRrMask(g) := Mux(mshrTaskGroupRrCand(g).orR,
+        LowerMaskPrefix(mshrTaskGroupRrCand(g)), LowerMaskPrefix(groupCandidates(g)))
+    }.elsewhen(mshrTask.fire && mshrTaskFinalSelOH(g)) {
+      mshrTaskGroupValid(g) := false.B
+      mshrTaskGroupWait(g) := 0.U
+    }.elsewhen(mshrTaskGroupValid(g) && !mshrTaskGroupSrcValid(g)) {
+      mshrTaskGroupValid(g) := false.B
+      mshrTaskGroupWait(g) := 0.U
+    }.elsewhen(mshrTaskGroupValid(g)) {
+      mshrTaskGroupWait(g) := Mux(mshrTaskGroupWait(g) === 63.U, 63.U, mshrTaskGroupWait(g) + 1.U)
+    }
+    groupOf(g).zipWithIndex.foreach { case (s, i) =>
+      s.ready := mshrTask.fire && mshrTaskFinalSelOH(g) && mshrTaskGroupIdx(g) === i.U
+    }
+  }
+  when(mshrTask.fire) {
+    mshrTaskFinalRrMask := Mux(mshrTaskFinalRrCand.orR,
+      LowerMaskPrefix(mshrTaskFinalRrCand), LowerMaskPrefix(mshrTaskFinalCandidates))
   }
   ArbPerf(mshrTaskSources.map(_.valid), mshrTaskSources.map(_.ready), mshrTask.ready, "mshr_task_arb")
   XSPerfAccumulate(
@@ -1649,24 +1739,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   XSPerfAccumulate("qos_starve_promote_cnt",
     PopCount(Cat((0 until nMshrTaskSrc).map(i =>
       mshrTaskSrcValids(i) && mshrTaskWaitCnt(i) === 63.U))))
-  // The arbiter input list contains two contexts per physical entry followed
-  // by the replace sidecars. RequestArb and all refill/release buffers still
-  // use the physical MSHR index, so translate the selected context index here.
-  val selectedTaskPhysicalId = Wire(UInt(mshrBits.W))
-  when(mshrTaskChosen < (2 * mshrsAll).U) {
-    selectedTaskPhysicalId := mshrTaskChosen >> 1
-  }.otherwise {
-    selectedTaskPhysicalId := mshrTaskChosen - (2 * mshrsAll).U
-  }
+  // The groups all have mshrsAll slots, so the cross-group winner already
+  // carries its physical MSHR id in mshrTaskGroupIdx; no index translation
+  // is needed here.
   io.mshrTask <> mshrTask
-  io.mshrTask.bits.mshrId := selectedTaskPhysicalId
-  // Every RR candidate belongs to this effective class. Bypass the selected
-  // payload mux so RequestArb's background gate does not feed ready through it.
-  io.mshrTask.bits.qosClass := mshrTaskBestClass
-  when(mshrTask.valid) {
-    assert(mshrTaskBestClass === Mux1H(mshrTaskChosenOH, mshrTaskEffClasses),
-      "selected task must belong to the best effective QoS class")
-  }
 
   /* releaseBuf link to MSHR id */
   // ReleaseBuf is owned by the replace sidecar and the snoop context only;
