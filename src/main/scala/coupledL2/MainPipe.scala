@@ -70,6 +70,9 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     /* send task to MSHRCtl at stage 3 */
     val toMSHRCtl = new Bundle() {
       val mshr_alloc_s3 = ValidIO(new MSHRRequest())
+      // Replacement metadata can synthesize a logical snoop hit even when
+      // Directory misses. Only the original hit owns the reported DS way.
+      val snoopDirectoryHit = Output(Bool())
       // ReplaceMSHR's internal DS-capture task reaches ReleaseBuf in S5.
       // Allocation/arbiter acceptance alone is not sufficient evidence that
       // the old line is available for a following writeback.
@@ -438,6 +441,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     !io.toMSHRCtl.mshr_alloc_s3.valid || !sinkC_req_s3,
     "a SinkC Release( Data ) must not allocate a normal or snoop MSHR"
   )
+  io.toMSHRCtl.snoopDirectoryHit := dirResult_s3.hit
   io.toMSHRCtl.mshr_alloc_s3.bits.dirResult := nestable_dirResult_s3
   io.toMSHRCtl.mshr_alloc_s3.bits.state := alloc_state
   io.toMSHRCtl.mshr_alloc_s3.bits.task match { case task =>

@@ -37,6 +37,7 @@ class RXSNP(
     val refillInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo())))
     val snoopInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo())))
     val replaceInfo = Vec(mshrsAll, Flipped(ValidIO(new ReplaceMSHRInfo)))
+    val replaceAlloc = Vec(4, Flipped(ValidIO(new ReplacementAllocAddress)))
   })
 
   val rxsnp = Wire(io.rxsnp.cloneType)
@@ -118,7 +119,10 @@ class RXSNP(
     !s.bits.willFree
   )).asUInt
   val replaceBlockSnp = replaceBlockSnpMask.orR
-  val sidecarBlockSnpMask = VecInit(io.replaceInfo.map(s =>
+  // Share the same-line sidecar compare between the nest and block paths.
+  // Both feed the same-cycle RXSNP admission cone, so this is a pure
+  // combinational factoring with no handshake or protocol latency change.
+  val sidecarLineMask = VecInit(io.replaceInfo.map(s =>
     s.valid && s.bits.set === task.set && s.bits.tag === task.tag
   )).asUInt
 
@@ -127,11 +131,11 @@ class RXSNP(
   // releaseStarted is not a blocking boundary. Only a CopyBackWrData already
   // issued to MainPipe is immutable; wait for its final data beat in that
   // narrow interval.
-  val sidecarNestSnpMask = VecInit(io.replaceInfo.map(s =>
-      s.valid && s.bits.set === task.set && s.bits.tag === task.tag &&
-      s.bits.probeDone && s.bits.releaseBufReady &&
+  val sidecarNestReadyMask = VecInit(io.replaceInfo.map(s =>
+    s.bits.probeDone && s.bits.releaseBufReady &&
       (!s.bits.releaseStarted || !s.bits.copyBackIssued)
   )).asUInt
+  val sidecarNestSnpMask = sidecarLineMask & sidecarNestReadyMask
 
   // A same-line snoop during a CMO is serviced by the CMO sidecar's ReleaseBuf
   // snapshot whenever nesting applies, so the CMO block yields to nesting.
@@ -190,7 +194,13 @@ class RXSNP(
   val snoopContextBlock = VecInit(io.snoopInfo.map(s =>
     s.valid && s.bits.blocksSnoop && s.bits.set === task.set && s.bits.reqTag === task.tag
   )).asUInt.orR
-  val sidecarBlockSnp = (sidecarBlockSnpMask & ~sidecarNestSnpMask).orR
+  // Allocation-stage victims cannot nest yet. Compare each origin address
+  // before its control mux and physical slot selection, then OR the block.
+  val allocatingSidecarBlockSnp = VecInit(io.replaceAlloc.map(s =>
+    s.valid && s.bits.set === task.set && s.bits.tag === task.tag
+  )).asUInt.orR
+  val sidecarBlockSnp = (sidecarLineMask & ~sidecarNestSnpMask).orR ||
+    allocatingSidecarBlockSnp
   val stall = reqBlockSnp || replaceBlockSnp || cmoBlockSnp || sidecarBlockSnp || snoopContextBlock
   io.task.valid := rxsnp.valid && !stall
   io.task.bits := task
@@ -215,9 +225,10 @@ class RXSNP(
     task.channel := "b010".U
     // Addr in CHI SNP channel has 3 fewer bits than full address
     val snpFullAddr = Cat(snp.addr, 0.U(3.W))
-    task.tag := parseAddress(snpFullAddr)._1
-    task.set := parseAddress(snpFullAddr)._2
-    task.off := parseAddress(snpFullAddr)._3
+    val snpAddress = parseAddress(snpFullAddr)
+    task.tag := snpAddress._1
+    task.set := snpAddress._2
+    task.off := snpAddress._3
     task.alias.foreach(_ := 0.U)
     task.vaddr.foreach(_ := 0.U)
     task.isKeyword.foreach(_ := false.B)

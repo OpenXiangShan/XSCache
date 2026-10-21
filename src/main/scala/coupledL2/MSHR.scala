@@ -96,6 +96,9 @@ class MSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   // Replace transaction control. RefillBuf remains owned by this normal MSHR;
   // the delegated victim uses another physical slot and its ReleaseBuf.
   val replaceActive = Input(Bool())
+  // Only registered, epoch-matched child ownership, without a same-cycle
+  // allocation intent. A finished child must permit a later replacer lookup.
+  val replaceLive = Input(Bool())
   // Accepted child ownership, separate from replaceActive's same-cycle
   // arbitration intent. Only this notification may latch delegation.
   val replaceAccepted = Input(Bool())
@@ -680,7 +683,15 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     afterIssueCOrElse(state.w_grantfirst, state.w_grantlast)
   val wcompack_valid = !state.s_wcompack.get && state.s_rcompack.get // wcompack can only be sent after rcompack
   io.tasks.txrsp.valid := rcompack_valid || wcompack_valid
-  io.tasks.source_b.valid := !sidecarOwnsVictim && (!state.s_pprobe || !state.s_rprobe)
+  // Suppress a parent Probe before child acceptance using local event fences,
+  // rather than the victim-tag/physical-slot allocation cone. These fences
+  // only postpone acceptance; the existing Probe state remains pending.
+  val probeAdmissionBlocked = sidecarDelegatedLatched || io.replResp.valid ||
+    io.nestedwb.c_set_dirty || (req_valid && cmo_cbo && dirResult.hit && !state.s_release)
+  io.tasks.source_b.valid := !probeAdmissionBlocked && (!state.s_pprobe || !state.s_rprobe)
+  when(io.tasks.source_b.fire) {
+    assert(!sidecarOwnsVictim, "normal Probe cannot race victim delegation")
+  }
   // The direct TXDAT path is ReplaceMSHR-only; the normal context's
   // CopyBackWrData keeps its mainpipe pass.
   io.tasks.txdat.valid := false.B
@@ -730,7 +741,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   val replReadTaskPending = req_valid &&
     (grantTaskPending || (!cmo_cbo && grantIssued))
   io.replReadWanted := replReadTaskPending && grantTaskAllowed && !dirResult.hit && !state.w_replResp &&
-    !replReadInFlight && !denied && !replReadBlockedBySnoopOrReplace
+    !replReadInFlight && !denied && !io.replaceLive
   val mp_repl_read_valid = replReadTaskPending && internalReplRead && grantTaskAllowed && !replLookupInFlight
   assert(
     !(mp_repl_read_valid && replReadBlockedBySnoopOrReplace),
@@ -2452,9 +2463,20 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     grantMergedClientLatched,
     mergedClientValid
   )
+  // Reserve the snoop ordering window when RequestArb actually accepts the
+  // Grant task, before it can reach MainPipe/SourceD. s_refill is registered
+  // at that acceptance and cleared if a replacer retry suppresses the Grant.
+  // Using grantSent here fed Directory/replacement retry through MainPipe,
+  // RXSNP and RequestArb back into this cycle s MSHR task arbitration.
+  // This is an admission reservation only: grantIssued still records solely
+  // the real SourceD handshake, and commit/retirement retain that distinction.
+  val grantAccepted = state.s_refill || grantIssued
   io.msInfo.bits.grantPending := req_valid && !cmo_cbo && committedGrantTransfersClient &&
-    (grantIssued || io.grantSent) &&
+    grantAccepted &&
     (!normalRefillCommitIssued || refillWritePending || refillWayCommitPending)
+  when(io.grantSent) {
+    assert(grantAccepted, "SourceD Grant must follow registered RequestArb acceptance")
+  }
   io.msInfo.bits.w_grantfirst := state.w_grantfirst
   io.msInfo.bits.w_grantlast := state.w_grantlast
   io.msInfo.bits.w_grant := state.w_grant
@@ -2631,8 +2653,11 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     !state.s_release && !sidecarDelegatedLatched
   io.cmoSidecarMode := Mux(req_cboClean, ReplaceMSHRMode.cmoClean,
     Mux(req_cboFlush, ReplaceMSHRMode.cmoFlush, ReplaceMSHRMode.cmoInval))
+  // A newly dirty old victim creates its own child this cycle. Already
+  // accepted children use the delegation register; first-cycle CMO capture
+  // is added by MSHRCtl together with that CMO's actual physical target.
   io.nestedwbData := nestedwb_match && io.nestedwb.c_set_dirty &&
-    (sidecarOwnsVictim || nestedReleaseNeedsReplace)
+    (sidecarDelegatedLatched || nestedReleaseNeedsReplace)
 
   dontTouch(state)
 

@@ -28,6 +28,8 @@ import xscache.coupledL2.prefetch.DemandRefillBundle
   * that requires an L1 Probe and/or a DCT response.
   */
 class SnoopMSHRIO(implicit p: Parameters) extends MSHRIO {
+  // dirResult.hit may describe replacement metadata rather than a DS hit.
+  val allocDirectoryHit = Input(Bool())
   // A paired normal MSHR can hold dirty ProbeAckData in RefillBuf. This is
   // distinct from normal RXDAT, which remains with the normal request until
   // the RXSNP refill/Grant interlock has released the snoop.
@@ -42,6 +44,11 @@ class SnoopMSHRIO(implicit p: Parameters) extends MSHRIO {
   val normalRefillPayloadFromPostGrantRelease = Input(Bool())
   // Physical index of the paired normal context (Valid when pending).
   val pairedNormalId = Flipped(ValidIO(UInt(mshrBits.W)))
+  // Allocation capture is independent of the selected physical snoop slot.
+  // Live inputs above refer only to this context's registered address.
+  val allocPostGrantReleasePending = Input(Bool())
+  val allocPostGrantReleasePayload = Input(Bool())
+  val allocPairedNormalId = Flipped(ValidIO(UInt(mshrBits.W)))
   // MainPipe finished RefillBuf[N] -> ReleaseBuf[S] for this snoop.
   val releaseBufCopyDone = Input(Bool())
   // Export the exact B-side state transition to the paired normal context.
@@ -85,6 +92,7 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   io.postGrantReleaseSnoopOutcomeToClean := false.B
   val req = RegInit(0.U.asTypeOf(new TaskBundle))
   val dirResult = RegInit(0.U.asTypeOf(new DirResult))
+  val directoryWayValid = RegInit(false.B)
   val stateInit = Wire(new FSMState)
   stateInit.elements.foreach(_._2 := true.B)
   val state = RegInit(stateInit)
@@ -107,18 +115,21 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
 
   when (io.alloc.valid) {
     assert(io.alloc.bits.task.fromB, "SnoopMSHR only accepts B-channel requests")
+    assert(!io.alloc.bits.dirResult.hit || io.allocDirectoryHit || io.alloc.bits.task.snpHitRelease,
+      "a synthetic snoop hit must be backed by replacement metadata")
     valid := true.B
     req := io.alloc.bits.task
     dirResult := io.alloc.bits.dirResult
+    directoryWayValid := io.allocDirectoryHit
     state := io.alloc.bits.state
     probeDirty := false.B
     normalProbePayloadLatched := false.B
-    normalPostGrantReleasePendingLatched := io.normalRefillPostGrantReleasePending
-    normalPostGrantReleasePayloadLatched := io.normalRefillPayloadFromPostGrantRelease
+    normalPostGrantReleasePendingLatched := io.allocPostGrantReleasePending
+    normalPostGrantReleasePayloadLatched := io.allocPostGrantReleasePayload
     releaseBufPayloadReady := false.B
     releaseBufCopyInFlight := false.B
-    pairedNormalIdValid := io.pairedNormalId.valid
-    pairedNormalId := io.pairedNormalId.bits
+    pairedNormalIdValid := io.allocPairedNormalId.valid
+    pairedNormalId := io.allocPairedNormalId.bits
     snpRespDone := false.B
     dctDone := false.B
     denied := false.B
@@ -474,7 +485,9 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   // or a forwarded response.  Keep the way out of refill replacement until
   // this context has finished; ReleaseBuf is not guaranteed to contain a copy
   // for every clean response path.
-  io.msInfo.bits.blockRefill := dirResult.hit &&
+  // A miss nested in replacement owns a ReleaseBuf snapshot, not the lookup's
+  // unrelated candidate DS way. Preserve that distinction through allocation.
+  io.msInfo.bits.blockRefill := directoryWayValid && dirResult.hit &&
     (doRespData || doFwd || meta.state === TRUNK)
   io.msInfo.bits.w_rprobeacklast := state.w_pprobeacklast
   io.msInfo.bits.blocksSnoop := true.B

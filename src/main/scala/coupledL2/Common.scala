@@ -382,6 +382,24 @@ class MSHRInfo(implicit p: Parameters) extends L2Bundle with HasTLChannelBits {
   val replace = new ReplaceMSHRInfo
 }
 
+// Same-cycle replacement admission needs the victim address before its
+// physical ReleaseBuf slot is selected. It cannot nest until capture/probe.
+class ReplacementAllocAddress(implicit p: Parameters) extends L2Bundle {
+  val set = UInt(setBits.W)
+  val tag = UInt(tagBits.W)
+}
+
+object ReplacementAllocAddress {
+  // Origins are ordered from lowest to highest priority, matching the
+  // successive incomingVictim assignments. Qualification must also hold when
+  // callers violate the independent-allocation assertion.
+  def acceptedOrigins(requested: Seq[Bool], accepted: Bool): Seq[Bool] = {
+    requested.indices.map { i =>
+      requested(i) && !requested.drop(i + 1).foldLeft(false.B)(_ || _) && accepted
+    }
+  }
+}
+
 class ReplaceMSHRInfo(implicit p: Parameters) extends L2Bundle {
   val valid = Bool()
   // The normal MSHR which owns RefillBuf and eventually installs the new line.

@@ -427,9 +427,13 @@ class Directory(implicit p: Parameters) extends L2Module {
       "a refill replacement must not select a DS way held by ReplaceMSHR")
   }
   val way_s3 = OHToUInt(wayOH_s3)
-  val meta_s3 = Mux1H(wayOH_s3, metaAll_s3)
+  // wayOH_s3 is one-hot for a legal selected way and zero for a retry/no-way
+  // cycle. Preserve Mux1H's zero result on the latter while giving synthesis
+  // one indexed selector for the shared tag/meta payload path.
+  val waySelected_s3 = wayOH_s3.orR
+  val meta_s3 = Mux(waySelected_s3, metaAll_s3(way_s3), 0.U.asTypeOf(new MetaEntry))
   val metaOnHit_s3 = Mux1H(hitOH, metaAll_s3) // only valid when hit
-  val tag_s3 = Mux1H(wayOH_s3, tagAll_s3)
+  val tag_s3 = Mux(waySelected_s3, tagAll_s3(way_s3), 0.U(tagBits.W))
   val set_s3 = req_s3.set
   val replacerInfo_s3 = req_s3.replacerInfo
   // Debug counters for the victim-selection-degradation investigation: how
@@ -559,12 +563,17 @@ class Directory(implicit p: Parameters) extends L2Module {
 
   val normalRefillRevalidateHit = req_s3.normalRefillRevalidate && hit_s3
   val replRespOH = Mux(normalRefillRevalidateHit, hitOH, finalReplOH)
+  // replRespOH is one-hot for every valid refill lookup. Use its binary index
+  // for the selected victim payload so tag/meta fields share one balanced
+  // selector instead of each field building an independent Mux1H AND/OR cone.
+  // Invalid cycles remain don't-care because all consumers gate on valid.
+  val replRespWay = OHToUInt(replRespOH)
   io.replResp.valid := refillReqValid_s3
   io.replResp.bits.hit := normalRefillRevalidateHit
-  io.replResp.bits.tag := Mux1H(replRespOH, tagAll_s3)
+  io.replResp.bits.tag := tagAll_s3(replRespWay)
   io.replResp.bits.set := req_s3.set
-  io.replResp.bits.way := OHToUInt(replRespOH)
-  io.replResp.bits.meta := Mux1H(replRespOH, metaAll_s3)
+  io.replResp.bits.way := replRespWay
+  io.replResp.bits.meta := metaAll_s3(replRespWay)
   io.replResp.bits.mshrId := req_s3.mshrId
   // Stale-victim-meta guard: a meta/tag write landing in the cycle right
   // after this lookup's SRAM read is not reflected in replResp.meta (the
