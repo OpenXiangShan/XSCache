@@ -1,5 +1,10 @@
 package oceanus.l2
 
+// Intent (phase2): optional deterministic VBOP/CDP producers exercise VA/TLB,
+// source queues and recursive Meta depth. With neither generated, retain the
+// existing routing/timing. In stub mode isolate receiver fallback traffic so
+// receiver priority is independent of the provenance encoded in its TxnID.
+
 // Intent (1c-2): RR one CDP half-line globally into an observable empty sink;
 // expose parallel event vectors and integration counters without an algorithm.
 
@@ -119,9 +124,13 @@ class L2Configuration(
   val pfBopQueueEntries: Int = 16,
   val pfRecvQueueEntries: Int = 32,
   val pfTlbEnable: Boolean = false,
-  val pfTrainEnable: Boolean = false
+  val pfTrainEnable: Boolean = false,
+  val vbopStubEnable: Boolean = false,
+  val cdpStubEnable: Boolean = false
 ) {
   def sliceNum = slices.size
+  val stubMode = vbopStubEnable || cdpStubEnable
+  require(!stubMode || (pfTlbEnable && pfTrainEnable), "VA stubs require TLB and training sideband")
 
   require(pfSrcID >= 0 && pfSrcID < (1 << srcIdWidth),
     s"pfSrcID=$pfSrcID is outside the $srcIdWidth-bit upstream SrcID range")
@@ -132,6 +141,10 @@ class L2Configuration(
 }
 
 class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Module with HasL2Params {
+
+  // Intent (phase2): a test subclass may pause issue while real producers fill
+  // their queues; production uses only the existing static issue parameter.
+  def prefetchIssueAllowed: Bool = config.prefetchIssueEnable.B
 
   val t1NIDs = config.upstream.type1.map(_.nid)
   val t4NIDs = config.upstream.type4.map(_.nid)
@@ -246,6 +259,20 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   val cdpDataSlice = cdpDataArb.io.chosen
   val cdpTrain = VecInit(slices.map(_.io.cdpTrain))
   val cdpEvict = VecInit(slices.map(_.io.cdpEvict))
+  val vbopStub = if (config.vbopStubEnable) Some(Module(new L2VBOPStub)) else None
+  val cdpStub = if (config.cdpStubEnable) Some(Module(new L2CDPStub(config.sliceNum * nMSHR))) else None
+  vbopStub.foreach { stub =>
+    stub.io.enable := vbopControlEnable
+    stub.io.tlb <> pfTlbClients.get(0)
+    stub.io.req.ready := true.B // downstream overwrite queues always accept
+  }
+  cdpStub.foreach { stub =>
+    stub.io.enable := cdpControlEnable
+    stub.io.data := cdpData
+    stub.io.evict := VecInit(slices.flatMap(_.io.cdpEvict.toSeq))
+    stub.io.tlb <> pfTlbClients.get(1)
+    stub.io.req.ready := true.B
+  }
   val cdpHalfDrops = VecInit(slices.map(_.io.cdpHalfDrops))
   val cdpCollisionDrops = VecInit(slices.map(_.io.cdpCollisionDrops))
   val trainEnableZeroCount = WireDefault(slices.map(_.io.trainDisabled).reduce(_ + _))
@@ -303,6 +330,10 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   bop.io.train.valid := bopTrainArb.io.out.valid && bopTrainEnabled
   bop.io.train.bits := bopTrainArb.io.out.bits.paddr
   bopTrainArb.io.out.ready := !bopTrainEnabled || bop.io.train.ready
+  vbopStub.foreach { stub =>
+    stub.io.train.valid := bopTrainArb.io.out.valid
+    stub.io.train.bits := bopTrainArb.io.out.bits
+  }
 
   // Internal Stash has no upstream completion; downstream IDs remain TSHR/slice IDs.
   // Source order is the policy boundary: receiver encodings precede PBOP/BOP,
@@ -318,7 +349,13 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   // intentionally not part of the CCHI-facing IO bundle.
   val pfQueueOverwriteBySource = Wire(Vec(config.sliceNum, Vec(pfSourceSlots.size, Bool())))
   pfQueueOverwriteBySource.foreach(_.foreach(_ := false.B))
-  val pfQueues: Seq[DecoupledIO[FlitREQ]] = if (!config.bopEnable && !config.pfRecvEnable) {
+  def pfTarget(addr: UInt): UInt = config.sliceNum match {
+    case 1 => map1(addr)
+    case 2 => map2(addr)
+    case 3 => map3(addr)
+    case _ => map4(addr)
+  }
+  val pfQueues: Seq[DecoupledIO[FlitREQ]] = if (!config.bopEnable && !config.pfRecvEnable && !config.stubMode) {
     bop.io.req.ready := true.B
     Nil
   } else {
@@ -335,14 +372,18 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
         val queue = Module(new OverwriteQueue(new FlitREQ, entries = entries))
         queue.suggestName(s"pfQueue_${i}_src${source}")
         pfQueueOverwriteBySource(i)(sourceIdx) := queue.io.overwrite
-        val fromBop = (source == L2PfSource.PBOP).B && bop.io.req.valid && prefetchTarget === config.slices(i).U
-        val fromRecv = if (config.pfRecvEnable) {
+        val fromBop = (source == L2PfSource.PBOP).B && bop.io.req.valid && prefetchTarget === config.slices(i).U &&
+          (!config.stubMode || config.bopEnable).B && (if (config.stubMode) bopControlEnable else true.B)
+        val fromRecv = if (config.pfRecvEnable && !config.stubMode) {
           // pfRecvReqs.ready is driven by the slice REQ arbiter below. A direct
           // fire owns the flit; queue admission is the fallback route only.
           pfRecvReqs(i).valid && !pfRecvReqs(i).ready &&
             L2PfSource.fromMemReqSource(io.pfRecv.get.pf_source) === source.U
         } else false.B
-        queue.io.enq.valid := fromBop || fromRecv
+        val stub = if (source == L2PfSource.BOP) vbopStub.map(_.io.req)
+          else if (source == L2PfSource.CDP) cdpStub.map(_.io.req) else None
+        val fromStub = stub.map(r => r.valid && pfTarget(r.bits.paddr) === config.slices(i).U).getOrElse(false.B)
+        queue.io.enq.valid := fromBop || fromRecv || fromStub
         val bopBits = WireInit(0.U.asTypeOf(new FlitREQ))
         bopBits.Opcode := CCHIOpcode.StashShared.U
         bopBits.Addr := bop.io.req.bits
@@ -354,7 +395,12 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
         bopBits.Size := CCHISize.B64.U
         bopBits.TagAlias := 0.U
         val recvBits = if (config.pfRecvEnable) pfRecvReqs(i).bits else 0.U.asTypeOf(new FlitREQ)
-        queue.io.enq.bits := Mux(fromBop, bopBits, recvBits)
+        val stubBits = WireInit(bopBits)
+        stub.foreach { r =>
+          stubBits.Addr := r.bits.paddr
+          stubBits.TxnID := L2PrefetchTxnID.encode(source.U(L2PfSource.Width.W), r.bits.depth, pfSequence, pfTxnWidth)
+        }
+        queue.io.enq.bits := Mux(fromStub, stubBits, Mux(fromBop, bopBits, recvBits))
         (source, queue)
       }
       // Boundary history compares only lastIssuedAddr, not an outstanding CAM.
@@ -363,13 +409,20 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       // This limited history costs efficiency, not correctness.
       val lastIssuedValid = RegInit(false.B)
       val lastIssuedAddr = Reg(UInt(paramL2.physicalAddrWidth.W))
+      def sourceEnabled(source: Int): Bool = if (!config.stubMode) true.B else source match {
+        case L2PfSource.BOP => vbopControlEnable
+        case L2PfSource.PBOP => bopControlEnable
+        case L2PfSource.CDP => cdpControlEnable
+        case _ => recvControlEnable
+      }
       val candidates = pfSourcePriority.map { source =>
         val q = sourceQueues.find(_._1 == source).get._2
-        q.io.deq.valid && !(lastIssuedValid && q.io.deq.bits.Addr === lastIssuedAddr)
+        q.io.deq.valid && sourceEnabled(source) && !(lastIssuedValid && q.io.deq.bits.Addr === lastIssuedAddr)
       }
       val chosen = PriorityEncoderOH(VecInit(candidates).asUInt)
       val issued = Wire(Decoupled(new FlitREQ))
-      issued.valid := candidates.reduce(_ || _) && config.prefetchIssueEnable.B && bopControlEnable
+      issued.valid := candidates.reduce(_ || _) && prefetchIssueAllowed &&
+        (if (config.stubMode) true.B else bopControlEnable)
       issued.bits := Mux1H(pfSourcePriority.zip(chosen.asBools).map { case (source, hit) =>
         hit -> sourceQueues.find(_._1 == source).get._2.io.deq.bits
       })
@@ -402,7 +455,20 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     queues
   }
 
-  when (bop.io.req.fire || recvReqFire) {
+  // Receiver fallback remains a separate producer in stub mode: its pfSource
+  // describes origin, and must not lower its arbitration priority to CDP's.
+  val recvFallback = if (config.stubMode && config.pfRecvEnable) {
+    Seq.tabulate(config.sliceNum) { i =>
+      val q = Module(new OverwriteQueue(new FlitREQ, config.pfRecvQueueEntries))
+      q.suggestName(s"recvFallback_$i")
+      q.io.enq.valid := pfRecvReqs(i).valid && !pfRecvReqs(i).ready
+      q.io.enq.bits := pfRecvReqs(i).bits
+      q
+    }
+  } else Nil
+
+  when (bop.io.req.fire || recvReqFire || vbopStub.map(_.io.req.fire).getOrElse(false.B) ||
+    cdpStub.map(_.io.req.fire).getOrElse(false.B)) {
     pfSequence := pfSequence + 1.U
   }
 
@@ -455,7 +521,14 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     // Recv is input 1 and therefore wins over queued sources when the slice
     // accepts it. Its ready signal also selects the mutually exclusive queue
     // fallback in the source-queue logic above.
-    val reqInputs = slice_io_UpRXREQ_remote +: (pfRecvReqs.lift(i).toSeq ++ pfQueues.lift(i).toSeq)
+    val fallback = recvFallback.lift(i).map { q =>
+      val out = Wire(Decoupled(new FlitREQ))
+      out.bits := q.io.deq.bits
+      out.valid := q.io.deq.valid && recvControlEnable && prefetchIssueAllowed
+      q.io.deq.ready := out.ready && recvControlEnable && prefetchIssueAllowed
+      out
+    }.toSeq
+    val reqInputs = slice_io_UpRXREQ_remote +: (pfRecvReqs.lift(i).toSeq ++ fallback ++ pfQueues.lift(i).toSeq)
     arb(reqInputs, slice.io.UpRXREQ, Some(s"UpRXREQ_$i"))
     slice.io.UpRXREQTrain.foreach { context =>
       // fire includes both routing arbiters and the allocator acceptance.
