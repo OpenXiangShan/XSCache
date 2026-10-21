@@ -171,7 +171,14 @@ object TestTop_L2Recv extends App with ChiselSim {
       ctrl.l2_vbop_en.poke(false.B); ctrl.l2_tp_en.poke(false.B); ctrl.l2_cdp_en.poke(false.B)
       ctrl.l2_pf_delay_latency.poke(0.U)
       dut.reset.poke(true.B); dut.clock.step(8); dut.reset.poke(false.B); dn.activateRxLink()
-      for (i <- 0 until 300) dn.stepWithCredits(i - 300)
+      // Intent (1c-1): exercise all master/VBOP/CDP control combinations during
+      // the existing idle warmup; keep its cycle count and request timing.
+      for (i <- 0 until 300) {
+        ctrl.l2_pf_master_en.poke((i >= 8 || (i & 4) != 0).B)
+        ctrl.l2_vbop_en.poke((i < 8 && (i & 2) != 0).B)
+        ctrl.l2_cdp_en.poke((i < 8 && (i & 1) != 0).B)
+        dn.stepWithCredits(i - 300)
+      }
       val target = BigInt("20040", 16)
       name match {
         case "single" =>

@@ -27,7 +27,13 @@ class L2TopUpstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim {
       tlb.resp.bits.poke(0.U.asTypeOf(tlb.resp.bits))
       tlb.pmp_resp.poke(0.U.asTypeOf(tlb.pmp_resp))
     }
-    dut.io.pfTrain.foreach(_.foreach(train => train.poke(0.U.asTypeOf(train))))
+    // Intent (1c-1): idle VA/source remain zero, but tie trainEnable HIGH to
+    // preserve legacy enabled training. An all-zero sideband now disables BOP;
+    // explicitly driven zero-enable cases are covered by TestTop_L2Train.
+    dut.io.pfTrain.foreach(_.foreach { train =>
+      train.poke(0.U.asTypeOf(train))
+      train.trainEnable.poke(true.B)
+    })
     dut.io.t1p(0).UpEVT.valid.poke(false.B)
     dut.io.t1p(0).UpEVT.bits.poke(0.U.asTypeOf(dut.io.t1p(0).UpEVT.bits))
     dut.io.t1p(0).UpREQ.valid.poke(false.B)

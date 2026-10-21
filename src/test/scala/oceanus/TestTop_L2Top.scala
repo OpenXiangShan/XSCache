@@ -36,6 +36,12 @@ class TestTop_L2Top(val l2cfg: L2Configuration)(implicit val p: Parameters) exte
     assert(!tlb.req.valid && !tlb.req_kill && tlb.resp.ready,
       "Phase 1a TLB must remain idle and discard responses")
   }
+  // Intent (1c-1): verify reserved VBOP/CDP controls against real runtime CSR
+  // inputs in every integrated harness, including the receiver's control matrix.
+  private val vbopEnable = chisel3.util.experimental.BoringUtils.bore(module.vbopControlEnable)
+  private val cdpEnable = chisel3.util.experimental.BoringUtils.bore(module.cdpControlEnable)
+  assert(vbopEnable === io.pfCtrl.map(c => c.l2_pf_master_en && c.l2_vbop_en).getOrElse(true.B))
+  assert(cdpEnable === io.pfCtrl.map(c => c.l2_pf_master_en && c.l2_cdp_en).getOrElse(true.B))
   io.pfTrain.foreach { ports =>
     require(ports.size == io.t1p.size)
     ports.foreach { train =>

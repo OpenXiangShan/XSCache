@@ -174,6 +174,10 @@ object TestTop_L2Train extends App with ChiselSim {
     assert(c.pending == 0 && c.accepts == c.executions)
     assert(completed == 2 * count + 2 && checkedBeats == completed * 2)
     c.report()
+    // Intent (1c-1): require both enabled and disabled events at the actual BOP
+    // boundary; the unchanged VA/RBE checker supplies independent expectations.
+    assert(c.gatedGlobal > 0 && c.acceptedByBop > 0)
+    println(s"TRAIN_GATE_RESULT pass=true enabled=${c.acceptedByBop} disabled=${c.gatedGlobal} slices=$count")
     println(s"VA_DIRECTED_RESULT pass=true slices=$count completed=$completed beats=$checkedBeats miss=true firstHit=true lateOwnVA=true enableZero=true multiPort=true multiSlice=true internalZero=true")
   }
 }
