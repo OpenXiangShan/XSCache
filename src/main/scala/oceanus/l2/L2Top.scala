@@ -1,5 +1,9 @@
 package oceanus.l2
 
+// Intent (3a): replace the optional VBOP stub with a reference-derived VBOP;
+// copy global event pulses into its four-entry drop-new queue. Retain the
+// legacy vbopStubEnable name as the generation switch for compatibility.
+
 // Intent (phase2): optional deterministic VBOP/CDP producers exercise VA/TLB,
 // source queues and recursive Meta depth. With neither generated, retain the
 // existing routing/timing. In stub mode isolate receiver fallback traffic so
@@ -126,7 +130,8 @@ class L2Configuration(
   val pfTlbEnable: Boolean = false,
   val pfTrainEnable: Boolean = false,
   val vbopStubEnable: Boolean = false,
-  val cdpStubEnable: Boolean = false
+  val cdpStubEnable: Boolean = false,
+  val vbopParams: OceanusVBOPParameters = OceanusVBOPParameters()
 ) {
   def sliceNum = slices.size
   val stubMode = vbopStubEnable || cdpStubEnable
@@ -259,7 +264,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   val cdpDataSlice = cdpDataArb.io.chosen
   val cdpTrain = VecInit(slices.map(_.io.cdpTrain))
   val cdpEvict = VecInit(slices.map(_.io.cdpEvict))
-  val vbopStub = if (config.vbopStubEnable) Some(Module(new L2VBOPStub)) else None
+  val vbopStub = if (config.vbopStubEnable) Some(Module(new OceanusVBOP(config.vbopParams))) else None
   val cdpStub = if (config.cdpStubEnable) Some(Module(new L2CDPStub(config.sliceNum * nMSHR))) else None
   vbopStub.foreach { stub =>
     stub.io.enable := vbopControlEnable
@@ -280,7 +285,8 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     cdpCollisionDrops, trainEnableZeroCount).foreach(dontTouch(_))
   // dontTouch requires a signal even when the optional control port is absent.
   val delayLatency = WireDefault(if (config.pfCtrlEnable) io.pfCtrl.get.l2_pf_delay_latency else 0.U(10.W))
-  dontTouch(delayLatency) // delay_latency is reserved for slice 4 queue control.
+  dontTouch(delayLatency)
+  vbopStub.foreach(_.io.delayLatency := delayLatency)
 
   val pfTxnWidth = (new FlitREQ).TxnID.getWidth
   val pfSeqWidth = L2PrefetchTxnID.sequenceWidth(pfTxnWidth)
@@ -331,6 +337,9 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   bop.io.train.bits := bopTrainArb.io.out.bits.paddr
   bopTrainArb.io.out.ready := !bopTrainEnabled || bop.io.train.ready
   vbopStub.foreach { stub =>
+    // Intent (3a refinement): slice training is a lossy Valid event pulse;
+    // copy it even when PBOP's independent learner is momentarily not ready.
+    // It cannot be replayed by the cache, and VBOP owns its own drop-new queue.
     stub.io.train.valid := bopTrainArb.io.out.valid
     stub.io.train.bits := bopTrainArb.io.out.bits
   }

@@ -235,6 +235,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     (((rxreq_readshared || rxreq_readunique || rxreq_makeunique) && !dirResult.hit) ||
       prefetched_hit_train)
   io.bopTrain.bits.paddr := io.tshr_paddr
+  // Intent (3a): ReadUnique/MakeUnique correspond to reference Acquire-toT;
+  // carry CCHI SrcID+TxnID as the sourceId identity, separate from reqSource.
+  io.bopTrain.bits.needT.foreach(_ := rxreq_readunique || rxreq_makeunique)
+  io.bopTrain.bits.sourceId.foreach(_ := Cat(rxreq.SrcID, rxreq.TxnID))
   io.UpRXREQTrain.foreach { context =>
     // Zero context stays all zero even when the internal request PA has a
     // nonzero page offset; only external Type-1 demands own a block VA.
