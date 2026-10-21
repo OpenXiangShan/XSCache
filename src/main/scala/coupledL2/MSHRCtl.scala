@@ -1138,10 +1138,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       io.txdatDone.bits.mshrId === i.U && io.txdatDone.bits.chiOpcode.get === CopyBackWrData
       replaceMshrs(i).io.rxrsp.valid := io.resps.rxrsp.valid && io.resps.rxrsp.mshrId === replaceMshrs(i).io.txnId
       replaceMshrs(i).io.rxrsp.bits := io.resps.rxrsp.respInfo
-      // Victim-mode writeback requests now leave on the direct TXREQ path
-      // (the txreq arbiter below includes the replaceMshrs).  Only the snoop
-      // response output stays unused.
-      replaceMshrs(i).io.tasks.txrsp.ready := false.B
 
       snoop.io.resps.rxdat.valid := false.B
       snoop.io.resps.rxdat.bits := io.resps.rxdat.respInfo
@@ -1333,7 +1329,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     PopCount(Cat(replaceMshrs.map(m => m.io.tasks.txdat.valid && !m.io.tasks.txdat.ready))))
 
   /* Response downwards to TXRSP*/
-  val txrspArb = twoLevelArb(mshrs.map(_.io.tasks.txrsp), io.toTXRSP, Some("txrsp"))
+  // ReplaceMSHR joins for the CompAck owed by a WriteEvictOrEvict Comp.
+  val txrspArb = twoLevelArb(mshrs.map(_.io.tasks.txrsp) ++ replaceMshrs.map(_.io.tasks.txrsp), io.toTXRSP, Some("txrsp"))
   ArbPerf(txrspArb, "txrsp_arb")
   // Sum contending contexts, rather than relying on ArbPerf input positions which
   // differ between the single-context and paired-context implementations.
