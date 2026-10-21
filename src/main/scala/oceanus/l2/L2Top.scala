@@ -1,5 +1,8 @@
 package oceanus.l2
 
+// Intent (1c-2): RR one CDP half-line globally into an observable empty sink;
+// expose parallel event vectors and integration counters without an algorithm.
+
 import chisel3._
 import chisel3.util._
 import utility._
@@ -231,6 +234,23 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   } else true.B)
   dontTouch(vbopControlEnable)
   dontTouch(cdpControlEnable)
+
+  val cdpDataArb = Module(new RRArbiter(new L2CDPHalf, config.sliceNum))
+  cdpDataArb.io.in.zip(slices).foreach { case (in, slice) => in <> slice.io.cdpData }
+  // Empty CDP sink for this stage: all ports remain observable, and cache
+  // progress never depends on consumption. The algorithm will replace it.
+  val cdpData = Wire(Valid(new L2CDPHalf))
+  cdpData.valid := cdpDataArb.io.out.valid
+  cdpData.bits := cdpDataArb.io.out.bits
+  cdpDataArb.io.out.ready := true.B
+  val cdpDataSlice = cdpDataArb.io.chosen
+  val cdpTrain = VecInit(slices.map(_.io.cdpTrain))
+  val cdpEvict = VecInit(slices.map(_.io.cdpEvict))
+  val cdpHalfDrops = VecInit(slices.map(_.io.cdpHalfDrops))
+  val cdpCollisionDrops = VecInit(slices.map(_.io.cdpCollisionDrops))
+  val trainEnableZeroCount = WireDefault(slices.map(_.io.trainDisabled).reduce(_ + _))
+  Seq(cdpData, cdpDataSlice, cdpTrain, cdpEvict, cdpHalfDrops,
+    cdpCollisionDrops, trainEnableZeroCount).foreach(dontTouch(_))
   // dontTouch requires a signal even when the optional control port is absent.
   val delayLatency = WireDefault(if (config.pfCtrlEnable) io.pfCtrl.get.l2_pf_delay_latency else 0.U(10.W))
   dontTouch(delayLatency) // delay_latency is reserved for slice 4 queue control.

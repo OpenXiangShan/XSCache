@@ -1,5 +1,8 @@
 package oceanus.l2
 
+// Intent (1c-2): buffer lossy CDP half-lines per slice without cache backpressure;
+// preserve parallel training/eviction events and count all disabled training.
+
 import chisel3._
 import chisel3.util._
 import utility._
@@ -73,6 +76,12 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
     val fromClientTableEVT = Input(Vec(paramL2.mshrSize, Vec(1, Bool()))) // TODO: parameterize with coherent l2 client count
 
     val bopTrain = Valid(new L2PrefetchTrain(pfTrainEnable))
+    val cdpData = Decoupled(new L2CDPHalf)
+    val cdpTrain = Output(Vec(paramL2.mshrSize, Valid(new L2CDPTrain)))
+    val cdpEvict = Output(Vec(paramL2.mshrSize, Valid(new L2CDPEvict)))
+    val cdpHalfDrops = Output(UInt(64.W))
+    val cdpCollisionDrops = Output(UInt(64.W))
+    val trainDisabled = Output(UInt(64.W))
   })
 
   //
@@ -116,6 +125,28 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   assert(!io.DnRXDAT.valid || (PopCount(tshrs.map(_.io.DnRXDAT.valid)) =/= 0.U), "DnRXDAT valid but no TSHR selected, flit lost")
   io.bopTrain.valid := tshrs.map(_.io.bopTrain.valid).orR
   io.bopTrain.bits := PriorityMux(tshrs.map(t => t.io.bopTrain.valid -> t.io.bopTrain.bits))
+  val cdpQueue = Module(new L2CDPHalfQueue)
+  val cdpValids = tshrs.map(_.io.cdpData.valid)
+  cdpQueue.io.in.valid := cdpValids.reduce(_ || _)
+  cdpQueue.io.in.bits := PriorityMux(tshrs.map(t => t.io.cdpData.valid -> t.io.cdpData.bits))
+  io.cdpData <> cdpQueue.io.out
+  io.cdpHalfDrops := cdpQueue.io.dropped
+  val cdpCollisionDrops = RegInit(0.U(64.W))
+  val cdpLineCount = PopCount(cdpValids)
+  when(cdpLineCount > 1.U) { cdpCollisionDrops := cdpCollisionDrops + ((cdpLineCount - 1.U) << 1) }
+  io.cdpCollisionDrops := cdpCollisionDrops
+  tshrs.zipWithIndex.foreach { case (t, i) =>
+    io.cdpTrain(i) := t.io.cdpTrain
+    io.cdpEvict(i) := t.io.cdpEvict
+  }
+  // Count all eligible demand training, including ordinary CDP hits, before
+  // any lossy arbiter; simultaneous disabled events all count independently.
+  val trainDisabled = RegInit(0.U(64.W))
+  val disabledThisCycle = PopCount(tshrs.map(t => t.io.cdpTrain.valid &&
+    !t.io.cdpTrain.bits.trainEnable))
+  trainDisabled := trainDisabled + disabledThisCycle
+  io.trainDisabled := trainDisabled
+  XSPerfAccumulate("trainEnableZero", disabledThisCycle)
   // ----------------------------------------------------------------
 
   // Per-slice BOP effectiveness. Sum EVERY TSHR event: OR would lose

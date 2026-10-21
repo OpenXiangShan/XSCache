@@ -1,5 +1,8 @@
 package oceanus.l2
 
+// Intent (1c-2): preserve depth on unrelated writes, update it atomically with
+// provenance, and return stored depth on both lookup and victim responses.
+
 import chisel3._
 import chisel3.util._
 import utility._
@@ -97,10 +100,8 @@ object L2Directory {
   // Write enables stay Boolean; SRAM bit masks must cover all four bits.
   // Source IDs follow coupledL2/prefetch/PrefetchParameters.scala (NoWhere=0, PBOP=3).
   // Meta: coherence state (NO tag — tag is internal to Directory)
-  // Phase 1a reserves CDP recursion depth: reference /data/zhuy/coupledL2/
-  // Directory.scala:44,58,70 and prefetch/CDP.scala:36-37,970-972 (2 bits;
-  // zero by default, derived depth on CDP requests). Writes stay zero and the
-  // SRAM depth readout is unused until 阶段 1c 接入; no per-depth write mask yet.
+  // Depth shares the provenance mask: both are installed on refill, consumed
+  // together by the first demand, and retained by unrelated coherence writes.
   class Meta(implicit val p: Parameters) extends Bundle with HasL2Params with HasCCHIParameters {
     val state = MetaState()
     val dirty = Bool()
@@ -125,11 +126,10 @@ object L2Directory {
     def any = this.asUInt.orR
 
     def maskAndWrite(dst: Meta, src: Meta): Unit = {
-      dst.cdpPfDepth := 0.U
       when (state) { dst.state := src.state }
       when (dirty) { dst.dirty := src.dirty }
       when (alias) { dst.alias := src.alias }
-      when (pfSource) { dst.pfSource := src.pfSource }
+      when (pfSource) { dst.pfSource := src.pfSource; dst.cdpPfDepth := src.cdpPfDepth }
       clients.zip(dst.clients.zip(src.clients)).foreach { case (mask, (dst, src)) => when (mask) { dst := src } }
     }
 
@@ -143,11 +143,10 @@ object L2Directory {
     }
 
     def unmaskAndWrite(dst: Meta, src: Meta): Unit = {
-      dst.cdpPfDepth := 0.U
       when (!state) { dst.state := src.state }
       when (!dirty) { dst.dirty := src.dirty }
       when (!alias) { dst.alias := src.alias }
-      when (!pfSource) { dst.pfSource := src.pfSource }
+      when (!pfSource) { dst.pfSource := src.pfSource; dst.cdpPfDepth := src.cdpPfDepth }
       clients.zip(dst.clients.zip(src.clients)).foreach { case (mask, (dst, src)) => when (!mask) { dst := src } }
     }
   }
@@ -560,7 +559,6 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val wbEntry = Wire(new L2Directory.DirEntry)
   wbEntry.tag  := reqTag
   wbEntry.meta := winReq.META
-  wbEntry.meta.cdpPfDepth := 0.U
 
   val wbMask = Wire(new L2Directory.DirEntry)
   wbMask.tag        := Fill(tagWidth, winReq.TAG_WEN)
@@ -568,7 +566,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   wbMask.meta.dirty := winReq.META_WEN.dirty
   wbMask.meta.alias := Fill(2, winReq.META_WEN.alias)
   wbMask.meta.pfSource := Fill(L2PfSource.Width, winReq.META_WEN.pfSource)
-  wbMask.meta.cdpPfDepth := Fill(2, true.B)
+  wbMask.meta.cdpPfDepth := Fill(2, winReq.META_WEN.pfSource)
   wbMask.meta.clients.zip(winReq.META_WEN.clients).foreach { case (m, w) => m := w }
 
   val dirWriteValid = initActive || isDirWb
@@ -841,6 +839,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
       o.META.clients := entry_s3.meta.clients
       o.META.alias   := entry_s3.meta.alias
       o.META.pfSource := entry_s3.meta.pfSource
+      o.META.cdpPfDepth := entry_s3.meta.cdpPfDepth
       o.META.way     := way_s3
       o.META.hit     := Mux(s3_isRepl, false.B, hit_s3)
     }

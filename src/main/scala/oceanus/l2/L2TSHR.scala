@@ -1,5 +1,8 @@
 package oceanus.l2
 
+// Intent (1c-2): snapshot each eligible REQ scan context before old Meta clears;
+// emit once with full data, forwarding the arriving second half immediately.
+
 import chisel3._
 import chisel3.util._
 import utility._
@@ -111,6 +114,9 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
     val bopPerfSource = Output(Vec(L2BOPPerf.names.size, UInt(L2PfSource.Width.W)))
 
     val bopTrain = Valid(new L2PrefetchTrain(pfTrainEnable))
+    val cdpData = Valid(new L2CDPLine)
+    val cdpTrain = Valid(new L2CDPTrain)
+    val cdpEvict = Valid(new L2CDPEvict)
   })
 
   // TSHR valid
@@ -544,6 +550,41 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
   vPipeREQ.io.UpRXREQTrain.foreach(_ := rbeREQ.io.out.bits.train.get)
   vPipeREQ.io.UpRXEVB := rbeEVB.io.out
   io.bopTrain := vPipeREQ.io.bopTrain
+  io.cdpTrain := vPipeREQ.io.cdpTrain
+  io.cdpEvict := vPipeREQ.io.cdpEvict
+
+  val cdpPending = RegInit(false.B)
+  val cdpContext = Reg(new L2CDPContext)
+  val cdpStart = vPipeREQ.io.cdpStart
+  val cdpCurrent = Mux(cdpStart.valid, cdpStart.bits, cdpContext)
+  val cdpHasContext = cdpStart.valid || (cdpPending && !vPipeREQ.io.UpRXREQ.valid)
+  // DS rd_done also asserts when the FIRST RXDAT cancels a pending read: it
+  // is not a full-line-valid bit. Track completeness independently of dirty
+  // commit bookkeeping, and reuse buffered data only for an actual hit.
+  val cdpBufferValid = RegInit(false.B)
+  val cdpRxData = tshr_buffer_wen_RXDAT_0 || tshr_buffer_wen_RXDAT_2
+  when(cdpRxData || tshr_dealloc) { cdpBufferValid := false.B }
+  when(tshr_buffer_wen_last || tshr_buffer_wen_DS) { cdpBufferValid := true.B }
+  val cdpFull = tshr_buffer_wen_last || tshr_buffer_wen_DS ||
+    (cdpCurrent.isHit && cdpBufferValid && !cdpRxData)
+  io.cdpData.valid := cdpHasContext && cdpFull && !tshr_dealloc
+  io.cdpData.bits.paddr := cdpCurrent.paddr
+  io.cdpData.bits.pfSource := cdpCurrent.pfSource
+  io.cdpData.bits.pfDepth := cdpCurrent.pfDepth
+  io.cdpData.bits.isHit := cdpCurrent.isHit
+  io.cdpData.bits.eventType := cdpCurrent.eventType
+  // The buffer registers change AFTER this edge. Match their write priority
+  // (downstream over upstream over DS) when forwarding the completing beat.
+  val cdpLow = Mux(tshr_buffer_wen_DnRXDAT_0, io.DnRXDAT.bits.Data.get,
+    Mux(tshr_buffer_wen_UpRXDAT_0, io.UpRXDAT.bits.Data,
+      Mux(tshr_buffer_wen_DS, io.fromDS.DATA(255, 0), tshr_buffer_0)))
+  val cdpHigh = Mux(tshr_buffer_wen_DnRXDAT_2, io.DnRXDAT.bits.Data.get,
+    Mux(tshr_buffer_wen_UpRXDAT_2, io.UpRXDAT.bits.Data,
+      Mux(tshr_buffer_wen_DS, io.fromDS.DATA(511, 256), tshr_buffer_2)))
+  io.cdpData.bits.data := Cat(cdpHigh, cdpLow)
+  when(vPipeREQ.io.UpRXREQ.valid || tshr_dealloc) { cdpPending := false.B }
+  when(cdpStart.valid) { cdpContext := cdpStart.bits; cdpPending := true.B }
+  when(io.cdpData.valid) { cdpPending := false.B }
 
   // Count late once at allocator acceptance into an existing TSHR, with the
   // internal StashShared REQ vPipe still active. Waiting before allocator
