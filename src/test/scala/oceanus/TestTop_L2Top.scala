@@ -1,5 +1,9 @@
 package oceanus
 
+// Intent (phase2): only the dedicated stub harness exposes an issue pause for
+// simultaneous queued-source arbitration. Keep the idle-TLB assertion for all
+// existing regressions and permit live translations when stubs are generated.
+
 import chisel3._
 import circt.stage.{ChiselStage, FirtoolOption}
 import chisel3.util._
@@ -27,6 +31,11 @@ class L2TopDepthHarness(config: L2Configuration, inject: Boolean)(implicit p: Pa
   }
 }
 
+class L2TopPhase2Harness(config: L2Configuration)(implicit p: Parameters) extends L2Top(config) {
+  lazy val holdIssue = IO(Input(Bool()))
+  override def prefetchIssueAllowed: Bool = config.prefetchIssueEnable.B && !holdIssue
+}
+
 // Phase 1a acceptance uses a test-only JVM property to elaborate both optional
 // interfaces in every existing production-path harness. Inputs remain idle;
 // test assertions check the exposed translation interface throughout each run.
@@ -35,7 +44,13 @@ class TestTop_L2Top(val l2cfg: L2Configuration)(implicit val p: Parameters) exte
   // Intent (1c-2): a test-only subclass can inject depth into real internal
   // prefetch flits; normal Recv/BOP producers and every regression stay zero.
   val depthInjection = sys.props.get("oceanus.phase1c2.depth").contains("true")
-  val module: L2Top = if (depthInjection) Module(new L2TopDepthHarness(l2cfg, true)) else Module(new L2Top(l2cfg))
+  val module: L2Top = if (depthInjection) Module(new L2TopDepthHarness(l2cfg, true))
+    else if (l2cfg.stubMode) Module(new L2TopPhase2Harness(l2cfg)) else Module(new L2Top(l2cfg))
+  val holdIssue = if (l2cfg.stubMode) Some(IO(Input(Bool()))) else None
+  module match {
+    case stubbed: L2TopPhase2Harness => stubbed.holdIssue := holdIssue.get
+    case _ =>
+  }
   val testDepth = if (depthInjection) Some(IO(Input(UInt(2.W)))) else None
   module match {
     case injected: L2TopDepthHarness => injected.testDepth.foreach(_ := testDepth.get)
@@ -56,7 +71,7 @@ class TestTop_L2Top(val l2cfg: L2Configuration)(implicit val p: Parameters) exte
   require(l2cfg.pfTlbEnable == L2TopPhase1aPorts.enabled)
   require(l2cfg.pfTrainEnable == L2TopPhase1aPorts.enabled)
   println(s"PHASE1A_PORTS tlb=${io.pfTlb.nonEmpty} train=${io.pfTrain.nonEmpty} type1=${io.t1p.size}")
-  io.pfTlb.foreach { tlb =>
+  io.pfTlb.filter(_ => !l2cfg.stubMode).foreach { tlb =>
     assert(!tlb.req.valid && !tlb.req_kill && tlb.resp.ready,
       "Phase 1a TLB must remain idle and discard responses")
   }

@@ -1,5 +1,11 @@
 package oceanus
 
+// Intent (phase2): stub-only configurations also own one merged queue output
+// per slice, even when both the physical BOP and receiver are absent.
+// Intent: include the separate stub-mode receiver fallback in per-source FIFO
+// ledgers, counting simultaneous producers separately and reading real stored
+// provenance for overwrite victims and residual entries.
+
 import chisel3._
 import chisel3.util._
 import chisel3.util.experimental.BoringUtils
@@ -412,7 +418,7 @@ object L2TopObservation {
   private val productionPfQueues = moduleIds.collect { case q: OverwriteQueue[_] => q }
   require(productionPfQueues.size >= pfQueues.size,
     "prefetch overwrite probe must cover every merged queue output")
-  private val expectedPfOutputs = if (module.config.bopEnable || module.config.pfRecvEnable)
+  private val expectedPfOutputs = if (module.config.bopEnable || module.config.pfRecvEnable || module.config.stubMode)
     module.config.sliceNum else 0
   require(pfQueues.size == expectedPfOutputs,
     "prefetch observation must cover every enabled slice output; disabled tops have no queues")
@@ -995,8 +1001,16 @@ object L2TopObservation {
     val sourceQueueEnd = math.min(sourceQueueStart + 9, productionPfQueues.size)
     val overwrites = productionPfQueues.slice(sourceQueueStart, sourceQueueEnd)
       .map(q => boreRead(privateBool(q, "overwrite")))
-    io.prefetchQueueOverwrite(i) := (if (overwrites.nonEmpty) overwrites.reduce(_ || _) else false.B)
+    io.prefetchQueueOverwrite(i) := (if (overwrites.nonEmpty) overwrites.reduce(_ || _) else false.B) ||
+      module.recvFallback.lift(i).map(q => boreRead(q.io.overwrite)).getOrElse(false.B)
     (0 to L2PfSource.CDP).foreach { source =>
+      val fallback = module.recvFallback.lift(i)
+      val fallbackEnq = fallback.map(q => boreRead(q.io.enq.valid) &&
+        L2PrefetchTxnID.decode(boreRead(q.io.enq.bits.TxnID)) === source.U).getOrElse(false.B)
+      val fallbackTake = fallback.map(q => boreRead(q.io.deq.valid) && boreRead(q.io.deq.ready) &&
+        L2PrefetchTxnID.decode(boreRead(q.io.deq.bits.TxnID)) === source.U).getOrElse(false.B)
+      val fallbackOverwrite = fallback.map(q => boreRead(q.io.overwrite) &&
+        L2PrefetchTxnID.decode(boreRead(q.io.deq.bits.TxnID)) === source.U).getOrElse(false.B)
       val recvAccepted = module.pfRecvReqs.lift(i).map(q => boreRead(q.valid) &&
         L2PrefetchTxnID.decode(boreRead(q.bits.TxnID)) === source.U).getOrElse(false.B)
       io.recvAcceptedBySource(i)(source) := accumulate(recvAccepted)
@@ -1010,18 +1024,18 @@ object L2TopObservation {
         L2PfSource.NL, L2PfSource.CDP).indexOf(source)
       val count = RegInit(0.U(64.W))
       val pulse = if (queueIdx >= 0) boreRead(pfQueueOverwriteBySource(i)(queueIdx)) else false.B
-      count := count + pulse
+      count := count + pulse + fallbackOverwrite
       io.prefetchQueueOverwriteBySource(i)(source) := count
       val accepted = pfQueues.lift(i).map(q => boreRead(q.valid) && boreRead(q.ready) &&
         L2PrefetchTxnID.decode(boreRead(q.bits.TxnID)) === source.U).getOrElse(false.B)
       val sourceQueue = if (queueIdx >= 0) productionPfQueues.lift(sourceQueueStart + queueIdx) else None
       val enqueued = sourceQueue.map(q => boreRead(q.io.enq.valid) && boreRead(q.io.enq.ready)).getOrElse(false.B)
       val dequeued = sourceQueue.map(q => boreRead(q.io.deq.valid) && boreRead(q.io.deq.ready)).getOrElse(false.B)
-      io.prefetchEnqueueBySource(i)(source) := accumulate(enqueued)
+      io.prefetchEnqueueBySource(i)(source) := accumulate(enqueued) + accumulate(fallbackEnq)
       io.prefetchDedupBySource(i)(source) := accumulate(dequeued && !accepted)
-      io.prefetchEnterBySource(i)(source) := accumulate(accepted)
+      io.prefetchEnterBySource(i)(source) := accumulate(accepted) + accumulate(fallbackTake)
       // Read the real FIFO pointers/full flag independently of event totals.
-      io.prefetchPendingBySource(i)(source) := sourceQueue.map { q =>
+      val sourcePending = sourceQueue.map { q =>
         val head = boreRead(privateField[UInt](q, "head"))
         val tail = boreRead(privateField[UInt](q, "tail"))
         val full = boreRead(privateBool(q, "full"))
@@ -1031,6 +1045,18 @@ object L2TopObservation {
         distance := tail - head
         Mux(full, entries.U, distance)
       }.getOrElse(0.U)
+      val fallbackPending = fallback.map { q =>
+        val head = boreRead(q.head)
+        val tail = boreRead(q.tail)
+        val full = boreRead(q.full)
+        val data = boreRead(q.data)
+        PopCount(data.zipWithIndex.map { case (entry, idx) =>
+          val occupied = full || Mux(head <= tail, idx.U >= head && idx.U < tail,
+            idx.U >= head || idx.U < tail)
+          occupied && L2PrefetchTxnID.decode(entry.TxnID) === source.U
+        })
+      }.getOrElse(0.U)
+      io.prefetchPendingBySource(i)(source) := sourcePending +& fallbackPending
     }
     io.prefetchQueueValid(i) := pfQueues.lift(i).map(q => boreRead(q.valid)).getOrElse(false.B)
     io.prefetchQueueReady(i) := pfQueues.lift(i).map(q => boreRead(q.ready)).getOrElse(false.B)
