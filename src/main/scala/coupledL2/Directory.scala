@@ -541,24 +541,25 @@ class Directory(implicit p: Parameters) extends L2Module {
 
   /* ======!! Replacement logic !!====== */
   /* ====== Read, choose replaceWay ====== */
-  val repl_state_s3 = if(random_repl) {
+  // The replacer's way selection is the head of the S3 victim cone
+  // (repl_state_s3 -> get_replace_OH -> replResp -> MSHRCtl).  The state is
+  // sampled from the replacer SRAM at S2, so the selection can be computed
+  // and registered on the same edge; S3 then only muxes the victim payload.
+  val (repl_state_s3, replaceOH_s3) = if(random_repl) {
     when(io.tagWReq.fire){
       repl.miss
     }
-    0.U
+    (0.U(repl.nBits.W), UIntToOH(repl.get_replace_way(0.U(repl.nBits.W)), ways))
   } else {
     val repl_sram_r = replacer_sram_opt.get.io.r(io.read.fire, io.read.bits.set).resp.data(0)
-    val repl_state = RegEnable(repl_sram_r, 0.U(repl.nBits.W), reqValid_s2)
-    repl_state
+    (RegEnable(repl_sram_r, 0.U(repl.nBits.W), reqValid_s2),
+     RegEnable(repl.get_replace_OH(repl_sram_r), 0.U(ways.W), reqValid_s2))
   }
-
-  if (cacheParams.replacement == "random") {
-    replaceWay := repl.get_replace_way(repl_state_s3)
-    replaceOH := UIntToOH(replaceWay, ways)
-  } else {
-    replaceOH := repl.get_replace_OH(repl_state_s3)
-    assert(PopCount(replaceOH) === 1.U, "Replacement way should be one-hot")
-    replaceWay := OHToUInt(replaceOH)
+  replaceOH := replaceOH_s3
+  replaceWay := OHToUInt(replaceOH_s3)
+  if (cacheParams.replacement != "random") {
+    assert(!reqValid_s3 || PopCount(replaceOH) === 1.U,
+      "Replacement way should be one-hot")
   }
 
   val normalRefillRevalidateHit = req_s3.normalRefillRevalidate && hit_s3
