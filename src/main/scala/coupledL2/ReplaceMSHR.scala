@@ -144,7 +144,9 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   val needsData = isCmoClean ||
     (!isCmoInval && (victim.meta.dirty || probeAckDataRecv))
   // Baseline isWriteBackFull: TIP/TRUNK (state(1)) and dirty, including data
-  // the L1 returned.  Victim mode only; CMO opcodes stay as they are.
+  // the L1 returned.  Victim mode only; the CMO flush keeps its own rule in
+  // the opcode mux below (needsData -> WriteBackFull) because its dirty
+  // payload must not be downgraded to a dataless Evict.
   val victimWriteBackFull = isVictim && isT(victim.meta.state) &&
     (victim.meta.dirty || probeAckDataRecv)
   val victimWriteEvictOrEvict = isVictim && afterIssueEbOrElse(!victimWriteBackFull, false.B)
@@ -167,7 +169,10 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   val releaseOpcode = Mux(isCmoClean, WriteCleanFull,
     Mux(isCmoInval, Evict,
       Mux(victimWriteBackFull, WriteBackFull,
-        Mux(victimWriteEvictOrEvict, WriteEvictOrEvict, Evict))))
+        Mux(victimWriteEvictOrEvict, WriteEvictOrEvict,
+          // CMO flush: a dirty line must still carry its data; a clean one
+          // evicts dataless, as before this split.
+          Mux(needsData, WriteBackFull, Evict)))))
 
   when (io.alloc.valid) {
     assert(!valid, "replace context allocated while still valid")
