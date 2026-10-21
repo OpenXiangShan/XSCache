@@ -22,7 +22,7 @@ case class CCHIParameters (
     WayIndex_Width: Width of the way index.
                     Decided by the maximum number of ways in the downstream cache.
     */
-    WayIndex_Width          : Int               = 2,
+    WayIndex_Width          : Int               = 3,
 
     /*
     UpstreamNodeID_Width: Width of the upstream node ID.

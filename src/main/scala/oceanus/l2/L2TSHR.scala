@@ -43,6 +43,19 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
     val toDir = Output(new L2Directory.PathToDirectory)
     val fromDir = Input(new L2Directory.PathFromDirectory)
 
+    // DRRIP release-type update, entrance path: pulses at a WayValid EVT
+    // entrance (Evict / WriteBackFull) carrying the flit's (set, way). The
+    // allocator guarantees at most one EVT entrance per cycle per slice.
+    // Elaborated only when the entrance path is enabled.
+    val replTrain = if (paramL2.enableDRRIPEntranceReleaseUpdate) {
+      Some(Output(Valid(new Bundle {
+        val set = UInt(setBits.W)
+        val way = UInt(wayBits.W)
+      })))
+    } else {
+      None
+    }
+
     val toDS = Output(new L2DataStorage.PathTSHRToDataStorage)
     val fromDS = Input(new L2DataStorage.PathDataStorageToTSHR)
 
@@ -109,6 +122,19 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   val tshr_enter_dirRead = tshr_enter &&
                            !tshr_enter_EVT_WayValid_Evict &&
                            !tshr_enter_EVT_WayValid_WriteBackFull
+
+  // DRRIP release train, entrance path: a WayValid EVT entrance trains the
+  // flit-carried (set, way) immediately, trusted exactly as the existing
+  // directoryReadNeed skip trusts it. WayValid-entered episodes never issue a
+  // DirRel (suppression in L2VPipeEVT); when the entrance update is disabled
+  // their release simply goes untrained (and this port is not elaborated).
+  val useDRRIP = paramL2.replacement == "drrip"
+  io.replTrain.foreach { t =>
+    t.valid := tshr_enter_EVT && io.UpRXEVT.WayValid &&
+      (io.UpRXEVT.Opcode === Evict.U || io.UpRXEVT.Opcode === WriteBackFull.U) && useDRRIP.B
+    t.bits.set := io.UpRXEVT.Addr(offsetBits + setBits - 1, offsetBits)
+    t.bits.way := io.UpRXEVT.Way(wayBits - 1, 0)
+  }
 
   // TSHR payloads
   val tshr_paddr = Reg(UInt(paramL2.physicalAddrWidth.W))
@@ -629,6 +655,11 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   proxyDir.io.meta_modified := meta_modified
   proxyDir.io.tag_modify := tag_modify
   proxyDir.io.tag_modified := tag_modified
+
+  // DRRIP release train, DirRel path: validated commit pulse from the EVT
+  // vPipe into the proxy's dedicated DirRel FSM (both ports elaborated only
+  // when the DirRel path is enabled).
+  proxyDir.io.repl_release.zip(vPipeEVT.io.tshr_repl_release).foreach { case (in, out) => in := out }
 
   rbeEVT.io.directoryReadDone := proxyDir.io.rd_done
   rbeSNP.io.directoryReadDone := proxyDir.io.rd_done

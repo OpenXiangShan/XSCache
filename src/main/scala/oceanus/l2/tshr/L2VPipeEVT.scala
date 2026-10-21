@@ -44,6 +44,13 @@ class L2VPipeEVT(
     val EVT_active = Output(Bool())
     val evtDataReadyOut = Output(Bool())
 
+    // DRRIP release-type update (commit path): single-cycle pulse at this
+    // episode's validated release commit. WayValid-entered episodes are dropped
+    // here unconditionally — they train at the allocation entrance instead (or
+    // not at all when the entrance update is disabled; no DirRel fallback).
+    // Elaborated only when the DirRel path is enabled.
+    val tshr_repl_release = if (paramL2.enableDRRIPReleaseUpdate) Some(Output(Bool())) else None
+
     val blockRBE = Output(new L2RBE.PathVPipeBlock)
     val free = Output(Bool())
   })
@@ -63,6 +70,7 @@ class L2VPipeEVT(
   val pTxnId = Reg(UInt(8.W))
   val pTraceTag = Reg(UInt(1.W))
   val pReqWay = Reg(UInt(4.W))
+  val pWayValid = RegInit(false.B) // entrance-time flit WayValid (DirRel suppression)
   val pEntState = Reg(UInt(2.W)) // entrance-time directory state (assertion use only)
   val dataArmed = RegInit(false.B)
   val dirHit = RegInit(false.B)
@@ -114,6 +122,7 @@ class L2VPipeEVT(
     pSrcId := io.UpRXEVT.bits.SrcID
     pTraceTag := io.UpRXEVT.bits.TraceTag
     pReqWay := dirResult.way
+    pWayValid := io.UpRXEVT.bits.WayValid
     pEntState := dirResult.state
     dirHit := dirResult.hit
     dataArmed := false.B
@@ -216,6 +225,14 @@ class L2VPipeEVT(
 
   io.tshr_meta_write_en := metaMask
   io.tshr_meta_write_meta := newMeta
+
+  // DRRIP release train (commit path): pulse at this episode's validated
+  // release commit — metaMask.state is asserted exactly at the commit points
+  // above. WayValid-entered episodes are dropped unconditionally: they train
+  // at the allocation entrance instead (or not at all when the entrance
+  // update is disabled; no DirRel fallback by design).
+  io.tshr_repl_release.foreach(_ := metaMask.state && !pWayValid &&
+    (paramL2.replacement == "drrip").B)
 
   assert(!(copyBackWrDataMatch && evtDataReady), "EVT: unexpected extra CopyBackWrData after evtDataReady")
   assert(!(state === sWaitData && !dataArmed), "EVT: data arrived before CompDBIDResp armed reception")

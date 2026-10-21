@@ -269,6 +269,12 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       --l2-replacement <pol>    L2 replacement policy, plru by default;
                                 plru is hardwired for 4 ways, drrip supports
                                 any power-of-two way count
+      --l2-drrip-release-update <0|1>
+                                DRRIP release-type update via the arbitrated
+                                DirRel op at the EVT vPipe commit, 1 (on) by default
+      --l2-drrip-entrance-release-update <0|1>
+                                DRRIP release-type update at WayValid EVT
+                                entrances, 1 (on) by default
       --llc-sets <n>            OpenLLC sets per bank, 64 by default (power of two)
       --llc-ways <n>            OpenLLC ways per bank, 4 by default (power of two)
       --llc-banks <n>           OpenLLC banks, 1 by default (power of two)
@@ -292,6 +298,8 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
   var l2Sets = 32
   var l2Ways = 4
   var l2Replacement = "plru"
+  var l2DRRIPReleaseUpdate = true
+  var l2DRRIPEntranceReleaseUpdate = true
   var llcSets = 64
   var llcWays = 4
   var llcBanks = 1
@@ -309,6 +317,8 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       case "--l2-sets"  => l2Sets = args(i + 1).toInt; i += 2
       case "--l2-ways"  => l2Ways = args(i + 1).toInt; i += 2
       case "--l2-replacement" => l2Replacement = args(i + 1); i += 2
+      case "--l2-drrip-release-update" => l2DRRIPReleaseUpdate = args(i + 1) == "1"; i += 2
+      case "--l2-drrip-entrance-release-update" => l2DRRIPEntranceReleaseUpdate = args(i + 1) == "1"; i += 2
       case "--llc-sets" => llcSets = args(i + 1).toInt; i += 2
       case "--llc-ways" => llcWays = args(i + 1).toInt; i += 2
       case "--llc-banks" => llcBanks = args(i + 1).toInt; i += 2
@@ -336,7 +346,9 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       mshrSize = tshrs,
       ways = l2Ways,
       sets = l2Sets,
-      replacement = l2Replacement
+      replacement = l2Replacement,
+      enableDRRIPReleaseUpdate = l2DRRIPReleaseUpdate,
+      enableDRRIPEntranceReleaseUpdate = l2DRRIPEntranceReleaseUpdate
     )
     case CHIParametersKey => CHIParameters (
       issue = EnumCHIIssue.E,

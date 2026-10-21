@@ -117,6 +117,7 @@ object L2Directory {
     val DirRd = Bool()
     val DirWb = Bool()
     val ReplRd = Bool()
+    val DirRel = Bool() // DRRIP release-type update (commit path)
   }
 
   class PathToDirectory(implicit val p: Parameters) extends PathToDirectoryUOPs with HasL2Params {
@@ -135,6 +136,7 @@ object L2Directory {
     val ReplRdArbComp = Bool()
     val ReplRdResp = Bool()
     val ReplRdRetryAck = Bool()
+    val DirRelArbComp = Bool()
   }
 
   class PathFromDirectory(implicit val p: Parameters) extends PathFromDirectoryUOPs with HasL2Params {
@@ -176,12 +178,7 @@ object PLRU4 {
 
 // ══════════════════════════════════════════════════════════════════════
 // DRRIP: 2-bit RRPV per way, generic way count (selected by
-// L2Params.replacement = "drrip"). Mirrors coupledL2's StaticRRIP
-// (coupledL2/utils/Replacer.scala) collapsed onto this directory's two
-// update events (DirRd hit / successful ReplRd refill): coupledL2's
-// SRRIP/BRRIP differ only on release-type updates, which do not exist at
-// this interface, so its PSEL/SDM dueling collapses away — a demand refill
-// inserts at RRPV 0 exactly as coupledL2's non-prefetch refill does.
+// L2Params.replacement = "drrip").
 // ══════════════════════════════════════════════════════════════════════
 
 object DRRIP {
@@ -220,6 +217,15 @@ object DRRIP {
       next(i) := Mux(i.U === way, 0.U, Mux(victimValid, cur(i) + inc, cur(i)))
     next.asUInt
   }
+
+  // Release-type update (client release, delivered via the EVT channel — the
+  // entRelFire / dirRelFire sites below)
+  def getNextStateRelease(state: UInt, way: UInt, reuse: Bool, ways: Int): UInt = {
+    val next = Wire(Vec(ways, UInt(2.W)))
+    next := state.asTypeOf(Vec(ways, UInt(2.W)))
+    next(way) := Mux(reuse, 0.U, 2.U)
+    next.asUInt
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -253,6 +259,18 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     val toDir   = Input(Vec(nMSHR, new L2Directory.PathToDirectory))
     val fromDir = Output(Vec(nMSHR, new L2Directory.PathFromDirectory))
     val tshrIdle = Input(Vec(nMSHR, Bool()))
+    // DRRIP release-type update, entrance path: WayValid EVT entrance train,
+    // reduced one-hot from the TSHRs (at most one EVT entrance per cycle per
+    // slice by allocator construction; see L2TSHRAlloc assertions).
+    // Elaborated only when the entrance path is enabled.
+    val evtRelTrain = if (paramL2.enableDRRIPEntranceReleaseUpdate) {
+      Some(Input(Valid(new Bundle {
+        val set = UInt(setBits.W)
+        val way = UInt(wayBits.W)
+      })))
+    } else {
+      None
+    }
     val debugStateWrite = if (enableDirStateProbe) {
       Some(Output(new Bundle {
         val valid = Bool()
@@ -338,6 +356,9 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   dirArray.io.broadcast.foreach(_ := 0.U.asTypeOf(new SramBroadcastBundle))
   // Replacement state registers (see replBits above).
   val replRegs = RegInit(VecInit(Seq.fill(sets)(0.U(replBits.W))))
+  // DRRIP release-train reuse tracking: cleared on refill, set on DirRd hit, 
+  // set on a release train. DRRIP-elaboration only.
+  val originBits = RegInit(VecInit(Seq.fill(sets)(0.U(ways.W))))
   // Refill lock table: one slot per TSHR, indexed directly by TSHR ID (at most
   // one outstanding refill lock per TSHR by construction). pendClear* is the
   // 1-deep pending-clear register: a lock is released one cycle after the
@@ -439,6 +460,23 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   def incrCapped(x: UInt, cond: Bool): UInt = Mux(cond && (x < MAX_AGE), x + 1.U, x)
   ageWb := Mux(grantDirWb, 0.U, incrCapped(ageWb, anyDirWb))
   ageRd := Mux(grantDirRd, 0.U, incrCapped(ageRd, anyDirRd))
+
+  // ══════════════════════════════════════════════════════════════════
+  // DirRel arbiter — FULLY SEPARATE from the DirRd/DirWb/ReplRd arbiter
+  // ══════════════════════════════════════════════════════════════════
+  val dirRelPath = if (paramL2.enableDRRIPReleaseUpdate) {
+    val relVec = VecInit(io.toDir.map(_.DirRel))
+    val anyRel = relVec.asUInt.orR && !initActive
+    val rrRel  = RegInit(0.U(idxW.W))
+    val winRel = roundRobinNext(rrRel, relVec.asUInt, nMSHR)
+    when(anyRel) { rrRel := winRel }
+    Some((anyRel, io.toDir(winRel), winRel))
+  } else {
+    None
+  }
+  val dirRelGrant = dirRelPath.map(_._1).getOrElse(false.B)
+  val dirRelReq   = dirRelPath.map(_._2).getOrElse(0.U.asTypeOf(new L2Directory.PathToDirectory))
+  val dirRelWin   = dirRelPath.map(_._3).getOrElse(0.U(idxW.W))
 
   // ══════════════════════════════════════════════════════════════════
   // S1: decode the arbitration winner
@@ -586,6 +624,47 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   }
   when(replWen) {
     replRegs(s3_set) := replNextState
+    if (useDRRIP) {
+      // Origin bit (reuse tracking): set on DirRd hit, cleared on refill —
+      // mirrors coupledL2's origin := hit_s3 at every replacer update.
+      when(s3_isDirRd) {
+        originBits(s3_set) := originBits(s3_set) | UIntToOH(way_s3, ways)
+      }.otherwise {
+        originBits(s3_set) := originBits(s3_set) & ~UIntToOH(way_s3, ways)
+      }
+    }
+  }
+
+  // ── DRRIP release-type updates via the EVT channel ─────────────────────
+  // Two fully separate, individually switched delivery paths (L2Params),
+  // each elaborated only when its switch is on:
+  //   entrance: a WayValid EVT entrance trains immediately (evtRelTrain input,
+  //             reduced one-hot from the TSHRs — at most one EVT entrance per
+  //             cycle per slice by allocator construction). WayValid-entered
+  //             episodes ONLY ever use this path (or none when disabled).
+  //   DirRel:   an arbitrated op issued by the proxy's dedicated DirRel FSM
+  //             at the EVT vPipe's validated commit, granted by the SEPARATE
+  //             DirRel arbiter above and applied at its grant cycle. It never
+  //             rides, shares, or disturbs the DirRd/DirWb/ReplRd paths.
+  // Both blocks sit after the S3 replWen block so they win same-edge ties
+  // (DirRel last of all); an in-flight S2 pipeline writer landing a cycle
+  // later can still clobber a train — the same race class this design already
+  // tolerates between concurrent DirRd-hit updates (best-effort heuristic
+  // state, not architectural), accepted deliberately.
+  io.evtRelTrain.foreach { t =>
+    val entRelFire = t.valid && useDRRIP.B && !initActive
+    when(entRelFire) {
+      replRegs(t.bits.set) := DRRIP.getNextStateRelease(replRegs(t.bits.set), t.bits.way, originBits(t.bits.set)(t.bits.way), ways)
+      originBits(t.bits.set) := originBits(t.bits.set) | UIntToOH(t.bits.way, ways)
+    }
+    XSPerfAccumulate("repl_rel_upd_ent", entRelFire)
+  }
+  val dirRelFire = dirRelGrant && useDRRIP.B
+  when(dirRelFire) {
+    val relSet = dirRelReq.PADDR(offsetBits + setBits - 1, offsetBits)
+    val relWay = dirRelReq.WAY(wayBits - 1, 0)
+    replRegs(relSet) := DRRIP.getNextStateRelease(replRegs(relSet), relWay, originBits(relSet)(relWay), ways)
+    originBits(relSet) := originBits(relSet) | UIntToOH(relWay, ways)
   }
 
   // Pending-clear application (one cycle after the release grant): the ONLY
@@ -693,6 +772,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     o.ReplRdArbComp  := false.B
     o.ReplRdResp     := false.B
     o.ReplRdRetryAck := false.B
+    o.DirRelArbComp  := false.B
   }
 
   // ArbComp — combinational at grant cycle (N) for all three operations.
@@ -701,6 +781,9 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   when(grantDirRd)  { io.fromDir(winIdx).DirRdArbComp  := true.B }
   when(grantReplRd) { io.fromDir(winIdx).ReplRdArbComp := true.B }
   when(grantDirWb)  { io.fromDir(winIdx).DirWbArbComp  := true.B }
+  // DirRelArbComp — from the separate DirRel arbiter (dirRelWin); placed here so
+  // the fromDir tie-off defaults above are overridden correctly.
+  when(dirRelGrant) { io.fromDir(dirRelWin).DirRelArbComp := true.B }
 
   // Resp at S3 — routed one-to-one to the originating TSHR
   when(s3_valid) {
@@ -729,7 +812,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   // Assertions
   // ══════════════════════════════════════════════════════════════════
   io.toDir.zipWithIndex.foreach { case (req, i) =>
-    assert(PopCount(Seq(req.ReplRd, req.DirRd, req.DirWb)) <= 1.U,
+    assert(PopCount(Seq(req.ReplRd, req.DirRd, req.DirWb, req.DirRel)) <= 1.U,
       s"Directory: TSHR $i asserts multiple op types")
   }
   assert(PopCount(Seq(grantReplRd, grantDirWb, grantDirRd)) <= 1.U,
@@ -755,12 +838,14 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   XSPerfAccumulate("grant_dirRd",   grantDirRd)
   XSPerfAccumulate("grant_replRd",  grantReplRd)
   XSPerfAccumulate("grant_dirWb",   grantDirWb)
+  XSPerfAccumulate("grant_dirRel",  dirRelGrant)
   XSPerfAccumulate("replStall",     replStall)
   XSPerfAccumulate("replRetry",     replRetry)
   XSPerfAccumulate("blockRefill_locked", PopCount(lockTable.map(_.valid)))
   XSPerfAccumulate("dirRd_hit",     s3_valid && s3_isDirRd && hit_s3)
   XSPerfAccumulate("dirRd_miss",    s3_valid && s3_isDirRd && !hit_s3)
   XSPerfAccumulate("repl_upd",      replWen)
+  XSPerfAccumulate("repl_rel_upd",     dirRelFire)
   XSPerfAccumulate("dir_init_active", initActive)
   XSPerfAccumulate("starve_wb",     wbStarved)
   XSPerfAccumulate("starve_rd",     rdStarved)
