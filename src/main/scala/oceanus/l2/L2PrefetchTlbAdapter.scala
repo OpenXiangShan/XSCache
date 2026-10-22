@@ -1,3 +1,5 @@
+// Intent (audit-fix-1): rotate issue across all eligible reserved slots, retain
+// stalled payload locking, and bound waiting in available service cycles.
 package oceanus.l2
 
 import chisel3._
@@ -27,10 +29,12 @@ class L2PrefetchTranslationClientIO(implicit p: Parameters) extends Bundle {
   val resp = Decoupled(new L2PrefetchTranslationResult)
 }
 
-class L2PrefetchTlbAdapter(val entries: Int = 8)(implicit val p: Parameters) extends Module {
+class L2PrefetchTlbAdapter(val entries: Int = 8, val serviceBound: Int = 0)(implicit val p: Parameters) extends Module {
   require(entries >= 2)
+  val maxServiceCycles = if (serviceBound == 0) entries else serviceBound
+  require(maxServiceCycles >= entries)
   val io = IO(new Bundle {
-    val clients = Vec(2, new L2PrefetchTranslationClientIO) // VBOP > CDP
+    val clients = Vec(2, new L2PrefetchTranslationClientIO) // admission: VBOP > CDP
     val tlb = new L2PrefetchTlbIO
   })
 
@@ -62,8 +66,11 @@ class L2PrefetchTlbAdapter(val entries: Int = 8)(implicit val p: Parameters) ext
 
   val eligible = VecInit((0 until entries).map(i =>
     state(i) === pending || (state(i) === retry && timer(i) === 0.U)))
-  val vbop = VecInit((0 until entries).map(i => eligible(i) && !owner(i)))
-  val selected = PriorityEncoder(Mux(vbop.asUInt.orR, vbop.asUInt, eligible.asUInt))
+  // All owners share the reserved capacity: issue must rotate across owners
+  // too. Admission still prefers VBOP when both clients offer a new request.
+  val nextIssue = RegInit(0.U(indexBits.W))
+  val after = VecInit((0 until entries).map(i => eligible(i) && i.U >= nextIssue))
+  val selected = PriorityEncoder(Mux(after.asUInt.orR, after.asUInt, eligible.asUInt))
   // A lower-priority request already offered to a stalled TLB must remain stable.
   val locked = RegInit(false.B)
   val lockedIndex = Reg(UInt(indexBits.W))
@@ -76,7 +83,23 @@ class L2PrefetchTlbAdapter(val entries: Int = 8)(implicit val p: Parameters) ext
   io.tlb.req.bits.size := 3.U
   io.tlb.req_kill := false.B
   when(io.tlb.req.valid && !io.tlb.req.ready) { locked := true.B; lockedIndex := issue }
-  when(io.tlb.req.fire) { locked := false.B; state(issue) := waiting }
+  when(io.tlb.req.fire) {
+    locked := false.B; state(issue) := waiting
+    nextIssue := Mux(issue === (entries - 1).U, 0.U, issue + 1.U)
+  }
+  // External ready can be withheld indefinitely. The finite bound therefore
+  // counts available service cycles (ready + inflight space), not wall time;
+  // retry countdown is outside eligibility. With continuous ready it is a
+  // wall-clock bound. No pending slot may be bypassed for maxServiceCycles.
+  val serviceAge = RegInit(VecInit(Seq.fill(entries)(0.U(log2Ceil(maxServiceCycles + 1).W))))
+  for (i <- 0 until entries) {
+    when(!eligible(i) || (io.tlb.req.fire && issue === i.U)) {
+      serviceAge(i) := 0.U
+    }.elsewhen(io.tlb.req.ready && inflight.io.enq.ready) {
+      assert(serviceAge(i) < (maxServiceCycles - 1).U, "pending TLB slot exceeded service bound")
+      serviceAge(i) := serviceAge(i) + 1.U
+    }
+  }
   inflight.io.enq.valid := io.tlb.req.fire
   inflight.io.enq.bits := issue
   io.tlb.resp.ready := true.B

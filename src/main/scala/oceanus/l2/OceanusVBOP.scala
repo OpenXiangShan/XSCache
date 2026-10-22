@@ -1,3 +1,5 @@
+// Intent (audit-fix-1): register shared capacity, same-VA serialization and
+// issue fairness deviations in the source ledger before updating it.
 /** *************************************************************************************
  * Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
  * Copyright (c) 2020-2021 Peng Cheng Laboratory
@@ -37,6 +39,17 @@
  * reference's vbop tables in one test circuit (ChiselDB has a global registry).
  * D1: fixed TLB fire-oh (:450-516) becomes arbitrary-latency handshakes
  * through L2PrefetchTlbAdapter; one miss replay/fault policy stays there.
+ * D1 capacity: the 16-entry buffer additionally shares 8 translation slots
+ * with CDP; slots remain reserved through client retirement, so congestion can
+ * increase full-drop relative to reference per-entry translation state.
+ * D1 same VA: distinct needT/source entries translate serially to preserve
+ * address-only response ownership; the reference permits parallel entries.
+ * D1 fairness: reference entry TwoLevelRRArbiter (:420-421,565-570) becomes
+ * global eligible-slot RR in the shared adapter (VBOP still wins admission).
+ * Offered TLB payload stays locked across backpressure; every eligible slot
+ * is served within the adapter's parameterized available-service-cycle bound.
+ * Training: needHint/trainEnable is filtered before TSHR and slice arbitration;
+ * enabled-vs-enabled simultaneous pulses retain Oceanus's lossy semantics.
  * D2: needT (:716,750,384) retained for dedup, output always Shared; counter
  * increments on req.fire for a needT=1 request. Future candidate: map needT=1
  * to StashUnique when the base supports that internal prefetch path.

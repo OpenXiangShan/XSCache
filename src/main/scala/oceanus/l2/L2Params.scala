@@ -1,3 +1,5 @@
+// Intent (audit-fix-1): propagate the top CDP generation contract to bundles
+// and child modules so disabled depth fields have zero storage width.
 package oceanus.l2
 
 import org.chipsalliance.cde.config.Field
@@ -24,6 +26,9 @@ case class L2Params(
     // Entrance path: WayValid EVT entrances train immediately at allocation entrance.
     enableDRRIPEntranceReleaseUpdate: Boolean = true,
 )
+
+// Standalone observation modules remain enabled; L2Top explicitly scopes this key.
+case object L2CDPObserveEnableKey extends Field[Boolean](true)
 
 case object L2ParamsKey extends Field[L2Params](L2Params())
 case object L2SliceDirStateProbeEnableKey extends Field[Boolean](false)

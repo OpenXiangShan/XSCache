@@ -1,3 +1,4 @@
+// Intent (audit-fix-1): omit CDP depth bits from Meta storage when disabled.
 package oceanus.l2
 
 // Intent (1c-2): preserve depth on unrelated writes, update it atomically with
@@ -108,7 +109,7 @@ object L2Directory {
     val clients = Vec(1, Bool()) // TODO: parameterize with coherent l2 client count
     val alias = UInt(paramCCHI.TagAlias_Width.W)
     val pfSource = UInt(L2PfSource.Width.W)
-    val cdpPfDepth = UInt(2.W)
+    val cdpPfDepth = UInt((if (p(L2CDPObserveEnableKey)) 2 else 0).W)
   }
 
   class MetaReadResult(implicit override val p: Parameters) extends Meta with HasL2Params {

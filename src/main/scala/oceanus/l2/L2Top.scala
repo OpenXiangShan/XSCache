@@ -1,3 +1,5 @@
+// Intent (audit-fix-1): reject disabled training before each lossy arbitration;
+// generate CDP observation/storage only when training observation is enabled.
 package oceanus.l2
 
 // Intent (3a): replace the optional VBOP stub with a reference-derived VBOP;
@@ -134,6 +136,8 @@ class L2Configuration(
   val vbopParams: OceanusVBOPParameters = OceanusVBOPParameters()
 ) {
   def sliceNum = slices.size
+  // Training enables cache event observation even without an algorithm sink.
+  val cdpObserveEnable = pfTrainEnable || cdpStubEnable
   val stubMode = vbopStubEnable || cdpStubEnable
   require(!stubMode || (pfTlbEnable && pfTrainEnable), "VA stubs require TLB and training sideband")
 
@@ -232,7 +236,8 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   // ----------------------------------------------------------------
 
   //
-  val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId, config.pfTrainEnable)))
+  val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId, config.pfTrainEnable)(
+    p.alterPartial { case L2CDPObserveEnableKey => config.cdpObserveEnable })))
 
   // The control bundle gates source issue only; the delay-latency field is
   // intentionally recorded here for the later queue-control slice.
@@ -253,15 +258,17 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   dontTouch(vbopControlEnable)
   dontTouch(cdpControlEnable)
 
-  val cdpDataArb = Module(new RRArbiter(new L2CDPHalf, config.sliceNum))
-  cdpDataArb.io.in.zip(slices).foreach { case (in, slice) => in <> slice.io.cdpData }
-  // Empty CDP sink for this stage: all ports remain observable, and cache
-  // progress never depends on consumption. The algorithm will replace it.
-  val cdpData = Wire(Valid(new L2CDPHalf))
-  cdpData.valid := cdpDataArb.io.out.valid
-  cdpData.bits := cdpDataArb.io.out.bits
-  cdpDataArb.io.out.ready := true.B
-  val cdpDataSlice = cdpDataArb.io.chosen
+  val cdpData = WireDefault(0.U.asTypeOf(Valid(new L2CDPHalf)))
+  val cdpDataSlice = WireDefault(0.U(log2Ceil(config.sliceNum).max(1).W))
+  if (config.cdpObserveEnable) {
+    val cdpDataArb = Module(new RRArbiter(new L2CDPHalf, config.sliceNum))
+    cdpDataArb.suggestName("cdpDataArb")
+    cdpDataArb.io.in.zip(slices).foreach { case (in, slice) => in <> slice.io.cdpData }
+    cdpData.valid := cdpDataArb.io.out.valid
+    cdpData.bits := cdpDataArb.io.out.bits
+    cdpDataArb.io.out.ready := true.B
+    cdpDataSlice := cdpDataArb.io.chosen
+  } else slices.foreach(_.io.cdpData.ready := true.B)
   val cdpTrain = VecInit(slices.map(_.io.cdpTrain))
   val cdpEvict = VecInit(slices.map(_.io.cdpEvict))
   val vbopStub = if (config.vbopStubEnable) Some(Module(new OceanusVBOP(config.vbopParams))) else None
@@ -282,7 +289,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   val cdpCollisionDrops = VecInit(slices.map(_.io.cdpCollisionDrops))
   val trainEnableZeroCount = WireDefault(slices.map(_.io.trainDisabled).reduce(_ + _))
   Seq(cdpData, cdpDataSlice, cdpTrain, cdpEvict, cdpHalfDrops,
-    cdpCollisionDrops, trainEnableZeroCount).foreach(dontTouch(_))
+    cdpCollisionDrops, trainEnableZeroCount).foreach(x => if (config.cdpObserveEnable) dontTouch(x))
   // dontTouch requires a signal even when the optional control port is absent.
   val delayLatency = WireDefault(if (config.pfCtrlEnable) io.pfCtrl.get.l2_pf_delay_latency else 0.U(10.W))
   dontTouch(delayLatency)
@@ -324,18 +331,16 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   val recvReqFire = pfRecvReqs.map(_.fire).reduceOption(_ || _).getOrElse(false.B)
 
   val bop = Module(new OceanusBOP(config.bopParams))
-  val bopTrainArb = Module(new FastArbiter(new L2PrefetchTrain(config.pfTrainEnable), config.sliceNum))
+  val bopTrainArb = Module(new L2PrefetchTrainArb(config.sliceNum, config.pfTrainEnable))
   bopTrainArb.io.in.zip(slices).foreach { case (sink, source) =>
     sink.valid := source.io.bopTrain.valid
     sink.bits := source.io.bopTrain.bits
   }
-  // Intent (1c-1): mirror reference MainPipe.scala:750-754 and
-  // Prefetcher.scala:346-348 PBOP needHint gating; absent sideband means enabled.
-  // Disabled events must still retire from the shared training arbiter.
-  val bopTrainEnabled = bopTrainArb.io.out.bits.trainEnable.getOrElse(true.B)
-  bop.io.train.valid := bopTrainArb.io.out.valid && bopTrainEnabled
+  // Reference MainPipe.scala:750-759 filters needHint before slice arbitration.
+  // Disabled events cannot consume a choice or displace another slice's pulse.
+  bop.io.train.valid := bopTrainArb.io.out.valid
   bop.io.train.bits := bopTrainArb.io.out.bits.paddr
-  bopTrainArb.io.out.ready := !bopTrainEnabled || bop.io.train.ready
+  bopTrainArb.io.out.ready := bop.io.train.ready
   vbopStub.foreach { stub =>
     // Intent (3a refinement): slice training is a lossy Valid event pulse;
     // copy it even when PBOP's independent learner is momentarily not ready.

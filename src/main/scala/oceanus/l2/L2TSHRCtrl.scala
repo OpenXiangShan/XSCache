@@ -1,3 +1,5 @@
+// Intent (audit-fix-1): filter TSHR candidates before PriorityMux and omit
+// CDP half queues/counters when the top disables CDP observation.
 package oceanus.l2
 
 // Intent (1c-2): buffer lossy CDP half-lines per slice without cache backpressure;
@@ -123,30 +125,39 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   assert(!io.UpRXDAT.valid || (PopCount(tshrs.map(_.io.UpRXDAT.valid)) =/= 0.U), "UpRXDAT valid but no TSHR selected, flit lost")
   assert(!io.DnRXRSP.valid || (PopCount(tshrs.map(_.io.DnRXRSP.valid)) =/= 0.U), "DnRXRSP valid but no TSHR selected, flit lost")
   assert(!io.DnRXDAT.valid || (PopCount(tshrs.map(_.io.DnRXDAT.valid)) =/= 0.U), "DnRXDAT valid but no TSHR selected, flit lost")
-  io.bopTrain.valid := tshrs.map(_.io.bopTrain.valid).orR
-  io.bopTrain.bits := PriorityMux(tshrs.map(t => t.io.bopTrain.valid -> t.io.bopTrain.bits))
-  val cdpQueue = Module(new L2CDPHalfQueue)
-  val cdpValids = tshrs.map(_.io.cdpData.valid)
-  cdpQueue.io.in.valid := cdpValids.reduce(_ || _)
-  cdpQueue.io.in.bits := PriorityMux(tshrs.map(t => t.io.cdpData.valid -> t.io.cdpData.bits))
-  io.cdpData <> cdpQueue.io.out
-  io.cdpHalfDrops := cdpQueue.io.dropped
-  val cdpCollisionDrops = RegInit(0.U(64.W))
-  val cdpLineCount = PopCount(cdpValids)
-  when(cdpLineCount > 1.U) { cdpCollisionDrops := cdpCollisionDrops + ((cdpLineCount - 1.U) << 1) }
-  io.cdpCollisionDrops := cdpCollisionDrops
-  tshrs.zipWithIndex.foreach { case (t, i) =>
-    io.cdpTrain(i) := t.io.cdpTrain
-    io.cdpEvict(i) := t.io.cdpEvict
+  io.bopTrain := L2PrefetchTrainSelect.local(tshrs.map(_.io.bopTrain))
+  if (p(L2CDPObserveEnableKey)) {
+    val cdpQueue = Module(new L2CDPHalfQueue)
+    val cdpValids = tshrs.map(_.io.cdpData.valid)
+    cdpQueue.io.in.valid := cdpValids.reduce(_ || _)
+    cdpQueue.io.in.bits := PriorityMux(tshrs.map(t => t.io.cdpData.valid -> t.io.cdpData.bits))
+    io.cdpData <> cdpQueue.io.out
+    io.cdpHalfDrops := cdpQueue.io.dropped
+    val cdpCollisionDrops = RegInit(0.U(64.W))
+    val cdpLineCount = PopCount(cdpValids)
+    when(cdpLineCount > 1.U) { cdpCollisionDrops := cdpCollisionDrops + ((cdpLineCount - 1.U) << 1) }
+    io.cdpCollisionDrops := cdpCollisionDrops
+    tshrs.zipWithIndex.foreach { case (t, i) =>
+      io.cdpTrain(i) := t.io.cdpTrain
+      io.cdpEvict(i) := t.io.cdpEvict
+    }
+    // Count all eligible demand training, including ordinary CDP hits, before
+    // any lossy arbiter; simultaneous disabled events all count independently.
+    val trainDisabled = RegInit(0.U(64.W))
+    val disabledThisCycle = PopCount(tshrs.map(t => t.io.cdpTrain.valid &&
+      !t.io.cdpTrain.bits.trainEnable))
+    trainDisabled := trainDisabled + disabledThisCycle
+    io.trainDisabled := trainDisabled
+    XSPerfAccumulate("trainEnableZero", disabledThisCycle)
+  } else {
+    io.cdpData.valid := false.B
+    io.cdpData.bits := 0.U.asTypeOf(io.cdpData.bits)
+    io.cdpTrain := 0.U.asTypeOf(io.cdpTrain)
+    io.cdpEvict := 0.U.asTypeOf(io.cdpEvict)
+    io.cdpHalfDrops := 0.U
+    io.cdpCollisionDrops := 0.U
+    io.trainDisabled := 0.U
   }
-  // Count all eligible demand training, including ordinary CDP hits, before
-  // any lossy arbiter; simultaneous disabled events all count independently.
-  val trainDisabled = RegInit(0.U(64.W))
-  val disabledThisCycle = PopCount(tshrs.map(t => t.io.cdpTrain.valid &&
-    !t.io.cdpTrain.bits.trainEnable))
-  trainDisabled := trainDisabled + disabledThisCycle
-  io.trainDisabled := trainDisabled
-  XSPerfAccumulate("trainEnableZero", disabledThisCycle)
   // ----------------------------------------------------------------
 
   // Per-slice BOP effectiveness. Sum EVERY TSHR event: OR would lose

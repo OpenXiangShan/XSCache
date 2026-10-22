@@ -1,3 +1,4 @@
+// Intent (audit-fix-1): generate CDP event extraction only for enabled observation.
 package oceanus.l2.tshr
 
 // Intent (1c-2): export qualified scan/old-meta training and actual victim
@@ -247,36 +248,41 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     io.bopTrain.bits.reqSource.get := context.reqSource
     io.bopTrain.bits.trainEnable.get := context.trainEnable
   }
-  // MainPipe s5 hit scans GrantData from CDP/SMS/BOP/PBOP, using OLD meta.
-  // Ordinary release/writeback is not a scan. Probe-supplied data is allowed
-  // only while completing one of these read/refill requests.
-  val cdpRead = rxreq_readshared || rxreq_readunique || rxreq_makeunique
-  val cdpHitSource = Seq(L2PfSource.CDP, L2PfSource.SMS, L2PfSource.BOP, L2PfSource.PBOP)
-    .map(s => dirResult.pfSource === s.U).reduce(_ || _)
-  val cdpHit = rxreq_demand && dirResult.hit && cdpHitSource &&
-    (rxreq_readshared || rxreq_readunique) && rxreq.ExpCompData
-  // Scan data-bearing read refills and HintAck-equivalent Stash refills,
-  // including source zero. MakeUnique returns permission without line data.
-  val cdpRefill = !dirResult.hit && (rxreq_readshared || rxreq_readunique ||
-    rxreq_stashshared || rxreq_stashunique)
-  io.cdpStart.valid := rxreq_fire && (cdpHit || cdpRefill)
-  io.cdpStart.bits.paddr := io.tshr_paddr
-  io.cdpStart.bits.isHit := cdpHit
-  io.cdpStart.bits.eventType := Mux(cdpHit, L2CDPEvent.Hit.U, L2CDPEvent.Refill.U)
-  io.cdpStart.bits.pfSource := Mux(cdpHit, dirResult.pfSource,
-    Mux(requestFromPrefetch, rxreqPfSource, L2PfSource.NoWhere.U))
-  io.cdpStart.bits.pfDepth := Mux(cdpHit, dirResult.cdpPfDepth,
-    Mux(requestFromPrefetch, L2PrefetchTxnID.depth(rxreq.TxnID), 0.U))
-  // VPN/filter training includes ordinary demand hits as well as misses.
-  // Preserve trainEnable and reqSource for the eventual CDP input filter.
-  io.cdpTrain.valid := rxreq_fire && rxreq_demand && cdpRead
-  io.cdpTrain.bits.paddr := io.tshr_paddr
-  io.cdpTrain.bits.pfSource := Mux(dirResult.hit, dirResult.pfSource, 0.U)
-  io.cdpTrain.bits.pfDepth := Mux(dirResult.hit, dirResult.cdpPfDepth, 0.U)
-  io.cdpTrain.bits.hit := dirResult.hit
-  io.cdpTrain.bits.vaddr := io.bopTrain.bits.vaddr.getOrElse(0.U)
-  io.cdpTrain.bits.reqSource := io.bopTrain.bits.reqSource.getOrElse(0.U)
-  io.cdpTrain.bits.trainEnable := io.bopTrain.bits.trainEnable.getOrElse(true.B)
+  if (p(L2CDPObserveEnableKey)) {
+    // MainPipe s5 hit scans GrantData from CDP/SMS/BOP/PBOP, using OLD meta.
+    // Ordinary release/writeback is not a scan. Probe-supplied data is allowed
+    // only while completing one of these read/refill requests.
+    val cdpRead = rxreq_readshared || rxreq_readunique || rxreq_makeunique
+    val cdpHitSource = Seq(L2PfSource.CDP, L2PfSource.SMS, L2PfSource.BOP, L2PfSource.PBOP)
+      .map(s => dirResult.pfSource === s.U).reduce(_ || _)
+    val cdpHit = rxreq_demand && dirResult.hit && cdpHitSource &&
+      (rxreq_readshared || rxreq_readunique) && rxreq.ExpCompData
+    // Scan data-bearing read refills and HintAck-equivalent Stash refills,
+    // including source zero. MakeUnique returns permission without line data.
+    val cdpRefill = !dirResult.hit && (rxreq_readshared || rxreq_readunique ||
+      rxreq_stashshared || rxreq_stashunique)
+    io.cdpStart.valid := rxreq_fire && (cdpHit || cdpRefill)
+    io.cdpStart.bits.paddr := io.tshr_paddr
+    io.cdpStart.bits.isHit := cdpHit
+    io.cdpStart.bits.eventType := Mux(cdpHit, L2CDPEvent.Hit.U, L2CDPEvent.Refill.U)
+    io.cdpStart.bits.pfSource := Mux(cdpHit, dirResult.pfSource,
+      Mux(requestFromPrefetch, rxreqPfSource, L2PfSource.NoWhere.U))
+    io.cdpStart.bits.pfDepth := Mux(cdpHit, dirResult.cdpPfDepth,
+      Mux(requestFromPrefetch, L2PrefetchTxnID.depth(rxreq.TxnID), 0.U))
+    // VPN/filter training includes ordinary demand hits as well as misses.
+    // Preserve trainEnable and reqSource for the eventual CDP input filter.
+    io.cdpTrain.valid := rxreq_fire && rxreq_demand && cdpRead
+    io.cdpTrain.bits.paddr := io.tshr_paddr
+    io.cdpTrain.bits.pfSource := Mux(dirResult.hit, dirResult.pfSource, 0.U)
+    io.cdpTrain.bits.pfDepth := Mux(dirResult.hit, dirResult.cdpPfDepth, 0.U)
+    io.cdpTrain.bits.hit := dirResult.hit
+    io.cdpTrain.bits.vaddr := io.bopTrain.bits.vaddr.getOrElse(0.U)
+    io.cdpTrain.bits.reqSource := io.bopTrain.bits.reqSource.getOrElse(0.U)
+    io.cdpTrain.bits.trainEnable := io.bopTrain.bits.trainEnable.getOrElse(true.B)
+  } else {
+    io.cdpStart := 0.U.asTypeOf(io.cdpStart)
+    io.cdpTrain := 0.U.asTypeOf(io.cdpTrain)
+  }
   XSPerfAccumulate("prefetchedHitTrain", prefetched_hit_train)
 
   // CCHI Stash is supported only as a fire-and-forget prefetch hint: with ExpCompStash=1 the
@@ -2055,11 +2061,13 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     io.tshr_meta_write_meta.state === MetaState.I && dirResult.hit &&
     dirResult.state =/= MetaState.I && dirResult.pfSource =/= L2PfSource.NoWhere.U
 
-  io.cdpEvict.valid := meta_wr_state_evictback_I && io.tshr_meta_write_en.state &&
-    io.tshr_meta_write_meta.state === MetaState.I && dirResult.hit && dirResult.state =/= MetaState.I
-  io.cdpEvict.bits.paddr := io.tshr_paddr
-  io.cdpEvict.bits.pfSource := dirResult.pfSource
-  io.cdpEvict.bits.pfDepth := dirResult.cdpPfDepth
+  if (p(L2CDPObserveEnableKey)) {
+    io.cdpEvict.valid := meta_wr_state_evictback_I && io.tshr_meta_write_en.state &&
+      io.tshr_meta_write_meta.state === MetaState.I && dirResult.hit && dirResult.state =/= MetaState.I
+    io.cdpEvict.bits.paddr := io.tshr_paddr
+    io.cdpEvict.bits.pfSource := dirResult.pfSource
+    io.cdpEvict.bits.pfDepth := dirResult.cdpPfDepth
+  } else io.cdpEvict := 0.U.asTypeOf(io.cdpEvict)
 
   io.bopPerf.source := L2PfSource.NoWhere.U
   when (io.bopPerf.useful) { io.bopPerf.source := dirResult.pfSource }
