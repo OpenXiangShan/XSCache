@@ -477,7 +477,12 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     backoffTimer := 0.U
   }
 
-  val sidecarOwnsVictim = io.replaceActive || sidecarDelegatedLatched
+  // Same-cycle local fence for the cycle in which this context's victim is
+  // delegated.  replaceActive is now the registered ownership (one cycle
+  // later); valid and mshrId are already registers, so this comparison does
+  // not rebuild the replResp/replaceActive cone.
+  val replRespForThisParent = io.replResp.valid && io.replResp.bits.mshrId === io.id
+  val sidecarOwnsVictim = io.replaceActive || sidecarDelegatedLatched || replRespForThisParent
   io.sidecarDelegated := sidecarDelegatedLatched
   io.probeIssued := sourceBProbeIssued
   when(io.replaceAccepted && !io.alloc.valid) {
@@ -710,7 +715,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   // A concurrent snoop delays the L1-visible Grant, but a miss must still
   // query the replacer. This is an internal Directory-only task; it never
   // commits the normal RefillBuf.
-  val replReadBlockedBySnoopOrReplace = io.replaceActive
+  val replReadBlockedBySnoopOrReplace = io.replaceActive || replRespForThisParent
   val grantNeedsReplRead = !dirResult.hit && !state.w_replResp &&
     !replReadInFlight && !io.blockReplRead && !denied && !replReadBlockedBySnoopOrReplace
   val normalGrantPending = !cmo_cbo && !state.s_refill && !grantIssued &&

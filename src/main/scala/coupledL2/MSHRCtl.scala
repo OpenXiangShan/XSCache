@@ -995,7 +995,12 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       when(parentReplaceMatch.orR) {
         parentReplaceInfo := Mux1H(parentReplaceMatch, replaceMshrs.map(_.io.info.bits))
       }
-      refill.io.replaceActive := replaceDelegatedForParent(i)
+      // Feed the parent the registered child ownership, not the allocation
+      // intent: the latter closes the replResp -> replaceActive -> willFree ->
+      // RXSNP task-valid cone.  MSHR adds a narrow same-cycle fence on
+      // replResp.valid/mshrId for the allocation cycle, so probe/replRead/
+      // cbwrdata still see the child on the cycle it is created.
+      refill.io.replaceActive := replaceActiveForParent(i)
       refill.io.replaceLive := replaceActiveForParent(i)
       // A full pool (or a same-cycle reservation taking its last free slot)
       // can reject an intent. The parent must keep requesting until accepted.
