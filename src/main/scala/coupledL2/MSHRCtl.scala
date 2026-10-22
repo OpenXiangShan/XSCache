@@ -1402,21 +1402,38 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // state, mirroring the pre-acceptance preemption of the RequestArb path.
   val directCbValids = VecInit(replaceMshrs.map(_.io.tasks.txdat.valid))
   val cbPresent = RegInit(false.B)
+  // The copyback pick is registered a cycle before the ReleaseBuf read.  The
+  // read id then no longer sits at the end of the txdat.valid/bFire cone, and
+  // the pick is re-confirmed when the read is issued: a sidecar withdrawn by
+  // a nested snoop drops the pick without touching ReleaseBuf.
+  val cbPickOHReg = Reg(UInt(mshrsAll.W))
+  val cbPickValidReg = RegInit(false.B)
   val cbSelOH = Reg(UInt(mshrsAll.W))
   val cbTaskReg = Reg(new TaskBundle)
   val cbRrGrantMask = RegInit(0.U(mshrsAll.W))
   val cbRrSelOH = MaskToOH(cbRrGrantMask & directCbValids.asUInt)
   val cbPickOH = Mux((cbRrSelOH & directCbValids.asUInt).orR, cbRrSelOH, MaskToOH(directCbValids.asUInt))
-  val cbPick = !cbPresent && directCbValids.asUInt.orR && io.txdatDirectSpace
+  val cbPick = !cbPresent && !cbPickValidReg && directCbValids.asUInt.orR && io.txdatDirectSpace
   when (cbPick) {
+    cbPickOHReg := cbPickOH
+    cbPickValidReg := true.B
+  }
+  val cbPickStillValid = Mux1H(cbPickOHReg, directCbValids)
+  val cbRead = cbPickValidReg && cbPickStillValid
+  io.releaseBufDirectRd.valid := cbRead
+  io.releaseBufDirectRd.bits.id := OHToUInt(cbPickOHReg)
+  when (cbRead) {
+    cbPickValidReg := false.B
     cbPresent := true.B
-    cbSelOH := cbPickOH
-    cbTaskReg := Mux1H(cbPickOH, replaceMshrs.map(_.io.tasks.txdat.bits))
+    cbSelOH := cbPickOHReg
+    cbTaskReg := Mux1H(cbPickOHReg, replaceMshrs.map(_.io.tasks.txdat.bits))
+  }.elsewhen (cbPickValidReg && !cbPickStillValid) {
+    // The sidecar withdrew before the read: drop the pick and let it present
+    // again with the post-snoop state.
+    cbPickValidReg := false.B
   }
   // ReleaseBuf resp2 is registered and holds until the next read, so the
   // data is stable for the whole present window.
-  io.releaseBufDirectRd.valid := cbPick
-  io.releaseBufDirectRd.bits.id := OHToUInt(cbPickOH)
   val cbSelStillValid = Mux1H(cbSelOH, directCbValids)
   io.toTXDAT.valid := cbPresent && cbSelStillValid
   io.toTXDAT.bits.task := cbTaskReg
