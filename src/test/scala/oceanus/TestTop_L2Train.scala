@@ -1,3 +1,4 @@
+// Intent (audit-fix-1): require disabled-event coverage before arbitration.
 package oceanus
 
 import chisel3._
@@ -18,6 +19,7 @@ import scala.collection.mutable
 // in the same REQ RBE and train later with its own (different) VPN.
 object TestTop_L2Train extends App with ChiselSim {
   require(L2TopPhase1aPorts.enabled && L2TopTrainStimulus.driven)
+  val mixedEnable = args.contains("--mixed-enable")
   val count = args.collectFirst { case a if a.startsWith("--slices=") => a.drop(9).toInt }.getOrElse(2)
   require(Set(2, 4)(count))
   val upstream = new L2UpstreamTable(Seq(L2UpstreamTableEntry(L2UpstreamPortType.Type1, 0),
@@ -160,6 +162,20 @@ object TestTop_L2Train extends App with ChiselSim {
       pair.zipWithIndex.foreach { case (a, port) => add(port, a + 0x80, group * 4 + 1) }
       drain(); assert(dn.trainChecker.hits - before == 1, s"one BOP target per simultaneous pair: hits=${dn.trainChecker.hits - before}")
     }
+    // Intent (audit-fix-1): real requests execute simultaneously on two slices;
+    // the lower slice is disabled, and the higher slice must train unchanged.
+    if (mixedEnable) {
+      val pair = (0 until 2).map { s =>
+        (0 until 128).map(i => BigInt(0x50000+i*0x100)).find(a => L2TopBOPExpectations.slice(a,count)==s).get
+      }
+      val before = dn.trainChecker.acceptedByBop
+      val mixedBefore = dn.trainChecker.mixedGlobal
+      add(0,pair(0),31); add(1,pair(1),32)
+      drain()
+      assert(dn.trainChecker.mixedGlobal > mixedBefore, "mixed real execution did not coincide")
+      assert(dn.trainChecker.acceptedByBop == before+1, "enabled peer lost to disabled train")
+      println(s"TRAIN_MIXED_INTEGRATION pass=true slices=$count enabledAccepted=1 disabledInputs=1")
+    }
     // A separate cold miss produces an actual in-flight BOP request. Submit
     // its target on the other port before the 100-cycle downstream response.
     val lateBase = BigInt(0x38000)
@@ -176,16 +192,15 @@ object TestTop_L2Train extends App with ChiselSim {
     assert(c.misses >= count + 1 && c.hits >= count / 2 + 1 && c.disabled > 0 && c.internal > 0)
     assert(c.lateHits >= 1 && c.simultaneousAccepts > 0 && c.simultaneousTrains > 0)
     assert(c.pending == 0 && c.accepts == c.executions)
-    assert(completed == 2 * count + 2 && checkedBeats == completed * 2)
+    assert(completed == 2 * count + 2 + (if(mixedEnable) 2 else 0) && checkedBeats == completed * 2)
     c.report()
     if (dut.cdpObservation.nonEmpty) {
       assert(cdp.lines > 0 && cdp.forwarded > 0 && cdp.hits > 0 && cdp.disabled > 0)
       cdp.report()
     }
-    // Intent (1c-1): require both enabled and disabled events at the actual BOP
-    // boundary; the unchanged VA/RBE checker supplies independent expectations.
-    assert(c.gatedGlobal > 0 && c.acceptedByBop > 0)
-    println(s"TRAIN_GATE_RESULT pass=true enabled=${c.acceptedByBop} disabled=${c.gatedGlobal} slices=$count")
+    // Count disabled raw events before arbitration and enabled BOP accepts.
+    assert(c.disabledBeforeArb > 0 && c.acceptedByBop > 0)
+    println(s"TRAIN_GATE_RESULT pass=true enabled=${c.acceptedByBop} disabledInputs=${c.disabledBeforeArb} slices=$count")
     println(s"VA_DIRECTED_RESULT pass=true slices=$count completed=$completed beats=$checkedBeats miss=true firstHit=true lateOwnVA=true enableZero=true multiPort=true multiSlice=true internalZero=true")
   }
 }

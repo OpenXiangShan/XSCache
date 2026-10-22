@@ -1,3 +1,5 @@
+// Intent (audit-fix-1): retain raw disabled observations, but require local
+// and global arbitration to select only enabled candidates.
 package oceanus
 
 import chisel3._
@@ -102,9 +104,9 @@ class L2TopTrainChecker(dut: TestTop_L2Top) extends ChiselSim {
   private val waiting = mutable.Map.empty[(Int, Int), Expected]
   var accepts = 0; var executions = 0; var misses = 0; var hits = 0
   var disabled = 0; var internal = 0; var lateHits = 0; var simultaneousAccepts = 0; var simultaneousTrains = 0
-  // Intent (1c-1): count observed disabled global events and actual BOP fires
-  // so directed tests demonstrate non-vacuous acceptance and rejection.
-  var gatedGlobal = 0; var acceptedByBop = 0
+  // Count disabled raw inputs before arbitration, and actual enabled BOP fires.
+  var disabledBeforeArb = 0; var acceptedByBop = 0
+  var mixedLocal = 0; var mixedGlobal = 0
   private def value(x: UInt): BigInt = x.peek().litValue
   private def flag(x: Bool): Boolean = x.peek().litToBoolean
   private def context(c: L2PrefetchTrainContext): (BigInt, BigInt, Boolean) = (value(c.vpn), value(c.reqSource), flag(c.trainEnable))
@@ -165,10 +167,15 @@ class L2TopTrainChecker(dut: TestTop_L2Top) extends ChiselSim {
             accepts += 1
           }
         }
-        assert(flag(obs.sliceValid(s)) == trained.nonEmpty)
-        if (trained.nonEmpty) { assert(event(obs.sliceEvent(s)) == trained.head); local += trained.head }
+        val enabled = trained.filter(_._4)
+        disabledBeforeArb += trained.count(e => !e._4)
+        if (enabled.nonEmpty && enabled.size != trained.size) mixedLocal += 1
+        assert(flag(obs.sliceValid(s)) == enabled.nonEmpty)
+        if (enabled.nonEmpty) { assert(event(obs.sliceEvent(s)) == enabled.head); local += enabled.head }
       }
       if (local.size > 1) simultaneousTrains += 1
+      val raw = obs.req.flatten.filter(r => flag(r.train))
+      if (raw.exists(r => !flag(r.event.trainEnable.get)) && local.nonEmpty) mixedGlobal += 1
       assert(flag(obs.globalValid) == local.nonEmpty)
       if (local.nonEmpty) assert(local.contains(event(obs.globalEvent)), s"global arbiter mixed payload ${event(obs.globalEvent)} from $local")
       // Intent (1c-1): check the actual BOP boundary against the independently
@@ -176,7 +183,7 @@ class L2TopTrainChecker(dut: TestTop_L2Top) extends ChiselSim {
       val expectedBopValid = flag(obs.globalValid) && flag(obs.globalEvent.trainEnable.get)
       assert(flag(dut.observation.bopTrainValid) == expectedBopValid, s"trainEnable gate mismatch cycle=$cycle")
       if (!expectedBopValid) assert(!flag(dut.observation.bopTrainFire))
-      if (flag(obs.globalValid) && !expectedBopValid) gatedGlobal += 1
+      if (flag(obs.globalValid)) assert(flag(obs.globalEvent.trainEnable.get), "disabled global training")
       if (flag(dut.observation.bopTrainFire)) acceptedByBop += 1
     }
   }

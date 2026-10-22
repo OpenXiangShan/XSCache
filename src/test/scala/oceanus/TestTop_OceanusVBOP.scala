@@ -1,3 +1,4 @@
+// Intent (audit-fix-1): allow a reproducible ten-sequence sample per class.
 package oceanus
 
 // Intent (3a): identical timed training events enter independent reference and
@@ -142,6 +143,8 @@ object TestTop_OceanusVBOP extends App with ChiselSim {
   // Test the complete production offset list and RR geometry. Shorter phases
   // make all five trace families exercise repeated commits with bounded runtime.
   val defaults = args.contains("--defaults")
+  val samples = args.find(_.startsWith("--samples=")).map(_.split("=",2)(1).toInt).getOrElse(if(defaults) 1 else 3)
+  require(samples > 0)
   // Reference roundBits=log2Up(roundMax): use a non-power-of-two short limit
   // so the reference counter can reach it (4 wraps in two bits). Preserve
   // that original algorithm behavior; production defaults remain roundMax=50.
@@ -164,7 +167,7 @@ object TestTop_OceanusVBOP extends App with ChiselSim {
     def value(x: UInt) = x.peek().litValue
     var totalSequences = 0
     var totalIssued = 0
-    for ((kind, k) <- kinds.zipWithIndex; seed <- 1 to (if(defaults) 1 else 3)) {
+    for ((kind, k) <- kinds.zipWithIndex; seed <- 1 to samples) {
       val random = new scala.util.Random(0x3a000L + k*100 + seed)
       val refLearning = mutable.ArrayBuffer.empty[BigInt]
       val dutLearning = mutable.ArrayBuffer.empty[BigInt]
@@ -221,7 +224,7 @@ object TestTop_OceanusVBOP extends App with ChiselSim {
       println(s"VBOP_DIFF_SEQUENCE pass=true kind=$kind seed=$seed trains=$count learning=${refLearning.size} requests=${refRequests.size} commits=${value(dut.io.commits)} learningSHA256=${digest(refLearning.toSeq)} requestSHA256=${digest(refRequests.map(_._1).toSeq)}")
       println(s"VBOP_DIFF_NEEDT kind=$kind seed=$seed original_equal=${refRequests.size} actual_equal=${refRequests.size-downgraded} downgraded=$downgraded deviation=D2")
     }
-    kinds.foreach(k => println(s"VBOP_DIFF_CLASS kind=$k sequences=${if(defaults) 1 else 3} identical=${if(defaults) 1 else 3} defaults=$defaults"))
+    kinds.foreach(k => println(s"VBOP_DIFF_CLASS kind=$k sequences=${samples} identical=${samples} defaults=$defaults"))
     if(!defaults) {
       dut.io.train.valid.poke(false.B); dut.io.ready.poke(true.B)
       dut.io.tlbReady.poke(true.B); dut.io.latency.poke(7.U)

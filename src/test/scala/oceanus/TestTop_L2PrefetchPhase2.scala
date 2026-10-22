@@ -1,3 +1,5 @@
+// Intent (audit-fix-1): inspect emitted SystemVerilog across independent
+// parameter combinations, including fully disabled CDP storage and arbitration.
 package oceanus
 
 // Intent (3a): run these real cache/translation/useful checks with OceanusVBOP;
@@ -393,7 +395,9 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
 object TestTop_L2StubParameters extends App {
   Constantin.init(false)
   val mode = args.head
-  val cfg = new L2Configuration(8, true, 0 until 2, pfTrainEnable = true, pfTlbEnable = true,
+  val cfg = new L2Configuration(8, true, 0 until 2,
+    pfTrainEnable = mode != "off" && mode != "tlb-only",
+    pfTlbEnable = mode != "off" && mode != "train-only",
     vbopStubEnable = mode == "vbop" || mode == "both", cdpStubEnable = mode == "cdp" || mode == "both")
   val params = new Config((_, _, _) => {
     case L2ParamsKey => L2Params(mshrSize = 8)
@@ -402,9 +406,27 @@ object TestTop_L2StubParameters extends App {
     case LogUtilsOptionsKey => LogUtilsOptions(enableDebug = false, enablePerf = true, fpgaPlatform = false)
     case PerfCounterOptionsKey => PerfCounterOptions(enablePerfPrint = true, enablePerfDB = false, perfLevel = XSPerfLevel.VERBOSE, 0)
   })
-  // emitCHIRRTL returns a string for inspection and writes no RTL artifact.
-  val fir = _root_.circt.stage.ChiselStage.emitCHIRRTL(new L2Top(cfg)(params))
-  assert(fir.contains("module OceanusVBOP :") == cfg.vbopStubEnable)
-  assert(fir.contains("module L2CDPStub") == cfg.cdpStubEnable)
+  // SRAMTemplate caches definitions per JVM: elaborate once and inspect
+  // the lowered RTL directly, avoiding a second incompatible definition cache.
+  // Save inspectable RTL on NVMe and check storage/instances after lowering.
+  val sv = _root_.circt.stage.ChiselStage.emitSystemVerilog(new L2Top(cfg)(params),
+    firtoolOpts = Array("--disable-all-randomization", "--strip-debug-info"))
+  val output = java.nio.file.Paths.get("/data/zhuy/pf-framework/audit-fix-1/rtl")
+  java.nio.file.Files.createDirectories(output)
+  java.nio.file.Files.writeString(output.resolve(s"parameters-$mode.sv"), sv)
+  assert(sv.contains("module OceanusVBOP") == cfg.vbopStubEnable)
+  assert(sv.contains("module L2CDPStub") == cfg.cdpStubEnable)
+  if (cfg.cdpObserveEnable) {
+    assert(sv.contains("L2CDPHalfQueue") && sv.contains("cdpDataArb") && sv.contains("cdpPfDepth"))
+    assert(sv.contains("cdpContext_paddr") && sv.contains("cdpBufferValid"))
+  } else {
+    assert(!sv.contains("L2CDPHalfQueue") && !sv.contains("cdpDataArb"))
+    assert(!sv.contains("cdpPfDepth"), "disabled Meta depth storage survives")
+    for (name <- Seq("cdpPending", "cdpContext", "cdpBufferValid", "cdpCollisionDrops", "trainDisabled")) {
+      val register = ("(?m)^\\s*(?:reg|logic)\\b[^;]*\\b" + name + "(?:_\\w+)?\\b[^;]*;").r
+      assert(register.findFirstIn(sv).isEmpty, s"disabled register survives: $name")
+    }
+  }
+  println(s"CDP_RTL_PARAMETERS pass=true mode=$mode observe=${cfg.cdpObserveEnable} tlb=${cfg.pfTlbEnable} train=${cfg.pfTrainEnable} rtl=${output.resolve(s"parameters-$mode.sv")}")
   println(s"PHASE2_PARAMETERS pass=true mode=$mode vbop=${cfg.vbopStubEnable} cdp=${cfg.cdpStubEnable} slices=2")
 }
