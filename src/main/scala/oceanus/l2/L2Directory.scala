@@ -200,15 +200,7 @@ object DRRIP {
     next.asUInt
   }
 
-  // Successful refill: insert the new line at RRPV 0 (coupledL2's
-  // non-prefetch refill insertion). When the victim held a valid line (a
-  // real eviction, not a fill of an Invalid slot), age all other ways by
-  // (3 - victim's old RRPV) — coupledL2's `increcement` rule. In the
-  // undiverted path the victim is always the RRPV-max way, so other ways
-  // (all <= max) saturate at exactly 3 and never wrap. Corner: when the
-  // lock mask diverts the victim to a non-max way, a true-max way can
-  // wrap 3->small (upstream-identical formula; rare — needs same-set
-  // concurrent refills; see OCEANUS_L2_DRRIP_REVIEW.md T-3).
+  // Successful refill: insert the new line at RRPV 0
   def getNextStateRefill(state: UInt, way: UInt, victimValid: Bool, ways: Int): UInt = {
     val cur = VecInit((0 until ways).map(i => state(2 * i + 1, 2 * i)))
     val inc = 3.U(2.W) - cur(way)
@@ -583,7 +575,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val hasInvalid = invalidVec.asUInt.orR
   val invalidWay = PriorityEncoder(invalidVec)
   val replWay    = if (useDRRIP) DRRIP.getReplaceWay(s3_repl, ways)
-                   else            PLRU4.getReplaceWay(s3_repl(PLRU4.nBits - 1, 0))
+                   else          PLRU4.getReplaceWay(s3_repl(PLRU4.nBits - 1, 0))
   val chosenWay  = Mux(hasInvalid, invalidWay, replWay)
 
   val victimMask_s3 = freeWayMask_s3
