@@ -174,6 +174,19 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   }}
 
   directory.io.tshrIdle := tshrs.map(!_.io.valid)
+
+  // DRRIP release train, entrance path: one-hot reduce the per-TSHR WayValid
+  // EVT entrance trains into the directory's single evtRelTrain input. The
+  // allocator guarantees at most one EVT entrance per cycle per slice
+  // (L2TSHRAlloc assertions), so the reduce stays one-hot. The whole reduce is
+  // elaborated only when the entrance path exists (directory port present).
+  directory.io.evtRelTrain.foreach { in =>
+    val replTrains = tshrs.flatMap(_.io.replTrain)
+    assert(PopCount(replTrains.map(_.valid)) <= 1.U,
+      "multiple EVT entrance release trains in one cycle")
+    in.valid := replTrains.map(_.valid).orR
+    in.bits  := Mux1H(replTrains.map(t => (t.valid, t.bits)))
+  }
   // ----------------------------------------------------------------
 
   // -- Data Storage connections

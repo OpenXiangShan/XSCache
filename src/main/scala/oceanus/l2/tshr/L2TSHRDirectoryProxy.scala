@@ -52,6 +52,21 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
     }
   }
 
+  class DirRelFSM extends Bundle {
+    val PreArb = Bool()     // sending Release-train Request to Directory, waiting for DirRel Arbiter completion
+    val Done = Bool()       // Release-train Request has been accepted by Directory
+    def NotYet =            // haven't sent Release-train Request to Directory
+      !PreArb && !Done
+  }
+
+  object DirRelFSM {
+    def init = {
+      val initState = Wire(new DirRelFSM)
+      initState.elements.foreach(_._2 := false.B)
+      initState
+    }
+  }
+
   val io = IO(new Bundle {
 
     val tshrId = Input(UInt(mshrIndexWidth.W))
@@ -72,6 +87,11 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
     val read_en = Input(Bool())
     val repl_en = Input(Bool())
     val repl_reset = Input(Bool())
+
+    // DRRIP release-type update (commit path): validated release-commit pulse
+    // from the EVT vPipe, serviced by the dedicated DirRel FSM below.
+    // Elaborated only when the DirRel path is enabled.
+    val repl_release = if (paramL2.enableDRRIPReleaseUpdate) Some(Input(Bool())) else None
 
     val meta = Input(new L2Directory.Meta)
     val meta_way = Input(UInt(wayBits.W))
@@ -415,6 +435,52 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   assert(!(fromDir_DirWbArbComp && !state_dirWrite.PreArb), "receiving DirWbArbComp on unexpected state (expecting PreArb)")
   assert(PopCount(state_dirWrite.asUInt) <= 1.U, "multiple active states in DirWriteFSM")
 
+  // ── DirRel FSM (DRRIP release-type update, commit path) ──────────────────
+  // Totally separate from the directory read/write (commit) machinery: a
+  // validated release-commit pulse from the EVT vPipe parks here until the
+  // directory's separate DirRel arbiter grants it. Never rides, shares, or
+  // depends on the DirRead/DirWrite (commit) FSMs. A pulse arriving while a
+  // previous DirRel is still pending is absorbed — the pending request covers
+  // the same (set, way) by TSHR construction. Elaborated only when the DirRel
+  // path is enabled (the repl_release input port exists only then).
+  if (paramL2.enableDRRIPReleaseUpdate) {
+    val fromDir_DirRelArbComp = fromDir_en && io.fromDir.DirRelArbComp
+
+    val state_dirRel = RegInit(new DirRelFSM, DirRelFSM.init)
+    val state_dirRel_next = WireInit(state_dirRel)
+
+    state_dirRel := state_dirRel_next
+
+    when (io.repl_release.get) {
+      when (state_dirRel.NotYet || state_dirRel.Done) {
+        state_dirRel_next.PreArb := true.B
+        state_dirRel_next.Done := false.B
+      }
+    }
+
+    when (state_dirRel.PreArb) {
+      when (fromDir_DirRelArbComp) {
+        state_dirRel_next.PreArb := false.B
+        state_dirRel_next.Done := true.B
+      }
+    }
+
+    when (io.tshr_dealloc) {
+      state_dirRel_next := DirRelFSM.init
+    }
+
+    assert(!(fromDir_DirRelArbComp && !state_dirRel.PreArb), "receiving DirRelArbComp on unexpected state (expecting PreArb)")
+    assert(PopCount(state_dirRel.asUInt) <= 1.U, "multiple active states in DirRelFSM")
+
+    // Drive-time exclusion only: the DirRel FSM keeps its PreArb state while a
+    // sibling FSM occupies toDir and resumes once it clears — one TSHR never
+    // asserts two op types in the same cycle.
+    io.toDir.DirRel := state_dirRel.PreArb &&
+      !(state_dirRead.PreArb || state_dirRead.ReplPreArb || state_dirWrite.PreArb)
+  } else {
+    io.toDir.DirRel := false.B
+  }
+
   // interactions with Directory
   io.toDir.TSHRID := io.tshrId
   io.toDir.PADDR := io.tshr_paddr
@@ -426,8 +492,8 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   io.toDir.DirWb := state_dirWrite.PreArb && !io.wb_locked
   io.toDir.ReplRd := state_dirRead.ReplPreArb
 
-  assert(PopCount(Seq(io.toDir.DirRd, io.toDir.DirWb, io.toDir.ReplRd)) <= 1.U,
-    "DirRd, DirWb and ReplRd operations to Directory overlapped")
+  assert(PopCount(Seq(io.toDir.DirRd, io.toDir.DirWb, io.toDir.ReplRd, io.toDir.DirRel)) <= 1.U,
+    "DirRd, DirWb, ReplRd and DirRel operations to Directory overlapped")
 
   FSMPerfHistogram(s"L2TSHR_${id}_DirWriteFSM_PreArb", state_dirWrite.PreArb, state_dirWrite_next.PreArb)
   FSMPerfHistogram(s"L2TSHR_${id}_DirWriteFSM_Done", state_dirWrite.Done, state_dirWrite_next.Done)
