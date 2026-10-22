@@ -17,7 +17,7 @@ case class L2Params(
     hasMbist: Boolean = false,
     hasSramCtl: Boolean = false,
     dataECC: Option[String] = Some("secded"),
-    replacement: String = "plru",
+    replacement: String = "drrip",
     // DRRIP release-type update (EVT channel) switches; see L2Directory.scala.
     // DirRel path: arbitrated DirRel op issued at the EVT vPipe's validated commit.
     enableDRRIPReleaseUpdate: Boolean = true,

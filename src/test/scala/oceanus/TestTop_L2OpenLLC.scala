@@ -266,7 +266,7 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
                                 the last 3 entries are reserved (EVB/L1EVT/L3SNP)
       --l2-sets <n>             L2 sets per slice, 32 by default (power of two)
       --l2-ways <n>             L2 ways per slice, 4 by default (power of two)
-      --l2-replacement <pol>    L2 replacement policy, plru by default;
+      --l2-replacement <pol>    L2 replacement policy, drrip by default;
                                 plru is hardwired for 4 ways, drrip supports
                                 any power-of-two way count
       --l2-drrip-release-update <0|1>
@@ -297,7 +297,7 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
   var tshrs = 16
   var l2Sets = 32
   var l2Ways = 4
-  var l2Replacement = "plru"
+  var l2Replacement = "drrip"
   var l2DRRIPReleaseUpdate = true
   var l2DRRIPEntranceReleaseUpdate = true
   var llcSets = 64

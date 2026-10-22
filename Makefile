@@ -99,8 +99,8 @@ PERF_ARGS = $(if $(filter 1,$(NO_PERF)),--noperf,)
 # geometry/parallelism knobs (defaults reproduce the original test-top RTL):
 #   NUM_TSHR        TSHR entries per slice (L2 MSHR equivalent; last 3 reserved)
 #   L2_SETS/L2_WAYS L2 sets/ways per slice
-#   L2_REPLACEMENT  L2 replacement policy (plru: 4 ways only; drrip: any
-#                   power-of-two ways)
+#   L2_REPLACEMENT  L2 replacement policy (drrip by default; plru: 4 ways
+#                   only; drrip: any power-of-two ways)
 #   LLC_SETS/LLC_WAYS/LLC_BANKS  OpenLLC sets/ways per bank / bank count
 #   LLC_MSHR_MEMORY/LLC_MSHR_REFILL  OpenLLC MSHRs; size memory/refill to
 #                   >= NUM_SLICE * (NUM_TSHR - 3) to absorb L2 parallelism
@@ -108,7 +108,7 @@ NUM_L2 ?= 1
 NUM_TSHR ?= 16
 L2_SETS ?= 32
 L2_WAYS ?= 4
-L2_REPLACEMENT ?= plru
+L2_REPLACEMENT ?= drrip
 L2_DRRIP_RELEASE_UPDATE ?= 1
 L2_DRRIP_ENTRANCE_RELEASE_UPDATE ?= 1
 LLC_SETS ?= 64
