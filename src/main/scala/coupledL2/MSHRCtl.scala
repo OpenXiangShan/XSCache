@@ -1019,7 +1019,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       // candidate blocked only by the snoop/replace pool defers this grant
       // conservatively; that pool drains independently of this normal's
       // commit, so the extra deferral cannot deadlock.
-      val pendingSnoopForRefill = io.fromReqArb.status_s1.bCandidateValid &&
+      // snoopCandidateSeen is the registered bCandidateValid.  blockB_s1
+      // forbids a B from firing on its first candidate cycle, so every fire
+      // cycle has snoopCandidateSeen set and the address compare below still
+      // catches it; a blocked candidate only adds a conservative deferral.
+      val pendingSnoopForRefill = snoopCandidateSeen &&
         refill.io.status.valid &&
         refill.io.status.bits.set === io.fromReqArb.status_s1.b_set &&
         refill.io.status.bits.reqTag === io.fromReqArb.status_s1.b_tag
@@ -1604,7 +1608,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val nMshrTaskSrc = mshrTaskSources.size
   def isGrantOp(op: UInt) = op === TLMessages.Grant || op === TLMessages.GrantData ||
     op === TLMessages.AccessAckData || op === TLMessages.HintAck
-  val mshrTaskClasses = mshrTaskSources.map { t =>
+  def mshrTaskClass(t: DecoupledIO[TaskBundle]): UInt = {
     val isResp = t.bits.mshrContext === 1.U ||
       (t.bits.mshrContext === 0.U && t.bits.fromB)
     val isGrant = t.bits.mshrContext === 0.U && !t.bits.refillOnly && isGrantOp(t.bits.opcode)
@@ -1616,6 +1620,16 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         Mux(isCommitOrLookup, 2.U(3.W),
           Mux(isCapture, 3.U(3.W), 4.U(3.W)))))
   }
+  val mshrTaskClasses = mshrTaskSources.map(mshrTaskClass)
+  // Register each source's class while it is valid.  The arbitration then
+  // reads a register instead of the deferGrant -> opcode -> class cone; a
+  // task type change is visible one cycle later, which only shifts a QoS
+  // hint and cannot affect correctness (the starvation guard stays).
+  val mshrTaskClassReg = mshrTaskSources.zip(mshrTaskClasses).map { case (t, c) =>
+    val r = RegInit(0.U(3.W))
+    when(t.valid) { r := c }
+    r
+  }
   val mshrTaskWaitCnt = mshrTaskSources.map { t =>
     val cnt = RegInit(0.U(6.W))
     when(t.fire) {
@@ -1625,7 +1639,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     }
     cnt
   }
-  val mshrTaskEffClasses = mshrTaskClasses.zip(mshrTaskWaitCnt).map { case (c, w) =>
+  val mshrTaskEffClasses = mshrTaskClassReg.zip(mshrTaskWaitCnt).map { case (c, w) =>
     Mux(w === 63.U, 0.U(3.W), c)
   }
   val mshrTaskSrcValids = VecInit(mshrTaskSources.map(_.valid)).asUInt
