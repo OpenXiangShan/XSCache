@@ -24,6 +24,25 @@
 
 /*
  * Intent/source ledger (C0), read before implementation:
+ * C3 source ledger: CDP.scala:869-1014 detector expressions are unchanged
+ * except local names. :1400-1434 eligibility precedes per-slice Queue8;
+ * :1372-1374/:1457-1468 RRArbiterInit, four 64-bit lanes, three pipeline clocks.
+ * :969-979 hit depth1, refill0 -> max, other refill +1; no new saturation.
+ * :1531-1549 each lane Queue8, static degree3, byte VA+0/64/128, cross-page.
+ * Dynamic degree is rejected until C6. :1351-1358 enable maps directly to the
+ * standalone platform's constant-one Constantin gate; accepted work drains.
+ * C3-provenance: :242-256/:553-564 lack slice; add observational slice sideband
+ * through the same three clocks and degree buffers, with no arbitration effect.
+ * C3-C4-boundary: :1578-1579 SentUnit connection becomes internal c4Input stub
+ * (ready=true); external req/TLB remain inactive. L2Top's old CDP is untouched.
+ * D-CDP-queue: :1372/:1532 use utility/MIMOQueue whose :149 advances only when
+ * the last enq fires. The local queue advances by all accepted ports, with the
+ * same pre-cycle capacity/full-drop boundary (no dequeue-space reclamation).
+ * Test reference dependency adapts only pointer advancement; original CDP body
+ * and read-only tree are unchanged. Raw dependency counterexamples are retained
+ * separately; normalized-reference zero mismatches do not imply raw equivalence.
+ * C3 capture boundary: full512 input; existing L2TSHR.scala:553-560 forwards
+ * the completing half on that clock. Cache/event integration remains C5.
  * C2 source ledger (read before implementation): :467-551 FilterTable,
  * :566-693 FtTrainPipeline, :1478-1484 Queue8, :1555-1573 query RR/owner.
  * Preserve two single-port sat banks, reset metadata only, one-cycle response,
@@ -53,14 +72,14 @@
  * MemBlock.scala:266-273 buffers the same instruction-uncache Get without
  * adding a hint. This does not remove the interface coverage deviation.
  * No cache/BOP edit.
- * CDP output remains inactive; only C1 training is instantiated, not C2-C6.
+ * CDP external output remains inactive; C1/C2 training and C3 frontend run independently.
  * /data/zhuy/coupledL2/prefetch/CDP.scala:35-79 parameters; :81-237 address
  * helpers; :239-288/:450-465/:553-564/:1016-1042 interface/entry definitions.
  * Names are prefixed OceanusCDP; geometry is explicit VA50/PA48/line64/page4K,
  * internal source4 and depth2. No coupledL2 types or modules are instantiated.
  * :1319-1336 top-level interface is adapted to full PA training events and the
  * existing variable-latency translation client. This skeleton is not wired
- * into L2Top. C1/C2 add VPN and Filter training; C3-C5 fill and integrate later.
+ * into L2Top. C1/C2 train, C3 detects; C4/C5 send and integrate later.
  * MainPipe.scala:731, CDP.scala:66/:212-228/:609-671: Filter used feedback is
  * by 4KB physical page, regardless of prefetch bit; do not implement :729 TODO.
  * mergeA maps to one demand hit after RBE wait (MainPipe.scala:726/:731/:770).
@@ -76,7 +95,7 @@
  * and cross-slice RR. Existing 1c-2 capture order differs; defer to C3/C5.
  * CDP.scala:68-69/:1501-1528: default static degree3 for C0-C5; C6 optional.
  * D-CDP-event: physical eviction timing, refiller reqSource and Get training
- * coverage differ. D-CDP-queue: local MIMOQueue partial-fire issue unresolved.
+ * coverage differ. D-CDP-queue: local accepted-count adaptation is explicit above.
  * D1-CDP: variable TLB timing/shared admission and slot RR require C4 proof.
  * Filter mechanism relationship to Apple US9886385 awaits legal assessment.
  * PC + relative-offset quality filtering is a future performance experiment
@@ -1052,6 +1071,275 @@ class OceanusCDPFilterTraining(implicit p: Parameters) extends OceanusCDPModule 
   XSPerfAccumulate("filter_train_accept", queue.io.enq.fire)
 }
 
+// C3: reference :869-1014, expression-equivalent local types.
+class OceanusCDPDetectPipeline(name: String)(implicit p: Parameters) extends OceanusCDPModule {
+  val io = IO(new Bundle {
+    val detectReq = Flipped(ValidIO(new OceanusCDPDetectTask(dataBits = 64)))
+
+    // to Vpn Table
+    val vtQueryReq = ValidIO(new OceanusCDPVtQueryReq)
+    val vtQueryRsp = Input(new OceanusCDPVtQueryRsp)
+
+    // Prefetch Req
+    val pftReq = ValidIO(new OceanusCDPCandidate)
+
+    // addrState
+    val addrState = new Bundle {
+      val isSv39 = Input(Bool())
+      val isSv48 = Input(Bool())
+      val isSv57 = Input(Bool())
+    }
+  })
+
+  val detectReq = io.detectReq
+  val pftReq = io.pftReq
+
+  val (vtQueryReq, vtQueryRsp) = (io.vtQueryReq, io.vtQueryRsp)
+
+  // Pipeline Ctrl Signals
+  val s0_req = Wire(Valid(new OceanusCDPDetectTask(dataBits=64)))
+  val s1_req = Wire(Valid(new OceanusCDPDetectTask(dataBits=64)))
+  val s2_req = Wire(Valid(new OceanusCDPDetectTask(dataBits=64)))
+  val s3_req = Wire(Valid(new OceanusCDPDetectTask(dataBits=64)))
+
+  // ------------------ s0 ------------------
+  s0_req.valid := detectReq.valid
+  s0_req.bits := detectReq.bits
+
+  // ------------------ s1 ------------------
+  // query VpnTable
+  s1_req.valid := RegNext(s0_req.valid)
+  s1_req.bits := RegEnable(s0_req.bits, s0_req.valid)
+
+  val s1_data = s1_req.bits.data
+  val s1_addr = s1_data(fullVAddrBits - 1, 0)
+  val s1_main_idx = getMainIdx(s1_addr)
+  val s1_sub_idx = getSubIdx(s1_addr)
+
+  vtQueryReq.valid := s1_req.valid
+  vtQueryReq.bits.mainIdx := s1_main_idx
+  vtQueryReq.bits.subIdx := s1_sub_idx
+
+  val s1_vt_query_rsp = vtQueryRsp
+
+  // ------------------ s2 ------------------
+  // check conditions
+  s2_req.valid := RegNext(s1_req.valid)
+  s2_req.bits := RegEnable(s1_req.bits, s1_req.valid)
+
+  val s2_data = s2_req.bits.data
+  val s2_addr = s2_data(fullVAddrBits - 1, 0)
+  val s2_depth = s2_req.bits.pfDepth
+  val s2_is_hit = s2_req.bits.isHit
+
+  val s2_vt_query_rsp = RegNext(s1_vt_query_rsp)
+
+  val s2_tag = getVpnTableTag(s2_addr)
+  val s2_vt_hit_vec = s2_vt_query_rsp.tagVec.zip(s2_vt_query_rsp.subValidVec).map {
+    case (t, v) =>
+      t === s2_tag && v
+  }
+  assert(PopCount(s2_vt_hit_vec) < 2.U || !s2_req.valid, "VpnTable multiple hit in OceanusCDPDetectPipeline!")
+
+  val s2_vt_hit = s2_vt_hit_vec.reduce(_ || _)
+  val s2_vt_hit_idx = PriorityEncoder(s2_vt_hit_vec)
+  val s2_vt_hit_hot = s2_vt_query_rsp.metaVec(s2_vt_hit_idx).hot
+
+  val s2_vpn0 = getVpn0(s2_addr)
+  val s2_vpn0_is_nzero = s2_vpn0 =/= 0.U
+
+  val s2_low_bit = s2_data(1, 0)
+  val s2_low_bit_is_zero = s2_low_bit === 0.U
+
+  val s2_high_bit = Mux(
+    io.addrState.isSv39,
+    s2_data(63, 39),
+    Mux(io.addrState.isSv48,
+      s2_data(63, 48),
+      Mux(io.addrState.isSv57, s2_data(63, 57), 0.U)
+    )
+  )
+  val s2_high_bit_is_zero = s2_high_bit === 0.U
+
+  // TODO: maybe we should move depth control totally to the entrance?
+  val s2_can_pft = s2_high_bit_is_zero && s2_low_bit_is_zero && s2_vpn0_is_nzero && s2_vt_hit && s2_vt_hit_hot
+
+  // ------------------ s3 ------------------
+  // generate prefetch req
+  s3_req.valid := RegNext(s2_req.valid && s2_can_pft)
+  s3_req.bits := RegEnable(s2_req.bits, s2_req.valid && s2_can_pft)
+
+  val s3_vt_hit = RegNext(s2_vt_hit)
+  val s3_vt_hit_idx = RegNext(s2_vt_hit_idx)
+  val s3_can_pft = RegNext(s2_can_pft)
+  val s3_depth = RegNext(Mux(
+    s2_is_hit,
+    1.U,      // hit a CDP prefetched block, reinforce
+    Mux(s2_depth === 0.U, cdpPfDepthMax.get.U, s2_depth + 1.U)
+  ))
+
+  val s3_data = s3_req.bits.data
+
+  pftReq.valid := s3_req.valid
+  pftReq.bits.pfVAddr := s3_data(fullVAddrBits - 1, 0)
+  pftReq.bits.pfDepth := s3_depth
+  pftReq.bits.pfSource := s3_req.bits.pfSource
+  pftReq.bits.isHit := s3_req.bits.isHit
+
+  // ------------------ Performance Counter ------------------
+  // Valid VpnTable hit/miss and distribution
+  XSPerfAccumulate("valid_vt_hit", s2_req.valid && s2_vt_hit && s2_high_bit_is_zero && s2_low_bit_is_zero && s2_vpn0_is_nzero)
+  XSPerfAccumulate("valid_vt_miss", s2_req.valid && !s2_vt_hit && s2_high_bit_is_zero && s2_low_bit_is_zero && s2_vpn0_is_nzero)
+
+  // ----------- ChiselDB -----------
+  class DetectTriggerEntry extends OceanusCDPBundle {
+    val vaddr = UInt(64.W)
+    val pfDepth = UInt(cdpPfDepthBits.get.W)
+    val pfSource = UInt(L2PfSource.Width.W)
+    val mainIdx = UInt(mainEntryBits.W)
+    val subIdx = UInt(subEntryBits.W)
+    val vtHit = Bool()
+    val vtHitHot = Bool()
+    val canPft = Bool()
+  }
+
+  val cdpDetectTriggerDB = ChiselDB.createTable(name + "_cdpDetect", new DetectTriggerEntry, basicDB = debug)
+
+  val detectTriggerEntry = Wire(new DetectTriggerEntry)
+  detectTriggerEntry.vaddr := s2_data
+  detectTriggerEntry.pfDepth := s2_depth
+  detectTriggerEntry.pfSource := s2_req.bits.pfSource
+  detectTriggerEntry.mainIdx := RegNext(s1_main_idx)
+  detectTriggerEntry.subIdx := RegNext(s1_sub_idx)
+  detectTriggerEntry.vtHit := s2_vt_hit
+  detectTriggerEntry.vtHitHot := s2_vt_hit_hot
+  detectTriggerEntry.canPft := s2_can_pft
+
+  val en = s2_req.valid && s2_high_bit_is_zero && s2_low_bit_is_zero && s2_vpn0_is_nzero
+  cdpDetectTriggerDB.log(detectTriggerEntry, en, "", clock, reset)
+}
+
+// C3 dependency adaptation, CDP.scala:1372/1532 and utility/MIMOQueue.scala:149.
+// Eight entries, independent prefix acceptance, no full-cycle slot reclamation.
+// Unlike the local legacy dependency, advance by ALL accepted ports, even when
+// the final port cannot fire. This is deliberately a local queue, not a patch
+// to utility or to the read-only reference. Test the raw dependency separately.
+class OceanusCDPQueue[T <: Data](gen: T, inputs: Int) extends Module {
+  val io = IO(new Bundle {
+    val enq = Flipped(Vec(inputs, Decoupled(gen)))
+    val deq = Decoupled(gen)
+    val count = Output(UInt(4.W))
+  })
+  val entries = Reg(Vec(8, gen))
+  val head = RegInit(0.U(3.W))
+  val tail = RegInit(0.U(3.W))
+  val count = RegInit(0.U(4.W))
+  val accepted = Wire(Vec(inputs, Bool()))
+  for(i <- 0 until inputs) {
+    val prior = if(i == 0) 0.U else PopCount(accepted.take(i))
+    io.enq(i).ready := count +& prior < 8.U
+    accepted(i) := io.enq(i).fire
+    when(accepted(i)) { entries((tail + prior)(2,0)) := io.enq(i).bits }
+  }
+  val added = PopCount(accepted)
+  io.deq.valid := count =/= 0.U
+  io.deq.bits := entries(head)
+  when(io.deq.fire) { head := head + 1.U }
+  tail := tail + added
+  count := count + added - io.deq.fire
+  io.count := count
+  assert(count <= 8.U)
+}
+
+// Provenance is observational: it does not enter detection or degree arithmetic.
+class OceanusCDPDetection(implicit p: Parameters) extends OceanusCDPCandidate {
+  val slice = UInt(log2Ceil(banks).max(1).W)
+}
+
+// C3 frontend boundary: complete, already assembled 512-bit lines. Cache's
+// completing half is forwarded by L2TSHR.scala:553-560; C5 owns that connection.
+// :1400-1434 filter before queueing; :1457-1468 four lanes; :1531-1549 degree/RR.
+// Constant enable record is 1 on this platform, hence direct io.enable here.
+class OceanusCDPDetectFrontend(implicit p: Parameters) extends OceanusCDPModule {
+  require(detectPipeNum == 4 && blockBits == 512)
+  require(!cdpParams.useDynamicDegree, "C6 dynamic degree is not implemented")
+  require(degree == 3, "C3 uses static degree three")
+  val io = IO(new Bundle {
+    val enable = Input(Bool())
+    val triggers = Flipped(Vec(banks, Valid(new OceanusCDPDetectTask(512))))
+    val queryReq = Vec(4, Valid(new OceanusCDPVtQueryReq))
+    val queryRsp = Input(Vec(4, new OceanusCDPVtQueryRsp))
+    val addrState = Input(new Bundle { val isSv39 = Bool(); val isSv48 = Bool(); val isSv57 = Bool() })
+    val out = Decoupled(new OceanusCDPDetection)
+  })
+  val queues = Seq.fill(banks)(Module(new OceanusCDPQueue(new OceanusCDPDetectTask(256), 2)))
+  val halfArb = Module(new RRArbiterInit(new OceanusCDPDetectTask(256), banks))
+  val admitted = Wire(Vec(banks, Bool()))
+  val accepted = Wire(Vec(banks, UInt(2.W)))
+  val dropped = Wire(Vec(banks, UInt(2.W)))
+  for(i <- 0 until banks) {
+    val trig = io.triggers(i)
+    val src = trig.bits.pfSource
+    val fromCDP = src === L2PfSource.CDP.U
+    val hit = trig.bits.isHit && ((fromCDP &&
+      (trig.bits.pfDepth === 1.U || trig.bits.pfDepth === cdpPfDepthMax.get.U)) ||
+      (if(useFilteredDetect) src === 1.U || src === 2.U || src === 3.U else false.B))
+    val refill = !trig.bits.isHit && trig.bits.pfDepth < depthThreshold.U &&
+      (if(useFilteredDetect) src === 0.U || fromCDP || src === 5.U || src === 4.U else true.B)
+    admitted(i) := io.enable && trig.valid && (hit || refill)
+    for(j <- 0 until 2) {
+      val in = queues(i).io.enq(j)
+      in.valid := admitted(i)
+      in.bits.data := trig.bits.data(256*(j+1)-1,256*j)
+      in.bits.pfDepth := trig.bits.pfDepth
+      in.bits.pfSource := src
+      in.bits.isHit := trig.bits.isHit
+    }
+    accepted(i) := PopCount(queues(i).io.enq.map(_.fire))
+    dropped(i) := Mux(admitted(i), 2.U - accepted(i), 0.U)
+    halfArb.io.in(i) <> queues(i).io.deq
+    XSPerfAccumulate(s"detect_half_accept_$i", accepted(i))
+    XSPerfAccumulate(s"detect_half_drop_$i", dropped(i))
+  }
+  halfArb.io.out.ready := true.B
+  val v1 = RegNext(halfArb.io.out.valid, false.B)
+  val v2 = RegNext(v1, false.B)
+  val slice1 = RegEnable(halfArb.io.chosen, halfArb.io.out.valid)
+  val slice2 = RegEnable(slice1, v1)
+  val slice3 = RegEnable(slice2, v2)
+  val lanes = Seq.tabulate(4)(i => Module(new OceanusCDPDetectPipeline(s"oceanus_dp$i")))
+  val raw = Wire(Vec(4, Valid(new OceanusCDPDetection)))
+  val degreeQueues = Seq.fill(4)(Module(new OceanusCDPQueue(new OceanusCDPDetection, 3)))
+  val degreeArb = Module(new RRArbiterInit(new OceanusCDPDetection, 4))
+  for(i <- 0 until 4) {
+    val lane = lanes(i)
+    lane.io.detectReq.valid := halfArb.io.out.valid
+    lane.io.detectReq.bits.data := halfArb.io.out.bits.data(64*(i+1)-1,64*i)
+    lane.io.detectReq.bits.pfDepth := halfArb.io.out.bits.pfDepth
+    lane.io.detectReq.bits.pfSource := halfArb.io.out.bits.pfSource
+    lane.io.detectReq.bits.isHit := halfArb.io.out.bits.isHit
+    lane.io.addrState := io.addrState
+    io.queryReq(i) := lane.io.vtQueryReq
+    lane.io.vtQueryRsp := io.queryRsp(i)
+    raw(i).valid := lane.io.pftReq.valid
+    raw(i).bits.pfVAddr := lane.io.pftReq.bits.pfVAddr
+    raw(i).bits.pfDepth := lane.io.pftReq.bits.pfDepth
+    raw(i).bits.pfSource := lane.io.pftReq.bits.pfSource
+    raw(i).bits.isHit := lane.io.pftReq.bits.isHit
+    raw(i).bits.slice := slice3
+    for(j <- 0 until 3) {
+      val in = degreeQueues(i).io.enq(j)
+      in.valid := raw(i).valid
+      in.bits := raw(i).bits
+      in.bits.pfVAddr := raw(i).bits.pfVAddr + (j*64).U
+    }
+    degreeArb.io.in(i) <> degreeQueues(i).io.deq
+    XSPerfAccumulate(s"degree_drop_$i", Mux(raw(i).valid,
+      3.U - PopCount(degreeQueues(i).io.enq.map(_.fire)), 0.U))
+  }
+  io.out <> degreeArb.io.out
+}
+
 object OceanusCDP {
   def configured(config: OceanusCDPParameters, banks: Int, p: Parameters): Parameters =
     p.alterPartial {
@@ -1079,10 +1367,18 @@ class OceanusCDP(config: OceanusCDPParameters = OceanusCDPParameters(), bankCoun
   vpnTable.io.queryReq(detectPipeNum) := vtTrainPipe.io.queryReq
   vtTrainPipe.io.queryRsp := vpnTable.io.queryRsp(detectPipeNum)
   vpnTable.io.trainReq := vtTrainPipe.io.trainReq
+  val detectFrontend = Module(new OceanusCDPDetectFrontend()(instanceParams))
+  detectFrontend.io.enable := io.enable
+  detectFrontend.io.triggers := io.l2DetectTriggers
+  detectFrontend.io.addrState := vtTrainPipe.io.addrState
   for (i <- 0 until detectPipeNum) {
-    vpnTable.io.queryReq(i).valid := false.B
-    vpnTable.io.queryReq(i).bits := 0.U.asTypeOf(vpnTable.io.queryReq(i).bits)
+    vpnTable.io.queryReq(i) := detectFrontend.io.queryReq(i)
+    detectFrontend.io.queryRsp(i) := vpnTable.io.queryRsp(i)
   }
+  // C4 input stub: drain candidates while SentUnit/TLB remains unimplemented.
+  val c4Input = Wire(Decoupled(new OceanusCDPDetection()(instanceParams)))
+  c4Input <> detectFrontend.io.out
+  c4Input.ready := true.B
   XSPerfAccumulate("vpn_train_drop", vpnTrainReqBuf.io.enq.valid && !vpnTrainReqBuf.io.enq.ready)
   XSPerfAccumulate("vpn_train_accept", vpnTrainReqBuf.io.enq.fire)
   // C2: exercise Filter training behind the standalone interface only.
