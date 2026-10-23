@@ -154,19 +154,22 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   // noSpaceForSinkReq in GrantBuffer may ensure that these queues will not overflow
   assert(enq_s3.ready || !enq_s3.valid)
 
-  // staging FIFO between the s1 hint event and hintQueue; depth 2 absorbs
-  // back-to-back s1 hint events, and RequestArb blocks hint-generating fires
-  // when full, so a hint event always has a place to go (see assert below)
-  val hint_s1Queue = Module(new HintQueue(2))
+  // Staging FIFO between the hint event and hintQueue. The hint event is now
+  // produced from the registered s2 task, one cycle after RequestArb's s1
+  // fullness check, so reserve one slot for that in-flight event: depth 3
+  // with "full" reported at count >= 2 guarantees room without dropping hints.
+  val hint_s1Queue = Module(new HintQueue(3))
   hint_s1Queue.io.cancel := io.hintCancel
   hint_s1Queue.io.enq.valid := valid_s1 && (!canFlow_s1 || !flow_s1.ready)
   hint_s1Queue.io.enq.bits  := enqBits_s1
   assert(!valid_s1 || hint_s1Queue.io.enq.ready || flow_s1.ready)
-  io.hint_s1QueueFull := hint_s1Queue.io.count === 2.U
+  io.hint_s1QueueFull := hint_s1Queue.io.count >= 2.U
 
-  drop_s1.valid := hint_s1Queue.io.deq.valid && !io.retry_s2
+  // A retried task's own hint is suppressed when it is generated at s2 (see
+  // MainPipe), so never discard an unrelated queued hint here.
+  drop_s1.valid := hint_s1Queue.io.deq.valid
   drop_s1.bits := hint_s1Queue.io.deq.bits
-  hint_s1Queue.io.deq.ready := drop_s1.ready || io.retry_s2
+  hint_s1Queue.io.deq.ready := drop_s1.ready
 
   flow_s1.valid := valid_s1 && canFlow_s1
   flow_s1.bits := enqBits_s1
