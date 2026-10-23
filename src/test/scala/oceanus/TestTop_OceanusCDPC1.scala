@@ -126,7 +126,9 @@ class CDPC1Harness(period: Int, hash: Boolean)(implicit p: Parameters) extends M
   // from test code so its real admission/Queue wiring is covered, including
   // enable changes and drain, without production observation ports.
   val productionTop = Module(new OceanusCDP(OceanusCDPParameters(
-    vpnResetPeriod = period, useVpnTableHashIndex = hash)))
+    // Intent (C2): this VPN-only multi-elaboration test omits Filter SRAM;
+    // C2's dedicated harness verifies the real top with Filter on and off.
+    vpnResetPeriod = period, useVpnTableHashIndex = hash, useFilterTable = false)))
   productionTop.io.enable := e(57)
   productionTop.io.vpnTrain.valid := e(58) && !io.direct
   productionTop.io.vpnTrain.bits := t

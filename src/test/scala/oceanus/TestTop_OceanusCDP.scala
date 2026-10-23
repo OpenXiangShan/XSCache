@@ -141,13 +141,16 @@ object TestTop_OceanusCDP extends App with ChiselSim {
       println(s"CDP_C0_HELPERS pass=true hash=$hash vectors=${values.size} literals=${if(hash) literals.size else 0} boundaries=${boundary.size} alias=${alias.size} random=512 widths=true")
     }
   }
-  // CHIRRTL validates all connections, including unused public interface
-  // fields; each elaboration has no SRAM definition imported into another.
-  for (banks <- Seq(1,2,4)) {
-    val chirrtl = _root_.circt.stage.ChiselStage.emitCHIRRTL(new OceanusCDP(bankCount=banks)(params))
-    assert(chirrtl.contains("OceanusCDP"))
-  }
-  val referenceRTL = _root_.circt.stage.ChiselStage.emitCHIRRTL(new ref.ReferenceCDP()(params))
-  assert(referenceRTL.contains("VpnTable") && referenceRTL.contains("FilterTable") && referenceRTL.contains("SentUnit"))
+  // Intent (C2): Filter SRAM definitions are cached by utility for one Chisel
+  // context. Elaborate all production geometries and the original reference
+  // as Definitions in one context, without reusing a prior circuit's SRAM.
+  val chirrtl = _root_.circt.stage.ChiselStage.emitCHIRRTL(new Module {
+    for (banks <- Seq(1,2,4)) {
+      chisel3.experimental.hierarchy.Definition(new OceanusCDP(bankCount=banks)(params))
+    }
+    chisel3.experimental.hierarchy.Definition(new ref.ReferenceCDP()(params))
+  })
+  assert(chirrtl.contains("OceanusCDP") && chirrtl.contains("VpnTable") &&
+    chirrtl.contains("FilterTable") && chirrtl.contains("SentUnit"))
   println(s"CDP_C0_RESULT pass=true vectors=$checked defaultFields=${production.productArity+3} skeletonBanks=1,2,4 referenceElaborated=true")
 }
