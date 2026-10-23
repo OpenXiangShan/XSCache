@@ -33,8 +33,10 @@
  * standalone platform's constant-one Constantin gate; accepted work drains.
  * C3-provenance: :242-256/:553-564 lack slice; add observational slice sideband
  * through the same three clocks and degree buffers, with no arbitration effect.
- * C3-C4-boundary: :1578-1579 SentUnit connection becomes internal c4Input stub
- * (ready=true); external req/TLB remain inactive. L2Top's old CDP is untouched.
+ * C4 boundary: :1578-1579 connects SentUnit when withSend=true. The default
+ * false preserves the C0-C3 drain-only observation boundary. C4 tests opt in;
+ * L2Top's old CDP is untouched until C5. See OceanusCDPSentUnit.scala for D1
+ * page reservation, adapter-owned retry, and output-backpressure deviations.
  * D-CDP-queue: :1372/:1532 use utility/MIMOQueue whose :149 advances only when
  * the last enq fires. The local queue advances by all accepted ports, with the
  * same pre-cycle capacity/full-drop boundary (no dequeue-space reclamation).
@@ -72,14 +74,14 @@
  * MemBlock.scala:266-273 buffers the same instruction-uncache Get without
  * adding a hint. This does not remove the interface coverage deviation.
  * No cache/BOP edit.
- * CDP external output remains inactive; C1/C2 training and C3 frontend run independently.
+ * With withSend=false, C1/C2 training and C3 frontend run independently.
  * /data/zhuy/coupledL2/prefetch/CDP.scala:35-79 parameters; :81-237 address
  * helpers; :239-288/:450-465/:553-564/:1016-1042 interface/entry definitions.
  * Names are prefixed OceanusCDP; geometry is explicit VA50/PA48/line64/page4K,
  * internal source4 and depth2. No coupledL2 types or modules are instantiated.
  * :1319-1336 top-level interface is adapted to full PA training events and the
  * existing variable-latency translation client. This skeleton is not wired
- * into L2Top. C1/C2 train, C3 detects; C4/C5 send and integrate later.
+ * into L2Top. C1/C2 train, C3 detects; C4 sends on opt-in, C5 integrates.
  * MainPipe.scala:731, CDP.scala:66/:212-228/:609-671: Filter used feedback is
  * by 4KB physical page, regardless of prefetch bit; do not implement :729 TODO.
  * mergeA maps to one demand hit after RBE wait (MainPipe.scala:726/:731/:770).
@@ -1348,9 +1350,10 @@ object OceanusCDP {
     }
 }
 
-// Intent (C1/C2): instantiate training behind the existing inactive
-// interface. Cache integration and request generation belong to later slices.
-class OceanusCDP(config: OceanusCDPParameters = OceanusCDPParameters(), bankCount: Int = 1)
+// C4: standalone training/detection and optional sending. Cache integration
+// remains C5; the default preserves earlier tests' inactive output boundary.
+class OceanusCDP(config: OceanusCDPParameters = OceanusCDPParameters(), bankCount: Int = 1,
+    withSend: Boolean = false)
     (implicit p: Parameters) extends OceanusCDPModule()(OceanusCDP.configured(config, bankCount, p)) {
   // Intent (C1): pass the instance's configured geometry explicitly to every
   // child; the constructor's implicit p is the caller's outer parameter set.
@@ -1375,10 +1378,10 @@ class OceanusCDP(config: OceanusCDPParameters = OceanusCDPParameters(), bankCoun
     vpnTable.io.queryReq(i) := detectFrontend.io.queryReq(i)
     detectFrontend.io.queryRsp(i) := vpnTable.io.queryRsp(i)
   }
-  // C4 input stub: drain candidates while SentUnit/TLB remains unimplemented.
+  // C4: opt in at the standalone module boundary; C0-C3 callers retain their
+  // established drain-only boundary. L2Top's old stub is replaced only in C5.
   val c4Input = Wire(Decoupled(new OceanusCDPDetection()(instanceParams)))
   c4Input <> detectFrontend.io.out
-  c4Input.ready := true.B
   XSPerfAccumulate("vpn_train_drop", vpnTrainReqBuf.io.enq.valid && !vpnTrainReqBuf.io.enq.ready)
   XSPerfAccumulate("vpn_train_accept", vpnTrainReqBuf.io.enq.fire)
   // C2: exercise Filter training behind the standalone interface only.
@@ -1386,12 +1389,35 @@ class OceanusCDP(config: OceanusCDPParameters = OceanusCDPParameters(), bankCoun
   filterTraining.foreach { ft =>
     ft.io.enable := io.enable
     ft.io.train := io.filterTrain
-    ft.io.sendQuery.valid := false.B
-    ft.io.sendQuery.bits := 0.U.asTypeOf(ft.io.sendQuery.bits)
   }
-  io.req.valid := false.B
-  io.req.bits := 0.U.asTypeOf(io.req.bits)
-  io.tlb.req.valid := false.B
-  io.tlb.req.bits := 0.U
-  io.tlb.resp.ready := true.B
+  if (withSend) {
+    val send = Module(new OceanusCDPSentUnit()(instanceParams))
+    send.io.in.valid := c4Input.valid
+    send.io.in.bits.pfVAddr := c4Input.bits.pfVAddr
+    send.io.in.bits.pfDepth := c4Input.bits.pfDepth
+    send.io.in.bits.pfSource := c4Input.bits.pfSource
+    send.io.in.bits.isHit := c4Input.bits.isHit
+    c4Input.ready := send.io.in.ready
+    io.req <> send.io.out
+    io.tlb <> send.io.tlb
+    filterTraining match {
+      case Some(ft) =>
+        ft.io.sendQuery <> send.io.ftQueryReq
+        send.io.ftQueryRsp := ft.io.sendRsp.bits
+      case None =>
+        send.io.ftQueryReq.ready := true.B
+        send.io.ftQueryRsp := 0.U.asTypeOf(send.io.ftQueryRsp)
+    }
+  } else {
+    c4Input.ready := true.B
+    filterTraining.foreach { ft =>
+      ft.io.sendQuery.valid := false.B
+      ft.io.sendQuery.bits := 0.U.asTypeOf(ft.io.sendQuery.bits)
+    }
+    io.req.valid := false.B
+    io.req.bits := 0.U.asTypeOf(io.req.bits)
+    io.tlb.req.valid := false.B
+    io.tlb.req.bits := 0.U
+    io.tlb.resp.ready := true.B
+  }
 }
