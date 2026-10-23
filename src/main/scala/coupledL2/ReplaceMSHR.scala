@@ -35,6 +35,10 @@ class ReplaceMSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   val releaseDataSeen = Input(Bool())
   val rxrsp = Flipped(ValidIO(new RespInfoBundle))
   val tasks = new MSHRTasks
+  // The direct TXREQ path commits into a one-entry skid inside MSHRCtl, so
+  // tasks.txreq.fire is the capture (ownership transfer), not the TXREQ
+  // enqueue.  txreqPending is the skid's occupancy for this context.
+  val txreqPending = Input(Bool())
   // Pulsed in the same cycle that MSHRCtl routes any victim snapshot to
   // ReleaseBuf. A clean DS fallback snapshot makes the buffer usable by a
   // nested snoop, but must not by itself turn Evict into WriteBackFull.
@@ -176,6 +180,10 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
 
   when (io.alloc.valid) {
     assert(!valid, "replace context allocated while still valid")
+    // A live skid entry belongs to the previous episode and still owns its
+    // txnID/ReleaseBuf; retirement below cannot release the slot early, so a
+    // new allocation must never observe a pending flit.
+    assert(!io.txreqPending, "replace context allocated before its TXREQ skid drained")
     valid := true.B
     probeSent := false.B
     probeAck := false.B
@@ -361,12 +369,21 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   // A late snoop has priority over CopyBackWrData issue. Its final state must
   // be reflected in the WriteData response, so never freeze CopyBackWrData
   // with the pre-snoop UD state in the same cycle that B enters RequestArb.
+  // releaseAck already implies the release left via TXREQ; the explicit skid
+  // hold keeps the request-before-data ordering independent of that argument.
   val copyBackTaskValid = valid && releaseAck && needsCopyBack && !copyBackSent &&
-    !snoopInFlight && !io.snoopStarted
+    !snoopInFlight && !io.snoopStarted && !io.txreqPending
   // Victim-mode writeback requests (WriteBackFull etc.) are control-only
   // flits: they need no DS/Directory work.  Send them on the direct
   // MSHR->TXREQ path instead of occupying a MainPipe pass.  CMO-mode releases
   // keep the MainPipe path (they are rare and ordering-sensitive).
+  // MSHRCtl captures this flit into a per-context one-entry skid before the
+  // shared two-level TXREQ arbiter: ready means "captured", not "enqueued".
+  // Capture is the irreversible point (same role the old arbiter fire had),
+  // so the live !io.snoopStarted veto above still lets a B preempt until the
+  // skid owns the flit.  Afterwards the sidecar keeps valid until releaseAck
+  // and the retire condition waits for !txreqPending, so its txnID and
+  // ReleaseBuf entry cannot be reused while the flit is still in the skid.
   io.tasks.txreq.valid := releaseTaskValid && mode === ReplaceMSHRMode.victim
   io.tasks.txreq.bits := releaseTask.toCHIREQBundle()
   // Victim-mode CopyBackWrData is a pure ReleaseBuf->TXDAT transfer: its
@@ -401,7 +418,10 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     probeSent := true.B
   }
   when (io.tasks.txreq.fire) {
-    // Victim-mode writeback request left on the direct TXREQ path.
+    // Victim-mode writeback request was committed to the direct TXREQ skid.
+    // releaseSent must be set here (not when the skid drains) so the sidecar
+    // can never re-present the same release: exactly one capture per episode.
+    assert(!releaseSent, "a ReplaceMSHR may capture only one TXREQ flit per episode")
     releaseSent := true.B
     // needsData only tracks a writeback the directory forces. WriteEvictOrEvict
     // carries data too: L3 replies CompDBIDResp on a local miss and then waits
@@ -448,6 +468,10 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     assert(valid && !copyBackSent,
       "a nested snoop must reserve ReplaceMSHR before CopyBackWrData is issued")
   }
+  // A skid entry is the committed tail of a still-live episode.  The retire
+  // holds keep the context valid until it drains, so it can never own a flit
+  // whose txnID/ReleaseBuf already moved on.
+  assert(!io.txreqPending || valid, "TXREQ skid holds a flit without a live ReplaceMSHR")
   when (snoopStart) {
     assert(snoopInFlightCnt =/= snoopInFlightMax, "nested snoop reservation tally overflow")
   }
@@ -512,12 +536,17 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   // still travelling -- retiring then would make that response's completion
   // arrive at an invalid sidecar. snoopInFlightNext subtracts this snoop's own
   // reservation, so the single-snoop case is unchanged.
-  when (valid && (snoopConsumed || io.snoopToInvalDone) && !releaseSent && snoopInFlightNext === 0.U) {
+  // Retiring frees the txnID/ReleaseBuf for reuse, so it must also wait until
+  // the skid has handed the release flit to TXREQ.  For the first branch
+  // !releaseSent already implies an empty skid; the explicit term documents
+  // the invariant.  The releaseAck branch implies the flit left long ago.
+  when (valid && (snoopConsumed || io.snoopToInvalDone) && !releaseSent &&
+    !io.txreqPending && snoopInFlightNext === 0.U) {
     valid := false.B
     victim.valid := false.B
     donePulse := true.B
   }.elsewhen (valid && releaseAck && !compAckPending && (!needsCopyBack || io.copyBackDone) &&
-    !snoopInFlight && !io.snoopStarted) {
+    !snoopInFlight && !io.snoopStarted && !io.txreqPending) {
     when (needsCopyBack) {
       assert(copyBackSent, "CopyBackWrData completed without being issued by ReplaceMSHR")
     }

@@ -113,6 +113,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
 
     /* send reqs */
     val toTXREQ = DecoupledIO(new CHIREQ())
+    // Occupancy of the per-ReplaceMSHR TXREQ skids.  These flits have left
+    // their sidecar but have not reached the TXREQ queue yet, so TXREQ must
+    // count them in inflightCnt/noSpace alongside the pipeline statuses.
+    val replaceTxreqPendingCnt = Output(UInt(log2Up(mshrsAll + 1).W))
     val toTXRSP = DecoupledIO(new CHIRSP()) // TODO: unify with main pipe, which should be TaskBundle
     // Direct ReplaceMSHR CopyBackWrData: task+data enqueued into TXDAT
     // without a MainPipe pass.  Data comes from the ReleaseBuf second read
@@ -1407,7 +1411,67 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // Normal reads (latency-critical) and victim writeback requests share the
   // direct MSHR->TXREQ path; writeback control is control-only and needs no
   // MainPipe pass.
-  ArbPerf(twoLevelArb(refillMshrs.map(_.io.tasks.txreq) ++ replaceMshrs.map(_.io.tasks.txreq), io.toTXREQ, Some("txreq")), "txreq_arb")
+  //
+  // R2: insert a one-entry registered skid per ReplaceMSHR before the shared
+  // two-level arbiter.  The live sidecar cone (state/snoopStarted ->
+  // txreq.valid/bits) previously ran through highArb and the TXREQ queue
+  // straight into the queue RAM write.  With the skid, that cone ends at a
+  // local valid/bits register and the RAM write starts from registered
+  // inputs.  Normal refill reads keep their direct, zero-added-latency path
+  // into lowArb.
+  //
+  // A capture is the sidecar's irreversible commit point (it sets
+  // releaseSent in ReplaceMSHR): the skid then owns the flit until the
+  // arbiter accepts it.  The sidecar stays valid and the retire/txdat
+  // conditions hold on !txreqPending, so the flit cannot be duplicated, and
+  // its txnID and ReleaseBuf entry are not reused while it is pending.  The
+  // request-before-CopyBackWrData ordering is preserved because the data
+  // path additionally waits for releaseAck, which the HN can only return
+  // after this request has actually left TXREQ.
+  val replaceTxreqSkids = replaceMshrs.zipWithIndex.map { case (m, i) =>
+    val busy = RegInit(false.B)
+    val bits = Reg(new CHIREQ)
+    val out = Wire(Decoupled(new CHIREQ))
+    // No bypass, one-entry FIFO: capture only when empty, hold otherwise.
+    m.io.tasks.txreq.ready := !busy
+    m.io.txreqPending := busy
+    out.valid := busy
+    out.bits := bits
+    when (m.io.tasks.txreq.fire) {
+      // fire == capture: the sidecar is still live, so its bits are stable.
+      busy := true.B
+      bits := m.io.tasks.txreq.bits
+    }.elsewhen(out.fire) {
+      busy := false.B
+    }
+    // Exactly one capture per episode, and never over an undrained flit.
+    when (m.io.tasks.txreq.fire) {
+      assert(!busy, s"replace TXREQ skid $i captured into a non-empty entry")
+    }
+    // A skid entry is a committed victim writeback.  It must never outlive
+    // the context that owns its txnID/ReleaseBuf.
+    assert(!busy || m.io.info.valid,
+      s"replace TXREQ skid $i holds a flit without a live sidecar")
+    when (m.io.alloc.valid) {
+      assert(!busy, s"replace TXREQ skid $i not drained before reallocation")
+    }
+    out
+  }
+  val replaceTxreqSkidAnyBusy = VecInit(replaceTxreqSkids.map(_.valid)).asUInt.orR
+  io.replaceTxreqPendingCnt := PopCount(VecInit(replaceTxreqSkids.map(_.valid)))
+  // Bounded drain watchdog: the two-level RR arbiter alternates the groups
+  // and round-robins inside each group, so a skid only waits for downstream
+  // bandwidth.  This bound is far above any legitimate backpressure window;
+  // hitting it means the handshake was lost.
+  val replaceTxreqSkidWait = RegInit(0.U(16.W))
+  when (replaceTxreqSkidAnyBusy) {
+    replaceTxreqSkidWait := Mux(replaceTxreqSkidWait === 65535.U, replaceTxreqSkidWait,
+      replaceTxreqSkidWait + 1.U)
+  }.otherwise {
+    replaceTxreqSkidWait := 0.U
+  }
+  assert(replaceTxreqSkidWait =/= 65535.U, "replace TXREQ skid failed to drain")
+  ArbPerf(twoLevelArb(refillMshrs.map(_.io.tasks.txreq) ++ replaceTxreqSkids, io.toTXREQ, Some("txreq")), "txreq_arb")
 
   /* Victim CopyBackWrData direct to TXDAT */
   // The sidecar's copyback task carries no directory/DS side effect; its

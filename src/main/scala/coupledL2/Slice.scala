@@ -74,6 +74,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   val status_vec_toTX = reqArb.io.status_vec_toTX ++ mainPipe.io.status_vec_toTX
   txreq.io.pipeReq <> mainPipe.io.toTXREQ
   txreq.io.mshrReq <> mshrCtl.io.toTXREQ
+  txreq.io.replacePendingCnt := mshrCtl.io.replaceTxreqPendingCnt
   txreq.io.pipeStatusVec := status_vec_toTX
   txreq.io.sliceId := io.sliceId
 
