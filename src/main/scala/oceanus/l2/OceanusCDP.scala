@@ -24,6 +24,17 @@
 
 /*
  * Intent/source ledger (C0), read before implementation:
+ * C2 source ledger (read before implementation): :467-551 FilterTable,
+ * :566-693 FtTrainPipeline, :1478-1484 Queue8, :1555-1573 query RR/owner.
+ * Preserve two single-port sat banks, reset metadata only, one-cycle response,
+ * write priority, same set+tag serialization, PLRU update on train.fire.
+ * :609-619 evict selects victim PA; isUsed wins even when isEvict=true.
+ * :661 ordinary used miss does not allocate; :667 miss initializes 1/3 and 2;
+ * :671 saturating decrement/increment. No prefetch-bit/source gate on used.
+ * Adaptations: local types/full PA/explicit flags; standalone SRAM MBIST and
+ * SRAM control are false (same reference test platform), not cache macros.
+ * Outer admission makes existing enable/trainEnable/reqSource eligibility
+ * explicit; unused-CDP qualification remains the event producer's C5 duty.
  * C1 intent/source ledger (read before implementation):
  * CDP.scala:290-448 VpnTable; :695-867 VtTrainPipeline, expression-for-expression
  * except local type names, fixed block-VA field and the debug table name.
@@ -49,7 +60,7 @@
  * internal source4 and depth2. No coupledL2 types or modules are instantiated.
  * :1319-1336 top-level interface is adapted to full PA training events and the
  * existing variable-latency translation client. This skeleton is not wired
- * into L2Top. C1 adds only VPN/VtTrain; C2-C5 fill and integrate later.
+ * into L2Top. C1/C2 add VPN and Filter training; C3-C5 fill and integrate later.
  * MainPipe.scala:731, CDP.scala:66/:212-228/:609-671: Filter used feedback is
  * by 4KB physical page, regardless of prefetch bit; do not implement :729 TODO.
  * mergeA maps to one demand hit after RBE wait (MainPipe.scala:726/:731/:770).
@@ -793,6 +804,254 @@ class OceanusCDPVtTrainPipeline(implicit p: Parameters) extends OceanusCDPModule
   cdpTrainTriggerDB.log(trainTriggerEntry, stage_valid(4), "", clock, reset)
 }
 
+// C2: expression-equivalent standalone Filter/FtTrain; no cache connection.
+class OceanusCDPFilterTable(implicit p: Parameters) extends OceanusCDPModule {
+  val io = IO(new Bundle {
+    val queryReq = Flipped(DecoupledIO(new OceanusCDPFtQueryReq))
+    val queryRsp = ValidIO(new OceanusCDPFtQueryRsp)
+    val trainReq = Flipped(DecoupledIO(new OceanusCDPFtTrainReq))
+  })
+
+  val (queryReq, queryRsp) = (io.queryReq, io.queryRsp)
+  val trainReq = io.trainReq
+
+  val SatBankNum = 2
+  val SatBankBlks = filterEntryBlks / SatBankNum
+  require(filterEntryBlks % SatBankNum == 0, "filterEntryBlks must be divisible by SatBankNum")
+
+  def ftMetaEntry() = new Bundle {
+    val valid = Bool()
+    val tag = UInt(filterTableTagBits.W)
+  }
+
+  val metaArray = Module(
+    new SRAMTemplate(
+      ftMetaEntry(),
+      set = filterTableSetNum,
+      way = filterTableWayNum,
+      shouldReset = true,
+      singlePort = true,
+      hasMbist = false,
+      hasSramCtl = false
+    )
+  )
+  val satBanks = Seq.fill(SatBankNum) {
+    Module(
+      new SRAMTemplate(
+        Vec(SatBankBlks, UInt(2.W)),
+        set = filterTableSetNum,
+        way = filterTableWayNum,
+        singlePort = true,
+        hasMbist = false,
+        hasSramCtl = false
+      )
+    )
+  }
+
+  // query
+  val queryReady = metaArray.io.r.req.ready && satBanks.map(_.io.r.req.ready).reduce(_ && _) && !trainReq.valid
+  queryReq.ready := queryReady
+  val queryFire = queryReq.valid && queryReady
+
+  metaArray.io.r.req.valid := queryFire
+  metaArray.io.r.req.bits.setIdx := queryReq.bits.setIdx
+  satBanks.foreach { bank =>
+    bank.io.r.req.valid := queryFire
+    bank.io.r.req.bits.setIdx := queryReq.bits.setIdx
+  }
+
+  queryRsp.valid := RegNext(queryFire, false.B)
+  for (i <- 0 until filterTableWayNum) {
+    queryRsp.bits.validVec(i) := metaArray.io.r.resp.data(i).valid
+    queryRsp.bits.tagVec(i)   := metaArray.io.r.resp.data(i).tag
+    for (j <- 0 until filterEntryBlks) {
+      queryRsp.bits.satVec(i)(j) := satBanks(j / SatBankBlks).io.r.resp.data(i)(j % SatBankBlks)
+    }
+  }
+
+  // train
+  val trainReady = metaArray.io.w.req.ready && satBanks.map(_.io.w.req.ready).reduce(_ && _)
+  trainReq.ready := trainReady
+  val trainFire = trainReq.valid && trainReady
+  val trainWayOH = UIntToOH(trainReq.bits.way, filterTableWayNum)
+
+  val metaWData = WireInit(0.U.asTypeOf(ftMetaEntry()))
+  metaWData.valid := true.B
+  metaWData.tag   := trainReq.bits.tag
+  metaArray.io.w.req.valid := trainFire
+  metaArray.io.w.req.bits.apply(metaWData, trainReq.bits.set, trainWayOH)
+
+  for (bankIdx <- 0 until SatBankNum) {
+    val satWData = Wire(Vec(SatBankBlks, UInt(2.W)))
+    for (blkIdx <- 0 until SatBankBlks) {
+      satWData(blkIdx) := trainReq.bits.sat(bankIdx * SatBankBlks + blkIdx)
+    }
+    satBanks(bankIdx).io.w.req.valid := trainFire
+    satBanks(bankIdx).io.w.req.bits.apply(satWData, trainReq.bits.set, trainWayOH)
+  }
+}
+
+class OceanusCDPFtTrainPipeline(implicit p: Parameters) extends OceanusCDPModule {
+  val io = IO(new Bundle {
+    val trainTrigger = Flipped(DecoupledIO(new OceanusCDPTrain))
+
+    // to OceanusCDPFilterTable
+    val queryReq = DecoupledIO(new OceanusCDPFtQueryReq)
+    val queryRsp = Input(new OceanusCDPFtQueryRsp)
+    val trainReq = DecoupledIO(new OceanusCDPFtTrainReq)
+  })
+
+  val (trainTrigger, queryReq, queryRsp, trainReq) =
+    (io.trainTrigger, io.queryReq, io.queryRsp, io.trainReq)
+
+  val replacer = ReplacementPolicy.fromString(replType, filterTableWayNum, filterTableSetNum)
+
+  class FtTrainTask extends Bundle {
+    val setIdx = UInt(filterTableSetBits.W)
+    val offset = UInt(filterTableOffsetBits.W)
+    val tag = UInt(filterTableTagBits.W)
+    val isUsed = Bool()
+    val isEvict = Bool()
+  }
+
+  val s0_valid = Wire(Bool())
+  val s0_task = Wire(new FtTrainTask)
+
+  val s1_valid = RegInit(false.B)
+  val s1_task = Reg(new FtTrainTask)
+
+  val s2_valid = RegInit(false.B)
+  val s2_task = Reg(new FtTrainTask)
+
+  val s3_valid = Wire(Bool())
+  val s3_task = Wire(new FtTrainTask)
+
+  val sameVec = Wire(Vec(3, Bool()))
+  val sameAddr = sameVec.reduce(_ || _)
+  val s1_ready = !s1_valid || queryReq.ready && trainReq.ready    // s1 ready to recv req from s0
+
+  // ----------- s0: accept train trigger -----------
+  s0_valid := trainTrigger.valid && !sameAddr
+  trainTrigger.ready := !reset.asBool && s1_ready && !sameAddr
+
+  val trainPaddr = Mux(
+    trainTrigger.bits.isEvict,
+    trainTrigger.bits.evictPaddr,
+    trainTrigger.bits.paddr
+  )
+
+  s0_task.setIdx := getFilterSet(trainPaddr)
+  s0_task.offset  := getFilterOffset(trainPaddr)
+  s0_task.tag     := getFilterTag(trainPaddr)
+  s0_task.isUsed := trainTrigger.bits.isUsed
+  s0_task.isEvict := trainTrigger.bits.isEvict
+
+  // ----------- s1: query OceanusCDPFilterTable -----------
+  when (s1_ready) {
+    s1_valid := s0_valid
+    s1_task := s0_task
+  }
+
+  queryReq.valid := s1_valid
+  queryReq.bits.setIdx := s1_task.setIdx
+
+  sameVec(0) := s1_valid && s1_task.setIdx === s0_task.setIdx && s1_task.tag === s0_task.tag
+
+  // ----------- s2: receive OceanusCDPFilterTable and latch -----------
+  when (queryReq.fire) {
+    s2_valid := s1_valid
+    s2_task := s1_task
+  }.otherwise {
+    s2_valid := false.B
+  }
+
+  val ft_s2_rsp = queryRsp
+
+  sameVec(1) := s2_valid && s2_task.setIdx === s0_task.setIdx && s2_task.tag === s0_task.tag
+
+  // ----------- s3: chk hit and update -----------
+  s3_valid := RegNext(s2_valid, false.B)
+  s3_task := RegEnable(s2_task, s2_valid)
+
+  val ft_s3_rsp = RegNext(ft_s2_rsp)
+
+  val s3_hit_vec = ft_s3_rsp.tagVec.zip(ft_s3_rsp.validVec).map {
+    case (tag, valid) => tag === s3_task.tag && valid
+  }
+
+  val s3_hit = s3_hit_vec.reduce(_ || _)
+  val s3_hit_way = PriorityEncoder(s3_hit_vec)
+  assert(PopCount(s3_hit_vec) < 2.U || !s3_valid, "OceanusCDPFilterTable entry multiple hit!")
+
+  val s3_repl_way = replacer.way(s3_task.setIdx)
+  val s3_target_way = Mux(s3_hit, s3_hit_way, s3_repl_way)
+  val s3_old_sat_vec = ft_s3_rsp.satVec(s3_target_way)
+  val s3_need_update = s3_hit || s3_task.isEvict
+
+  val s3_next_sat_vec = Wire(Vec(filterEntryBlks, UInt(2.W)))
+  for (i <- 0 until filterEntryBlks) {
+    val oldSat = s3_old_sat_vec(i)
+    when (!s3_hit) {
+      s3_next_sat_vec(i) := Mux(i.U === s3_task.offset, Mux(s3_task.isUsed, 1.U, 3.U), 2.U)  // if not hit, set the accessed block to 1 or 3, others to 2
+    }.otherwise {
+      // if hit, update the accessed block's sat counter based on whether it is used or not
+      s3_next_sat_vec(i) := Mux(i.U === s3_task.offset,
+        Mux(s3_task.isUsed, Mux(oldSat === 0.U, 0.U, oldSat - 1.U), Mux(oldSat === 3.U, 3.U, oldSat + 1.U)),
+        oldSat
+      )
+    }
+  }
+
+  val s3_update_info = WireInit(0.U.asTypeOf(new OceanusCDPFtTrainReq))
+  s3_update_info.set := s3_task.setIdx
+  s3_update_info.way := s3_target_way
+  s3_update_info.tag := s3_task.tag
+  s3_update_info.sat := s3_next_sat_vec
+
+  sameVec(2) := s3_valid && s3_task.setIdx === s0_task.setIdx && s3_task.tag === s0_task.tag
+
+  trainReq.valid := s3_valid && s3_need_update
+  trainReq.bits  := s3_update_info
+
+  assert(!trainReq.valid || trainReq.ready, "OceanusCDPFilterTable train req should be ready when valid!")
+
+  when (trainReq.fire) {
+    replacer.access(s3_update_info.set, s3_update_info.way)
+  }
+}
+
+// C2: reference :1478-1484 and :1555-1573. Sender query remains an independent
+// port for C4; the unused top-level sender is tied off until integration.
+class OceanusCDPFilterTraining(implicit p: Parameters) extends OceanusCDPModule {
+  val io = IO(new Bundle {
+    val enable = Input(Bool())
+    val train = Flipped(Valid(new OceanusCDPTrain))
+    val sendQuery = Flipped(Decoupled(new OceanusCDPFtQueryReq))
+    val sendRsp = Valid(new OceanusCDPFtQueryRsp)
+  })
+  val table = Module(new OceanusCDPFilterTable)
+  val pipe = Module(new OceanusCDPFtTrainPipeline)
+  val queue = Module(new Queue(new OceanusCDPTrain, 8))
+  queue.io.enq.valid := io.train.valid && io.enable && io.train.bits.trainEnable &&
+    (io.train.bits.isUsed || io.train.bits.isEvict) &&
+    io.train.bits.reqSource =/= MemReqSource.L1DataPrefetch.id.U
+  queue.io.enq.bits := io.train.bits
+  pipe.io.trainTrigger <> queue.io.deq
+  val arb = Module(new RRArbiter(new OceanusCDPFtQueryReq, 2))
+  arb.io.in(0) <> pipe.io.queryReq
+  arb.io.in(1) <> io.sendQuery
+  table.io.queryReq <> arb.io.out
+  table.io.trainReq <> pipe.io.trainReq
+  val chosen = RegEnable(arb.io.chosen, arb.io.out.fire)
+  pipe.io.queryRsp := Mux(table.io.queryRsp.valid && chosen === 0.U,
+    table.io.queryRsp.bits, 0.U.asTypeOf(new OceanusCDPFtQueryRsp))
+  io.sendRsp.valid := table.io.queryRsp.valid && chosen === 1.U
+  io.sendRsp.bits := Mux(io.sendRsp.valid, table.io.queryRsp.bits,
+    0.U.asTypeOf(new OceanusCDPFtQueryRsp))
+  XSPerfAccumulate("filter_train_drop", queue.io.enq.valid && !queue.io.enq.ready)
+  XSPerfAccumulate("filter_train_accept", queue.io.enq.fire)
+}
+
 object OceanusCDP {
   def configured(config: OceanusCDPParameters, banks: Int, p: Parameters): Parameters =
     p.alterPartial {
@@ -801,7 +1060,7 @@ object OceanusCDP {
     }
 }
 
-// Intent (C1): instantiate only VPN training behind the existing inactive
+// Intent (C1/C2): instantiate training behind the existing inactive
 // interface. Cache integration and request generation belong to later slices.
 class OceanusCDP(config: OceanusCDPParameters = OceanusCDPParameters(), bankCount: Int = 1)
     (implicit p: Parameters) extends OceanusCDPModule()(OceanusCDP.configured(config, bankCount, p)) {
@@ -826,6 +1085,14 @@ class OceanusCDP(config: OceanusCDPParameters = OceanusCDPParameters(), bankCoun
   }
   XSPerfAccumulate("vpn_train_drop", vpnTrainReqBuf.io.enq.valid && !vpnTrainReqBuf.io.enq.ready)
   XSPerfAccumulate("vpn_train_accept", vpnTrainReqBuf.io.enq.fire)
+  // C2: exercise Filter training behind the standalone interface only.
+  val filterTraining = if (useFilterTable) Some(Module(new OceanusCDPFilterTraining()(instanceParams))) else None
+  filterTraining.foreach { ft =>
+    ft.io.enable := io.enable
+    ft.io.train := io.filterTrain
+    ft.io.sendQuery.valid := false.B
+    ft.io.sendQuery.bits := 0.U.asTypeOf(ft.io.sendQuery.bits)
+  }
   io.req.valid := false.B
   io.req.bits := 0.U.asTypeOf(io.req.bits)
   io.tlb.req.valid := false.B
