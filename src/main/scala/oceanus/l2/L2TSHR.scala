@@ -607,6 +607,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   vPipeREQ.io.self_unlock_dir_ack := io.self_unlock_dir_ack
 
   vPipeREQ.io.L1EVT_active := vPipeEVT.io.EVT_active
+  vPipeREQ.io.L1EVT_data_pending := vPipeEVT.io.EVT_data_pending
 
   // connections between TX channels and TSHR local modules
   io.DnTXREQ <> vPipeREQ.io.DnTXREQ

@@ -42,6 +42,10 @@ class L2VPipeEVT(
     val at_commit = Output(Bool()) // parked at sWaitCommit (for TSHR-level assertions)
 
     val EVT_active = Output(Bool())
+    // Level: a WriteBackFull is being serviced and its upstream data beats
+    // have not fully arrived yet (gates the peer REQ pipe's EvictBack
+    // downstream CopyBackWrData issue). Clean Evict never asserts this.
+    val EVT_data_pending = Output(Bool())
     val evtDataReadyOut = Output(Bool())
 
     // DRRIP release-type update (commit path): single-cycle pulse at this
@@ -78,6 +82,7 @@ class L2VPipeEVT(
   val commitPending = RegInit(false.B) // WriteBackFull meta commit deferred past a peer meta.state write
 
   io.EVT_active := inflightEvict
+  io.EVT_data_pending := pIsWbFull && (state === sSendCompDBIDResp || state === sWaitData)
   io.evtDataReadyOut := RegNext(io.UpRXDAT.valid &&
     io.UpRXDAT.bits.TxnID === io.consts.tshrId &&
     io.UpRXDAT.bits.Opcode === CCHIOpcode.CopyBackWrData.U &&
