@@ -1733,25 +1733,17 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val base = mshrTaskGroupOffsets(g)
     VecInit((0 until mshrTaskGroupSize).map(i => mshrTaskEffClasses(base + i)))
   }
-  def groupBestClass(g: Int): UInt = {
-    val v = groupValids(g)
+  def groupBestClass(g: Int, v: UInt): UInt = {
     val cs = groupClasses(g)
     PriorityEncoder(VecInit((0 until 5).map(c =>
       (v & VecInit(cs.map(_ === c.U)).asUInt).orR)).asUInt)
   }
-  def groupCandidates(g: Int): UInt = {
-    val v = groupValids(g)
+  def groupCandidates(g: Int, v: UInt): UInt = {
     val cs = groupClasses(g)
-    val bc = groupBestClass(g)
+    val bc = groupBestClass(g, v)
     v & VecInit(cs.map(_ === bc)).asUInt
   }
   val mshrTaskGroupRrMask = Seq.fill(nMshrTaskGroups)(RegInit(0.U(mshrTaskGroupSize.W)))
-  val mshrTaskGroupRrCand = (0 until nMshrTaskGroups).map(g => mshrTaskGroupRrMask(g) & groupCandidates(g))
-  val mshrTaskGroupSelOH = (0 until nMshrTaskGroups).map { g =>
-    Mux(mshrTaskGroupRrCand(g).orR, MaskToOH(mshrTaskGroupRrCand(g)),
-      MaskToOH(groupCandidates(g)))
-  }
-  val mshrTaskGroupSelIdx = mshrTaskGroupSelOH.map(OHToUInt(_))
   // Registered arbitration decision.  The choice is made from this cycle's
   // valids and classes, but the source is consumed only when mshrTask
   // actually fires, so every MSHR evaluates its ordering guards in the same
@@ -1760,6 +1752,13 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val mshrTaskGroupValid = Seq.fill(nMshrTaskGroups)(RegInit(false.B))
   val mshrTaskGroupClass = Seq.fill(nMshrTaskGroups)(RegInit(0.U(3.W)))
   val mshrTaskGroupIdx = Seq.fill(nMshrTaskGroups)(RegInit(0.U(log2Up(mshrTaskGroupSize).W)))
+  // R3: snapshot the selected source payload at the same edge as the group
+  // decision.  This register ends the source-bits -> 16:1 group mux cone, so
+  // the RequestArb S1 payload no longer carries either that mux or the live
+  // final-valid gate (mshrTaskGroupReady -> selected source valid ->
+  // bFire/snoopStarted).
+  val mshrTaskGroupBits = Seq.fill(nMshrTaskGroups)(
+    RegInit(0.U.asTypeOf(new TaskBundle())))
   // A held decision blocks its group until the cross-group stage drains it.
   // Promote it after the same 63-cycle bound as a source so a low-class
   // decision cannot hold back a promoted source behind it.
@@ -1770,8 +1769,34 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val mshrTaskGroupSrcValid = (0 until nMshrTaskGroups).map { g =>
     VecInit(groupOf(g).map(_.valid))(mshrTaskGroupIdx(g))
   }
+  // R3: the payload is a snapshot taken when the decision was made.  A source
+  // may keep valid high while a higher-priority task variant becomes ready
+  // (e.g. grant -> repl_read/revalidate share the same MSHR output), which
+  // changes the payload without a valid gap.  Firing the snapshot then would
+  // disagree with the source's own fire side effects (replTask/refillOnly),
+  // so the decision is only usable while the live task type still matches.
+  // Only the control/type fields are compared; the wide address/data fields
+  // are stable within a variant.  A mismatch drops the decision and the
+  // group re-decides from the freshly presented bits next cycle.
+  def mshrTaskType(t: TaskBundle): UInt = Cat(
+    t.opcode, t.txChannel, t.mshrContext,
+    t.replTask.asUInt, t.refillOnly.asUInt, t.deferRefillWrite.asUInt,
+    t.normalRefillRevalidate.asUInt, t.replaceTask.asUInt,
+    t.replaceCapture.asUInt, t.refillToReleaseCopy.asUInt,
+    t.readRefillData.asUInt, t.readProbeDataDown.asUInt,
+    t.useProbeData.asUInt, t.dsWen.asUInt, t.metaWen.asUInt, t.tagWen.asUInt,
+    t.mshrRetry.asUInt, t.cmoTask.asUInt,
+    t.chiOpcode.getOrElse(0.U(OPCODE_WIDTH.W)),
+    t.resp.getOrElse(0.U(RESP_WIDTH.W)),
+    t.fwdState.getOrElse(0.U(FWDSTATE_WIDTH.W)),
+    t.expCompAck.getOrElse(false.B).asUInt,
+    t.likelyshared.getOrElse(false.B).asUInt)
+  val mshrTaskGroupPayloadStable = (0 until nMshrTaskGroups).map { g =>
+    mshrTaskType(mshrTaskGroupBits(g)) ===
+      VecInit(groupOf(g).map(s => mshrTaskType(s.bits)))(mshrTaskGroupIdx(g))
+  }
   val mshrTaskGroupReady = (0 until nMshrTaskGroups).map { g =>
-    mshrTaskGroupValid(g) && mshrTaskGroupSrcValid(g)
+    mshrTaskGroupValid(g) && mshrTaskGroupSrcValid(g) && mshrTaskGroupPayloadStable(g)
   }
 
   // Cross-group arbitration over the three held decisions.
@@ -1785,13 +1810,12 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val mshrTaskFinalRrCand = mshrTaskFinalRrMask & mshrTaskFinalCandidates
   val mshrTaskFinalSelOH = Mux(mshrTaskFinalRrCand.orR, MaskToOH(mshrTaskFinalRrCand),
     MaskToOH(mshrTaskFinalCandidates))
-  val mshrTaskGroupSelBits = mshrTaskGroups.zip(mshrTaskGroupIdx).map { case (srcs, idx) =>
-    VecInit(srcs.map(_.bits))(idx)
-  }
+  // R3: only the three registered group payloads reach the output mux.  The
+  // payload is don't-care while valid is low, so it is no longer gated by
+  // mshrTask.valid; the live valid cone now stops at mshrTask.valid and does
+  // not ripple through every TaskBundle bit.
   mshrTask.valid := mshrTaskFinalCandidates.orR
-  mshrTask.bits := Mux(mshrTask.valid,
-    Mux1H(mshrTaskFinalSelOH, mshrTaskGroupSelBits),
-    0.U.asTypeOf(new TaskBundle()))
+  mshrTask.bits := Mux1H(mshrTaskFinalSelOH, mshrTaskGroupBits)
   // Every group has mshrsAll slots, so the decided index is the physical
   // MSHR id for refill, snoop and replace alike.
   mshrTask.bits.mshrId := Mux1H(mshrTaskFinalSelOH, mshrTaskGroupIdx)
@@ -1801,19 +1825,34 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     "selected task must belong to the best effective QoS class")
 
   (0 until nMshrTaskGroups).foreach { g =>
-    val load = (!mshrTaskGroupValid(g) || (mshrTask.fire && mshrTaskFinalSelOH(g))) &&
-      groupCandidates(g).orR
+    // R3: the source granted in this cycle is consumed by mshrTask.fire and
+    // its bits are the task currently leaving.  Mask it out of the reload:
+    // sampling it here would capture the pre-fire payload and, if the source
+    // keeps valid high for its next task, re-issue the same task.  The group
+    // then re-decides from freshly presented bits one cycle later.
+    val granted = mshrTask.fire && mshrTaskFinalSelOH(g)
+    val grantedOH = Mux(granted, UIntToOH(mshrTaskGroupIdx(g), mshrTaskGroupSize), 0.U)
+    val loadValids = groupValids(g) & ~grantedOH
+    val loadCand = groupCandidates(g, loadValids)
+    val loadRrCand = mshrTaskGroupRrMask(g) & loadCand
+    val loadSelOH = Mux(loadRrCand.orR, MaskToOH(loadRrCand), MaskToOH(loadCand))
+    val loadSelIdx = OHToUInt(loadSelOH)
+    val load = (!mshrTaskGroupValid(g) || granted) && loadCand.orR
     when(load) {
       mshrTaskGroupValid(g) := true.B
-      mshrTaskGroupClass(g) := groupBestClass(g)
-      mshrTaskGroupIdx(g) := mshrTaskGroupSelIdx(g)
+      mshrTaskGroupClass(g) := groupBestClass(g, loadValids)
+      mshrTaskGroupIdx(g) := loadSelIdx
+      mshrTaskGroupBits(g) := VecInit(groupOf(g).map(_.bits))(loadSelIdx)
       mshrTaskGroupWait(g) := 0.U
-      mshrTaskGroupRrMask(g) := Mux(mshrTaskGroupRrCand(g).orR,
-        LowerMaskPrefix(mshrTaskGroupRrCand(g)), LowerMaskPrefix(groupCandidates(g)))
-    }.elsewhen(mshrTask.fire && mshrTaskFinalSelOH(g)) {
+      mshrTaskGroupRrMask(g) := Mux(loadRrCand.orR,
+        LowerMaskPrefix(loadRrCand), LowerMaskPrefix(loadCand))
+    }.elsewhen(granted) {
       mshrTaskGroupValid(g) := false.B
       mshrTaskGroupWait(g) := 0.U
-    }.elsewhen(mshrTaskGroupValid(g) && !mshrTaskGroupSrcValid(g)) {
+    }.elsewhen(mshrTaskGroupValid(g) &&
+      (!mshrTaskGroupSrcValid(g) || !mshrTaskGroupPayloadStable(g))) {
+      // Source withdrawn or switched task variant under the held payload:
+      // drop the decision without consuming the source.
       mshrTaskGroupValid(g) := false.B
       mshrTaskGroupWait(g) := 0.U
     }.elsewhen(mshrTaskGroupValid(g)) {
@@ -1823,6 +1862,18 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       s.ready := mshrTask.fire && mshrTaskFinalSelOH(g) && mshrTaskGroupIdx(g) === i.U
     }
   }
+  // R3 exactly-once: a source is consumed only by mshrTask.fire (its ready
+  // above), and the reload masks the granted source.  Therefore two
+  // consecutive cycles cannot grant the same source; a valid that survives
+  // the fire is a new task and must pass through a fresh decision (and a
+  // fresh payload snapshot) before it can be granted again.
+  val mshrTaskGrantSrc = VecInit((0 until nMshrTaskGroups).map { g =>
+    Mux(mshrTask.fire && mshrTaskFinalSelOH(g),
+      UIntToOH(mshrTaskGroupIdx(g), mshrTaskGroupSize), 0.U)
+  }).asUInt
+  val mshrTaskGrantSrcLast = RegNext(mshrTaskGrantSrc, 0.U(nMshrTaskSrc.W))
+  assert(!(mshrTaskGrantSrcLast & mshrTaskGrantSrc).orR,
+    "an MSHR task source must not be granted twice without a re-decision")
   when(mshrTask.fire) {
     mshrTaskFinalRrMask := Mux(mshrTaskFinalRrCand.orR,
       LowerMaskPrefix(mshrTaskFinalRrCand), LowerMaskPrefix(mshrTaskFinalCandidates))
