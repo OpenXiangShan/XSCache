@@ -155,7 +155,12 @@ class L2VPipeEVT(
     commitPending := false.B
   }
 
-  io.at_commit := state === sWaitCommit || commitPending || wbCommitFire
+  // Commit windows for the TSHR-level race assertion. WBFull commits at the
+  // CompDBIDResp handshake (fc38d04), so its sWaitCommit park carries no
+  // pending meta write: only the handshake and a deferred commit are real
+  // commit windows. Clean Evict still commits in sWaitCommit and keeps the
+  // full park as its window.
+  io.at_commit := (state === sWaitCommit && !pIsWbFull) || commitPending || wbCommitFire
 
   when (state === sWaitCommit) {
     when (pIsWbFull) {
