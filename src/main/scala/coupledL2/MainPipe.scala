@@ -878,8 +878,15 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // TODO: check this
   val customL1Hint = Module(new CustomL1Hint)
 
-  customL1Hint.io.mshrHintQInfo := io.mshrHintQInfo
-  customL1Hint.io.sinkCHintQInfo := io.sinkCHintQInfo
+  // Generate the s1 hint event from the registered s2 task instead of the
+  // combinational s1 admission signals. This keeps the hint queue write path
+  // off the long A/B/C-valid -> RequestArb -> Directory-ready cone.
+  // task_s2.valid is exactly the s1 fire of this task, so this only delays
+  // every hint by one cycle; the payload is unchanged.
+  customL1Hint.io.mshrHintQInfo.valid := task_s2.valid && task_s2.bits.mshrTask && !io.retryFastFwd_s2
+  customL1Hint.io.mshrHintQInfo.bits := task_s2.bits
+  customL1Hint.io.sinkCHintQInfo.valid := task_s2.valid && task_s2.bits.fromC && !io.retryFastFwd_s2
+  customL1Hint.io.sinkCHintQInfo.bits := task_s2.bits
   customL1Hint.io.retry_s2 := io.retryFastFwd_s2 && task_s2.valid
   io.hint_s1QueueFull := customL1Hint.io.hint_s1QueueFull
   customL1Hint.io.hintCancel := io.hintCancel
