@@ -393,11 +393,16 @@ object ReplacementAllocAddress {
   // Origins are ordered from lowest to highest priority, matching the
   // successive incomingVictim assignments. Qualification must also hold when
   // callers violate the independent-allocation assertion.
-  def acceptedOrigins(requested: Seq[Bool], accepted: Bool): Seq[Bool] = {
+  def requestedOrigins(requested: Seq[Bool]): Seq[Bool] = {
     requested.indices.map { i =>
-      requested(i) && !requested.drop(i + 1).foldLeft(false.B)(_ || _) && accepted
+      requested(i) && !requested.drop(i + 1).foldLeft(false.B)(_ || _)
     }
   }
+  // The same-cycle snoop guard advertises the winning request before the
+  // physical slot is selected. The accepted allocation is gated separately
+  // so RXSNP never waits on the slot-selection/replaceAllocValid cone.
+  def acceptedOrigins(requested: Seq[Bool], accepted: Bool): Seq[Bool] =
+    requestedOrigins(requested).map(_ && accepted)
 }
 
 class ReplaceMSHRInfo(implicit p: Parameters) extends L2Bundle {

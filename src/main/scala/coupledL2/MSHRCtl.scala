@@ -605,8 +605,20 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // New replacements cannot supply a nested snoop yet: incomingReplaceInfo
   // has neither probeDone nor releaseBufReady. Advertise their addresses
   // independently of slot selection, while keeping registered sidecars
-  // indexed as their ReleaseBuf owners. Only an accepted allocation blocks;
-  // capacity, retry and parent/epoch conditions remain exactly unchanged.
+  // indexed as their ReleaseBuf owners.
+  //
+  // R1: RXSNP's same-cycle block uses the raw (pre-acceptance) origins. The
+  // accepted cone (replaceNeedsAlloc -> replaceSlotAvailable ->
+  // acceptedOrigins) sits behind the MainPipe postGrantReleaseHolds compare
+  // and must not gate snoop admission. The accepted allocation below still
+  // owns the actual ReplaceMSHR/ReleaseBuf routing.
+  //
+  // Lifetime: every raw origin is either a one-cycle pulse (replResp,
+  // nested C, orphan ReleaseData) or, for the CMO, already qualified by
+  // replaceSlotIdle and the reservation fences, so it coincides with an
+  // accepted allocation in any legal cycle. RXSNP additionally yields this
+  // block to a nest-ready sidecar, so an origin that outlives its allocation
+  // can never block that sidecar's own nested snoop.
   val replaceAllocSnoopSources = Seq(
     (nestedReleaseNeedsReplace, nestedVictim.set, nestedVictim.tag),
     (replRespNeedsReplace, io.replResp.bits.set, io.replResp.bits.tag),
@@ -615,13 +627,15 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.reqTag))),
     (orphanReleaseData, io.nestedwb.set, io.nestedwb.tag)
   )
-  val replaceAllocOriginAccepted = ReplacementAllocAddress.acceptedOrigins(
-    replaceAllocSnoopSources.map(_._1), replaceAllocValid)
+  val replaceAllocOriginRequested = ReplacementAllocAddress.requestedOrigins(
+    replaceAllocSnoopSources.map(_._1))
   replaceAllocSnoopSources.zipWithIndex.foreach { case ((_, set, tag), i) =>
-    io.replaceAllocForSnoop(i).valid := replaceAllocOriginAccepted(i)
+    io.replaceAllocForSnoop(i).valid := replaceAllocOriginRequested(i)
     io.replaceAllocForSnoop(i).bits.set := set
     io.replaceAllocForSnoop(i).bits.tag := tag
-    when(io.replaceAllocForSnoop(i).valid) {
+    // A raw origin may be rejected by capacity or parent ownership; only an
+    // accepted one must equal the victim actually allocated this cycle.
+    when(io.replaceAllocForSnoop(i).valid && replaceAllocValid) {
       assert(set === incomingVictim.set && tag === incomingVictim.tag,
         "snoop allocation address must equal the accepted replacement victim")
     }

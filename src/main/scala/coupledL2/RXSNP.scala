@@ -194,11 +194,17 @@ class RXSNP(
   val snoopContextBlock = VecInit(io.snoopInfo.map(s =>
     s.valid && s.bits.blocksSnoop && s.bits.set === task.set && s.bits.reqTag === task.tag
   )).asUInt.orR
-  // Allocation-stage victims cannot nest yet. Compare each origin address
+  // Allocation-stage victims cannot nest yet. Compare each raw origin address
   // before its control mux and physical slot selection, then OR the block.
-  val allocatingSidecarBlockSnp = VecInit(io.replaceAlloc.map(s =>
+  // R1: the origin is advertised before slot acceptance, so yield the guard
+  // once a same-line sidecar is nest-ready. The registered-sidecar term below
+  // then owns the decision (block while not ready, nest when ready), so an
+  // origin that stays valid after its allocation can never block the newly
+  // allocated sidecar's own nested snoop.
+  val allocatingSidecarMatch = VecInit(io.replaceAlloc.map(s =>
     s.valid && s.bits.set === task.set && s.bits.tag === task.tag
   )).asUInt.orR
+  val allocatingSidecarBlockSnp = allocatingSidecarMatch && !sidecarNestSnpMask.orR
   val sidecarBlockSnp = (sidecarLineMask & ~sidecarNestSnpMask).orR ||
     allocatingSidecarBlockSnp
   val stall = reqBlockSnp || replaceBlockSnp || cmoBlockSnp || sidecarBlockSnp || snoopContextBlock
@@ -217,6 +223,29 @@ class RXSNP(
   assert(stallCnt <= STALL_CNT_MAX,
     "stallCnt full! maybe there is a deadlock! addr => 0x%x req_opcode => %d txn_id => %d",
     rxsnp.bits.addr, rxsnp.bits.opcode, rxsnp.bits.txnID)
+
+  // A sidecar's nested snoop must never be blocked by the allocation origin
+  // that created it: the guard above yields whenever nesting is possible.
+  when (allocatingSidecarBlockSnp) {
+    assert(!sidecarNestSnpMask.orR,
+      "a sidecar's own nested snoop must not be blocked by its allocation origin")
+  }
+  // Liveness: while the origin is the only reason a snoop waits, the
+  // allocation must register its sidecar and hand the line to the terms above.
+  // The raw origin itself may outlive the allocation, so bound the
+  // exclusively-allocating-blocked window rather than the origin pulse.
+  val allocBlockOnly = rxsnp.valid && allocatingSidecarBlockSnp &&
+    !(reqBlockSnp || replaceBlockSnp || cmoBlockSnp || snoopContextBlock ||
+      (sidecarLineMask & ~sidecarNestSnpMask).orR)
+  val allocBlockCnt = RegInit(0.U(8.W))
+  when (allocBlockOnly) {
+    allocBlockCnt := allocBlockCnt + 1.U
+  }.otherwise {
+    allocBlockCnt := 0.U
+  }
+  val ALLOC_BLOCK_CNT_MAX = 255.U
+  assert(allocBlockCnt =/= ALLOC_BLOCK_CNT_MAX,
+    "a snoop blocked only by an allocating sidecar must eventually be admitted")
 
   assert(!(stall && rxsnp.fire))
 
