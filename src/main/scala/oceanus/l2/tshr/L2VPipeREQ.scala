@@ -128,6 +128,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
     val L1EVT_active = Input(Bool())
 
+    // Peer EVT pipe is servicing a WriteBackFull whose data beats have not
+    // fully arrived yet (see L2VPipeEVT.EVT_data_pending). Gates the
+    // downstream EvictBack CopyBackWrData issue so the L3 is never written
+    // with the stale DS-read copy ahead of the L1's authoritative beats.
+    val L1EVT_data_pending = Input(Bool())
+
     val L2EVT_opcode = Valid(UInt(paramCHI.reqOpcodeWidth.W))
   })
 
@@ -949,8 +955,13 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val dn_txdat_cbwrdata0 = io.DnTXDAT.fire && io.DnTXDAT.bits.Opcode.get === CHI_CopyBackWrData.U && io.DnTXDAT.bits.DataID.get === 0.U
   val dn_txdat_cbwrdata2 = io.DnTXDAT.fire && io.DnTXDAT.bits.Opcode.get === CHI_CopyBackWrData.U && io.DnTXDAT.bits.DataID.get === 2.U
 
-  val allow_dn_evict_cbwrdata0 = !w_snpresp0 && !w_ds_resp && io.tbuf_data0_valid
-  val allow_dn_evict_cbwrdata2 = !w_snpresp2 && !w_ds_resp && io.tbuf_data2_valid
+  // When the eviction snoop is answered by a separate WriteBackFull, the L1's
+  // authoritative beats are still in flight while the EVT pipe has them
+  // pending: hold the downstream issue so the L3 is never written with the
+  // stale DS-read copy ahead of those beats (lbm_6382 gsim-struct abort).
+  // Clean Evict episodes never assert the gate, so they are not stalled.
+  val allow_dn_evict_cbwrdata0 = !w_snpresp0 && !w_ds_resp && io.tbuf_data0_valid && !io.L1EVT_data_pending
+  val allow_dn_evict_cbwrdata2 = !w_snpresp2 && !w_ds_resp && io.tbuf_data2_valid && !io.L1EVT_data_pending
 
   val sched_dn_evict_cbwrdata = w_evict_dn_compdbid && dn_rxrsp_compdbidresp
 
