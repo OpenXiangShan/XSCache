@@ -239,8 +239,8 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId, config.pfTrainEnable)(
     p.alterPartial { case L2CDPObserveEnableKey => config.cdpObserveEnable })))
 
-  // The control bundle gates source issue only; the delay-latency field is
-  // intentionally recorded here for the later queue-control slice.
+  // Source controls gate issue. delay_latency drives both BOP delay queues;
+  // zero selects each algorithm's configured default (reference DelayQueue).
   val pfMasterEnable = if (config.pfCtrlEnable) io.pfCtrl.get.l2_pf_master_en else true.B
   val recvControlEnable = if (config.pfCtrlEnable) {
     pfMasterEnable && io.pfCtrl.get.l2_pf_recv_en
@@ -331,6 +331,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   val recvReqFire = pfRecvReqs.map(_.fire).reduceOption(_ || _).getOrElse(false.B)
 
   val bop = Module(new OceanusBOP(config.bopParams))
+  bop.io.delayLatency := delayLatency
   val bopTrainArb = Module(new L2PrefetchTrainArb(config.sliceNum, config.pfTrainEnable))
   bopTrainArb.io.in.zip(slices).foreach { case (sink, source) =>
     sink.valid := source.io.bopTrain.valid

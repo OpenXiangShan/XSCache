@@ -152,6 +152,16 @@
  *                 MU miss SC/UC: cold miss trainDelta=1/internalFills=1, subsequent
  *                 ordinary hit trainDelta=0. A/B six groups have identical counts.
  *
+ * [Resolved D4] PBOP now samples the delay_latency CSR on queue admission.
+ * Reference:      BestOffsetPrefetch.scala:628-637 (test ReferenceVBOP.scala:670)
+ *                 selects nonzero CSR, otherwise configured latency (default 300).
+ * Previous implementation: PBOP used only delayQueueLatency; VBOP has consumed
+ *                 the CSR since f2478aa8. The slice-3 deferred-control note was stale.
+ * Resolution:     L2Top connects the same CSR to PBOP and VBOP; zero preserves
+ *                 the constructor fallback, including accelerated test settings.
+ * Evidence:       L1 VBOP same-value differential 600/600; CSR=0 falls back to 300.
+ *                 TestTop_OceanusBOPDelay compares 0/300/37 against reference.
+ *
  * [Implementation detail — not a deviation] The coupledL2 PBOP structure is flattened.
  * Reference:      coupledL2 separates RecentRequestTable, OffsetScoreTable, and
  *                 DelayQueue modules, uses Constantin controls, and retains ChiselDB
@@ -425,6 +435,7 @@ private class OceanusBOPDelayQueue(name: String, params: OceanusBOPParameters)(i
   require(bopParams.delayQueueLatency >= 0 && bopParams.delayQueueLatency < bopParams.delayQueueMaxLatency)
 
   val io = IO(new Bundle {
+    val delayLatency = Input(UInt(10.W))
     val in = Flipped(DecoupledIO(UInt(noOffsetAddressWidth.W)))
     val out = DecoupledIO(UInt(addressWidth.W))
     val fullDrop = Output(Bool())
@@ -447,7 +458,7 @@ private class OceanusBOPDelayQueue(name: String, params: OceanusBOPParameters)(i
 
   when(io.in.valid && !full) {
     queue(tail).addressNoOffset := io.in.bits
-    queue(tail).count := bopParams.delayQueueLatency.U
+    queue(tail).count := Mux(io.delayLatency.orR, io.delayLatency, bopParams.delayQueueLatency.U)
     valid(tail) := true.B
     tail := tail + 1.U
   }
@@ -485,6 +496,7 @@ class OceanusBOP(val bopParams: OceanusBOPParameters = OceanusBOPParameters())(i
   private val pageOffsetBits = 12
 
   val io = IO(new Bundle {
+    val delayLatency = Input(UInt(10.W))
     val train = Flipped(Decoupled(UInt(addressWidth.W)))
     val req = Decoupled(UInt(addressWidth.W))
     val crossPageDrop = Output(Bool())
@@ -499,6 +511,7 @@ class OceanusBOP(val bopParams: OceanusBOPParameters = OceanusBOPParameters())(i
   private val requestValid = RegInit(false.B)
 
   private val delayQueue = Module(new OceanusBOPDelayQueue("pbop", bopParams))
+  delayQueue.io.delayLatency := io.delayLatency
   private val recentRequestTable = Module(new OceanusBOPRecentRequestTable("pbop", bopParams))
   private val scoreTable = Module(new OceanusBOPOffsetScoreTable("pbop", bopParams))
 
