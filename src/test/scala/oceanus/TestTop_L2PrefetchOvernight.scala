@@ -53,9 +53,10 @@ class TestTopOvernight(cfg: L2Configuration)(implicit p: Parameters) extends Tes
   probe.fastAllocate.valid := read(vf.accepted) && read(vf.io.in.bits.translated)
   probe.fastAllocate.bits := Cat(read(vf.io.in.bits.va),read(vf.io.in.bits.pa))
   probe.fastTranslatedAtTlb := read(vf.io.tlb.req.valid) && read(vf.entries)(read(vf.selected)).translated
-  Seq(module.vbopStub.get.io.req,module.cdpStub.get.io.req).zipWithIndex.foreach { case(r,i)=>
-    probe.algorithm(i).valid := read(r.valid) && read(r.ready)
-    probe.algorithm(i).bits := read(r.bits.paddr)
+  Seq((read(module.vbopStub.get.io.req.valid) && read(module.vbopStub.get.io.req.ready), read(module.vbopStub.get.io.req.bits.paddr)),
+    (read(module.cdp.get.io.req.valid) && read(module.cdp.get.io.req.ready), read(module.cdp.get.io.req.bits.paddr))).zipWithIndex.foreach { case((fire,pa),i)=>
+    probe.algorithm(i).valid := read(fire)
+    probe.algorithm(i).bits := read(pa)
   }
   def bank(pa: UInt): UInt = cfg.sliceNum match {
     case 1 => 0.U
@@ -65,7 +66,7 @@ class TestTopOvernight(cfg: L2Configuration)(implicit p: Parameters) extends Tes
   for(s <- 0 until cfg.sliceNum) {
     val v = module.vbopStub.get.io.req
     val b = module.bop.io.req
-    val c = module.cdpStub.get.io.req
+    val c = module.cdp.get.io.req
     probe.produced(s) := Cat(
       read(c.valid) && read(c.ready) && bank(read(c.bits.paddr))===s.U,
       read(b.valid) && read(module.bopControlEnable) && bank(read(b.bits))===s.U,
@@ -292,7 +293,7 @@ object TestTop_L2PrefetchOvernight extends App with ChiselSim {
           terminals((t.client,t.va))=t
           modelDone+=1
           if(t.miss || t.fault) modelDrops+=1
-          else allowed(t.client)(physical(t.va))+=1
+          else allowed(t.client)(if(t.client==1) physical(t.va)>>12 else physical(t.va))+=1
         } else modelRetries+=1
       }
       // Compare adapter retirements to an independent request/response model.
@@ -340,8 +341,12 @@ object TestTop_L2PrefetchOvernight extends App with ChiselSim {
         val a=dut.probe.algorithm(c)
         if(flag(a.valid)) {
           val pa=value(a.bits)
-          assert(allowed(c)(pa)>0,s"algorithm issued without successful translation/fast path client=$c PA=$pa")
-          allowed(c)(pa)-=1
+          // C5 D1: a successful CDP page translation permits each waiting
+          // line offset, and Filter may suppress a translated entry. Keep
+          // page permission separately from VBOP one-line retirement credits.
+          val permission=if(c==1) pa>>12 else pa
+          assert(allowed(c)(permission)>0,s"algorithm issued without successful translation/fast path client=$c PA=$pa")
+          if(c==0) allowed(c)(pa)-=1
           if(fast && c==0) fastEmits+=1
         }
       }
@@ -389,7 +394,7 @@ object TestTop_L2PrefetchOvernight extends App with ChiselSim {
       dn.stepWithCredits(cycle); cycle+=1
     }
     check()
-    assert(allowed.forall(_.values.forall(_==0)),"successful translation/fast allocation did not emit exactly once")
+    assert(allowed(0).values.forall(_==0),"successful translation/fast allocation did not emit exactly once")
     assert(transactions.isEmpty && terminals.isEmpty && modelDone==actualDone && modelDrops==actualDrops && modelRetries==actualRetries,
       s"TLB ledger done=$modelDone/$actualDone retries=$modelRetries/$actualRetries drops=$modelDrops/$actualDrops live=$transactions terminals=$terminals")
     println(s"OVERNIGHT_TLB pass=true slices=$slices seed=$seed harsh=$harsh requests=$translations injectedMisses=$injectedMisses injectedFaults=$injectedFaults modelRetries=$modelRetries actualRetries=$actualRetries modelDrops=$modelDrops actualDrops=$actualDrops completed=$actualDone fast=$fast fastAllocations=$fastAllocations vbopEmits=$fastEmits")

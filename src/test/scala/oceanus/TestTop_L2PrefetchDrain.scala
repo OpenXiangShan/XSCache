@@ -41,6 +41,7 @@ class TestTopDrain(cfg: L2Configuration)(implicit p: Parameters) extends TestTop
       case q: Queue[_] => add(path + ".count", q.io.count)
       case q: OverwriteQueue[_] => add(path + ".nonempty", !read(q.empty))
       case q: L2CDPHalfQueue => add(path + ".count", q.io.occupancy)
+      case q: OceanusCDPQueue[_] => add(path + ".count", q.io.count)
       case _ =>
     }
     children(m).zipWithIndex.foreach { case (child, i) =>
@@ -93,7 +94,22 @@ class TestTopDrain(cfg: L2Configuration)(implicit p: Parameters) extends TestTop
   add("vbop.delay", PopCount(read(v.delayQueue.valids)))
   add("pbop.delay", PopCount(read(field[Vec[Bool]](field[AnyRef](module.bop, "delayQueue"), "valid"))))
   add("pbop.output", module.bop.io.req.valid)
-  add("cdp.waiting", module.cdpStub.get.waiting)
+  val cdp = module.cdp.get
+  val send = cdp.sentUnit.get
+  add("cdp.entries", PopCount(read(send.valids)))
+  add("cdp.tlbHeld", send.tlbHeld)
+  add("cdp.filterQuery1", send.pftS1); add("cdp.filterQuery2", send.pftS2)
+  cdp.filterTraining.foreach { f =>
+    Seq(f.pipe.s0_valid, f.pipe.s1_valid, f.pipe.s2_valid, f.pipe.s3_valid).zipWithIndex.foreach {
+      case (valid, i) => add(s"cdp.filterTrain$i", valid)
+    }
+  }
+  // C5: census includes every detection/degree and train pipeline valid,
+  // not just queues and the old stub's single waiting bit.
+  add("cdp.vtPipeline", PopCount(read(cdp.vtTrainPipe.stage_valid)))
+  for ((lane, i) <- cdp.detectFrontend.lanes.zipWithIndex)
+    for (stage <- Seq(lane.s1_req, lane.s2_req, lane.s3_req).zipWithIndex)
+      add(s"cdp.detect$i.${stage._2}", stage._1.valid)
   module.slices.zipWithIndex.foreach { case (slice, s) =>
     field[Seq[L2TSHR]](slice, "tshrs").zipWithIndex.foreach { case (t, i) =>
       add(s"slice$s.tshr$i.valid", t.tshr_valid)
@@ -239,7 +255,8 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
         // Reproduce the original end-of-loop assertion ordering before draining.
         val reason = if(transactions.nonEmpty || terminals.nonEmpty) "TLB-ledger" else "absolute-watchdog"
         println(s"DRAIN_STOP seed=$seed cycle=$cycle reason=$reason")
-        if(seed == 16) assert(transactions.toMap == Map((0,BigInt(2161024)) -> 0), "seed16 boundary differs from legacy failure")
+        // C5 changes CDP occupancy/TLB traffic; the historical stub's exact
+        // seed16 transaction at this cut is no longer an expected invariant.
       }
       stimulus=cycle<stopCycle && (cycle<minimum || !sources.forall(src=>entered.map(_(src)).sum>0))
       if(stimulus) activeCycles+=1
@@ -272,7 +289,7 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
           terminals((t.client,t.va))=t
           modelDone+=1
           if(t.miss || t.fault) modelDrops+=1
-          else allowed(t.client)(physical(t.va))+=1
+          else allowed(t.client)(if(t.client==1) physical(t.va)>>12 else physical(t.va))+=1
         } else modelRetries+=1
       }
       // Compare adapter retirements to an independent request/response model.
@@ -327,8 +344,12 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
         val a=dut.probe.algorithm(c)
         if(flag(a.valid)) {
           val pa=value(a.bits)
-          assert(allowed(c)(pa)>0,s"algorithm issued without successful translation/fast path client=$c PA=$pa")
-          allowed(c)(pa)-=1
+          // C5 D1: a successful CDP page translation permits each waiting
+          // line offset, and Filter may suppress a translated entry. Keep
+          // page permission separately from VBOP one-line retirement credits.
+          val permission=if(c==1) pa>>12 else pa
+          assert(allowed(c)(permission)>0,s"algorithm issued without successful translation/fast path client=$c PA=$pa")
+          if(c==0) allowed(c)(pa)-=1
           if(fast && c==0) fastEmits+=1
         }
       }
@@ -393,7 +414,7 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
       val pendingQueues=(0 until slices).flatMap(s=>(0 to 9).map(src=>count(dut.observation.prefetchPendingBySource,s,src))).sum
       val idle= !stimulus && driver.pending==0 && data.isEmpty && rsp.isEmpty && live.isEmpty && snoops.isEmpty && replies.isEmpty && pendingQueues==0 && !active
       val fullyIdle=idle && transactions.isEmpty && terminals.isEmpty && replies.isEmpty &&
-        allowed.forall(_.values.forall(_==0)) && flag(dut.drainEmpty)
+        allowed(0).values.forall(_==0) && flag(dut.drainEmpty)
       if(cycle >= stopCycle && fullyIdle && firstEmpty < 0) firstEmpty=cycle
       quiet=if(cycle >= stopCycle && fullyIdle) quiet+1 else 0
       if(cycle >= stopCycle && (cycle % 1024 == 0 || quiet == 40)) snapshot("drain")
@@ -402,7 +423,7 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
     check(); snapshot("final")
     println(s"DRAIN_RESULT seed=$seed pass=${quiet>=40} stop=$stopCycle firstEmpty=$firstEmpty end=$cycle drainedIn=${if(firstEmpty<0) -1 else firstEmpty-stopCycle} quiet=$quiet")
     assert(quiet>=40 && flag(dut.drainEmpty), "drain timeout: see final state")
-    assert(allowed.forall(_.values.forall(_==0)),"successful translation/fast allocation did not emit exactly once")
+    assert(allowed(0).values.forall(_==0),"successful translation/fast allocation did not emit exactly once")
     assert(transactions.isEmpty && terminals.isEmpty && modelDone==actualDone && modelDrops==actualDrops && modelRetries==actualRetries,
       s"TLB ledger done=$modelDone/$actualDone retries=$modelRetries/$actualRetries drops=$modelDrops/$actualDrops live=$transactions terminals=$terminals")
     println(s"OVERNIGHT_TLB pass=true slices=$slices seed=$seed harsh=$harsh requests=$translations injectedMisses=$injectedMisses injectedFaults=$injectedFaults modelRetries=$modelRetries actualRetries=$actualRetries modelDrops=$modelDrops actualDrops=$actualDrops completed=$actualDone fast=$fast fastAllocations=$fastAllocations vbopEmits=$fastEmits")

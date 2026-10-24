@@ -90,16 +90,16 @@ object Phase2Observation {
       out.source := read(req.io.tshr_meta_write_meta.pfSource)
       out.depth := read(req.io.tshr_meta_write_meta.cdpPfDepth)
     }
-    obs.evictions := read(top.cdpStub.get.evictions)
+    obs.evictions := read(top.cdpEvents.get.evictions)
     obs.evictPulses := PopCount(top.slices.flatMap(_.io.cdpEvict.map(e => read(e.valid))))
     obs.vbopOverflow := read(top.vbopStub.get.overwritten)
     obs.needTDowngraded := read(top.vbopStub.get.needTDowngraded)
-    obs.cdpOverflow := read(top.cdpStub.get.overwritten)
+    obs.cdpOverflow := read(top.cdpEvents.get.vpnCollisions) + read(top.cdpEvents.get.filterCollisions)
     obs.generated.foreach(_ := false.B)
     obs.generated(1) := read(top.pfRecvReqs.head.valid)
     obs.generated(2) := read(top.vbopStub.get.io.req.valid) && read(top.vbopStub.get.io.req.ready)
     obs.generated(3) := read(top.bop.io.req.valid) && read(top.bopControlEnable)
-    obs.generated(9) := read(top.cdpStub.get.io.req.valid) && read(top.cdpStub.get.io.req.ready)
+    obs.generated(9) := read(top.cdp.get.io.req.valid) && read(top.cdp.get.io.req.ready)
     obs
   }
 }
@@ -317,18 +317,21 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
     println("PHASE2_VBOP_FAULT pass=true emitted=0")
 
     controls(c = true)
+    // C5: actual demand training reaches the reference's 128-event refresh,
+    // establishing a hot 2MiB region before pointer detection. No table force.
+    for (_ <- 0 until 130) request(0x3e040, 0x200040)
     pointers(BigInt(0x40040)) = BigInt(0x210080)
     pointers(BigInt(0x61080)) = BigInt(0x2200c0)
     pointers(BigInt(0x620c0)) = BigInt(0x230100)
     val vbopBeforeCDP = entered.count(_._2 == 2)
     request(0x40040, 0x200040)
     assert(entered.count(_._2 == 2) == vbopBeforeCDP)
-    assert(entered.contains((BigInt(0x61080), 9, 1)) && writes.contains((BigInt(0x61080), 9, 1)))
-    assert(entered.contains((BigInt(0x620c0), 9, 2)) && writes.contains((BigInt(0x620c0), 9, 2)))
-    assert(attempts(BigInt(0x210080)) == 1 && attempts(BigInt(0x2200c0)) == 1 && attempts(BigInt(0x230100)) == 0)
-    println("PHASE2_CDP_CHAIN pass=true PA=61080,620c0 source=9 depth=1,2 stop=2")
+    for (pa <- Seq(0x61080, 0x610c0, 0x61100))
+      assert(entered.contains((BigInt(pa), 9, 3)) && writes.contains((BigInt(pa), 9, 3)))
+    assert(attempts(BigInt(0x210080)) == 1 && attempts(BigInt(0x2200c0)) == 0 && attempts(BigInt(0x230100)) == 0)
+    println("PHASE2_CDP_CHAIN pass=true PA=61080,610c0,61100 source=9 depth=3 degree=3 refillAtMaxStops=true hotTraining=130")
     controls(); val beforeUsefulC = useful(9); val beforeHitDn = downstream.size
-    request(0x61080, 0x210080, train = false); request(0x620c0, 0x2200c0, train = false)
+    request(0x61080, 0x210080, train = false); request(0x610c0, 0x2100c0, train = false)
     assert(useful(9) == beforeUsefulC + 2 && downstream.size == beforeHitDn)
     println("PHASE2_CDP_USEFUL pass=true source=9 delta=2")
     val startDisabled = entered.size; val startTlb = attempts.values.sum
@@ -367,8 +370,8 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
     val arbStart = entered.size
     dut.holdIssue.get.poke(false.B); drain()
     val order = entered.drop(arbStart).map(_._2).toSeq
-    assert(order == Seq(1, 2, 3, 9), s"four source priority $order")
-    println("PHASE2_ARBITRATION pass=true order=Recv,VBOP,PBOP,CDP sources=1,2,3,9")
+    assert(order == Seq(1, 2, 3, 9, 9, 9), s"four source priority $order")
+    println("PHASE2_ARBITRATION pass=true order=Recv,VBOP,PBOP,CDP sources=1,2,3,9,9,9")
     assert(queueModels.forall(_.isEmpty))
     controls(v = true)
     val beforeDowngrade = value(dut.phase2.needTDowngraded)
@@ -411,11 +414,12 @@ object TestTop_L2StubParameters extends App {
   // Save inspectable RTL on NVMe and check storage/instances after lowering.
   val sv = _root_.circt.stage.ChiselStage.emitSystemVerilog(new L2Top(cfg)(params),
     firtoolOpts = Array("--disable-all-randomization", "--strip-debug-info"))
-  val output = java.nio.file.Paths.get("/data/zhuy/pf-framework/audit-fix-1/rtl")
+  val output = java.nio.file.Paths.get(sys.props.getOrElse("oceanus.parameters.dir", "/data/zhuy/pf-framework/audit-fix-1/rtl"))
   java.nio.file.Files.createDirectories(output)
   java.nio.file.Files.writeString(output.resolve(s"parameters-$mode.sv"), sv)
   assert(sv.contains("module OceanusVBOP") == cfg.vbopStubEnable)
-  assert(sv.contains("module L2CDPStub") == cfg.cdpStubEnable)
+  assert(sv.contains("module OceanusCDP(") == cfg.cdpStubEnable)
+  assert(!sv.contains("module L2CDPStub"))
   if (cfg.cdpObserveEnable) {
     assert(sv.contains("L2CDPHalfQueue") && sv.contains("cdpDataArb") && sv.contains("cdpPfDepth"))
     assert(sv.contains("cdpContext_paddr") && sv.contains("cdpBufferValid"))
