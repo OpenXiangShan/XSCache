@@ -133,7 +133,8 @@ class L2Configuration(
   val pfTrainEnable: Boolean = false,
   val vbopStubEnable: Boolean = false,
   val cdpStubEnable: Boolean = false,
-  val vbopParams: OceanusVBOPParameters = OceanusVBOPParameters()
+  val vbopParams: OceanusVBOPParameters = OceanusVBOPParameters(),
+  val cdpParams: OceanusCDPParameters = OceanusCDPParameters()
 ) {
   def sliceNum = slices.size
   // Training enables cache event observation even without an algorithm sink.
@@ -272,18 +273,50 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   val cdpTrain = VecInit(slices.map(_.io.cdpTrain))
   val cdpEvict = VecInit(slices.map(_.io.cdpEvict))
   val vbopStub = if (config.vbopStubEnable) Some(Module(new OceanusVBOP(config.vbopParams))) else None
-  val cdpStub = if (config.cdpStubEnable) Some(Module(new L2CDPStub(config.sliceNum * nMSHR))) else None
+  // C5: keep the public generation knob compatible, but construct the actual
+  // C1-C4 algorithm. Capture queues/RR remain at the 1c-2 boundary; no second
+  // half queue is inserted. All new event logic disappears when the knob is off.
+  val cdp = if (config.cdpStubEnable) Some(Module(new OceanusCDP(
+    config.cdpParams, config.sliceNum, withSend = true, capturedHalves = true))) else None
+  val cdpEvents = if (config.cdpStubEnable) Some(Module(new L2CDPCacheEvents(config.sliceNum * nMSHR))) else None
   vbopStub.foreach { stub =>
     stub.io.enable := vbopControlEnable
     stub.io.tlb <> pfTlbClients.get(0)
     stub.io.req.ready := true.B // downstream overwrite queues always accept
   }
-  cdpStub.foreach { stub =>
-    stub.io.enable := cdpControlEnable
-    stub.io.data := cdpData
-    stub.io.evict := VecInit(slices.flatMap(_.io.cdpEvict.toSeq))
-    stub.io.tlb <> pfTlbClients.get(1)
-    stub.io.req.ready := true.B
+  cdp.foreach { algorithm =>
+    val events = cdpEvents.get
+    events.io.enable := cdpControlEnable
+    events.io.train := VecInit(slices.flatMap(_.io.cdpTrain.toSeq))
+    events.io.evict := VecInit(slices.flatMap(_.io.cdpEvict.toSeq))
+    algorithm.io.enable := cdpControlEnable
+    algorithm.io.vpnTrain := events.io.vpn
+    algorithm.io.filterTrain := events.io.filter
+    algorithm.io.l2DetectTriggers := 0.U.asTypeOf(algorithm.io.l2DetectTriggers)
+    algorithm.io.capturedHalf.get.valid := cdpData.valid
+    algorithm.io.capturedHalf.get.bits.data := cdpData.bits.data
+    algorithm.io.capturedHalf.get.bits.pfDepth := cdpData.bits.pfDepth
+    algorithm.io.capturedHalf.get.bits.pfSource := cdpData.bits.pfSource
+    algorithm.io.capturedHalf.get.bits.isHit := cdpData.bits.isHit
+    algorithm.io.capturedHalf.get.bits.slice := cdpDataSlice
+    // Static degree3 does not consume dynamic sent/hit counters (C6 deferred).
+    algorithm.io.pfStat := 0.U.asTypeOf(algorithm.io.pfStat)
+    val client = pfTlbClients.get(1)
+    client.req.valid := algorithm.io.tlb.req.valid && cdpControlEnable
+    client.req.bits := algorithm.io.tlb.req.bits
+    algorithm.io.tlb.req.ready := client.req.ready && cdpControlEnable
+    algorithm.io.tlb.resp <> client.resp
+    algorithm.io.req.ready := cdpControlEnable
+  }
+  // Normalize once at the algorithm/source-queue boundary. The overwrite
+  // queues accept every enabled producer fire; per-slice routing is unchanged.
+  val cdpReq = cdp.map { algorithm =>
+    val r = Wire(Decoupled(new L2PrefetchAlgorithmRequest))
+    r.valid := algorithm.io.req.valid && cdpControlEnable
+    r.bits.paddr := algorithm.io.req.bits.paddr
+    r.bits.depth := algorithm.io.req.bits.pfDepth
+    r.ready := true.B
+    r
   }
   val cdpHalfDrops = VecInit(slices.map(_.io.cdpHalfDrops))
   val cdpCollisionDrops = VecInit(slices.map(_.io.cdpCollisionDrops))
@@ -396,7 +429,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
             L2PfSource.fromMemReqSource(io.pfRecv.get.pf_source) === source.U
         } else false.B
         val stub = if (source == L2PfSource.BOP) vbopStub.map(_.io.req)
-          else if (source == L2PfSource.CDP) cdpStub.map(_.io.req) else None
+          else if (source == L2PfSource.CDP) cdpReq else None
         val fromStub = stub.map(r => r.valid && pfTarget(r.bits.paddr) === config.slices(i).U).getOrElse(false.B)
         queue.io.enq.valid := fromBop || fromRecv || fromStub
         val bopBits = WireInit(0.U.asTypeOf(new FlitREQ))
@@ -483,7 +516,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   } else Nil
 
   when (bop.io.req.fire || recvReqFire || vbopStub.map(_.io.req.fire).getOrElse(false.B) ||
-    cdpStub.map(_.io.req.fire).getOrElse(false.B)) {
+    cdp.map(_.io.req.fire).getOrElse(false.B)) {
     pfSequence := pfSequence + 1.U
   }
 

@@ -35,7 +35,7 @@
  * through the same three clocks and degree buffers, with no arbitration effect.
  * C4 boundary: :1578-1579 connects SentUnit when withSend=true. The default
  * false preserves the C0-C3 drain-only observation boundary. C4 tests opt in;
- * L2Top's old CDP is untouched until C5. See OceanusCDPSentUnit.scala for D1
+ * C5 selects true plus capturedHalves at L2Top. See OceanusCDPSentUnit.scala for D1
  * page reservation, adapter-owned retry, and output-backpressure deviations.
  * D-CDP-queue: :1372/:1532 use utility/MIMOQueue whose :149 advances only when
  * the last enq fires. The local queue advances by all accepted ports, with the
@@ -80,8 +80,8 @@
  * Names are prefixed OceanusCDP; geometry is explicit VA50/PA48/line64/page4K,
  * internal source4 and depth2. No coupledL2 types or modules are instantiated.
  * :1319-1336 top-level interface is adapted to full PA training events and the
- * existing variable-latency translation client. This skeleton is not wired
- * into L2Top. C1/C2 train, C3 detects; C4 sends on opt-in, C5 integrates.
+ * existing variable-latency translation client. The real algorithm is wired
+ * into L2Top with capturedHalves=true in C5; standalone defaults stay intact.
  * MainPipe.scala:731, CDP.scala:66/:212-228/:609-671: Filter used feedback is
  * by 4KB physical page, regardless of prefetch bit; do not implement :729 TODO.
  * mergeA maps to one demand hit after RBE wait (MainPipe.scala:726/:731/:770).
@@ -94,7 +94,10 @@
  * CDP.scala:609-619/:667-671: evict chooses victim PA; simultaneous used=true
  * still wins the decrement branch. Distinct events are not silently merged.
  * CDP.scala:1400-1434: filter WHOLE lines before slice arbitration, half queue
- * and cross-slice RR. Existing 1c-2 capture order differs; defer to C3/C5.
+ * and cross-slice RR. C5 keeps the existing earlier 1c-2 capture boundary:
+ * capturedHalves bypasses internal half queues, then qualifies before the
+ * four detector lanes. Capacity/reclaim/filter-order differences are explicit
+ * in report-pf-c5.md; PA/high remain cache observations, not algorithm inputs.
  * CDP.scala:68-69/:1501-1528: default static degree3 for C0-C5; C6 optional.
  * D-CDP-event: physical eviction timing, refiller reqSource and Get training
  * coverage differ. D-CDP-queue: local accepted-count adaptation is explicit above.
@@ -481,9 +484,16 @@ class OceanusCDPStat extends Bundle {
   val pfHitVec = Vec(10, UInt(64.W))
 }
 
-class OceanusCDPIO(implicit p: Parameters) extends OceanusCDPBundle {
+// C5: the cache already owns the per-slice half queues and global RR. This
+// optional boundary consumes captured halves without queueing a second time.
+class OceanusCDPCapturedHalf(implicit p: Parameters) extends OceanusCDPDetectTask(256) {
+  val slice = UInt(log2Ceil(banks).max(1).W)
+}
+
+class OceanusCDPIO(capturedHalves: Boolean = false)(implicit p: Parameters) extends OceanusCDPBundle {
   val enable = Input(Bool())
   val l2DetectTriggers = Flipped(Vec(banks, Valid(new OceanusCDPDetectTask(512))))
+  val capturedHalf = if (capturedHalves) Some(Flipped(Valid(new OceanusCDPCapturedHalf))) else None
   val vpnTrain = Flipped(Valid(new OceanusCDPTrain))
   val filterTrain = Flipped(Valid(new OceanusCDPTrain))
   val pfStat = Input(new OceanusCDPStat)
@@ -1262,44 +1272,60 @@ class OceanusCDPDetection(implicit p: Parameters) extends OceanusCDPCandidate {
 // completing half is forwarded by L2TSHR.scala:553-560; C5 owns that connection.
 // :1400-1434 filter before queueing; :1457-1468 four lanes; :1531-1549 degree/RR.
 // Constant enable record is 1 on this platform, hence direct io.enable here.
-class OceanusCDPDetectFrontend(implicit p: Parameters) extends OceanusCDPModule {
+class OceanusCDPDetectFrontend(capturedHalves: Boolean = false)(implicit p: Parameters) extends OceanusCDPModule {
   require(detectPipeNum == 4 && blockBits == 512)
   require(!cdpParams.useDynamicDegree, "C6 dynamic degree is not implemented")
   require(degree == 3, "C3 uses static degree three")
   val io = IO(new Bundle {
     val enable = Input(Bool())
     val triggers = Flipped(Vec(banks, Valid(new OceanusCDPDetectTask(512))))
+    val capturedHalf = if (capturedHalves) Some(Flipped(Valid(new OceanusCDPCapturedHalf))) else None
     val queryReq = Vec(4, Valid(new OceanusCDPVtQueryReq))
     val queryRsp = Input(Vec(4, new OceanusCDPVtQueryRsp))
     val addrState = Input(new Bundle { val isSv39 = Bool(); val isSv48 = Bool(); val isSv57 = Bool() })
     val out = Decoupled(new OceanusCDPDetection)
   })
-  val queues = Seq.fill(banks)(Module(new OceanusCDPQueue(new OceanusCDPDetectTask(256), 2)))
+  val queues = if (capturedHalves) Seq.empty else
+    Seq.fill(banks)(Module(new OceanusCDPQueue(new OceanusCDPDetectTask(256), 2)))
   val halfArb = Module(new RRArbiterInit(new OceanusCDPDetectTask(256), banks))
   val admitted = Wire(Vec(banks, Bool()))
   val accepted = Wire(Vec(banks, UInt(2.W)))
   val dropped = Wire(Vec(banks, UInt(2.W)))
   for(i <- 0 until banks) {
     val trig = io.triggers(i)
-    val src = trig.bits.pfSource
+    // C5 ledger: eligibility follows early cache capture. Rejected halves are
+    // counted here; cache overflow/collision counts remain at their producers.
+    val context = if (capturedHalves) io.capturedHalf.get.bits else trig.bits
+    val valid = if (capturedHalves) io.capturedHalf.get.valid && io.capturedHalf.get.bits.slice === i.U else trig.valid
+    val src = context.pfSource
     val fromCDP = src === L2PfSource.CDP.U
-    val hit = trig.bits.isHit && ((fromCDP &&
-      (trig.bits.pfDepth === 1.U || trig.bits.pfDepth === cdpPfDepthMax.get.U)) ||
+    val hit = context.isHit && ((fromCDP &&
+      (context.pfDepth === 1.U || context.pfDepth === cdpPfDepthMax.get.U)) ||
       (if(useFilteredDetect) src === 1.U || src === 2.U || src === 3.U else false.B))
-    val refill = !trig.bits.isHit && trig.bits.pfDepth < depthThreshold.U &&
+    val refill = !context.isHit && context.pfDepth < depthThreshold.U &&
       (if(useFilteredDetect) src === 0.U || fromCDP || src === 5.U || src === 4.U else true.B)
-    admitted(i) := io.enable && trig.valid && (hit || refill)
-    for(j <- 0 until 2) {
+    admitted(i) := io.enable && valid && (hit || refill)
+    if (capturedHalves) {
+      halfArb.io.in(i).valid := admitted(i)
+      halfArb.io.in(i).bits.data := context.data
+      halfArb.io.in(i).bits.pfDepth := context.pfDepth
+      halfArb.io.in(i).bits.pfSource := src
+      halfArb.io.in(i).bits.isHit := context.isHit
+      accepted(i) := admitted(i)
+      dropped(i) := valid && !admitted(i)
+    } else {
+      for(j <- 0 until 2) {
       val in = queues(i).io.enq(j)
       in.valid := admitted(i)
       in.bits.data := trig.bits.data(256*(j+1)-1,256*j)
       in.bits.pfDepth := trig.bits.pfDepth
       in.bits.pfSource := src
       in.bits.isHit := trig.bits.isHit
+      }
+      accepted(i) := PopCount(queues(i).io.enq.map(_.fire))
+      dropped(i) := Mux(admitted(i), 2.U - accepted(i), 0.U)
+      halfArb.io.in(i) <> queues(i).io.deq
     }
-    accepted(i) := PopCount(queues(i).io.enq.map(_.fire))
-    dropped(i) := Mux(admitted(i), 2.U - accepted(i), 0.U)
-    halfArb.io.in(i) <> queues(i).io.deq
     XSPerfAccumulate(s"detect_half_accept_$i", accepted(i))
     XSPerfAccumulate(s"detect_half_drop_$i", dropped(i))
   }
@@ -1350,15 +1376,15 @@ object OceanusCDP {
     }
 }
 
-// C4: standalone training/detection and optional sending. Cache integration
-// remains C5; the default preserves earlier tests' inactive output boundary.
+// C5: standalone/full-line or cache/captured-half training and detection.
+// The default preserves earlier tests' inactive output boundary.
 class OceanusCDP(config: OceanusCDPParameters = OceanusCDPParameters(), bankCount: Int = 1,
-    withSend: Boolean = false)
+    withSend: Boolean = false, capturedHalves: Boolean = false)
     (implicit p: Parameters) extends OceanusCDPModule()(OceanusCDP.configured(config, bankCount, p)) {
   // Intent (C1): pass the instance's configured geometry explicitly to every
   // child; the constructor's implicit p is the caller's outer parameter set.
   private val instanceParams = OceanusCDP.configured(config, bankCount, p)
-  val io = IO(new OceanusCDPIO()(instanceParams))
+  val io = IO(new OceanusCDPIO(capturedHalves)(instanceParams))
   val vpnTable = Module(new OceanusCDPVpnTable()(instanceParams))
   val vtTrainPipe = Module(new OceanusCDPVtTrainPipeline()(instanceParams))
   val vpnTrainReqBuf = Module(new Queue(new OceanusCDPTrain()(instanceParams), 8))
@@ -1370,16 +1396,17 @@ class OceanusCDP(config: OceanusCDPParameters = OceanusCDPParameters(), bankCoun
   vpnTable.io.queryReq(detectPipeNum) := vtTrainPipe.io.queryReq
   vtTrainPipe.io.queryRsp := vpnTable.io.queryRsp(detectPipeNum)
   vpnTable.io.trainReq := vtTrainPipe.io.trainReq
-  val detectFrontend = Module(new OceanusCDPDetectFrontend()(instanceParams))
+  val detectFrontend = Module(new OceanusCDPDetectFrontend(capturedHalves)(instanceParams))
   detectFrontend.io.enable := io.enable
   detectFrontend.io.triggers := io.l2DetectTriggers
+  if (capturedHalves) detectFrontend.io.capturedHalf.get := io.capturedHalf.get
   detectFrontend.io.addrState := vtTrainPipe.io.addrState
   for (i <- 0 until detectPipeNum) {
     vpnTable.io.queryReq(i) := detectFrontend.io.queryReq(i)
     detectFrontend.io.queryRsp(i) := vpnTable.io.queryRsp(i)
   }
   // C4: opt in at the standalone module boundary; C0-C3 callers retain their
-  // established drain-only boundary. L2Top's old stub is replaced only in C5.
+  // established drain-only boundary. L2Top explicitly opts in for C5.
   val c4Input = Wire(Decoupled(new OceanusCDPDetection()(instanceParams)))
   c4Input <> detectFrontend.io.out
   XSPerfAccumulate("vpn_train_drop", vpnTrainReqBuf.io.enq.valid && !vpnTrainReqBuf.io.enq.ready)
@@ -1390,8 +1417,9 @@ class OceanusCDP(config: OceanusCDPParameters = OceanusCDPParameters(), bankCoun
     ft.io.enable := io.enable
     ft.io.train := io.filterTrain
   }
+  val sentUnit = if (withSend) Some(Module(new OceanusCDPSentUnit()(instanceParams))) else None
   if (withSend) {
-    val send = Module(new OceanusCDPSentUnit()(instanceParams))
+    val send = sentUnit.get
     send.io.in.valid := c4Input.valid
     send.io.in.bits.pfVAddr := c4Input.bits.pfVAddr
     send.io.in.bits.pfDepth := c4Input.bits.pfDepth
