@@ -75,6 +75,7 @@ class ConflictQueueProbe extends Bundle {
   val headPacked=UInt(256.W)
 }
 class TestTopConflict(cfg: L2Configuration)(implicit p: Parameters) extends TestTopOvernight(cfg) {
+  val hnNodeID=cfg.nodeId
   val ct=IO(Output(Vec(cfg.sliceNum,Vec(8,new ConflictTshrProbe))))
   val cq=IO(Output(Vec(cfg.sliceNum*10,new ConflictQueueProbe)))
   val enterPA=IO(Output(Vec(cfg.sliceNum,UInt(48.W))))
@@ -256,6 +257,84 @@ class ConflictDemandDriver(dut: TestTop_L2Top, upstream: L2TopUpstreamModel) ext
 }
 
 
+// HN ordering at the external CHI interface (IHI0050E.b 4.11.2 / 2.8.3).
+// Keep completion state through CompAck, even after the data queue is empty.
+// IllegalStateException deliberately bypasses the random seed AssertionError
+// recovery: an illegal stimulus must stop the entire simulation immediately.
+class ConflictHNOrdering {
+  private case class Read(line:BigInt,expAck:Boolean,var started:Boolean=false,
+    var acked:Boolean=false,var beats:Set[Int]=Set.empty)
+  private val reads=mutable.Map.empty[(BigInt,BigInt),Read]
+  private val snoops=mutable.Map.empty[(BigInt,BigInt),(BigInt,BigInt)]
+  private val evictions=mutable.Map.empty[(BigInt,BigInt),BigInt]
+  private case class CopyBack(line:BigInt,var beats:Set[Int]=Set.empty)
+  private val copybacks=mutable.Map.empty[(BigInt,BigInt),CopyBack]
+  private def line(pa:BigInt)=pa>>6
+  private def check(ok:Boolean,detail: =>String):Unit=
+    if(!ok) throw new IllegalStateException("HN_CHI_ORDER_VIOLATION "+detail)
+  def canData(rn:BigInt,pa:BigInt):Boolean= !snoops.values.exists(_==((rn,line(pa))))
+  def canSnoop(rn:BigInt,pa:BigInt):Boolean=
+    !reads.exists{case((src,_),r)=>src==rn&&r.line==line(pa)&&r.started&&
+      (r.beats.size<2||(r.expAck&& !r.acked))} &&
+    !copybacks.exists{case((src,_),w)=>src==rn&&w.line==line(pa)}
+  def request(rn:BigInt,txn:BigInt,pa:BigInt,expAck:Boolean):Unit={
+    check(!reads.contains((rn,txn)),s"read identity reused rn=$rn txn=$txn")
+    reads((rn,txn))=Read(line(pa),expAck)
+  }
+  def eviction(rn:BigInt,txn:BigInt,pa:BigInt):Unit={
+    check(!evictions.contains((rn,txn)),s"eviction identity reused rn=$rn txn=$txn")
+    evictions((rn,txn))=line(pa)
+  }
+  def completion(rn:BigInt,txn:BigInt,dbid:BigInt,opcode:Int,cycle:Int):Unit={
+    val key=(rn,txn)
+    check(evictions.contains(key),s"unmatched eviction completion cycle=$cycle rn=$rn txn=$txn")
+    val pa=evictions(key)<<6
+    check(canData(rn,pa),s"eviction completion while SnpResp pending cycle=$cycle rn=$rn txn=$txn line=0x${pa.toString(16)}")
+    check(Set(4,5)(opcode),s"unexpected eviction response opcode=$opcode")
+    if(opcode==5) {
+      check(!copybacks.contains((rn,dbid)),s"CopyBack DBID reused rn=$rn dbid=$dbid")
+      copybacks((rn,dbid))=CopyBack(line(pa))
+    }
+    evictions.remove(key)
+  }
+  def writeData(rn:BigInt,dbid:BigInt,beat:Int,cycle:Int):Unit={
+    val key=(rn,dbid)
+    check(copybacks.contains(key),s"unmatched CopyBackWrData cycle=$cycle rn=$rn dbid=$dbid")
+    val w=copybacks(key)
+    check(Set(0,2)(beat)&& !w.beats(beat),s"invalid CopyBackWrData beat cycle=$cycle rn=$rn dbid=$dbid beat=$beat")
+    w.beats+=beat
+    if(w.beats.size==2) copybacks.remove(key)
+  }
+  private def retire(key:(BigInt,BigInt)):Unit={
+    val r=reads(key)
+    if(r.beats.size==2&&(!r.expAck||r.acked)) reads.remove(key)
+  }
+  def data(rn:BigInt,txn:BigInt,beat:Int,cycle:Int):Unit={
+    val key=(rn,txn)
+    check(reads.contains(key),s"unmatched CompData cycle=$cycle rn=$rn txn=$txn")
+    val r=reads(key)
+    check(canData(rn,r.line<<6),s"CompData while SnpResp pending cycle=$cycle rn=$rn txn=$txn line=0x${(r.line<<6).toString(16)}")
+    check(Set(0,2)(beat)&& !r.beats(beat),s"invalid CompData beat cycle=$cycle rn=$rn txn=$txn beat=$beat")
+    r.started=true;r.beats+=beat;retire(key)
+  }
+  def snoop(rn:BigInt,hn:BigInt,txn:BigInt,pa:BigInt,cycle:Int):Unit={
+    check(canSnoop(rn,pa),s"SNP before CompAck/WriteData cycle=$cycle rn=$rn txn=$txn line=0x${(line(pa)<<6).toString(16)}")
+    check(!snoops.contains((hn,txn)),s"snoop identity reused hn=$hn txn=$txn")
+    snoops((hn,txn))=(rn,line(pa))
+  }
+  def response(rn:BigInt,hn:BigInt,txn:BigInt,opcode:Int,cycle:Int):Unit=opcode match {
+    case 1 =>
+      check(snoops.get((hn,txn)).exists(_._1==rn),s"unmatched SnpResp cycle=$cycle rn=$rn hn=$hn txn=$txn")
+      snoops.remove((hn,txn))
+    case 2 =>
+      val key=(rn,txn)
+      check(reads.get(key).exists(r=>r.expAck&&r.started&& !r.acked),s"unmatched CompAck cycle=$cycle rn=$rn txn=$txn")
+      reads(key).acked=true;retire(key)
+    case _ => ()
+  }
+  def empty:Boolean=reads.isEmpty&&snoops.isEmpty&&evictions.isEmpty&&copybacks.isEmpty
+}
+
 // Host models use literal transaction histories/FIFOs, not DUT accounting as
 // their expected values. All counters below are sampled before the same edge.
 class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val randomMode: Boolean) extends ChiselSim {
@@ -284,6 +363,11 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
   def inFlightPrefetch(pa:BigInt)=live.exists{case(id,addr)=>addr==pa&&livePrefetch(id)}
   val snps=mutable.Queue.empty[(SnpTxnID,BigInt)]
   val sentSnps=mutable.Map.empty[BigInt,BigInt]
+  val hnOrdering=new ConflictHNOrdering
+  // This CHI link addresses one RN, shared by all slices.
+  val hnRequester=BigInt(dut.hnNodeID)
+  val snoopOffers=mutable.Queue.empty[BigInt]
+  var dataOrderStalls=0L;var snoopOrderStalls=0L;var responseOrderStalls=0L
   val lateDemands=mutable.Set.empty[BigInt]
   val receivedData=mutable.Map.empty[DnTxnID,Int].withDefaultValue(0)
   val paused=mutable.Set.empty[BigInt]
@@ -339,7 +423,7 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
     if(!stash) submitted+=1
   }
   def recv(pa:BigInt):Unit={recvNext=Some(pa);tick()}
-  def sendSnoop(pa:BigInt):Unit={snpNext=Some(pa);while(snpNext.nonEmpty) tick()}
+  def sendSnoop(pa:BigInt):Unit={snpNext=Some(pa);while(snpNext.nonEmpty||snoopOffers.nonEmpty) tick()}
   def bit(f:Int,n:Int)=(f&(1<<n))!=0
   def ledgerCheck():Unit={
     val o=dut.observation
@@ -365,7 +449,8 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
     val rawRecv=recvNext;val rawSnp=snpNext
     if(sourceMode!="all"&&sourceMode!="recv") recvNext=None
     val frameHold=hold;val frameTrain=trainEnable
-    var chosenData:Option[PendingDnComp]=None;var chosenDelay=0;var chosenTlbDelay=1
+    var chosenData:Option[PendingDnComp]=None;var chosenResponsePA:Option[BigInt]=None
+    var chosenDelay=0;var chosenTlbDelay=1
     up.clearResponses();dn.clearResponses();driver.drive(cycle)
     dut.holdIssue.get.poke(hold.B)
     val train=dut.io.pfTrain.get.head;val pa=value(dut.io.t1p.head.UpREQ.bits.Addr)
@@ -385,20 +470,29 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
     // Complete inbound channel stimulus before observing combinational
     // metadata/eviction/line events. Sampling before RXRSP missed same-cycle
     // victim invalidations even though the production counter saw the edge.
+    def dataLegal(d:PendingDnComp)=hnOrdering.canData(d.srcId,d.addr)
+    if(data.exists(d=>d.due<=cycle&& !dataLegal(d))) dataOrderStalls+=1
     val selected=frame match {
       case Some(f) if f.dataID<0 => None
       case Some(f) =>
-        def eligible(d:PendingDnComp)=d.due<=cycle && !paused(d.addr) && dn.canDriveRxDat
+        def eligible(d:PendingDnComp)=d.due<=cycle && !paused(d.addr) && dn.canDriveRxDat && dataLegal(d)
         data.dequeueFirst(d=>eligible(d)&&d.dnTxnID.v==f.dataID&&d.addr==f.dataPA&&d.beat==f.dataBeat)
           .orElse(data.dequeueFirst(eligible))
-      case None =>data.dequeueFirst(d=>d.due<=cycle && !paused(d.addr) && dn.canDriveRxDat && (!randomMode||random.nextInt(5)!=0))
+      case None =>data.dequeueFirst(d=>d.due<=cycle && !paused(d.addr) && dn.canDriveRxDat && dataLegal(d) && (!randomMode||random.nextInt(5)!=0))
     }
     selected.foreach{d=>
       chosenData=Some(d)
       record(s"DN_DAT cycle=$cycle txn=${d.dnTxnID.v} pa=0x${d.addr.toString(16)} beat=${d.beat}");assert(live.get(d.dnTxnID).contains(d.addr),"RXDAT address/identity mismatch");assert((receivedData(d.dnTxnID)&(1<<d.beat))==0,"duplicate RXDAT beat");receivedData(d.dnTxnID)|=(1<<d.beat);dn.driveDnData(d);dut.io.chi.rxdat.flit.Data.get.poke(OvernightMemory.beat(d.addr,d.beat).U)
       val finalBeat=receivedData(d.dnTxnID)==3;dn.noteResponse(d.dnTxnID,finalBeat,cycle);if(finalBeat) {assert(live.remove(d.dnTxnID).nonEmpty);livePrefetch-=d.dnTxnID;receivedData-=d.dnTxnID}
     }
-    rsp.dequeueFirst(r=>r.due<=cycle&&dn.canDriveRxRsp).foreach{r=>dn.driveDnRsp(r);dn.noteResponse(r.dnTxnID,true,cycle);assert(live.remove(r.dnTxnID).nonEmpty);livePrefetch-=r.dnTxnID}
+    // 4.11.2 also forbids CopyBack completion while SnpResp is pending.
+    // Waiting only on CompData leaves the replacement/SNP hazard illegal.
+    if(rsp.exists(r=>r.due<=cycle&& !hnOrdering.canData(r.srcId,live(r.dnTxnID)))) responseOrderStalls+=1
+    rsp.dequeueFirst(r=>r.due<=cycle&&dn.canDriveRxRsp&&hnOrdering.canData(r.srcId,live(r.dnTxnID))).foreach{r=>
+      chosenResponsePA=Some(live(r.dnTxnID))
+      record(s"DN_RSP cycle=$cycle rn=${r.srcId} txn=${r.dnTxnID.v} pa=0x${live(r.dnTxnID).toString(16)} opcode=${r.opcode}")
+      dn.driveDnRsp(r);dn.noteResponse(r.dnTxnID,true,cycle);assert(live.remove(r.dnTxnID).nonEmpty);livePrefetch-=r.dnTxnID
+    }
     if(!flag(dut.io.t1p.head.UpRSP.valid)) snps.headOption.foreach{case(id,src)=>up.driveUpSnpResp(id,src);if(flag(dut.io.t1p.head.UpRSP.ready)) snps.dequeue()}
     if(flag(dut.io.t1p.head.DnSNP.valid)) snps.enqueue((SnpTxnID(value(dut.io.t1p.head.DnSNP.bits.TxnID)),value(dut.io.t1p.head.DnSNP.bits.SrcID)))
     // Read event flags once per cycle; fields are sampled only for real events.
@@ -465,13 +559,18 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
     if(trainSlices.size>=2) hit("C06",s"trainSlices=${trainSlices.toSeq.sorted.mkString(",")}")
     if(trainSlices.nonEmpty && disabled) hit("C06_mixed",s"enabledSlices=${trainSlices.toSeq.sorted.mkString(",")} disabledRaw=true")
     // Exact-credit snoop injection, after observing demand execution this cycle.
-    snpNext.filter(_=>dn.canDriveRxSnp).foreach{addr=>
+    snpNext.foreach(snoopOffers.enqueue(_));snpNext=None
+    def snoopLegal(addr:BigInt)=hnOrdering.canSnoop(hnRequester,addr)&&
+      !chosenData.exists(d=>(d.addr>>6)==(addr>>6)&&d.srcId==hnRequester)&&
+      !chosenResponsePA.exists(pa=>(pa>>6)==(addr>>6))
+    if(snoopOffers.headOption.exists(a=> !snoopLegal(a))) snoopOrderStalls+=1
+    snoopOffers.headOption.filter(addr=>dn.canDriveRxSnp&&snoopLegal(addr)).foreach{addr=>
       val io=dut.io.chi.rxsnp
       io.flitv.poke(true.B);io.flitpend.poke(true.B);io.flit.poke(0.U.asTypeOf(io.flit))
       io.flit.Opcode.get.poke(7.U);io.flit.DoNotGoToSD_DoNotDataPull.get.poke(1.U)
       io.flit.Addr.get.poke((addr>>3).U);io.flit.TxnID.get.poke(snoopID.U);io.flit.SrcID.get.poke(0.U)
       hitThisCycle.get(addr).foreach(src=>hit("C03c",s"pa=0x${addr.toString(16)} demandHit=true oldSource=$src snoopCredit=true"))
-      sentSnps(snoopID)=addr;snoopID+=1;snpNext=None
+      sentSnps(snoopID)=addr;snoopID+=1;snoopOffers.dequeue()
       record(s"SNP_SEND cycle=$cycle pa=0x${addr.toString(16)} id=${snoopID-1}")
       val noData=live.exists{case(id,pa)=>pa==addr&&livePrefetch(id)&&receivedData(id)==0}
       if(inFlightPrefetch(addr) && noData) hit("C03a",s"pa=0x${addr.toString(16)} downstreamOutstanding=true rxdatNotReturned=true")
@@ -555,6 +654,38 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
       if(dn.isEvictReq(op)) rsp.enqueue(PendingDnRsp(id,src,cycle+delay,dn.downstreamEvictRspOpcode(op)))
       else {readRequests+=((cycle,addr));for(b<-0 until 2) data.enqueue(PendingDnComp(id,src,cycle+delay+b,b,if(op==7) CHIFieldResp.CompData_UC else CHIFieldResp.CompData_SC,addr))}
     }
+    // Independently sample the actual pins, rather than trusting queue choices.
+    // Outgoing messages are checked before incoming responses at this edge:
+    // a response observed now only releases an ordering barrier next cycle.
+    if(flag(dut.io.chi.txreq.flitv)) {
+      val f=dut.io.chi.txreq.flit
+      if(dn.isEvictReq(value(f.Opcode.get)))
+        hnOrdering.eviction(value(f.SrcID.get),value(f.TxnID.get),value(f.Addr.get))
+      else
+        hnOrdering.request(value(f.SrcID.get),value(f.TxnID.get),value(f.Addr.get),value(f.ExpCompAck.get)!=0)
+    }
+    if(flag(dut.io.chi.rxdat.flitv)) {
+      val f=dut.io.chi.rxdat.flit
+      hnOrdering.data(value(f.TgtID.get),value(f.TxnID.get),value(f.DataID.get).toInt,cycle)
+    }
+    if(flag(dut.io.chi.rxrsp.flitv)) {
+      val f=dut.io.chi.rxrsp.flit
+      hnOrdering.completion(value(f.TgtID.get),value(f.TxnID.get),value(f.DBID_PGroupID_StashGroupID_TagGroupID.get),value(f.Opcode.get).toInt,cycle)
+    }
+    if(flag(dut.io.chi.rxsnp.flitv)) {
+      val f=dut.io.chi.rxsnp.flit
+      hnOrdering.snoop(hnRequester,value(f.SrcID.get),value(f.TxnID.get),value(f.Addr.get)<<3,cycle)
+    }
+    if(flag(dut.io.chi.txrsp.flitv)) {
+      val f=dut.io.chi.txrsp.flit;val op=value(f.Opcode.get).toInt
+      hnOrdering.response(value(f.SrcID.get),value(f.TgtID.get),value(f.TxnID.get),op,cycle)
+      if(op==2) record(s"COMP_ACK cycle=$cycle rn=${value(f.SrcID.get)} txn=${value(f.TxnID.get)}")
+    }
+    if(flag(dut.io.chi.txdat.flitv)&&value(dut.io.chi.txdat.flit.Opcode.get)==L2TopDownstreamOpcodes.CopyBackWrData) {
+      val f=dut.io.chi.txdat.flit
+      hnOrdering.writeData(value(f.SrcID.get),value(f.TxnID.get),value(f.DataID.get).toInt,cycle)
+      record(s"COPYBACK_DATA cycle=$cycle rn=${value(f.SrcID.get)} dbid=${value(f.TxnID.get)} beat=${value(f.DataID.get)}")
+    }
     assert(!flag(dut.io.t1p.head.DnRSP.valid),"unexpected response (external Stash is silent)")
     tapeWriter.foreach{out=>
       out.println(ConflictFrame(cycle,frameHold,frameTrain,rawRecv,rawSnp,readyNow,
@@ -575,6 +706,7 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
       assert(cycle-start<40000,s"drain watchdog seed=$seed cycle=$cycle live=$live slots=${value(dut.slots)} tlb=$translations")
       tick()
       val empty=driver.pending==0 && data.isEmpty && rsp.isEmpty && live.isEmpty && snps.isEmpty && replies.isEmpty && sentSnps.isEmpty &&
+        snoopOffers.isEmpty && snpNext.isEmpty && hnOrdering.empty &&
         !pendingTshrs && (if(queues) qModels.forall(_.isEmpty)&&value(dut.slots)==0&&translations.isEmpty&& !flag(dut.algorithmBusy) else true)
       quiet=if(empty) quiet+1 else 0
     }
@@ -595,6 +727,8 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
     assert(translations.isEmpty&&terminals.isEmpty&&permits.forall(_.values.forall(_==0)),"TLB permits/inflight closure")
     assert(modelRetry==actualRetry&&modelDrop==actualDrop,"TLB retry/drop closure")
     assert(sentSnps.isEmpty&&receivedData.isEmpty&&value(dut.slots)==0&&qModels.forall(_.isEmpty),"final occupancy zero")
+    assert(hnOrdering.empty&&snoopOffers.isEmpty,"HN ordering closure")
+    println(s"HN_CHI_ORDER_CHECK pass=true seed=$seed pending=0 dataStallCycles=$dataOrderStalls snoopStallCycles=$snoopOrderStalls responseStallCycles=$responseOrderStalls")
     println(s"CONFLICT_CLOSURE pass=true seed=$seed slices=$slices cycles=$cycle demands=$submitted checkedBeats=${driver.checkedBeats} stashes=${driver.stashes} recv=$recvInputs tlbRequests=$tlbRequests tlbRetired=$retired retries=$actualRetry drops=$actualDrop snoops=$snoopDone pending=0")
     Seq("C01","C01_enter","C01_wait","C01_hit","C02","C03a","C03b","C03c","C04","C05","C06","C06_mixed","C07","C08","C08_release","C09","C09_simultaneous","C10").foreach(k=>if(!evidence.contains(k)) evidence(k)=0)
     evidence.toSeq.sortBy(_._1).foreach{case(k,n)=>println(s"CONFLICT_COVER seed=$seed slices=$slices name=$k count=$n")}
@@ -670,11 +804,8 @@ object TestTop_L2PrefetchConflict extends App with ChiselSim {
       } else if(mode=="directed") {
         scenario match {
           case "demand-snoop-refill" | "demand-refill" =>
-            // Known failure: BUG-TSHR-DROP, introduced by 0465baf.
-            // Keep the data assertion active; runners report this as XFAIL
-            // only when the refill/drop signature is confirmed.
-            if(scenario=="demand-snoop-refill")
-              println("CONFLICT_KNOWN_FAILURE bug=BUG-TSHR-DROP introduced=0465baf expected=data-mismatch-after-refill-snoop")
+            // Regression for the former illegal pending-SNP/CompData overlap.
+            // The HN must receive SnpResp before returning the refill.
             // A baseline demand miss, a same-line invalidating snoop before
             // RXDAT, and a second read after both original transactions retire.
             // The memory is read-only, so either miss/refetch or a hit must
