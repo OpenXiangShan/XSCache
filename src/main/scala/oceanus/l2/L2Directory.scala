@@ -205,8 +205,13 @@ object DRRIP {
     val cur = VecInit((0 until ways).map(i => state(2 * i + 1, 2 * i)))
     val inc = 3.U(2.W) - cur(way)
     val next = Wire(Vec(ways, UInt(2.W)))
-    for (i <- 0 until ways)
-      next(i) := Mux(i.U === way, 0.U, Mux(victimValid, cur(i) + inc, cur(i)))
+    for (i <- 0 until ways) {
+      // Saturate at the RRPV maximum instead of wrapping: the lock-mask victim
+      // fallback can divert the pick to a non-max way, and a plain 2-bit add
+      // would then wrap every higher RRPV modulo 4, inverting the policy.
+      val aged = cur(i) +& inc
+      next(i) := Mux(i.U === way, 0.U, Mux(victimValid, Mux(aged > 3.U, 3.U, aged(1, 0)), cur(i)))
+    }
     next.asUInt
   }
 
