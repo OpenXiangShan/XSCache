@@ -153,25 +153,51 @@ object L2Directory {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Tree-PLRU for 4-way (3 bits/set)
+// Tree-PLRU, generic power-of-two way count (ways-1 bits/set), selected by
+// L2Params.replacement = "plru".
+//
+// State bits are heap-indexed tree nodes: node 0 is the root, the children
+// of node i are 2i+1 (left/lower) and 2i+2 (right/higher). A CLEAR bit
+// marks the left (lower) subtree as the older one — the victim walk
+// descends left on a clear bit, right on a set bit; a touch sets every
+// node on the touched way's root-to-leaf path to point AWAY from it.
+// Layout for 8 ways (7 bits):
+//                      bit[0]: ways 3-0 older than ways 7-4
+//                      /                                  \
+//            bit[1]: ways 1+0 > 3+2                bit[2]: ways 5+4 > 7+6
+//            /                    \                /                    \
+//     bit[3]: way 1>0    bit[4]: way 3>2    bit[5]: way 5>4    bit[6]: way 7>6
+// (">" = "older than" when the bit is SET. At 4 ways this degenerates to
+// bit[0] root + bit[1]/bit[2] leaves — bit-identical to the old PLRU4.)
 // ══════════════════════════════════════════════════════════════════════
 
-object PLRU4 {
-  val nBits = 3
-  def getReplaceWay(state: UInt): UInt = {
-    val way = WireDefault(0.U(2.W))
-    when(state(0) === 0.U) { way := Mux(state(1) === 0.U, 0.U, 1.U) }
-      .otherwise           { way := Mux(state(2) === 0.U, 2.U, 3.U) }
-    way
+object TreePLRU {
+  def nBits(ways: Int) = ways - 1
+
+  // Victim: walk the tree from the root, descending into the older subtree
+  // (clear bit = left/lower). Way assembled msb-first.
+  def getReplaceWay(state: UInt, ways: Int): UInt = {
+    def pick(node: Int, sub: Int): UInt =
+      if (sub == 2) state(node)
+      else Cat(state(node),
+               Mux(state(node) === 0.U, pick(2 * node + 1, sub / 2),
+                                        pick(2 * node + 2, sub / 2)))
+    pick(0, ways)
   }
-  def getNextState(state: UInt, touchWay: UInt): UInt = {
-    val next = Wire(Vec(nBits, Bool()))
-    next := state.asTypeOf(Vec(nBits, Bool()))
-    val inLeft = touchWay(1) === 0.U
-    val first  = touchWay(0) === 0.U
-    next(0) := Mux(inLeft, true.B, false.B)
-    when(inLeft) { next(1) := Mux(first, true.B, false.B) }
-      .otherwise { next(2) := Mux(first, true.B, false.B) }
+
+  // Touch: every node on the touched way's path is set away from the touched
+  // direction. Evaluated per node with static indices: node i sits at level
+  // l = floor(log2(i+1)) with path prefix (i+1 - 2^l); it is on the touched
+  // path iff the touchWay bits above its level equal that prefix.
+  def getNextState(state: UInt, touchWay: UInt, ways: Int): UInt = {
+    val levels = log2Ceil(ways)
+    val next = Wire(Vec(ways - 1, Bool()))
+    for (i <- 0 until ways - 1) {
+      val l = BigInt(i + 1).bitLength - 1
+      val onPath = if (l == 0) true.B
+                   else touchWay(levels - 1, levels - l) === (i + 1 - (1 << l)).U
+      next(i) := Mux(onPath, !touchWay(levels - 1 - l), state(i))
+    }
     next.asUInt
   }
 }
@@ -241,8 +267,9 @@ object DRRIP {
 class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val MAX_AGE = 15.U(4.W)
   val idxW    = log2Ceil(nMSHR)
-  // Replacement state width: 2 bits/way RRPV under DRRIP; PLRU uses the low 3.
-  val replBits = DRRIP.nBits(paramL2.ways) // >= 4 for ways >= 2; covers PLRU4.nBits
+  // Replacement state width: 2 bits/way RRPV under DRRIP; tree-PLRU uses the
+  // low ways-1.
+  val replBits = DRRIP.nBits(paramL2.ways) // >= 4 for ways >= 2; covers TreePLRU.nBits
   private val enableDirStateProbe = p(L2SliceDirStateProbeEnableKey)
   private val enableDirPlruProbe = p(L2SliceDirPlruProbeEnableKey)
   private val blockRefillFaultMode = p(L2DirectoryBlockRefillFaultModeKey).U(2.W)
@@ -335,8 +362,6 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     s"Directory: unknown replacement policy '${paramL2.replacement}'")
   require(isPow2(ways) && ways >= 2,
     s"Directory: ways must be a power of two >= 2, got $ways")
-  require(useDRRIP || ways == 4,
-    "Directory: PLRU policy is hardwired for 4 ways (use replacement=\"drrip\" for other way counts)")
 
   // ── SRAM + replacement state ────────────────────────────────────────
   val dirArray = Module(new SRAMTemplate(
@@ -575,7 +600,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val hasInvalid = invalidVec.asUInt.orR
   val invalidWay = PriorityEncoder(invalidVec)
   val replWay    = if (useDRRIP) DRRIP.getReplaceWay(s3_repl, ways)
-                   else          PLRU4.getReplaceWay(s3_repl(PLRU4.nBits - 1, 0))
+                   else          TreePLRU.getReplaceWay(s3_repl(TreePLRU.nBits(ways) - 1, 0), ways)
   val chosenWay  = Mux(hasInvalid, invalidWay, replWay)
 
   val victimMask_s3 = freeWayMask_s3
@@ -612,7 +637,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
       DRRIP.getNextStateHit(s3_repl, way_s3, ways),
       DRRIP.getNextStateRefill(s3_repl, way_s3, victimHoldsValid, ways))
   } else {
-    replNextState := PLRU4.getNextState(s3_repl(PLRU4.nBits - 1, 0), way_s3).pad(replBits)
+    replNextState := TreePLRU.getNextState(s3_repl(TreePLRU.nBits(ways) - 1, 0), way_s3, ways).pad(replBits)
   }
   when(replWen) {
     replRegs(s3_set) := replNextState
