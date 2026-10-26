@@ -267,8 +267,8 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       --l2-sets <n>             L2 sets per slice, 32 by default (power of two)
       --l2-ways <n>             L2 ways per slice, 4 by default (power of two)
       --l2-replacement <pol>    L2 replacement policy, drrip by default;
-                                plru is hardwired for 4 ways, drrip supports
-                                any power-of-two way count
+                                both plru and drrip support any power-of-two
+                                way count
       --l2-drrip-release-update <0|1>
                                 DRRIP release-type update via the arbitrated
                                 DirRel op at the EVT vPipe commit, 1 (on) by default
