@@ -13,11 +13,10 @@ import xscache.oceanus.compactchi.{CCHIParameters, CCHIParametersKey}
 import scala.collection.mutable.ArrayBuffer
 
 /* Release-oriented generation top for the Oceanus L2 (L2Top), configured after
- * the Kunminghu DefaultConfig (XiangShan top/Configs.scala):
- *  - 2MB L2 in 4 slices (banks): 2048 sets x 4 ways x 64B per slice.
- *    Unlike the Kunminghu 8-way L2, ways = 4 and sets are doubled to keep
- *    2MB total (the Oceanus Directory supports both plru and drrip at any
- *    power-of-two way count; drrip is the default).
+ * the Kunminghu V2 DefaultConfig (XiangShan top/Configs.scala):
+ *  - 2MB L2 in 4 slices (banks): 1024 sets x 8 ways x 64B per slice.
+ *    The 8-way DRRIP configuration matches Kunminghu V2's L2 associativity
+ *    and CoupledL2's default replacement policy.
  *  - mshrSize = 32
  *  - 48-bit physical address, CHI Issue E, 256-bit data width
  *  - data ECC (secded) enabled
@@ -99,13 +98,14 @@ Usage: Top_L2Top [<--option> <values>]
     slices = 0 until numSlices
   )
 
-  // Kunminghu DefaultConfig alignment, see the class comment above
+  // Kunminghu V2 DefaultConfig alignment, see the class comment above
   val config = new Config((_, _, _) => {
     case L2ParamsKey => L2Params (
       physicalAddrWidth = 48,
       mshrSize = numTshr,
-      ways = 4,
-      sets = 2048,
+      ways = 8,
+      sets = 1024,
+      replacement = "drrip",
       blockBytes = 64,
       dataSRAMSplit = 8,
       enableDataECC = true,
