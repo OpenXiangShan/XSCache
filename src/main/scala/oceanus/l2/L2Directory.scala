@@ -3,7 +3,7 @@ package oceanus.l2
 import chisel3._
 import chisel3.util._
 import utility._
-import utility.sram.{SRAMTemplate, SramBroadcastBundle}
+import utility.sram.SRAMTemplate
 import oceanus.l2._
 import oceanus.compactchi._
 import org.chipsalliance.cde.config.{Field, Parameters}
@@ -343,9 +343,6 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     gen = new L2Directory.DirEntry, set = sets, way = ways,
     singlePort = true, useBitmask = true, hasMbist = paramL2.hasMbist
   ))
-  // No top-level broadcast source in a standalone L2; tie off the mbist
-  // broadcast IO that SRAMTemplate exposes when hasMbist is set.
-  dirArray.io.broadcast.foreach(_ := 0.U.asTypeOf(new SramBroadcastBundle))
   // Replacement state registers (see replBits above).
   val replRegs = RegInit(VecInit(Seq.fill(sets)(0.U(replBits.W))))
   // DRRIP release-train reuse tracking: cleared on refill, set on DirRd hit, 

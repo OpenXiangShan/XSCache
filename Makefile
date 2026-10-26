@@ -39,6 +39,11 @@ gen-test-top:
 	mill -i XSCache.testtop.l2.runMain xscache.coupledL2.$(TOP)_$(SYSTEM) -td $(BUILD_DIR_L2) --target systemverilog --split-verilog
 	if [ -f "$(TOP_V_L2).conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(TOP_V_L2).conf" "$(BUILD_DIR_L2)"; fi
 
+BUILD_DIR_COUPLEDL2_REL = ./build/coupledl2_release
+
+gen-top-coupledl2:
+	mill -i XSCache.testtop.l2.runMain xscache.coupledL2.TopCoupledL2 -td $(BUILD_DIR_COUPLEDL2_REL) --target systemverilog --split-verilog
+
 gen-test-top-chi:
 	mill -i XSCache.testtop.l2.runMain xscache.coupledL2.$(TOP)_$(SYSTEM) -td $(BUILD_DIR_L2) $(CHI_TOP_ARGS) --target systemverilog --split-verilog
 	if [ -f "$(TOP_V_L2).conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(TOP_V_L2).conf" "$(BUILD_DIR_L2)"; fi
@@ -79,6 +84,12 @@ TOP_V_TSHRCTRL = $(BUILD_DIR_TSHRCTRL)/TestTop_L2TSHRCtrl.sv
 test-top-tshrctrl:
 	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2TSHRCtrl -td $(BUILD_DIR_TSHRCTRL) --target systemverilog --split-verilog
 	if [ -f "$(TOP_V_TSHRCTRL).conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(TOP_V_TSHRCTRL).conf" "$(BUILD_DIR_TSHRCTRL)"; fi
+
+BUILD_DIR_TOP_L2TOP = ./build/l2top_release
+TSHR ?= 32
+
+gen-top-l2top:
+	mill -i XSCache.testtop.oceanus.runMain oceanus.Top_L2Top -td $(BUILD_DIR_TOP_L2TOP) --tshr $(TSHR) --target systemverilog --split-verilog
 
 BUILD_DIR_L2TOP = ./build/l2top
 
