@@ -2,7 +2,7 @@ package xscache.coupledL2.utils
 
 import chisel3._
 import chisel3.util._
-import utility.sram.{SramBroadcastBundle, SramHelper}
+import utility.sram.SramHelper
 
 // split SRAM by set/way/data
 // 1. use lower-bits of set to select bank
@@ -53,14 +53,6 @@ class SplittedSRAM[T <: Data]
       suffix = Some(suffix.getOrElse(SramHelper.getSramSuffix(valName.value)))
     ))
   )))
-
-  // SRAMTemplate exposes a broadcast IO when mbist is enabled; there is no
-  // top-level broadcast source in a standalone L2, so tie it off here.
-  if (hasMbist) {
-    array.flatten.flatten.foreach(
-      _.io.broadcast.foreach(_ := 0.U.asTypeOf(new SramBroadcastBundle))
-    )
-  }
 
   for (i <- 0 until setSplit) {
     val ren = i.U === r_bankSel

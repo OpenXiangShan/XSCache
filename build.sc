@@ -112,7 +112,10 @@ object XSCache extends HasChisel with $file.common.XSCacheModule {
       override def millSourcePath = pwd
       override def moduleDeps = super.moduleDeps ++ Seq(XSCache)
       override def sources = T.sources {
-        Seq(PathRef(pwd / "src" / "test" / "scala" / "TestTopL2.scala"))
+        Seq(
+          PathRef(pwd / "src" / "test" / "scala" / "TestTopL2.scala"),
+          PathRef(pwd / "src" / "test" / "scala" / "TopCoupledL2.scala")
+        )
       }
       override def scalacOptions = super.scalacOptions() ++ Agg("-deprecation", "-feature")
     }
