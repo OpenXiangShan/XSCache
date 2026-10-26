@@ -52,7 +52,7 @@ class CDPC4TlbModel extends Module {
   io.attempt := q.io.deq.bits.attempt
 }
 
-class CDPC4Harness(implicit p: Parameters) extends Module {
+class CDPC4Harness(val checkFixedCycle: Boolean = true)(implicit p: Parameters) extends Module {
   val io = IO(new Bundle {
     val candidate = Input(UInt(58.W)) // [valid|VA50|depth2|source4|hit]
     val gate = Input(Bool()); val delay = Input(UInt(8.W))
@@ -150,7 +150,7 @@ class CDPC4Harness(implicit p: Parameters) extends Module {
   val refDrops = VecInit((0 until 16).map(i => rv(i) && (
     (missValid && reference.io.tlbReq.resp.valid && r.miss && re(i).retryEn && re(i).vTag(43,6) === missAddress(49,12)) ||
     (pmpValid && finalValid && !finalBits.miss && read(reference.s3_drop) && re(i).vTag(43,6) === pmpAddress(49,12)))))
-  when(io.fixed && !reset.asBool) {
+  when(io.fixed && checkFixedCycle.B && !reset.asBool) {
     assert(read(prod.valids).asUInt === rv.asUInt, "fixed valid state")
     val pe = read(prod.entries)
     for (i <- 0 until 16) {
@@ -216,7 +216,8 @@ object TestTop_OceanusCDPC4 extends App with ChiselSim {
   Files.createDirectories(traceDir)
   val coverage = mutable.Map.empty[String,Long].withDefaultValue(0L)
   var totalCycles = 0L; var comparisons = 0L; var scenes = 0
-  simulate(new CDPC4Harness()(params)) { dut =>
+  simulate(new CDPC4OrderingHarness()(params)) { dut =>
+    val ordering=new CDPOrderingTracker(dut,traceDir)
     case class Item(va: BigInt, depth: Int, id: Int)
     val live = Array.fill(2)(mutable.Map.empty[Int,Item])
     val results = Array.fill(2)(mutable.ArrayBuffer.empty[String])
@@ -244,6 +245,7 @@ object TestTop_OceanusCDPC4 extends App with ChiselSim {
       dut.io.candidate.poke(encoded); dut.io.gate.poke(gate); dut.io.delay.poke(delay)
       dut.io.ready.poke(ready); dut.io.queryReady.poke(query); dut.io.filter.poke(filter)
       dut.io.vbop.poke(vbop); dut.io.vbopVA.poke(vbVA)
+      ordering.sample(encoded,ready,filter,query)
       val packed = dut.io.packed.peek().litValue
       var bits = packed
       def get(n: Int): BigInt = {val v=bits & ((BigInt(1)<<n)-1); bits >>= n; v}
@@ -350,6 +352,7 @@ object TestTop_OceanusCDPC4 extends App with ChiselSim {
       live.foreach(_.clear());results.foreach(_.clear());discarded.foreach(_.clear())
       issueOrder.clear();pageAttempts.clear();misses.clear();activePages.clear()
       held=None;tickNo=0;inputID=0;vbAccepted=0;vbCompleted=0
+      ordering.reset(label)
     }
     def finish(compare: Boolean, compareSet: Boolean=false): Unit = {
       assert(live.forall(_.isEmpty) && activePages.isEmpty && issueOrder.isEmpty)
@@ -365,6 +368,7 @@ object TestTop_OceanusCDPC4 extends App with ChiselSim {
         count("d1-set-epochs")
         if(results(0)!=results(1))count("d1-order-difference")
       }
+      ordering.finish(results.map(_.toVector).toVector,compareSet,requireSourceOrder=args.contains("--require-source-order"))
       currentTrace.close();currentTrace=null;scenes+=1
     }
     // Entire input set is present before either page translation can start.
@@ -432,6 +436,7 @@ object TestTop_OceanusCDPC4 extends App with ChiselSim {
       (0 to 10).map("kind-"+_)++(0 to 3).map("depth-"+_)++(1 to 7).map("delay-"+_)++(2 to 9).map("drop-kind-"+_)
     required.foreach(k=>assert(coverage(k)>0,s"missing coverage $k"))
     coverage.toSeq.sortBy(_._1).foreach{case(k,v)=>println(s"CDP_C4_COVER $k=$v")}
+    println(s"CDP_C4_ORDER_RESULT independentScheduleChecked=true illegalPermutationRejected=true fullMultisetsRetained=true contractApproval=D5-pending scenes=$scenes")
     println(s"CDP_C4_RESULT pass=true seeds=$seeds cycles=$totalCycles scenes=$scenes reference_epochs=$comparisons request_and_drop_mismatches=0")
   }
 }

@@ -13,7 +13,7 @@ import utility._
 import scala.collection.mutable
 import java.nio.file.{Files, Paths}
 
-class CDPH2Harness(implicit p: Parameters) extends CDPC4Harness {
+class CDPH2Harness(implicit p: Parameters) extends CDPC4Harness() {
   val dt = RegEnable(prod.getFilterTag(read(prod.pftArb.io.out.bits.paddr)), prod.io.ftQueryReq.fire)
   val rt = RegEnable(reference.getFilterTag(read(reference.pftArb.io.out.bits).addr), reference.io.ftQueryReq.fire)
   prod.io.ftQueryRsp.validVec(0) := true.B
