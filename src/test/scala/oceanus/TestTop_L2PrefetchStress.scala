@@ -477,7 +477,11 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
     val knownPrefetch=mutable.ArrayBuffer.empty[BigInt]
     val offeredSnoops=mutable.Queue.empty[BigInt]
     var replaySnoopOffered=0;var replaySnoopSent=0
-    def qos():Unit=println(s"STRESS_QOS caseId=$caseId seed=$seed cycle=$cycle completed=${driver.completed} submitted=$submitted maxDemandNoCompletion=$maxDemandNoCompletion maxUpReqBlocked=$maxUpReqBlocked lastDemandCompleteCycle=$lastDemandCompleteCycle stimulusSnoops=$stimulusSnoops snpSent=$snpSent snpDone=$snpDone maxActiveNoCompletion=$activeNoCompletion snoopOffers=$snoopOffers pendingOffers=${offeredSnoops.size}")
+    def cdpSnapshot(closed:Boolean):Unit={
+      val raw=dut.cdpCountPacked.peek().litValue
+      println(s"STRESS_CDP_SNAPSHOT caseId=$caseId seed=$seed cycle=$cycle closed=$closed " + dut.cdpCounters.indices.map(i=>dut.cdpCounters(i)._1+"="+((raw>>(64*i))&((BigInt(1)<<64)-1))).mkString(" "))
+    }
+    def qos():Unit={cdpSnapshot(false);println(s"STRESS_QOS caseId=$caseId seed=$seed cycle=$cycle completed=${driver.completed} submitted=$submitted maxDemandNoCompletion=$maxDemandNoCompletion maxUpReqBlocked=$maxUpReqBlocked lastDemandCompleteCycle=$lastDemandCompleteCycle stimulusSnoops=$stimulusSnoops snpSent=$snpSent snpDone=$snpDone maxActiveNoCompletion=$activeNoCompletion snoopOffers=$snoopOffers pendingOffers=${offeredSnoops.size}")}
     val retryLive=mutable.Map.empty[DnTxnID,(BigInt,BigInt,BigInt)]
     var retryDemand=0; var retryPrefetch=0; var reissues=0; var pcrdSent=0
     var offered=0L; var blocked=0L; var activeCompleted=0
