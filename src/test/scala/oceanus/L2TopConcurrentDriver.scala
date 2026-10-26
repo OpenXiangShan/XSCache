@@ -21,15 +21,21 @@ object L2TopReferenceMemory {
   * port never gates request issue on another port. Type-1 completes on the
   * accepted CompAck; Type-4 has no RSP channel and completes on its last DAT.
   */
-class L2TopConcurrentDriver(dut: TestTop_L2Top, upstream: L2TopUpstreamModel) extends ChiselSim {
-  val masters = Seq(MasterId.t1p0, MasterId.t4p0, MasterId.t4p1)
+class L2TopConcurrentDriver(dut: TestTop_L2Top, upstream: L2TopUpstreamModel, type1Ports: Int = 1) extends ChiselSim {
+  require(type1Ports == 1 || type1Ports == 2)
+  val masters = Seq(MasterId.t1p0, MasterId.t4p0, MasterId.t4p1) ++
+    (if (type1Ports == 2) Seq(MasterId.t1p1) else Seq.empty)
+  private def type1Index(master: MasterId): Int = if (master == MasterId.T1P1) 1 else 0
+  private def isType1(master: MasterId): Boolean = master == MasterId.T1P0 || master == MasterId.T1P1
   private def reqPort(master: MasterId) = master match {
     case MasterId.T1P0 => dut.io.t1p(0).UpREQ
+    case MasterId.T1P1 => dut.io.t1p(1).UpREQ
     case MasterId.T4P0 => dut.io.t4p(0).UpREQ
     case MasterId.T4P1 => dut.io.t4p(1).UpREQ
   }
   private def dataPort(master: MasterId) = master match {
     case MasterId.T1P0 => dut.io.t1p(0).DnDAT
+    case MasterId.T1P1 => dut.io.t1p(1).DnDAT
     case MasterId.T4P0 => dut.io.t4p(0).DnDAT
     case MasterId.T4P1 => dut.io.t4p(1).DnDAT
   }
@@ -47,7 +53,13 @@ class L2TopConcurrentDriver(dut: TestTop_L2Top, upstream: L2TopUpstreamModel) ex
   def outstanding: Int = active.size
   def pending: Int = active.size + held.size + queues.values.map(_.size).sum + acks.size
   def queued: Int = held.size + queues.values.map(_.size).sum
-  def enqueue(requests: Seq[UpRequestSpec]): Unit = requests.foreach(r => queues(r.master).enqueue(r))
+  def enqueue(requests: Seq[UpRequestSpec]): Unit = {
+    // Type-4 whitelist: CHIron cchi_protocol_encoding.hpp:175-187.
+    // Use the upstream drive boundary check; validate the whole
+    // batch first so an illegal request cannot partially enqueue a batch.
+    requests.foreach(L2TopUpstreamLegality.check)
+    requests.foreach(r => queues(r.master).enqueue(r))
+  }
   def drive(cycle: Int): Unit = {
     upstream.clearUpReq()
     masters.foreach { master =>
@@ -57,30 +69,39 @@ class L2TopConcurrentDriver(dut: TestTop_L2Top, upstream: L2TopUpstreamModel) ex
           .find(id => !active.contains((master, BigInt(id)))).foreach { id =>
             val src = master match {
               case MasterId.T1P0 => 0
+              case MasterId.T1P1 => 2
               case MasterId.T4P0 => 4
               case MasterId.T4P1 => 5
             }
             held(master) = queues(master).dequeue().copy(txnId = id, srcId = src,
-              expCompData = master == MasterId.T1P0)
+              expCompData = isType1(master))
           }
       }
-      held.get(master).foreach(upstream.driveRead)
+      held.get(master).foreach { req =>
+        L2TopUpstreamLegality.check(req)
+        upstream.driveRead(req)
+      }
     }
     // Existing acks only: a data response observed below cannot be acked at
     // the same edge, and DBID is always qualified by its source slice.
-    acks.headOption.foreach(a => upstream.driveUpCompAck(UpDBID(a.dbid), a.slice.toInt))
+    acks.groupBy(a => type1Index(a.key._1)).values.foreach(_.headOption.foreach(a =>
+      upstream.driveUpCompAck(UpDBID(a.dbid), a.slice.toInt, type1Index(a.key._1))))
   }
   def sample(cycle: Int): Unit = {
-    if (acks.nonEmpty && dut.io.t1p(0).UpRSP.valid.peek().litToBoolean &&
-        dut.io.t1p(0).UpRSP.ready.peek().litToBoolean) {
-      val ack = acks.dequeue()
-      assert(active.remove(ack.key).nonEmpty)
-      completed += 1
+    (0 until type1Ports).foreach { idx =>
+      val port = dut.io.t1p(idx).UpRSP
+      if (port.valid.peek().litToBoolean && port.ready.peek().litToBoolean) {
+        acks.dequeueFirst(a => type1Index(a.key._1) == idx).foreach { ack =>
+          assert(active.remove(ack.key).nonEmpty)
+          completed += 1
+        }
+      }
     }
     masters.foreach { master =>
       val port = reqPort(master)
       if (port.valid.peek().litToBoolean && port.ready.peek().litToBoolean) {
         val request = held.remove(master).get
+        L2TopUpstreamLegality.check(request)
         val key = (master, request.txnId)
         assert(!active.contains(key), s"TxnID reused while active: $key")
         active(key) = Read(request)
@@ -103,7 +124,7 @@ class L2TopConcurrentDriver(dut: TestTop_L2Top, upstream: L2TopUpstreamModel) ex
         read.beats += beat
         checkedBeats += 1
         if (read.beats.size == 2) {
-          if (master == MasterId.T1P0) {
+          if (isType1(master)) {
             acks.enqueue(Ack(key, data.bits.DBID.peek().litValue, data.bits.SrcID.peek().litValue))
           } else {
             active.remove(key)

@@ -14,7 +14,7 @@ import scala.collection.mutable
 case class L2TopConcurrentPlan(name: String, slices: Int,
   batches: Seq[(Int, Seq[UpRequestSpec])], latency: Int = 80,
   bopParams: OceanusBOPParameters = OceanusBOPParameters(), watchdog: Int = 6000,
-  bopQueueEntries: Int = 16)
+  bopQueueEntries: Int = 16, type1Ports: Int = 1, bopEnable: Boolean = true)
 case class L2TopConcurrentTrace(
   accepts: Seq[(Int, UpRequestSpec)], trains: Seq[(Int, Int, BigInt)],
   received: Seq[(Int, BigInt)], enqueues: Seq[(Int, BigInt)], issues: Seq[(Int, Int, BigInt)],
@@ -29,8 +29,12 @@ case class L2TopConcurrentTrace(
 object L2TopConcurrentSimulation extends ChiselSim {
   def run(plan: L2TopConcurrentPlan)(verify: L2TopConcurrentTrace => Unit): Unit = {
     // Phase 1a: run the same oracle with optional ports absent or present and idle.
+    require(plan.type1Ports == 1 || plan.type1Ports == 2)
+    // NID 1 remains reserved for injected prefetches; the second Type-1 uses 2.
+    val upstreamTable = new L2UpstreamTable(L2UpstreamTable.defaults.entries ++
+      (if (plan.type1Ports == 2) Seq(L2UpstreamTableEntry(L2UpstreamPortType.Type1, 2)) else Seq.empty))
     val cfg = new L2Configuration(8, true, 0 until plan.slices,
-      bopEnable = true, bopParams = plan.bopParams, pfBopQueueEntries = plan.bopQueueEntries,
+      upstream = upstreamTable, bopEnable = plan.bopEnable, bopParams = plan.bopParams, pfBopQueueEntries = plan.bopQueueEntries,
       pfTlbEnable = L2TopPhase1aPorts.enabled, pfTrainEnable = L2TopPhase1aPorts.enabled)
     val params = new Config((_, _, _) => {
       case L2ParamsKey => L2Params(mshrSize = 8, ways = 4, sets = 128,
@@ -43,17 +47,22 @@ object L2TopConcurrentSimulation extends ChiselSim {
     })
     implicit val simulator: HasSimulator = HasSimulator.default
     val all = plan.batches.flatMap(_._2)
+    if (plan.type1Ports == 2) {
+      val coherent = all.filter(r => r.master == MasterId.T1P0 || r.master == MasterId.T1P1)
+      require(coherent.groupBy(_.addr >> 6).values.forall(_.map(_.master).distinct.size == 1),
+        "multi-Type-1 sources must use disjoint cache lines (L2UpstreamTable contract)")
+    }
     val spec = CaseSpec(plan.name, UpConfig(all.map(_.master).distinct,
       ExplicitRequestStream(all, Seq.fill(all.size)(BigInt(CHIFieldResp.CompData_SC))), SnoopPolicy.SnpRespI),
       DnConfig(FixedLatency(plan.latency), FixedOutstanding(64), ImmediateCreditPolicy()), plan.watchdog, (0, plan.watchdog), Seq.empty)
     simulate(new TestTop_L2Top(cfg)(params)) { dut =>
       val up = new L2TopUpstreamModel(dut, spec)
-      val driver = new L2TopConcurrentDriver(dut, up)
+      val driver = new L2TopConcurrentDriver(dut, up, plan.type1Ports)
       val dn = new L2TopDownstreamModel(dut, spec)
       val data = mutable.Queue.empty[PendingDnComp]
       val rsp = mutable.Queue.empty[PendingDnRsp]
       val dnLive = mutable.Set.empty[DnTxnID]
-      val snoops = mutable.Queue.empty[(SnpTxnID, BigInt)]
+      val snoops = mutable.Queue.empty[(Int, SnpTxnID, BigInt)]
       val trains = mutable.ArrayBuffer.empty[(Int, Int, BigInt)]
       val received = mutable.ArrayBuffer.empty[(Int, BigInt)]
       val enqueues = mutable.ArrayBuffer.empty[(Int, BigInt)]
@@ -115,13 +124,17 @@ object L2TopConcurrentSimulation extends ChiselSim {
         rsp.dequeueFirst(p => p.due <= cycle && dn.canDriveRxRsp).foreach { p =>
           dn.driveDnRsp(p); dn.noteResponse(p.dnTxnID, true, cycle); assert(dnLive.remove(p.dnTxnID))
         }
-        if (!dut.io.t1p(0).UpRSP.valid.peek().litToBoolean) {
-          snoops.headOption.foreach { case (id, src) => up.driveUpSnpResp(id, src) }
-          if (snoops.nonEmpty && dut.io.t1p(0).UpRSP.ready.peek().litToBoolean) snoops.dequeue()
-        }
-        if (dut.io.t1p(0).DnSNP.valid.peek().litToBoolean) {
-          snoops.enqueue((SnpTxnID(dut.io.t1p(0).DnSNP.bits.TxnID.peek().litValue),
-            dut.io.t1p(0).DnSNP.bits.SrcID.peek().litValue))
+        dut.io.t1p.zipWithIndex.foreach { case (port, idx) =>
+          if (!port.UpRSP.valid.peek().litToBoolean) {
+            snoops.find(_._1 == idx).foreach { case (_, id, src) =>
+              up.driveUpSnpResp(id, src, idx)
+              if (port.UpRSP.ready.peek().litToBoolean) snoops.dequeueFirst(_._1 == idx)
+            }
+          }
+          if (port.DnSNP.valid.peek().litToBoolean && port.DnSNP.ready.peek().litToBoolean) {
+            snoops.enqueue((idx, SnpTxnID(port.DnSNP.bits.TxnID.peek().litValue),
+              port.DnSNP.bits.SrcID.peek().litValue))
+          }
         }
         var activeTshrs = 0
         (0 until plan.slices).foreach { s =>

@@ -17,6 +17,19 @@ case class PendingUpAck(handle: Long, upDBID: UpDBID, upTxnID: UpTxnID, due: Int
 case class PendingSnpRsp(snpTxnID: SnpTxnID, tgtId: BigInt, due: Int)
 case class PendingSnpData(snpTxnID: SnpTxnID, tgtId: BigInt, due: Int, beat: Int, resp: BigInt)
 
+/** Test-side REQ legality, checked before asserting valid or queuing work. */
+object L2TopUpstreamLegality {
+  // CHIron cchi/spec/cchi_protocol_encoding.hpp:175-187 (Type4),
+  // pinned by test/CHIron at 6f2e59ce. ReadShared is not in this list.
+  private val type4Opcodes = Set[BigInt](CCHIOpcode.StashShared.opcode,
+    CCHIOpcode.StashUnique.opcode, CCHIOpcode.ReadNoSnp.opcode, CCHIOpcode.ReadOnce.opcode)
+  def check(req: UpRequestSpec): Unit = {
+    if (req.master == MasterId.T4P0 || req.master == MasterId.T4P1)
+      require(type4Opcodes.contains(req.opcode),
+        s"CCHI_TYPE4_OPCODE_VIOLATION master=${req.master.name} opcode=0x${req.opcode.toString(16)} addr=0x${req.addr.toString(16)} allowed=0x00,0x01,0x02,0x03")
+  }
+}
+
 class L2TopUpstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim {
   // Phase 1a optional ports have no upstream producer yet. Initialize their
   // inputs to deterministic idle values for both acceptance configurations.
@@ -34,17 +47,19 @@ class L2TopUpstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim {
       train.poke(0.U.asTypeOf(train))
       train.trainEnable.poke(true.B)
     })
-    dut.io.t1p(0).UpEVT.valid.poke(false.B)
-    dut.io.t1p(0).UpEVT.bits.poke(0.U.asTypeOf(dut.io.t1p(0).UpEVT.bits))
-    dut.io.t1p(0).UpREQ.valid.poke(false.B)
-    dut.io.t1p(0).UpREQ.bits.poke(0.U.asTypeOf(dut.io.t1p(0).UpREQ.bits))
-    dut.io.t1p(0).UpRSP.valid.poke(false.B)
-    dut.io.t1p(0).UpRSP.bits.poke(0.U.asTypeOf(dut.io.t1p(0).UpRSP.bits))
-    dut.io.t1p(0).UpDAT.valid.poke(false.B)
-    dut.io.t1p(0).UpDAT.bits.poke(0.U.asTypeOf(dut.io.t1p(0).UpDAT.bits))
-    dut.io.t1p(0).DnSNP.ready.poke(true.B)
-    dut.io.t1p(0).DnRSP.ready.poke(true.B)
-    dut.io.t1p(0).DnDAT.ready.poke(true.B)
+    dut.io.t1p.foreach { port =>
+      port.UpEVT.valid.poke(false.B)
+      port.UpEVT.bits.poke(0.U.asTypeOf(port.UpEVT.bits))
+      port.UpREQ.valid.poke(false.B)
+      port.UpREQ.bits.poke(0.U.asTypeOf(port.UpREQ.bits))
+      port.UpRSP.valid.poke(false.B)
+      port.UpRSP.bits.poke(0.U.asTypeOf(port.UpRSP.bits))
+      port.UpDAT.valid.poke(false.B)
+      port.UpDAT.bits.poke(0.U.asTypeOf(port.UpDAT.bits))
+      port.DnSNP.ready.poke(true.B)
+      port.DnRSP.ready.poke(true.B)
+      port.DnDAT.ready.poke(true.B)
+    }
 
     dut.io.t4p.zipWithIndex.foreach { case (port, _) =>
       port.UpREQ.valid.poke(false.B)
@@ -54,13 +69,15 @@ class L2TopUpstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim {
   }
 
   def clearUpReq(): Unit = {
-    dut.io.t1p(0).UpREQ.valid.poke(false.B)
+    dut.io.t1p.foreach(_.UpREQ.valid.poke(false.B))
     dut.io.t4p.foreach(_.UpREQ.valid.poke(false.B))
   }
 
   def clearResponses(): Unit = {
-    dut.io.t1p(0).UpRSP.valid.poke(false.B)
-    dut.io.t1p(0).UpDAT.valid.poke(false.B)
+    dut.io.t1p.foreach { port =>
+      port.UpRSP.valid.poke(false.B)
+      port.UpDAT.valid.poke(false.B)
+    }
   }
 
   def requestAddr(index: Int): BigInt = spec.up.stream.request(index).addr
@@ -72,8 +89,10 @@ class L2TopUpstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim {
 
   /** Drive one request on its owning port. TxnID belongs to that port. */
   def driveRead(req: UpRequestSpec): Unit = {
+    L2TopUpstreamLegality.check(req)
     val port = req.master match {
       case MasterId.T1P0 => dut.io.t1p(0).UpREQ
+      case MasterId.T1P1 => dut.io.t1p(1).UpREQ
       case MasterId.T4P0 => dut.io.t4p(0).UpREQ
       case MasterId.T4P1 => dut.io.t4p(1).UpREQ
     }
@@ -95,23 +114,24 @@ class L2TopUpstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim {
       dut.io.pfTrain.foreach(p => L2TopTrainStimulus.poke(p(0), req.addr, req.srcId, req.txnId))
   }
 
-  def driveUpCompAck(upDBID: UpDBID, sliceIdx: Int = 0): Unit = {
-    dut.io.t1p(0).UpRSP.valid.poke(true.B)
-    dut.io.t1p(0).UpRSP.bits.poke(0.U.asTypeOf(dut.io.t1p(0).UpRSP.bits))
-    dut.io.t1p(0).UpRSP.bits.TxnID.poke(upDBID.v.U)
-    dut.io.t1p(0).UpRSP.bits.SrcID.poke(0.U)
-    dut.io.t1p(0).UpRSP.bits.TgtID.poke(sliceIdx.U)
-    dut.io.t1p(0).UpRSP.bits.Opcode.poke(CCHIOpcode.CompAck.U)
+  def driveUpCompAck(upDBID: UpDBID, sliceIdx: Int = 0, portIdx: Int = 0): Unit = {
+    val port = dut.io.t1p(portIdx).UpRSP
+    port.valid.poke(true.B)
+    port.bits.poke(0.U.asTypeOf(port.bits))
+    port.bits.TxnID.poke(upDBID.v.U)
+    port.bits.SrcID.poke(dut.l2cfg.upstream.type1(portIdx).nid.U)
+    port.bits.TgtID.poke(sliceIdx.U)
+    port.bits.Opcode.poke(CCHIOpcode.CompAck.U)
   }
 
-  def driveUpSnpResp(snpTxnID: SnpTxnID, tgtId: BigInt = BigInt(0)): Unit = {
-    dut.io.t1p(0).UpRSP.valid.poke(true.B)
-    dut.io.t1p(0).UpRSP.bits.poke(0.U.asTypeOf(dut.io.t1p(0).UpRSP.bits))
-    dut.io.t1p(0).UpRSP.bits.TxnID.poke(snpTxnID.v.U)
-    dut.io.t1p(0).UpRSP.bits.SrcID.poke(0.U)
-    dut.io.t1p(0).UpRSP.bits.TgtID.poke(tgtId.U)
-    dut.io.t1p(0).UpRSP.bits.Opcode.poke(CCHIOpcode.SnpResp.U)
-    dut.io.t1p(0).UpRSP.bits.Resp.poke(CCHIResp.I.U)
+  def driveUpSnpResp(snpTxnID: SnpTxnID, tgtId: BigInt = BigInt(0), portIdx: Int = 0): Unit = {
+    dut.io.t1p(portIdx).UpRSP.valid.poke(true.B)
+    dut.io.t1p(portIdx).UpRSP.bits.poke(0.U.asTypeOf(dut.io.t1p(portIdx).UpRSP.bits))
+    dut.io.t1p(portIdx).UpRSP.bits.TxnID.poke(snpTxnID.v.U)
+    dut.io.t1p(portIdx).UpRSP.bits.SrcID.poke(dut.l2cfg.upstream.type1(portIdx).nid.U)
+    dut.io.t1p(portIdx).UpRSP.bits.TgtID.poke(tgtId.U)
+    dut.io.t1p(portIdx).UpRSP.bits.Opcode.poke(CCHIOpcode.SnpResp.U)
+    dut.io.t1p(portIdx).UpRSP.bits.Resp.poke(CCHIResp.I.U)
   }
 
   def driveUpSnpRespData(p: PendingSnpData): Unit = {

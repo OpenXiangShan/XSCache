@@ -20,9 +20,11 @@ import svsim.verilator.Backend.CompilationSettings.TraceStyle
 sealed trait MasterId { def name: String }
 object MasterId {
   case object T1P0 extends MasterId { val name = "t1p0" }
+  case object T1P1 extends MasterId { val name = "t1p1" }
   case object T4P0 extends MasterId { val name = "t4p0" }
   case object T4P1 extends MasterId { val name = "t4p1" }
   val t1p0: MasterId = T1P0
+  val t1p1: MasterId = T1P1
   val t4p0: MasterId = T4P0
   val t4p1: MasterId = T4P1
 }
