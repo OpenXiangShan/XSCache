@@ -558,6 +558,22 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
   if (p(L2CDPObserveEnableKey)) {
     val cdpContext = Reg(new L2CDPContext)
     val cdpStart = vPipeREQ.io.cdpStart
+    // A data-bearing demand queued BEFORE the CDP prefetch completes owns
+    // one merged refill (MainPipe:592-595/925-937, MSHR:829-840). Keep old
+    // directory metadata for training, but scan the merged default meta only
+    // when that waiting demand executes. Hold a CDP prefetch scan through
+    // protocol completion as a demand can still enter its RBE after RXDAT.
+    // A demand arriving after completion retains the ordinary hit mapping.
+    val cdpMergedWait = RegInit(false.B)
+    val cdpMergeEnter = tshr_enter_REQ && io.fromAlloc.reuse.REQ &&
+      io.UpRXREQ.SrcID =/= io.consts.pfSrcID && io.UpRXREQ.ExpCompData &&
+      (io.UpRXREQ.Opcode === ReadShared.U || io.UpRXREQ.Opcode === ReadUnique.U) &&
+      vPipeREQ.io.bopPerf.activePrefetch && cdpPending &&
+      !cdpContext.isHit && cdpContext.pfSource === L2PfSource.CDP.U
+    val cdpMergeWaiting = cdpMergedWait || cdpMergeEnter
+    val cdpMergedStart = cdpMergedWait && cdpStart.valid && cdpStart.bits.isHit
+    when(tshr_dealloc || vPipeREQ.io.UpRXREQ.valid) { cdpMergedWait := false.B }
+    when(cdpMergeEnter) { cdpMergedWait := true.B }
     val cdpCurrent = Mux(cdpStart.valid, cdpStart.bits, cdpContext)
     val cdpHasContext = cdpStart.valid || (cdpPending && !vPipeREQ.io.UpRXREQ.valid)
     // DS rd_done also asserts when the FIRST RXDAT cancels a pending read: it
@@ -567,14 +583,23 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
     val cdpRxData = tshr_buffer_wen_RXDAT_0 || tshr_buffer_wen_RXDAT_2
     when(cdpRxData || tshr_dealloc) { cdpBufferValid := false.B }
     when(tshr_buffer_wen_last || tshr_buffer_wen_DS) { cdpBufferValid := true.B }
+    val cdpPrefetchScan = !cdpCurrent.isHit && cdpCurrent.pfSource === L2PfSource.CDP.U
     val cdpFull = tshr_buffer_wen_last || tshr_buffer_wen_DS ||
-      (cdpCurrent.isHit && cdpBufferValid && !cdpRxData)
-    io.cdpData.valid := cdpHasContext && cdpFull && !tshr_dealloc
+      ((cdpCurrent.isHit || cdpPrefetchScan) && cdpBufferValid && !cdpRxData)
+    // Include a same-edge RBE acceptance in suppression. Buffered data can
+    // still satisfy the later hit execution even though its scan is a refill.
+    // A deferred prefetch may become idle on the deallocation edge itself.
+    // Its complete buffer/context are still valid before that edge; capture
+    // the final event then, without extending the TSHR lifetime.
+    val cdpRetiringScan = cdpPrefetchScan && cdpBufferValid && cdpPending
+    io.cdpData.valid := cdpHasContext && cdpFull && (!tshr_dealloc || cdpRetiringScan) &&
+      (!cdpMergeWaiting || cdpMergedStart) &&
+      !(cdpPrefetchScan && vPipeREQ.io.bopPerf.activePrefetch)
     io.cdpData.bits.paddr := cdpCurrent.paddr
-    io.cdpData.bits.pfSource := cdpCurrent.pfSource
-    io.cdpData.bits.pfDepth := cdpCurrent.pfDepth
-    io.cdpData.bits.isHit := cdpCurrent.isHit
-    io.cdpData.bits.eventType := cdpCurrent.eventType
+    io.cdpData.bits.pfSource := Mux(cdpMergedStart, L2PfSource.NoWhere.U, cdpCurrent.pfSource)
+    io.cdpData.bits.pfDepth := Mux(cdpMergedStart, 0.U, cdpCurrent.pfDepth)
+    io.cdpData.bits.isHit := cdpCurrent.isHit && !cdpMergedStart
+    io.cdpData.bits.eventType := Mux(cdpMergedStart, L2CDPEvent.Refill.U, cdpCurrent.eventType)
     // The buffer registers change AFTER this edge. Match their write priority
     // (downstream over upstream over DS) when forwarding the completing beat.
     val cdpLow = Mux(tshr_buffer_wen_DnRXDAT_0, io.DnRXDAT.bits.Data.get,
@@ -585,7 +610,16 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
         Mux(tshr_buffer_wen_DS, io.fromDS.DATA(511, 256), tshr_buffer_2)))
     io.cdpData.bits.data := Cat(cdpHigh, cdpLow)
     when(vPipeREQ.io.UpRXREQ.valid || tshr_dealloc) { cdpPending := false.B }
-    when(cdpStart.valid) { cdpContext := cdpStart.bits; cdpPending := true.B }
+    when(cdpStart.valid) {
+      cdpContext := cdpStart.bits
+      when(cdpMergedStart) {
+        cdpContext.pfSource := L2PfSource.NoWhere.U
+        cdpContext.pfDepth := 0.U
+        cdpContext.isHit := false.B
+        cdpContext.eventType := L2CDPEvent.Refill.U
+      }
+      cdpPending := true.B
+    }
     when(io.cdpData.valid) { cdpPending := false.B }
   } else {
     io.cdpData.valid := false.B
