@@ -151,9 +151,10 @@ class StressTopEvents(cfg: L2Configuration)(implicit p: Parameters) extends Stre
   probe.fastAllocate.valid := read(vf.accepted) && read(vf.io.in.bits.translated)
   probe.fastAllocate.bits := Cat(read(vf.io.in.bits.va),read(vf.io.in.bits.pa))
   probe.fastTranslatedAtTlb := read(vf.io.tlb.req.valid) && read(vf.entries)(read(vf.selected)).translated
-  Seq(module.vbopStub.get.io.req,module.cdpStub.get.io.req).zipWithIndex.foreach { case(r,i)=>
-    probe.algorithm(i).valid := read(r.valid) && read(r.ready)
-    probe.algorithm(i).bits := read(r.bits.paddr)
+  Seq((read(module.vbopStub.get.io.req.valid) && read(module.vbopStub.get.io.req.ready), read(module.vbopStub.get.io.req.bits.paddr)),
+    (read(module.cdp.get.io.req.valid) && read(module.cdp.get.io.req.ready), read(module.cdp.get.io.req.bits.paddr))).zipWithIndex.foreach { case((fire,pa),i)=>
+    probe.algorithm(i).valid := read(fire)
+    probe.algorithm(i).bits := read(pa)
   }
   def bank(pa: UInt): UInt = cfg.sliceNum match {
     case 1 => 0.U
@@ -163,7 +164,7 @@ class StressTopEvents(cfg: L2Configuration)(implicit p: Parameters) extends Stre
   for(s <- 0 until cfg.sliceNum) {
     val v = module.vbopStub.get.io.req
     val b = module.bop.io.req
-    val c = module.cdpStub.get.io.req
+    val c = module.cdp.get.io.req
     probe.produced(s) := Cat(
       read(c.valid) && read(c.ready) && bank(read(c.bits.paddr))===s.U,
       read(b.valid) && read(module.bopControlEnable) && bank(read(b.bits))===s.U,

@@ -54,6 +54,7 @@ class TestTopStress(cfg: L2Configuration)(implicit p: Parameters) extends Stress
         val h=read(q.head); val t=read(q.tail)
         obs.occupancy := Mux(read(q.full),cap.U,(t-h)(h.getWidth-1,0))
         fifos += ((path,cap,obs)); add(path+".count",obs.occupancy,cap)
+      case q: OceanusCDPQueue[_] => add(path+".count",q.io.count,8)
       case q: L2CDPHalfQueue => add(path+".count",q.io.occupancy,8)
       case _ =>
     }
@@ -79,7 +80,28 @@ class TestTopStress(cfg: L2Configuration)(implicit p: Parameters) extends Stress
   }
   add("pbop.delay",PopCount(read(field[Vec[Bool]](field[AnyRef](module.bop,"delayQueue"),"valid"))),16)
   add("pbop.output",module.bop.io.req.valid)
-  add("cdp.waiting",module.cdpStub.get.waiting)
+  val cdp=module.cdp.get;val send=cdp.sentUnit.get
+  add("cdp.entries",PopCount(read(send.valids)),16)
+  add("cdp.tlbHeld",send.tlbHeld);add("cdp.query1",send.pftS1);add("cdp.query2",send.pftS2)
+  add("cdp.vtPipe",PopCount(read(cdp.vtTrainPipe.stage_valid)),5)
+  cdp.filterTraining.foreach(f=>Seq(f.pipe.s0_valid,f.pipe.s1_valid,f.pipe.s2_valid,f.pipe.s3_valid).zipWithIndex.foreach{case(v,i)=>add("cdp.filterPipe"+i,v)})
+  cdp.detectFrontend.lanes.zipWithIndex.foreach {case(l,i)=>Seq(l.s1_req,l.s2_req,l.s3_req).zipWithIndex.foreach{case(v,j)=>add("cdp.detect"+i+"stage"+j,v.valid)}}
+  val cdpCounters=mutable.ArrayBuffer.empty[(String,UInt)]
+  def cc(name:String,n:UInt):Unit={val x=RegInit(0.U(64.W));x:=x+read(n);cdpCounters+=name->x}
+  cc("emitted",(read(cdp.io.req.valid)&&read(cdp.io.req.ready)).asUInt)
+  cc("candidate",read(send.io.in.valid).asUInt);cc("allocated",send.allocate.asUInt)
+  cc("duplicate",send.duplicate.asUInt);cc("fullDrop",send.fullDrop.asUInt)
+  cc("filterDrop",send.filterDrop.asUInt);cc("translationDrop",PopCount(read(send.translationDrop)))
+  cc("halfAccepted",PopCount(read(cdp.detectFrontend.admitted)))
+  cc("halfRejected",read(cdp.detectFrontend.dropped).reduce(_+&_))
+  cc("degreeDrop",VecInit(cdp.detectFrontend.degreeQueues.map(q=>Mux(read(q.io.enq.head.valid),3.U-PopCount(read(q.accepted)),0.U))).reduce(_+&_))
+  cc("vpnTrainDrop",(read(cdp.vpnTrainReqBuf.io.enq.valid)&& !read(cdp.vpnTrainReqBuf.io.enq.ready)).asUInt)
+  cdp.filterTraining.foreach(f=>cc("filterTrainDrop",(read(f.queue.io.enq.valid)&& !read(f.queue.io.enq.ready)).asUInt))
+  val cdpEntryProbe=IO(Output(Vec(16,UInt(88.W))))
+  for(i<-0 until 16) cdpEntryProbe(i):=Cat(read(send.valids)(i),read(send.entries)(i).paddrValid,read(send.entries)(i).vTag,read(send.entries)(i).pTag)
+  val cdpSendEvents=IO(Output(UInt(128.W)))
+  cdpSendEvents:=Cat(read(send.allocate),read(send.freeEntryIdx),read(send.io.in.bits.pfVAddr),read(send.filterDrop),read(send.idx2),read(send.io.out.valid)&&read(send.io.out.ready),read(send.output.io.deq.bits.index),read(send.translationDrop).asUInt)
+  val cdpCountPacked=IO(Output(UInt((64*cdpCounters.size).W)));cdpCountPacked:=Cat(cdpCounters.reverse.map(_._2).toSeq)
   module.slices.zipWithIndex.foreach { case(s,bank)=>
     add(s"slice$bank.active",PopCount(s.tshrs.map(t=>read(t.tshr_valid))),nMSHR)
     s.tshrs.zipWithIndex.foreach { case(t,i)=>add(s"slice$bank.tshr$i.cdpPending",t.cdpPending) }
@@ -431,6 +453,7 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
     case class Translation(client: Int,va: BigInt,due: Int,miss: Boolean,fault: Boolean,attempt: Int)
     val transactions=mutable.Map.empty[(Int,BigInt),Int]
     val terminals=mutable.Map.empty[(Int,BigInt),Translation]
+    val cdpExpected=mutable.Map.empty[Int,(BigInt,Option[BigInt])]
     val allowed=Seq.fill(2)(mutable.Map.empty[BigInt,Int].withDefaultValue(0))
     var modelRetries=0; var modelDrops=0; var modelDone=0
     var actualRetries=0; var actualDrops=0; var actualDone=0
@@ -629,8 +652,13 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
           terminals((t.client,t.va))=t
           modelDone+=1
           if(t.miss || t.fault) modelDrops+=1
-          else allowed(t.client)(physical(t.va))+=1
+          else if(t.client==0) allowed(0)(physical(t.va))+=1
         } else modelRetries+=1
+      }
+      for(i<-0 until 16) {
+        val e=value(dut.cdpEntryProbe(i));val valid=e.testBit(87);val pvalid=e.testBit(86)
+        assert(valid==cdpExpected.contains(i),s"CDP slot identity cycle=$cycle index=$i")
+        if(valid) {val(va,pa)=cdpExpected(i);assert(((e>>42)&((BigInt(1)<<44)-1))==(va>>6),"CDP VA identity");assert(pvalid==pa.nonEmpty,"CDP translated flag");pa.foreach(p=>assert((e&((BigInt(1)<<42)-1))==(p>>6),"CDP PA mapping"))}
       }
       // Compare adapter retirements to an independent request/response model.
       for(c <- 0 until 2) {
@@ -641,6 +669,10 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
           val retried=transactions.remove(key).get==2
           assert(flag(r.bits.retried)==retried && flag(r.bits.miss)==t.miss && flag(r.bits.fault)==(!t.miss && t.fault))
           assert(flag(r.bits.dropped)==(t.miss || t.fault) && value(r.bits.paddr)==physical(va),s"translation result mismatch $key")
+          if(c==1) for((i,(line,pa))<-cdpExpected.toSeq if pa.isEmpty && (line>>12)==(va>>12)) {
+            if(flag(r.bits.dropped)) cdpExpected.remove(i)
+            else cdpExpected(i)=(line,Some(physical(line)))
+          }
           actualDone+=1; if(retried) actualRetries+=1
           if(flag(r.bits.dropped)) actualDrops+=1
         }
@@ -673,12 +705,17 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
         replies.enqueue(Translation(c,va,cycle+tlbMin+random.nextInt(tlbMax-tlbMin+1),miss,fault,attempt))
         translations+=1
       }
+      val sev=value(dut.cdpSendEvents)
+      val outIndex=((sev>>16)&15).toInt;val outFire=sev.testBit(20);val filterIndex=((sev>>21)&15).toInt;val filterDrop=sev.testBit(25)
+      val allocatedVA=(sev>>26)&((BigInt(1)<<50)-1);val allocatedIndex=((sev>>76)&15).toInt;val allocated=sev.testBit(80)
+      if(outFire) {val e=cdpExpected.remove(outIndex).getOrElse(throw new AssertionError("CDP output without live slot"));assert(e._2.contains(value(dut.probe.algorithm(1).bits)),"CDP output without matching successful page translation")}
+      if(filterDrop) {val e=cdpExpected.remove(filterIndex).getOrElse(throw new AssertionError("CDP filter drop missing slot"));assert(e._2.nonEmpty,"CDP filter before translation")}
+      if(allocated) {assert(!cdpExpected.contains(allocatedIndex));cdpExpected(allocatedIndex)=(allocatedVA,None)}
       for(c <- 0 until 2) {
         val a=dut.probe.algorithm(c)
         if(flag(a.valid)) {
           val pa=value(a.bits)
-          assert(allowed(c)(pa)>0,s"algorithm issued without successful translation/fast path client=$c PA=$pa")
-          allowed(c)(pa)-=1
+          if(c==0) {assert(allowed(c)(pa)>0,s"algorithm issued without successful translation/fast path client=$c PA=$pa");allowed(c)(pa)-=1}
           if(fast && c==0) fastEmits+=1
         }
       }
@@ -882,8 +919,8 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
       val active= !flag(dut.stateEmpty)
       val pendingQueues=(0 until slices).flatMap(s=>(0 to 9).map(src=>count(dut.observation.prefetchPendingBySource,s,src))).sum
       val idle= !stimulus && driver.pending==0 && data.isEmpty && rsp.isEmpty && live.isEmpty && snoops.isEmpty && replies.isEmpty && pendingQueues==0 && !active
-      val fullyIdle=idle && transactions.isEmpty && terminals.isEmpty &&
-        allowed.forall(_.values.forall(_==0)) && flag(dut.stateEmpty) && snpLive.isEmpty && retryLive.isEmpty && firstBeatSent.isEmpty && offeredSnoops.isEmpty && hnOrdering.empty
+      val fullyIdle=idle && transactions.isEmpty && terminals.isEmpty && cdpExpected.isEmpty &&
+        allowed(0).values.forall(_==0) && flag(dut.stateEmpty) && snpLive.isEmpty && retryLive.isEmpty && firstBeatSent.isEmpty && offeredSnoops.isEmpty && hnOrdering.empty
       quiet=if(fullyIdle) quiet+1 else 0
       withholding=stimulus && ((creditHold>0 && cycle%(creditHold+64)<creditHold) || random.nextInt(100)<creditRandom)
       dn.withholdRequestCredit=withholding
@@ -893,10 +930,17 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
       }
       cycle+=1
     }
+    val cpacked=value(dut.cdpCountPacked)
+    val ccvals=dut.cdpCounters.indices.map(i=>dut.cdpCounters(i)._1->((cpacked>>(64*i))&((BigInt(1)<<64)-1))).toMap
+    assert(ccvals("candidate")==ccvals("allocated")+ccvals("duplicate")+ccvals("fullDrop"),"CDP candidate closure")
+    assert(ccvals("allocated")==ccvals("emitted")+ccvals("filterDrop")+ccvals("translationDrop"),"CDP allocated/terminal closure")
+    assert(ccvals("emitted")==produced.map(_(9)).sum,"CDP output/source closure")
+    println(s"STRESS_CDP caseId=$caseId seed=$seed " + ccvals.toSeq.sortBy(_._1).map{case(k,v)=>s"$k=$v"}.mkString(" "))
     if(qualityEnabled) qualityModel.report(cycle,true)
     check()
-    assert(allowed.forall(_.values.forall(_==0)),"successful translation/fast allocation did not emit exactly once")
-    assert(transactions.isEmpty && terminals.isEmpty && modelDone==actualDone && modelDrops==actualDrops && modelRetries==actualRetries,
+    assert(cdpExpected.isEmpty,"CDP slots not retired")
+    assert(allowed(0).values.forall(_==0),"successful translation/fast allocation did not emit exactly once")
+    assert(transactions.isEmpty && terminals.isEmpty && cdpExpected.isEmpty && modelDone==actualDone && modelDrops==actualDrops && modelRetries==actualRetries,
       s"TLB ledger done=$modelDone/$actualDone retries=$modelRetries/$actualRetries drops=$modelDrops/$actualDrops live=$transactions terminals=$terminals")
     println(s"STRESS_TLB caseId=$caseId servicePeak=$servicePeak serviceCycles=$serviceCycles pass=true slices=$slices seed=$seed harsh=$harsh requests=$translations injectedMisses=$injectedMisses injectedFaults=$injectedFaults modelRetries=$modelRetries actualRetries=$actualRetries modelDrops=$modelDrops actualDrops=$actualDrops completed=$actualDone fast=$fast fastAllocations=$fastAllocations vbopEmits=$fastEmits")
 
