@@ -96,6 +96,17 @@ class TestTopCDPC5(cfg: L2Configuration)(implicit p: Parameters) extends TestTop
   }
   add("vpnCollisions", module.cdpEvents.get.vpnCollisions)
   add("filterCollisions", module.cdpEvents.get.filterCollisions)
+  // H2 lifecycle observations; no production or reference algorithm changes.
+  add("h2.index", s.freeEntryIdx)
+  add("h2.valid", read(s.valids).asUInt)
+  add("h2.pa", VecInit(entries.map(_.paddrValid)).asUInt)
+  add("h2.inflight", read(s.reqInflight).asUInt)
+  add("h2.eligible", VecInit((0 until 16).map(i => read(s.pftArb.io.in(i).valid))).asUInt)
+  event("h2.query", fire(s.io.ftQueryReq), "index" -> s.pftArb.io.chosen,
+    "va" -> Cat(entries(read(s.pftArb.io.chosen)).vTag, 0.U(6.W)),
+    "pa" -> read(s.pftArb.io.out.bits).paddr)
+  event("h2.query2", s.pftS2, "index" -> s.idx2, "canPft" -> s.canPft)
+  add("h2.queue", s.output.io.count)
   add("resident", PopCount(read(s.valids)))
   add("candidatePending", c.c4Input.valid)
   val boundary = IO(Output(UInt(fields.map(_._2.getWidth).sum.W)))
@@ -107,6 +118,7 @@ object TestTop_OceanusCDPC5 extends App with ChiselSim {
   Constantin.init(false)
   def opt(n: String, default: Int): Int = args.find(_.startsWith(n + "=")).map(_.split("=", 2)(1).toInt).getOrElse(default)
   val seeds = opt("--seeds", 3); val slices = opt("--slices", 1)
+  val overlap = args.contains("--overlap")
   val cfg = new L2Configuration(8, true, 0 until slices, bopEnable = false,
     pfRecvEnable = true, pfCtrlEnable = true, pfTrainEnable = true, pfTlbEnable = true,
     vbopStubEnable = true, cdpStubEnable = true,
@@ -301,7 +313,10 @@ object TestTop_OceanusCDPC5 extends App with ChiselSim {
     // VBOP refills can start new detections while D1 sends are draining, whose
     // different fixed/variable latency changes duplicate residency (not just
     // output order). Pointer detection below still competes for shared slots.
-    for(i <- 0 until 12) { request(BigInt(0xb0000 + i * 64), BigInt(0x280040 + i * 4096)); run(120) }
+    // The independent overlap entry retains the original legal pointer-bearing
+    // VBOP workload; the default case continues to isolate shared TLB contention.
+    val contentionVA = if(overlap) 0x200040 else 0x280040
+    for(i <- 0 until 12) { request(BigInt(0xb0000 + i * 64), BigInt(contentionVA + i * 4096)); run(120) }
     request(BigInt(0x40000 + seeds * 64), BigInt(0x200000 + seeds * 64)); run(155)
     gate = true; drain(); controls()
     assert(contention > 0, "shared TLB slot contention was empty")
@@ -314,4 +329,9 @@ object TestTop_OceanusCDPC5 extends App with ChiselSim {
     trace.close()
     println(s"CDP_C5_SYSTEM_RESULT pass=true seeds=$seeds slices=$slices cycles=$cycle demands=$txn checkedBeats=$beats candidates=$allCandidates discarded=$allDrops outputs=${emitted.size} admitted=${admitted.size} useful=$hits unused=$unused tlbContention=$contention csrOff=0 trace=$tracePath")
   }
+}
+
+// Permanent H2 workload: preserve the original overlapping detection/send case.
+object TestTop_OceanusCDPC5Overlap {
+  def main(args: Array[String]): Unit = TestTop_OceanusCDPC5.main(args :+ "--overlap")
 }

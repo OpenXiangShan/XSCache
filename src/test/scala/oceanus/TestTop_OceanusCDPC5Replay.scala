@@ -56,6 +56,19 @@ class CDPC5ReplayReference(implicit p: Parameters) extends ref.ReferenceCDP {
   }
   event("filterDrop", read(s.pft_s2_valid) && !read(s.canPft), "va" -> Cat(entries(read(s.pft_s2_chosen_idx)).vTag, 0.U(6.W)), "depth" -> read(s.pft_s2_req).cdpPfDepth.get)
   event("out", io.pftReq.fire, "pa" -> io.pftReq.bits.addr, "depth" -> io.pftReq.bits.cdpPfDepth.get)
+  // Named H2 observations leave the verbatim ReferenceCDP body untouched.
+  add("h2.index", read(s.freeEntryIdx))
+  add("h2.valid", read(s.valids).asUInt)
+  add("h2.pa", VecInit(entries.map(_.paddrValid)).asUInt)
+  add("h2.inflight", read(s.reqInflight).asUInt)
+  add("h2.eligible", VecInit((0 until 16).map(i => read(s.pftArb.io.in(i).valid))).asUInt)
+  event("h2.query", s.io.ftQueryReq.fire, "index" -> read(s.pftArb.io.chosen),
+    "va" -> Cat(entries(read(s.pftArb.io.chosen)).vTag, 0.U(6.W)),
+    "pa" -> read(s.pftArb.io.out.bits).addr)
+  event("h2.query2", read(s.pft_s2_valid), "index" -> read(s.pft_s2_chosen_idx), "canPft" -> read(s.canPft))
+  event("h2.tlb", s.io.tlbReq.req.fire, "va" -> s.io.tlbReq.req.bits.vaddr)
+  event("h2.terminal", read(s.tlb_s3_valid) && read(s.tlb_s3_rsp_valid) && !read(s.tlb_s3_rsp_bits).miss,
+    "va" -> read(s.tlb_s3_addr))
   add("vpnAccepted", vpnTrainReqBuf.io.enq.fire)
   add("vpnDropped", vpnTrainReqBuf.io.enq.valid && !vpnTrainReqBuf.io.enq.ready)
   val observationBits = IO(Output(UInt(fields.map(_._2.getWidth).sum.W)))
@@ -66,6 +79,9 @@ class CDPC5ReplayReference(implicit p: Parameters) extends ref.ReferenceCDP {
 object TestTop_OceanusCDPC5Replay extends App with ChiselSim {
   Constantin.init(false)
   val path = Paths.get(args.head)
+  val diagnostic = args.contains("--h2-diagnostic")
+  val differences = mutable.ArrayBuffer.empty[ujson.Value]
+  val lifecycle = mutable.ArrayBuffer.empty[ujson.Value]
   val input = Source.fromInputStream(new GZIPInputStream(Files.newInputStream(path)))
   val lines = input.getLines()
   val header = ujson.read(lines.next())
@@ -167,8 +183,14 @@ object TestTop_OceanusCDPC5Replay extends App with ChiselSim {
       val output = decode(dut.observationBits.peek().litValue)
       // The detection/training boundaries retain exact cycle identity. D1 is
       // limited to translated outputs/drops, compared as complete epoch bags.
-      for(k <- Seq("candidate", "allocated", "duplicate", "full", "vpnAccepted", "vpnDropped"))
-        assert(output(k) == r(k), s"cycle=${row.cycle} epoch=$e $k DUT=${r(k)} reference=${output(k)}")
+      for(k <- Seq("candidate", "allocated", "duplicate", "full", "vpnAccepted", "vpnDropped")) {
+        if(diagnostic && output(k) != r(k)) differences += ujson.Obj("cycle"->row.cycle,"epoch"->e,
+          "field"->k,"dut"->r(k).toInt,"reference"->output(k).toInt)
+        else assert(output(k) == r(k), s"cycle=${row.cycle} epoch=$e $k DUT=${r(k)} reference=${output(k)}")
+      }
+      if(diagnostic && e == header("seeds").num.toInt+1) lifecycle += ujson.Obj("cycle"->row.cycle,
+        "dut"->ujson.Obj.from(r.map {case(k,v)=>k->ujson.Str(v.toString(16))}),
+        "reference"->ujson.Obj.from(output.map {case(k,v)=>k->ujson.Str(v.toString(16))}))
       if(r("candidate") != 0) for(k <- Seq("candidate.va", "candidate.depth"))
         assert(output(k) == r(k), s"cycle=${row.cycle} epoch=$e $k")
       outcomes(output, list(actual, e)); admission(output, list(referenceAccepted, e))
@@ -177,12 +199,27 @@ object TestTop_OceanusCDPC5Replay extends App with ChiselSim {
     var orderDifferences = 0
     for(e <- expected.keys.toVector.sorted) {
       val d = list(expected, e).toVector; val r = list(actual, e).toVector
-      assert(d.sorted == r.sorted, s"epoch=$e full output/drop multiset mismatch DUT=$d reference=$r")
-      assert(list(accepted, e) == list(referenceAccepted, e), s"epoch=$e accepted identities differ")
+      if(!diagnostic) {
+        assert(d.sorted == r.sorted, s"epoch=$e full output/drop multiset mismatch DUT=$d reference=$r")
+        assert(list(accepted, e) == list(referenceAccepted, e), s"epoch=$e accepted identities differ")
+      }
       if(d != r) orderDifferences += 1
     }
     val outputCount = expected.values.flatten.count(_.startsWith("out:"))
     assert(outputCount > 0 && requestCount > 0)
-    println(s"CDP_C5_REPLAY_RESULT pass=true seeds=${header("seeds").num.toInt} slices=${header("slices").num.toInt} cycles=${rows.size} outputs=$outputCount outcomes=${expected.values.map(_.size).sum} epochs=${expected.size} d1OrderDifferences=$orderDifferences missing=0 extra=0 referenceBody=unmodified trace=$path")
+    if(diagnostic) {
+      require(differences.nonEmpty,"H2 diagnostic did not preserve the admission counterexample")
+      Files.writeString(path.resolveSibling("h2-lifecycle.json"),ujson.Obj("head"->header("head"),
+        "diagnosticOnly"->true,"strictComparatorPassed"->false,
+        "differences"->ujson.Arr.from(differences),"lifecycle"->ujson.Arr.from(lifecycle),
+        "dutOutcomes"->ujson.Obj.from(expected.map {case(e,v)=>e.toString->ujson.Arr.from(v)}),
+        "referenceOutcomes"->ujson.Obj.from(actual.map {case(e,v)=>e.toString->ujson.Arr.from(v)})).render())
+      println(s"CDP_H2_DIAGNOSTIC recorded=true strictComparatorPassed=false differences=${differences.size} first=${differences.head}")
+    } else println(s"CDP_C5_REPLAY_RESULT pass=true seeds=${header("seeds").num.toInt} slices=${header("slices").num.toInt} cycles=${rows.size} outputs=$outputCount outcomes=${expected.values.map(_.size).sum} epochs=${expected.size} d1OrderDifferences=$orderDifferences missing=0 extra=0 referenceBody=unmodified trace=$path")
   }
+}
+
+// Separate diagnostic entry; the normal C5 comparator retains all assertions.
+object TestTop_OceanusCDPH2Replay {
+  def main(args: Array[String]): Unit = TestTop_OceanusCDPC5Replay.main(args :+ "--h2-diagnostic")
 }
