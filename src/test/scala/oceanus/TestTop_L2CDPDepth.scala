@@ -132,6 +132,10 @@ object TestTop_L2CDPDepth extends App with ChiselSim {
     ctrl.l2_pf_delay_latency.poke(0.U)
     dut.reset.poke(true.B); dut.clock.step(8); dut.reset.poke(false.B); dn.activateRxLink()
     for (warmup <- -300 until 0) dn.stepWithCredits(warmup)
+    // Preserve actual same-edge data forwarding coverage independently of
+    // CDP prefetch scans, which now wait for possible RBE merge completion.
+    request(BigInt(0x3c080))
+    assert(cdp.forwarded == 1)
     for (depth <- 0 until 4) {
       val addr = BigInt(0x20040 + depth * 0x100)
       prefetch(addr, depth)
@@ -161,7 +165,7 @@ object TestTop_L2CDPDepth extends App with ChiselSim {
         s"victim PA/old Meta mismatch: $addr $source $depth")
     }
     cdp.report()
-    assert(cdp.forwarded >= 15 && cdp.hits >= 5 && checkedBeats == 18 && cdp.disabled >= 4)
+    assert(cdp.forwarded >= 1 && cdp.hits >= 4 && cdp.mergedScans == 1 && checkedBeats == 20 && cdp.disabled >= 4)
     println(s"CDP_DEPTH_RESULT pass=true depths=0,1,2,3 lateRBE=true ordinaryDisabledHits=4 victims=${victims.size} checkedBeats=$checkedBeats")
   }
 }

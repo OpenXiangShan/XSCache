@@ -18,6 +18,16 @@ class L2CDPProbe(implicit p: Parameters) extends Bundle {
   val train = Valid(new L2CDPTrain)
   val evict = Valid(new L2CDPEvict)
   val complete = Bool()
+  val dataStart = Bool()
+  val deallocate = Bool()
+  val prefetchActive = Bool()
+  val prefetchSource = UInt(4.W)
+  val enterREQ = Bool()
+  val reuseREQ = Bool()
+  val incomingSource = UInt(16.W)
+  val prefetchSourceID = UInt(16.W)
+  val incomingOpcode = UInt(8.W)
+  val incomingData = Bool()
   val ds = Bool()
   val execute = Bool()
   val addr = UInt(48.W)
@@ -60,6 +70,16 @@ object L2TopCDPObservation {
         probe.train := read(req.io.cdpTrain)
         probe.evict := read(req.io.cdpEvict)
         probe.complete := read(tshr.tshr_buffer_wen_last)
+        probe.dataStart := read(tshr.tshr_buffer_wen_RXDAT_0) || read(tshr.tshr_buffer_wen_RXDAT_2)
+        probe.deallocate := read(tshr.tshr_dealloc)
+        probe.prefetchActive := read(req.io.bopPerf.activePrefetch)
+        probe.prefetchSource := read(req.io.bopPerf.activePrefetchSource)
+        probe.enterREQ := read(tshr.tshr_enter_REQ)
+        probe.reuseREQ := read(tshr.io.fromAlloc.reuse.REQ)
+        probe.incomingSource := read(tshr.io.UpRXREQ.SrcID)
+        probe.prefetchSourceID := read(tshr.io.consts.pfSrcID)
+        probe.incomingOpcode := read(tshr.io.UpRXREQ.Opcode)
+        probe.incomingData := read(tshr.io.UpRXREQ.ExpCompData)
         probe.ds := read(tshr.tshr_buffer_wen_DS)
         probe.execute := read(req.io.UpRXREQ.valid)
         probe.addr := read(req.io.tshr_paddr)
@@ -92,12 +112,17 @@ class L2TopCDPChecker(dut: TestTop_L2Top) extends ChiselSim {
   var forwarded = 0
   var hits = 0
   var simultaneous = 0
+  var mergedScans = 0
+  var deferredRefills = 0
   var consumes = 0
   val writes = mutable.ArrayBuffer.empty[(BigInt, BigInt, BigInt)]
   val reads = mutable.ArrayBuffer.empty[(BigInt, BigInt, BigInt)]
   val evictions = mutable.ArrayBuffer.empty[(BigInt, BigInt, BigInt)]
   val trains = mutable.ArrayBuffer.empty[(BigInt, BigInt, BigInt, Boolean)]
   private val pending = mutable.Map.empty[(Int, Int), (BigInt, BigInt, BigInt, Boolean)]
+  private val dataReady = mutable.Set.empty[(Int, Int)]
+  private val waitingMerge = mutable.Set.empty[(Int, Int)]
+  private val mergedPending = mutable.Set.empty[(Int, Int)]
   private def flag(signal: Bool): Boolean = signal.peek().litToBoolean
   private def value(signal: UInt): BigInt = signal.peek().litValue
   def sample(): Unit = dut.cdpObservation.foreach { obs =>
@@ -123,13 +148,38 @@ class L2TopCDPChecker(dut: TestTop_L2Top) extends ChiselSim {
       val emitted = mutable.ArrayBuffer.empty[Seq[Half]]
       probes.zipWithIndex.foreach { case (probe, entry) =>
         val key = (bank, entry)
+        // Derive the merge from raw allocator acceptance and the active
+        // prefetch identity, never from the RTL's merged flag/output metadata.
+        val incomingRead = Set(oceanus.compactchi.CCHIOpcode.ReadShared.opcode,
+          oceanus.compactchi.CCHIOpcode.ReadUnique.opcode).contains(value(probe.incomingOpcode).toInt)
+        if(flag(probe.enterREQ) && flag(probe.reuseREQ) && flag(probe.prefetchActive) &&
+          value(probe.prefetchSource) == 9 && value(probe.incomingSource) != value(probe.prefetchSourceID) &&
+          incomingRead && flag(probe.incomingData)) {
+          assert(pending.get(key).exists(c => c._2 == 9 && !c._4), "late demand has no pending CDP refill")
+          waitingMerge += key
+        }
         if (flag(probe.execute)) pending.remove(key)
         if (flag(probe.start.valid)) {
           val start = probe.start.bits
-          pending(key) = (value(start.paddr), value(start.pfSource), value(start.pfDepth), flag(start.isHit))
+          val old = (value(start.paddr), value(start.pfSource), value(start.pfDepth), flag(start.isHit))
+          if(waitingMerge(key) && old._4) {
+            assert(old._2 == 9)
+            pending(key) = (old._1, BigInt(0), BigInt(0), false)
+            mergedPending += key
+            waitingMerge -= key
+          } else pending(key) = old
+          if(!old._4) dataReady -= key
         }
-        if (pending.contains(key) && (flag(probe.complete) || flag(probe.ds)))
-          assert(flag(probe.line.valid), s"scan missing on completing cycle bank=$bank entry=$entry")
+        if(flag(probe.dataStart)) dataReady -= key
+        if(flag(probe.complete) || flag(probe.ds)) dataReady += key
+        val expectedLine = pending.get(key).exists { context =>
+          val cdpRefill = context._2 == 9 && !context._4
+          val full = flag(probe.complete) || flag(probe.ds) ||
+            (dataReady(key) && (context._4 || cdpRefill || mergedPending(key)))
+          full && !waitingMerge(key) && !(cdpRefill && flag(probe.prefetchActive))
+        }
+        assert(flag(probe.line.valid) == expectedLine,
+          s"scan lifecycle mismatch bank=$bank entry=$entry expected=$expectedLine")
         if (flag(probe.line.valid)) {
           val line = probe.line.bits
           assert(pending.remove(key).contains((value(line.paddr), value(line.pfSource),
@@ -138,6 +188,10 @@ class L2TopCDPChecker(dut: TestTop_L2Top) extends ChiselSim {
           val expected = L2TopReferenceMemory.beat(addr, 0) |
             (L2TopReferenceMemory.beat(addr, 1) << 256)
           assert(value(line.data) == expected, s"full-line/forwarding mismatch addr=$addr")
+          if(mergedPending.remove(key)) {
+            assert(value(line.pfSource) == 0 && value(line.pfDepth) == 0 && !flag(line.isHit))
+            mergedScans += 1
+          } else if(value(line.pfSource) == 9 && !flag(line.isHit) && !flag(probe.complete)) deferredRefills += 1
           val hit = flag(line.isHit)
           assert(value(line.eventType) == (if (hit) 1 else 0))
           val halves = (0 until 2).map { half => Half(addr, value(line.pfSource),
@@ -146,6 +200,10 @@ class L2TopCDPChecker(dut: TestTop_L2Top) extends ChiselSim {
           lines += 1
           if (hit) hits += 1
           if (flag(probe.complete)) forwarded += 1
+        }
+        if(flag(probe.deallocate)) {
+          assert(!pending.contains(key) && !waitingMerge(key) && !mergedPending(key), "deallocated scan context")
+          dataReady -= key
         }
         if (flag(probe.train.valid)) {
           val train = probe.train.bits
@@ -181,7 +239,8 @@ class L2TopCDPChecker(dut: TestTop_L2Top) extends ChiselSim {
     if (emittingBanks > 1) simultaneous += 1
   }
   def report(): Unit = {
-    assert(queues.forall(_.isEmpty) && pending.isEmpty)
+    assert(queues.forall(_.isEmpty) && pending.isEmpty && waitingMerge.isEmpty && mergedPending.isEmpty)
+    println(s"CDP_MERGE_RESULT pass=true merged=$mergedScans deferredRefills=$deferredRefills")
     println(s"CDP_DATA_RESULT pass=true slices=$banks lines=$lines halves=$halves forwarded=$forwarded hits=$hits simultaneous=$simultaneous consumes=$consumes disabled=$disabled")
   }
 }
