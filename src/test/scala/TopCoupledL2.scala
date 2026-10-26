@@ -16,8 +16,8 @@ import xscache.common.{AliasField, BankBitsKey, DirtyField, PrefetchField}
 import xscache.chi._
 
 /* Release-oriented generation top for CoupledL2, configured after the Kunminghu
- * V2 DefaultConfig (XiangShan top/Configs.scala: L2CacheConfig("2MB", banks=4)
- * on top of BaseConfig/DebugOptions defaults):
+ * V2 DefaultConfig cache/DFT parameters (XiangShan top/Configs.scala:
+ * L2CacheConfig("2MB", banks=4) on top of BaseConfig):
  *  - 2MB L2 in 4 banks: 1024 sets x 8 ways x 64B per bank
  *  - 16 MSHRs (coupledL2 default)
  *  - client: 64KB 4-way L1D model (128 sets, 6 ways, 2 alias bits, 44-bit vaddr)
@@ -26,6 +26,7 @@ import xscache.chi._
  *  - CHI downstream Issue E.b, 48-bit address
  *  - MBIST enabled (dft/dft_reset exposed at top, as in XiangShan's L2Top),
  *    SRAM ctl disabled
+ *  - performance, debug, and trace instrumentation disabled
  * The L1-facing TileLink slave port (tl_in) and the CHI RN-F port (chi) are the
  * top-level interfaces.
  *
@@ -123,18 +124,6 @@ class TopCoupledL2(banks: Int = 4)(implicit p: Parameters) extends LazyModule
     l2.module.io.l2_tlb_req := DontCare
 
     dontTouch(l2.module.io)
-
-    val timer = WireDefault(0.U(64.W))
-    val logEnable = WireDefault(true.B)
-    val clean = WireDefault(false.B)
-    val dump = WireDefault(false.B)
-
-    dontTouch(timer)
-    dontTouch(logEnable)
-    dontTouch(clean)
-    dontTouch(dump)
-
-    XSLog.collect(timer, logEnable, clean, dump)
   }
 }
 
@@ -178,10 +167,12 @@ Usage: TopCoupledL2 [<chisel/firtool options>]
       enablePoison        = true,
       prefetch            = Seq(BOPParameters(), CDPParameters(), PrefetchReceiverParams()),
       enableL2Flush       = false,
-      enablePerf          = true,
+      enablePerf          = false,
       enableRollingDB     = false,
-      enableMonitor       = true,
-      elaboratedTopDown   = true,
+      enableMonitor       = false,
+      enableTLLog         = false,
+      enableCHILog        = false,
+      elaboratedTopDown   = false,
       hasMbist            = true,
       hasSramCtl          = false,
       FPGAPlatform        = false
@@ -191,18 +182,18 @@ Usage: TopCoupledL2 [<chisel/firtool options>]
     case MaxHartIdBits => 0
     case LogUtilsOptionsKey => LogUtilsOptions(
       enableDebug = false,
-      enablePerf = true,
+      enablePerf = false,
       fpgaPlatform = false
     )
     case PerfCounterOptionsKey => PerfCounterOptions(
-      enablePerfPrint = true,
+      enablePerfPrint = false,
       enablePerfDB = false,
       perfLevel = XSPerfLevel.VERBOSE,
       0
     )
   })
 
-  CLogB.init(true)
+  CLogB.init(false)
   ChiselDB.init(false)
   Constantin.init(false)
 
@@ -218,6 +209,5 @@ Usage: TopCoupledL2 [<chisel/firtool options>]
   (new ChiselStage).execute(args,
     ChiselGeneratorAnnotation(() => top.module) +: releaseFirtoolOptions)
 
-  ChiselDB.addToFileRegisters
   FileRegisters.write("./build")
 }

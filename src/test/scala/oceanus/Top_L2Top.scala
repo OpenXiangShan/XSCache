@@ -21,6 +21,7 @@ import scala.collection.mutable.ArrayBuffer
  *  - 48-bit physical address, CHI Issue E, 256-bit data width
  *  - data ECC (secded) enabled
  *  - MBIST enabled, SRAM ctl disabled (Kunminghu DFTOptions defaults)
+ *  - performance, debug, and trace instrumentation disabled
  *
  * Firtool options follow the XiangShan release flow (XiangShan Makefile
  * MFC_ARGS), so the generated Verilog carries no location-info comments and no
@@ -41,18 +42,6 @@ class Top_L2Top(val l2cfg: L2Configuration)(implicit val p: Parameters) extends 
   // genBroadCastBundleTop and forwards io.dft).
   val dft = IO(Input(new SramBroadcastBundle))
   SramHelper.genBroadCastBundleTop() := dft
-
-  val timer = WireDefault(0.U(64.W))
-  val logEnable = WireDefault(true.B)
-  val clean = WireDefault(false.B)
-  val dump = WireDefault(false.B)
-
-  dontTouch(timer)
-  dontTouch(logEnable)
-  dontTouch(clean)
-  dontTouch(dump)
-
-  XSLog.collect(timer, logEnable, clean, dump)
 }
 
 object Top_L2Top extends App {
@@ -122,11 +111,11 @@ Usage: Top_L2Top [<--option> <values>]
     case CCHIParametersKey => CCHIParameters()
     case LogUtilsOptionsKey => LogUtilsOptions(
       enableDebug = false,
-      enablePerf = true,
+      enablePerf = false,
       fpgaPlatform = false
     )
     case PerfCounterOptionsKey => PerfCounterOptions (
-      enablePerfPrint = true,
+      enablePerfPrint = false,
       enablePerfDB = false,
       perfLevel = XSPerfLevel.VERBOSE,
       0
