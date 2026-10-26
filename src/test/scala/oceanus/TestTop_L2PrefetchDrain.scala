@@ -150,7 +150,7 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
     case LogUtilsOptionsKey => LogUtilsOptions(enableDebug=false,enablePerf=true,fpgaPlatform=false)
     case PerfCounterOptionsKey => PerfCounterOptions(enablePerfPrint=true,enablePerfDB=false,perfLevel=XSPerfLevel.VERBOSE,0)
   })
-  implicit val simulator: HasSimulator=HasSimulator.default
+  implicit val simulator: HasSimulator=CDPAuditSimulator.bounded
   simulate(new TestTopDrain(cfg)(params)) { dut =>
     for(seed <- firstSeed to lastSeed) {
     println(s"OVERNIGHT_BEGIN seed=$seed slices=$slices cycles=$minimum harsh=$harsh fast=$fast")
@@ -168,7 +168,8 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
     case class Translation(client: Int,va: BigInt,due: Int,miss: Boolean,fault: Boolean,attempt: Int)
     val transactions=mutable.Map.empty[(Int,BigInt),Int]
     val terminals=mutable.Map.empty[(Int,BigInt),Translation]
-    val allowed=Seq.fill(2)(mutable.Map.empty[BigInt,Int].withDefaultValue(0))
+    val allowed=Seq.fill(1)(mutable.Map.empty[BigInt,Int].withDefaultValue(0))
+    val cdpLedger=new CDPCandidateLedger
     var modelRetries=0; var modelDrops=0; var modelDone=0
     var actualRetries=0; var actualDrops=0; var actualDone=0
     var injectedMisses=0; var injectedFaults=0; var fastAllocations=0; var fastEmits=0
@@ -289,7 +290,7 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
           terminals((t.client,t.va))=t
           modelDone+=1
           if(t.miss || t.fault) modelDrops+=1
-          else allowed(t.client)(if(t.client==1) physical(t.va)>>12 else physical(t.va))+=1
+          else if(t.client==0) allowed(0)(physical(t.va))+=1
         } else modelRetries+=1
       }
       // Compare adapter retirements to an independent request/response model.
@@ -340,16 +341,15 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
           println(s"DRAIN_TLB event=external-request seed=$seed cycle=$cycle client=$c va=$va attempt=$attempt due=${replies.last.due}")
         translations+=1
       }
+      cdpLedger.sample(dut.cdpAudit, cycle)
       for(c <- 0 until 2) {
         val a=dut.probe.algorithm(c)
         if(flag(a.valid)) {
           val pa=value(a.bits)
-          // C5 D1: a successful CDP page translation permits each waiting
-          // line offset, and Filter may suppress a translated entry. Keep
-          // page permission separately from VBOP one-line retirement credits.
-          val permission=if(c==1) pa>>12 else pa
-          assert(allowed(c)(permission)>0,s"algorithm issued without successful translation/fast path client=$c PA=$pa")
-          if(c==0) allowed(c)(pa)-=1
+          if(c==0) {
+            assert(allowed(0)(pa)>0,s"VBOP issued without successful translation/fast path PA=$pa")
+            allowed(0)(pa)-=1
+          }
           if(fast && c==0) fastEmits+=1
         }
       }
@@ -414,7 +414,7 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
       val pendingQueues=(0 until slices).flatMap(s=>(0 to 9).map(src=>count(dut.observation.prefetchPendingBySource,s,src))).sum
       val idle= !stimulus && driver.pending==0 && data.isEmpty && rsp.isEmpty && live.isEmpty && snoops.isEmpty && replies.isEmpty && pendingQueues==0 && !active
       val fullyIdle=idle && transactions.isEmpty && terminals.isEmpty && replies.isEmpty &&
-        allowed(0).values.forall(_==0) && flag(dut.drainEmpty)
+        allowed(0).values.forall(_==0) && cdpLedger.pending==0 && flag(dut.drainEmpty)
       if(cycle >= stopCycle && fullyIdle && firstEmpty < 0) firstEmpty=cycle
       quiet=if(cycle >= stopCycle && fullyIdle) quiet+1 else 0
       if(cycle >= stopCycle && (cycle % 1024 == 0 || quiet == 40)) snapshot("drain")
@@ -423,6 +423,7 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
     check(); snapshot("final")
     println(s"DRAIN_RESULT seed=$seed pass=${quiet>=40} stop=$stopCycle firstEmpty=$firstEmpty end=$cycle drainedIn=${if(firstEmpty<0) -1 else firstEmpty-stopCycle} quiet=$quiet")
     assert(quiet>=40 && flag(dut.drainEmpty), "drain timeout: see final state")
+    cdpLedger.finish(s"slices=$slices seed=$seed")
     assert(allowed(0).values.forall(_==0),"successful translation/fast allocation did not emit exactly once")
     assert(transactions.isEmpty && terminals.isEmpty && modelDone==actualDone && modelDrops==actualDrops && modelRetries==actualRetries,
       s"TLB ledger done=$modelDone/$actualDone retries=$modelRetries/$actualRetries drops=$modelDrops/$actualDrops live=$transactions terminals=$terminals")

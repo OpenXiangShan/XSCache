@@ -1,0 +1,414 @@
+package oceanus
+import chisel3._
+import chisel3.util._
+import chisel3.simulator.{ChiselSim,HasSimulator}
+import oceanus.compactchi.CCHIOpcode
+import oceanus.chi._
+import oceanus.chi.field.CHIFieldResp
+import oceanus.l2._
+import scala.collection.mutable
+import java.nio.file.{Files,Paths}
+import java.io.{PrintWriter,FileOutputStream}
+import java.util.zip.GZIPOutputStream
+import utility._
+object TestTop_CDPRawAudit extends App with ChiselSim {
+  Constantin.init(false)
+  def opt(n: String, default: Int): Int = args.find(_.startsWith(n + "=")).map(_.split("=", 2)(1).toInt).getOrElse(default)
+  val seeds = opt("--seeds", 3); val slices = opt("--slices", 1)
+  val conflictMode=args.contains("--conflicts")
+  val csrMode=args.contains("--csr")
+  val upstream=if(conflictMode) new L2UpstreamTable(Seq(0,2,6,7).map(n=>L2UpstreamTableEntry(L2UpstreamPortType.Type1,n)) ++
+    Seq(4,5).map(n=>L2UpstreamTableEntry(L2UpstreamPortType.Type4,n))) else L2UpstreamTable.defaults
+  val cfg = new L2Configuration(8, true, 0 until slices, upstream=upstream,bopEnable = false,
+    pfRecvEnable = true, pfCtrlEnable = true, pfTrainEnable = true, pfTlbEnable = true,
+    vbopStubEnable = true, cdpStubEnable = true,
+    vbopParams = OceanusVBOPParameters(badScore = 0, roundMax = 100000))
+  implicit val simulator: HasSimulator = CDPAuditSimulator.bounded
+  simulate(new TestTopCDPRawAudit(cfg)(CDPC5Params.apply)) { dut =>
+    val directory = Paths.get(sys.props.getOrElse("oceanus.c5.trace","/data/zhuy/pf-audit-tests/traces")); Files.createDirectories(directory)
+    val tracePath = directory.resolve(s"system-$slices-$seeds.jsonl.gz")
+    val trace = new PrintWriter(new GZIPOutputStream(new FileOutputStream(tracePath.toFile)))
+    trace.println(ujson.Obj("head" -> sys.props.getOrElse("oceanus.c5.head","402504254fe4fffbd4e6b80785e52b973c6d4c9e"), "slices" -> slices,
+      "seeds" -> seeds, "widths" -> ujson.Arr.from(dut.widths.map { case (n, w) => ujson.Arr(n, w) })).render())
+    val dummy = UpRequestSpec(MasterId.t1p0, 0, 0, 0, CCHIOpcode.ReadShared.opcode, BigInt(0), expCompData = true)
+    val spec = CaseSpec("cdp-c5", UpConfig(Seq(MasterId.t1p0), ExplicitRequestStream(Seq(dummy), Seq(BigInt(CHIFieldResp.CompData_SC))), SnoopPolicy.SnpRespI),
+      DnConfig(FixedLatency(80), FixedOutstanding(64), ImmediateCreditPolicy()), 2000000, (0, 2000000), Seq.empty)
+    val up = new L2TopUpstreamModel(dut, spec); val dn = new L2TopDownstreamModel(dut, spec)
+    val data = mutable.Queue.empty[PendingDnComp]; val rsp = mutable.Queue.empty[PendingDnRsp]
+    val ack = mutable.Queue.empty[PendingUpAck]; val snoop = mutable.Queue.empty[PendingSnpRsp]
+    val replies = mutable.Queue.empty[(Int, BigInt, Boolean, Boolean)]
+    val attempts = mutable.Map.empty[BigInt, Int].withDefaultValue(0)
+    val writes = mutable.ArrayBuffer.empty[(BigInt, Int, Int)]
+    val emitted = mutable.ArrayBuffer.empty[(BigInt, Int)]
+    val admitted = mutable.ArrayBuffer.empty[(BigInt, Int)]
+    val useful = mutable.Map.empty[BigInt, Int].withDefaultValue(0)
+    val seenDownstream = mutable.Set.empty[BigInt]
+    var cycle = 0; var txn = 0; var epoch = -1; var beats = 0
+    var gate = true; var activePA = BigInt(0); var reset = false
+    var allCandidates = 0; var allDrops = 0; var hits = 0; var unused = 0; var contention = 0
+    var activeSeed = 0
+    var responseDelay=0
+    var holdAcks=false
+    var disabledHalves=0L
+    val csrFindings=mutable.ArrayBuffer.empty[String]
+    val filterImage=mutable.Map.empty[Int,BigInt]
+    var filterQuery:Option[Int]=None
+    var filterMemoryWrites=0L
+    val acceptedPorts=mutable.Set.empty[Int]
+    val demandAddresses=mutable.Map.empty[(Int,BigInt),BigInt]
+    val demandBeats=mutable.Map.empty[(Int,BigInt),Set[Int]].withDefaultValue(Set.empty)
+    val portAcks=Seq.fill(cfg.upstream.type1.size)(mutable.Queue.empty[(BigInt,BigInt)])
+    def flag(b: Bool) = b.peek().litToBoolean
+    def value(b: UInt) = b.peek().litValue
+    def rowSourcePending:BigInt=(0 until slices).map(b=>value(dut.observation.prefetchPendingBySource(b)(9))).sum
+    def pa(va: BigInt): BigInt = if ((va >> 12) >= 0x300 && (va >> 12) < 0x340) va + 0x300000
+      else if ((va >> 12) == 0x200) va - 0x1c0000 else va + 0x1000000
+    // Byte-exact independent memory image. Every seed has eight pointers;
+    // both halves/four lanes participate, [1:0]=0 and bit2=1 is intentional.
+    def memory(addr: BigInt, beat: Int): BigInt = {
+      if(addr>=0x48000 && addr<0x49000) {
+        val index=((addr-0x48000)>>6).toInt
+        return (0 until 4).map { i=>
+          val page=0x300+((index*8+beat*4+i)%64)
+          BigInt(page*4096+(((index+beat*4+i)*7)%60)*64+4)<<(i*64)
+        }.sum
+      }
+      val index = ((addr - 0x40000) >> 6).toInt
+      if(index >= 0 && index < seeds + 2) {
+        val random = new scala.util.Random(0xC50000L + index)
+        val page = 0x300 + random.nextInt(32)
+        val words = Vector.fill(8)(BigInt(page * 4096 + random.nextInt(60) * 64 + 4))
+        words.slice(beat * 4, beat * 4 + 4).zipWithIndex.map { case (v, i) => v << (i * 64) }.sum
+      } else BigInt(0)
+    }
+    val reference=new CDPRawEventReference(slices,memory _)
+    val identities=new CDPCandidateLedger
+    def controls(c: Boolean = true, v: Boolean = false): Unit = {
+      val ctrl = dut.io.pfCtrl.get
+      ctrl.l2_pf_master_en.poke(true); ctrl.l2_pf_recv_en.poke(true)
+      ctrl.l2_cdp_en.poke(c); ctrl.l2_vbop_en.poke(v); ctrl.l2_pbop_en.poke(false)
+    }
+    def observe():Map[String,BigInt]={
+      var bits=value(dut.boundary)
+      dut.widths.map {case(n,w)=>val item=bits&((BigInt(1)<<w)-1);bits>>=w;n->item}.toMap
+    }
+    def tick(): Map[String, BigInt] = {
+      acceptedPorts.clear()
+      up.clearResponses(); dn.clearResponses()
+      dut.io.t1p.foreach(_.UpRSP.valid.poke(false))
+      for((queue,index)<-portAcks.zipWithIndex) queue.headOption.filter(_=> !holdAcks).foreach {case(dbid,target)=>
+        val p=dut.io.t1p(index).UpRSP
+        p.valid.poke(true);p.bits.poke(0.U.asTypeOf(p.bits));p.bits.TxnID.poke(dbid);p.bits.SrcID.poke(cfg.upstream.type1(index).nid)
+        p.bits.TgtID.poke(target);p.bits.Opcode.poke(CCHIOpcode.CompAck.opcode)
+      }
+      ack.headOption.foreach { a => up.driveUpCompAck(a.upDBID, a.sliceIdx); ack.dequeue() }
+      if(!flag(dut.io.t1p.head.UpRSP.valid)) snoop.headOption.foreach { a => up.driveUpSnpResp(a.snpTxnID, a.tgtId); snoop.dequeue() }
+      data.headOption.filter(p => p.due <= cycle && dn.canDriveRxDat).foreach { p =>
+        dn.driveDnData(p); dut.io.chi.rxdat.flit.Data.get.poke(memory(p.addr, p.beat)); data.dequeue()
+        dn.noteResponse(p.dnTxnID, p.beat == 1, cycle)
+      }
+      rsp.headOption.filter(p => p.due <= cycle && dn.canDriveRxRsp).foreach { p =>
+        dn.driveDnRsp(p); rsp.dequeue(); dn.noteResponse(p.dnTxnID, true, cycle)
+      }
+      // Sample acknowledgement fires only after all port valids are driven;
+      // an earlier per-port ready peek can change when another port joins
+      // the same slice arbiter, losing an acknowledgement in the host model.
+      for((queue,index)<-portAcks.zipWithIndex) {
+        val p=dut.io.t1p(index).UpRSP
+        if(queue.nonEmpty && !holdAcks && flag(p.valid) && flag(p.ready))queue.dequeue()
+      }
+      val tlb = dut.io.pfTlb.get
+      tlb.req.ready.poke(gate); tlb.resp.valid.poke(false)
+      tlb.resp.bits.poke(0.U.asTypeOf(tlb.resp.bits)); tlb.pmp_resp.poke(0.U.asTypeOf(tlb.pmp_resp))
+      replies.headOption.filter(_._1 <= cycle).foreach { case (_, va, miss, fault) =>
+        replies.dequeue(); tlb.resp.valid.poke(true); tlb.resp.bits.paddr.head.poke(pa(va))
+        tlb.resp.bits.miss.poke(miss); tlb.resp.bits.excp.head.pf.ld.poke(fault)
+      }
+      if(gate && flag(tlb.req.valid)) {
+        val va = value(tlb.req.bits.vaddr); attempts(va >> 12) += 1
+        val kind = if(epoch >= 0) activeSeed % 7 else 0
+        val miss = kind == 1 && attempts(va >> 12) % 2 == 1 || kind == 2
+        val fault = kind == 3
+        replies.enqueue((cycle + 1 + activeSeed % 7 + responseDelay, va, miss, fault))
+      }
+      if(flag(dut.io.chi.txreq.flitv)) {
+        val f = dut.io.chi.txreq.flit
+        val id = DnTxnID(value(f.TxnID.get)); val src = value(f.SrcID.get)
+        val op = value(f.Opcode.get); val addr = value(f.Addr.get); dn.noteRequest(id)
+        if(dn.isEvictReq(op)) rsp.enqueue(PendingDnRsp(id, src, cycle + 80, dn.downstreamEvictRspOpcode(op)))
+        else {
+          seenDownstream += addr
+          val response = if(op == 0x07) CHIFieldResp.CompData_UC else CHIFieldResp.CompData_SC
+          for(b <- 0 until 2) data.enqueue(PendingDnComp(id, src, cycle + 80 + b, b, BigInt(response), addr))
+        }
+      }
+      for((port,index)<-dut.io.t1p.zipWithIndex) {
+        if(flag(port.DnDAT.valid) && flag(port.DnDAT.ready)) {
+          val f=port.DnDAT.bits;val beat=value(f.DataID).toInt;val key=index->value(f.TxnID)
+          val addr=demandAddresses.getOrElse(key,throw new AssertionError(s"unknown demand response $key"))
+          assert(value(f.Data)==memory(addr,beat),s"cache data mismatch key=$key PA=$addr beat=$beat")
+          assert(!demandBeats(key)(beat));demandBeats(key)+=beat;beats+=1
+          if(demandBeats(key).size==2) {portAcks(index).enqueue(value(f.DBID)->value(f.SrcID));demandBeats.remove(key);demandAddresses.remove(key)}
+        }
+        if(flag(port.DnSNP.valid)) snoop.enqueue(PendingSnpRsp(SnpTxnID(value(port.DnSNP.bits.TxnID)),value(port.DnSNP.bits.SrcID),cycle+1))
+        assert(!flag(port.DnRSP.valid),s"unexpected nondata response port=$index")
+        if(flag(port.UpREQ.valid) && flag(port.UpREQ.ready)) {
+          acceptedPorts+=index
+          val p=port.UpREQ;val ctx=dut.io.pfTrain.get(index);val key=index->value(p.bits.TxnID)
+          assert(!demandAddresses.contains(key));demandAddresses(key)=value(p.bits.Addr)
+          reference.upstream(value(p.bits.SrcID),value(p.bits.TxnID),value(p.bits.Addr),
+            (value(ctx.vaddrBlock)>>6<<12)|(value(p.bits.Addr)&0xfc0),value(ctx.reqSource).toInt,flag(ctx.trainEnable))
+        }
+      }
+      for(port<-dut.io.t4p.map(_.UpREQ)) if(flag(port.valid) && flag(port.ready))
+        reference.upstream(value(port.bits.SrcID),value(port.bits.TxnID),value(port.bits.Addr),value(port.bits.Addr)&0xfc0,0,false)
+      val packed = value(dut.boundary)
+      var rest = packed
+      val row = dut.widths.map { case (n, w) => val v = rest & ((BigInt(1) << w) - 1); rest >>= w; n -> v }.toMap
+      assert(rest == 0)
+      if(row.getOrElse("filterResponse",BigInt(0))!=0) filterQuery.foreach(i=>filterImage(i)=row("filterResponse.masked"))
+      filterQuery=if(row.getOrElse("filterQuery",BigInt(0))!=0) Some(row("filterQuery.set").toInt) else None
+      filterMemoryWrites+=row.getOrElse("filterMemoryWrites",BigInt(0)).toLong
+      if(row("enable")==0) {
+        assert(row("tlbRequest")==0 && row("out")==0,"M4 disabled new CDP admission/output")
+        for(b<-0 until slices) assert(row(s"enter$b")==0 || (row(s"enter$b.txn")>>4)!=9,"M4 disabled source9 issue")
+        if(row("half")!=0) {assert(row("halfAccepted")==0 && row("halfRejected")>0,"M4 captured half not rejected");disabledHalves+=1}
+      }
+      reference.sample(dut,row,cycle)
+      identities.sample(dut.audit,cycle)
+      trace.println(ujson.Arr(cycle, epoch, gate, packed.toString(16)).render())
+      if(row("candidate") != 0) allCandidates += 1
+      allDrops += row("full").toInt + row("duplicate").toInt + row("filterDrop").toInt + (0 until 16).map(i => row(s"translationDrop$i").toInt).sum
+      contention += row("vbopBlockedCDP").toInt
+      if(row("out") != 0) {
+        assert(row("enable") != 0, "CSR disabled CDP emitted")
+        emitted += ((row("out.pa"), row("out.depth").toInt))
+      }
+      for(bank <- 0 until slices) {
+        if(row(s"enter$bank") != 0 && (row(s"enter$bank.txn") >> 4) == 9) {
+          val addr = row(s"enter$bank.pa"); val depth = ((row(s"enter$bank.txn") >> 2) & 3).toInt
+          assert(emitted.contains((addr, depth)), "source9/depth TxnID without CDP producer")
+          admitted += ((addr, depth))
+        }
+        for(i <- 0 until 8) {
+          if(row(s"evict$bank.$i") != 0 && row(s"evict$bank.$i.source") == 9) {
+            assert(emitted.exists(_._1 == row(s"evict$bank.$i.pa")), "unused victim was never issued by CDP")
+            assert(useful(row(s"evict$bank.$i.pa")) == 0, "used CDP line reported unused")
+            unused += 1
+          }
+        }
+      }
+      if(row("filter") != 0 && row("filter.used") != 0 && row("filter.source") == 9) {
+        useful(row("filter.pa")) += 1; hits += 1
+      }
+      dn.stepWithCredits(cycle); cycle += 1
+      if(cycle%2048==0 && (conflictMode || csrMode)) println(s"CDP_AUDIT_PROGRESS cycle=$cycle demands=$txn beats=$beats addresses=$demandAddresses beatMasks=$demandBeats portAcks=${portAcks.map(_.size)} data=${data.size} rsp=${rsp.size} snoop=${snoop.size} replies=${replies.size} rawCoverage=${reference.coverage}")
+      assert(cycle < 60000, "audit watchdog")
+      row
+    }
+    def run(n: Int): Unit = for(_ <- 0 until n) tick()
+    def drain(): Unit = {
+      var quiet = 0
+      val began=cycle
+      while(quiet < 35) {
+        assert(cycle-began<4000,s"audit drain watchdog demand=$demandAddresses masks=$demandBeats ack=${portAcks.map(_.size)} data=$data rsp=$rsp snoop=$snoop replies=$replies")
+        val row = tick()
+        val idle = data.isEmpty && rsp.isEmpty && ack.isEmpty && portAcks.forall(_.isEmpty) && demandAddresses.isEmpty && snoop.isEmpty && replies.isEmpty &&
+          row("resident") == 0 && row("candidatePending") == 0 &&
+          dut.observation.dirProbeBySlice.flatten.forall(p => !flag(p.valid) && !flag(p.reqActive))
+        quiet = if(idle) quiet + 1 else 0
+      }
+    }
+    def request(addr: BigInt, va: BigInt, enable: Boolean = true, opcode: Int = CCHIOpcode.ReadShared.opcode): Unit = {
+      activePA = addr
+      up.driveRead(dummy.copy(txnId = txn % 256, addr = addr, opcode = opcode))
+      dut.io.pfTrain.get.head.vaddrBlock.poke(va >> 6)
+      dut.io.pfTrain.get.head.trainEnable.poke(enable)
+      while(!flag(dut.io.t1p.head.UpREQ.ready)) tick()
+      tick(); up.clearUpReq(); txn += 1
+    }
+    up.initInputs(); dn.initInputs(); dut.log.dump.poke(false); dut.log.clean.poke(false)
+    for(port<-dut.io.t1p.drop(1)) {
+      port.UpREQ.valid.poke(false);port.UpREQ.bits.poke(0.U.asTypeOf(port.UpREQ.bits))
+      port.UpEVT.valid.poke(false);port.UpEVT.bits.poke(0.U.asTypeOf(port.UpEVT.bits))
+      port.UpDAT.valid.poke(false);port.UpDAT.bits.poke(0.U.asTypeOf(port.UpDAT.bits))
+      port.UpRSP.valid.poke(false);port.UpRSP.bits.poke(0.U.asTypeOf(port.UpRSP.bits))
+      port.DnDAT.ready.poke(true);port.DnRSP.ready.poke(true);port.DnSNP.ready.poke(true)
+    }
+    dut.holdIssue.get.poke(false)
+    dut.io.pfRecv.get.poke(0.U.asTypeOf(dut.io.pfRecv.get))
+    dut.io.pfCtrl.get.poke(0.U.asTypeOf(dut.io.pfCtrl.get)); controls()
+    dut.io.pfTrain.get.foreach(_.poke(0.U.asTypeOf(dut.io.pfTrain.get.head)))
+    dut.io.pfTlb.get.req.ready.poke(true); dut.io.pfTlb.get.resp.valid.poke(false)
+    dut.io.pfTlb.get.resp.bits.poke(0.U.asTypeOf(dut.io.pfTlb.get.resp.bits))
+    dut.io.pfTlb.get.pmp_resp.poke(0.U.asTypeOf(dut.io.pfTlb.get.pmp_resp))
+    dut.reset.poke(true); dut.clock.step(8); dut.reset.poke(false); dn.activateRxLink()
+    for(w <- -300 until 0) dn.stepWithCredits(w)
+    for(_ <- 0 until 130) { request(0x3e040, 0x200040); drain() }
+    for(seed <- 0 until seeds) {
+      epoch = seed; activeSeed = seed; attempts.clear()
+      val before = allCandidates; val outBefore = emitted.size
+      gate = false
+      request(BigInt(0x40000 + seed * 64), BigInt(0x200000 + seed * 64))
+      // Both real refill halves must arrive before releasing translation.
+      run(155); gate = true; drain()
+      assert(allCandidates > before, s"seed $seed detection was empty")
+      if(seed < 2 && emitted.size > outBefore) {
+        val (addr, _) = emitted(outBefore)
+        assert(admitted.exists(_._1 == addr) && seenDownstream(addr))
+        // Actual directory hit/old source -> used feedback, with CSR enabled.
+        request(addr, addr - 0x300000); drain()
+        assert(useful(addr) == 1, s"missing actual used feedback PA=$addr")
+      }
+      trace.flush()
+      if(seed % 50 == 0) println(s"CDP_C5_PROGRESS slices=$slices seed=$seed cycles=$cycle candidates=$allCandidates outputs=${emitted.size}")
+    }
+    // Preserve an unused genuine CDP line, then evict it with actual same-set
+    // demand replacements. The victim PA must come from the old host Meta.
+    epoch = seeds; activeSeed = 0; attempts.clear()
+    val unusedTarget = emitted.map(_._1).find(a => useful(a) == 0).get
+    def bank(addr: BigInt): Int = if(slices == 1) 0 else if(slices == 2) (addr >> 6).bitCount % 2 else {
+      val low = (6 until 48 by 2).count(addr.testBit) % 2
+      val high = (7 until 48 by 2).count(addr.testBit) % 2
+      low + 2 * high
+    }
+    val victimsBefore = unused
+    val conflicts = (1 to 128).map(i => unusedTarget + i * 8192).filter(a => bank(a) == bank(unusedTarget)).take(10)
+    for(addr <- conflicts) { request(addr, 0x200040); drain() }
+    assert(unused > victimsBefore, "no unused genuine CDP victim feedback")
+    // Occupy all shared translation slots with real VBOP trains. A subsequent
+    // pointer line waits alongside VBOP; production assertion checks priority.
+    epoch = seeds + 1; gate = false; controls(v = true)
+    // Keep VBOP translations outside the pointer-memory image. Otherwise
+    // VBOP refills can start new detections while D1 sends are draining, whose
+    // different fixed/variable latency changes duplicate residency (not just
+    // output order). Pointer detection below still competes for shared slots.
+    for(i <- 0 until 12) { request(BigInt(0xb0000 + i * 64), BigInt(0x280040 + i * 4096)); run(120) }
+    request(BigInt(0x40000 + seeds * 64), BigInt(0x200000 + seeds * 64)); run(155)
+    gate = true; drain(); controls()
+    assert(contention > 0, "shared TLB slot contention was empty")
+    epoch = seeds + 2
+    val disabled = emitted.size; controls(c = false)
+    request(0x90000, 0x200040); drain()
+    assert(emitted.size == disabled, "CSR off emitted a request")
+    assert(emitted.nonEmpty && admitted.nonEmpty && hits > 0)
+    assert(beats == txn * 2, "demand data scoreboard did not close")
+    if(csrMode) {
+      controls();drain()
+      def transient(row:Map[String,BigInt]):BigInt=row("resident")+row("candidatePending")+row("tlbSlots")+row("outputPending")+
+        row("filterQueueCount")+row("vpnQueueCount")+(0 until slices).map(b=>row(s"halfCount$b")).sum+rowSourcePending
+      val cases=Seq("retry","slots8","waitingResult","outputBackpressure","halfQueue","source9Queue")
+      for((name,index)<-cases.zipWithIndex) {
+        epoch=1000+index;activeSeed=if(name=="retry")1 else 0;attempts.clear();controls()
+        responseDelay=if(name=="waitingResult")250 else 0
+        gate=name!="slots8"
+        dut.holdIssue.get.poke(name=="source9Queue")
+        val rejectedBefore=disabledHalves
+        request(BigInt(0x48000+index*64),0x200040)
+        var row=observe();var waited=0
+        def triggered(r:Map[String,BigInt]):Boolean=name match {
+          case "retry"=>r("tlbRetry")>0
+          case "slots8"=>r("tlbSlots")==8
+          case "waitingResult"=>r("tlbWaiting")>0
+          case "outputBackpressure"=>r("outputValid")>0
+          case "halfQueue"=>(0 until slices).exists(b=>r(s"halfCount$b")>0)
+          case "source9Queue"=>rowSourcePending>0
+        }
+        while(!triggered(row) && waited<1200) {tick();row=observe();waited+=1}
+        assert(triggered(row),s"M4 trigger absent state=$name row=$row")
+        controls(c=false);row=tick()
+        if(name=="outputBackpressure")assert(row("outputValid")>0 && row("outputReady")==0,"M4 no actual output backpressure")
+        val atClose=transient(row);val imageBefore=filterImage.toMap;val vpnBefore=row("vpnValids")
+        val candidatesBefore=identities.counters;val physicalWritesBefore=filterMemoryWrites
+        val vpnSnapshotBefore=row("vpnSnapshot")
+        def sourceLedger:Vector[BigInt]=Seq(dut.observation.prefetchEnqueueBySource,dut.observation.prefetchEnterBySource,
+          dut.observation.prefetchDedupBySource,dut.observation.prefetchQueueOverwriteBySource,dut.observation.prefetchPendingBySource)
+          .map(x=>(0 until slices).map(b=>value(x(b)(9))).sum).toVector
+        val sourceBefore=sourceLedger
+        gate=true;responseDelay=0
+        // Retained page retries/results may complete; no new admission is permitted.
+        run(350);row=tick()
+        val retained=transient(row);val vpnAfter=row("vpnValids")
+        val candidatesAfter=identities.counters;val sourceAfter=sourceLedger
+        assert(sourceAfter(0)-sourceBefore(0)==sourceAfter(1)-sourceBefore(1)+sourceAfter(2)-sourceBefore(2)+sourceAfter(3)-sourceBefore(3)+sourceAfter(4)-sourceBefore(4),"M4 source9 conservation")
+        assert(candidatesAfter("allocated")-candidatesBefore("allocated")==
+          candidatesAfter("output")-candidatesBefore("output")+candidatesAfter("filterDrop")-candidatesBefore("filterDrop")+
+          candidatesAfter("translationDrop")-candidatesBefore("translationDrop")+candidatesAfter("pending")-candidatesBefore("pending"),"M4 retirement conservation")
+        val transientFields=Seq("resident","candidatePending","tlbSlots","tlbRetry","tlbWaiting","tlbDone","outputPending","filterQueueCount","vpnQueueCount")
+        println(s"CDP_CSR_ACCOUNT state=$name candidatesBefore=$candidatesBefore candidatesAfter=$candidatesAfter sourceBefore=${sourceBefore.mkString(",")} sourceAfter=${sourceAfter.mkString(",")} transient=${transientFields.map(k=>s"$k:${row(k)}").mkString(",")} halfRejected=${disabledHalves-rejectedBefore} vpnSnapshotUnchanged=${vpnSnapshotBefore==row("vpnSnapshot")} filterPhysicalWrites=${filterMemoryWrites-physicalWritesBefore}")
+        val filterAfter=filterImage.toMap
+        val tableMode=if(imageBefore==filterAfter) "retained-observed-sets" else "changed-observed-sets"
+        println(s"CDP_CSR_CASE state=$name trigger=1 atClose=$atClose beforeReopen=$retained disabledHalfRejected=${disabledHalves-rejectedBefore} vpnBefore=$vpnBefore vpnAfter=$vpnAfter filter=$tableMode filterSets=${imageBefore.size}")
+        // Report the observed contract discrepancy and continue all six cases.
+        if(retained!=0)csrFindings+=s"$name:reopenTransient=$retained"
+        controls();dut.holdIssue.get.poke(false);drain()
+        row=tick();assert(transient(row)==0,s"M4 failed to drain after reopening state=$name")
+        identities.checkConservation()
+      }
+      assert(disabledHalves>0,"M4 no captured-half rejection observed")
+      println(s"CDP_CSR_RESULT exercised=${cases.size} disabledHalfRejected=$disabledHalves contractMismatches=${csrFindings.size} findings=${csrFindings.mkString(",")} accounting=true")
+    }
+    if(conflictMode) {
+      // Actual upstream ports create independent buffered request lifecycles.
+      // Concurrent repeated hits build capture pressure without forcing any DUT event.
+      def burst(round: Int,negative: Int = -1,base: BigInt = BigInt(0x60000)): Unit = {
+        val pending=mutable.Set.from(dut.io.t1p.indices)
+        for(i<-dut.io.t1p.indices) {
+          val port=dut.io.t1p(i).UpREQ;val addr=base+((round*4+i)%64)*64
+          port.valid.poke(true);port.bits.poke(0.U.asTypeOf(port.bits))
+          port.bits.SrcID.poke(cfg.upstream.type1(i).nid);port.bits.TxnID.poke(txn%256)
+          port.bits.Opcode.poke(if(negative==0) CCHIOpcode.ReadOnce.opcode else CCHIOpcode.ReadShared.opcode)
+          port.bits.Size.poke(6);port.bits.MemAttr.poke(15);port.bits.ExpCompData.poke(true);port.bits.Addr.poke(addr)
+          val ctx=dut.io.pfTrain.get(i);ctx.vaddrBlock.poke((BigInt(0x200000)|(addr&0xfc0))>>6)
+          ctx.reqSource.poke(if(negative==1) MemReqSource.L1DataPrefetch.id else 0);ctx.trainEnable.poke(negative!=2)
+          txn+=1
+        }
+        while(pending.nonEmpty) {
+          tick();acceptedPorts.toVector.foreach {i=>dut.io.t1p(i).UpREQ.valid.poke(false);pending-=i}
+        }
+      }
+      controls()
+      // Hold real completion acknowledgements, enqueue another request to
+      // each same-PA RBE, then release independent upstream CompAck ports
+      // together. Multiple old TSHRs can execute their waiting demands at
+      // one edge even though the slice accepts only one new request per edge.
+      for(r<-0 until 12) {
+        holdAcks=true;burst(r);run(180)
+        assert(portAcks.count(_.nonEmpty)>=2,"M3 acknowledgement barrier empty")
+        burst(r);run(8);holdAcks=false;drain()
+      }
+      for(r<-12 until 96) {burst(r);run(if(r<16) 120 else r%3)}
+      drain()
+      // Build genuine prefetched resident lines first. Fresh first-use hits
+      // carry capture provenance; repeatedly hitting ordinary source0 rows
+      // cannot exercise the half queue because first use clears the mark.
+      val recv=dut.io.pfRecv.get
+      recv.pf_en.poke(true);recv.pf_source.poke(MemReqSource.Prefetch2L2SMS.id)
+      for(i<-0 until 64){recv.addr.poke(BigInt(0x70000+i*64));recv.addr_valid.poke(true);tick()}
+      recv.addr_valid.poke(false);drain()
+      for(r<-0 until 16)burst(r,base=BigInt(0x70000))
+      drain()
+      println("CDP_M3_FIRST_USE_PRESSURE "+reference.coverage.toSeq.sortBy(_._1).map{case(k,v)=>s"$k=$v"}.mkString(" "))
+      for(negative<-Seq(1,2)) {burst(0,negative);drain()}
+      // ReadOnce is excluded from training, but the present REQ pipe has no
+      // ReadOnce upstream CompData scheduler. Observe its execution without
+      // pretending its unreturned demand has passed the normal data drain.
+      val readOnceBefore=reference.coverage("ReadOnce");val readOnceBeats=beats
+      burst(0,0);run(200)
+      assert(reference.coverage("ReadOnce")-readOnceBefore==4,"M3 ReadOnce execution absent")
+      println(s"CDP_READONCE_RESULT eligibilityChecked=4 returnedBeats=${beats-readOnceBeats} outstanding=${demandAddresses.size} responseContract=${if(demandAddresses.isEmpty) "complete" else "missing-response"}")
+      trace.close()
+      println("CDP_M3_COVERAGE "+reference.coverage.toSeq.sortBy(_._1).map {case(k,v)=>s"$k=$v"}.mkString(" "))
+      reference.requireCoverage(Seq("crossSliceTrain","vpnFilterDifferent","captureSimultaneous","ReadOnce","L1DataPrefetch","trainEnable0") ++
+        (if(slices>1) Seq("captureOneSlot","captureFull") else Seq.empty))
+      // Keep all requested witnesses explicit: zero is a failing coverage gap.
+      reference.requireCoverage(Seq("crossTSHRTrain","crossTSHREvict","crossSliceEvict","trainEvictSameCycle","usedEvictConflict"))
+    }
+    reference.finish();identities.finish(s"audit=raw slices=$slices")
+    trace.close()
+    println(s"CDP_RAW_SYSTEM_RESULT pass=true seeds=$seeds slices=$slices cycles=$cycle demands=$txn checkedBeats=$beats candidates=$allCandidates discarded=$allDrops outputs=${emitted.size} admitted=${admitted.size} useful=$hits unused=$unused tlbContention=$contention csrOff=0 trace=$tracePath")
+    // Collect all six witnesses and close every identity before failing the
+    // confirmed CSR contract difference. Accounting success is not a waiver.
+    assert(!csrMode || csrFindings.isEmpty,s"M4 reopen requires empty transient state: ${csrFindings.mkString(",")}")
+  }
+}

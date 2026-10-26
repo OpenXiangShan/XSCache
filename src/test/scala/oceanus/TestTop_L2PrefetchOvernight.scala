@@ -39,6 +39,8 @@ class OvernightProbe(slices: Int)(implicit val p: Parameters) extends Bundle {
 class TestTopOvernight(cfg: L2Configuration)(implicit p: Parameters) extends TestTop_L2Top(cfg) {
   def read[T <: Data](x: T): T = BoringUtils.bore(x)
   val probe = IO(Output(new OvernightProbe(cfg.sliceNum)))
+  val cdpAudit = IO(Output(new CDPAuditProbe))
+  CDPAuditProbe.connect(cdpAudit, module.cdp.get, read _)
   val adapter=module.pfTlbAdapter.get
   probe.tlbOwner := read(adapter.owner)(read(adapter.issue))
   probe.tlbRetry := read(adapter.retried)(read(adapter.issue))
@@ -196,7 +198,7 @@ object TestTop_L2PrefetchOvernight extends App with ChiselSim {
     case LogUtilsOptionsKey => LogUtilsOptions(enableDebug=false,enablePerf=true,fpgaPlatform=false)
     case PerfCounterOptionsKey => PerfCounterOptions(enablePerfPrint=true,enablePerfDB=false,perfLevel=XSPerfLevel.VERBOSE,0)
   })
-  implicit val simulator: HasSimulator=HasSimulator.default
+  implicit val simulator: HasSimulator=CDPAuditSimulator.bounded
   simulate(new TestTopOvernight(cfg)(params)) { dut =>
     for(seed <- firstSeed to lastSeed) {
     println(s"OVERNIGHT_BEGIN seed=$seed slices=$slices cycles=$minimum harsh=$harsh fast=$fast")
@@ -214,7 +216,8 @@ object TestTop_L2PrefetchOvernight extends App with ChiselSim {
     case class Translation(client: Int,va: BigInt,due: Int,miss: Boolean,fault: Boolean,attempt: Int)
     val transactions=mutable.Map.empty[(Int,BigInt),Int]
     val terminals=mutable.Map.empty[(Int,BigInt),Translation]
-    val allowed=Seq.fill(2)(mutable.Map.empty[BigInt,Int].withDefaultValue(0))
+    val allowed=Seq.fill(1)(mutable.Map.empty[BigInt,Int].withDefaultValue(0))
+    val cdpLedger=new CDPCandidateLedger
     var modelRetries=0; var modelDrops=0; var modelDone=0
     var actualRetries=0; var actualDrops=0; var actualDone=0
     var injectedMisses=0; var injectedFaults=0; var fastAllocations=0; var fastEmits=0
@@ -293,7 +296,7 @@ object TestTop_L2PrefetchOvernight extends App with ChiselSim {
           terminals((t.client,t.va))=t
           modelDone+=1
           if(t.miss || t.fault) modelDrops+=1
-          else allowed(t.client)(if(t.client==1) physical(t.va)>>12 else physical(t.va))+=1
+          else if(t.client==0) allowed(0)(physical(t.va))+=1
         } else modelRetries+=1
       }
       // Compare adapter retirements to an independent request/response model.
@@ -337,16 +340,15 @@ object TestTop_L2PrefetchOvernight extends App with ChiselSim {
         replies.enqueue(Translation(c,va,cycle+(if(harsh) 1+random.nextInt(7) else Seq(1,3,7)(random.nextInt(3))),miss,fault,attempt))
         translations+=1
       }
+      cdpLedger.sample(dut.cdpAudit, cycle)
       for(c <- 0 until 2) {
         val a=dut.probe.algorithm(c)
         if(flag(a.valid)) {
           val pa=value(a.bits)
-          // C5 D1: a successful CDP page translation permits each waiting
-          // line offset, and Filter may suppress a translated entry. Keep
-          // page permission separately from VBOP one-line retirement credits.
-          val permission=if(c==1) pa>>12 else pa
-          assert(allowed(c)(permission)>0,s"algorithm issued without successful translation/fast path client=$c PA=$pa")
-          if(c==0) allowed(c)(pa)-=1
+          if(c==0) {
+            assert(allowed(0)(pa)>0,s"VBOP issued without successful translation/fast path PA=$pa")
+            allowed(0)(pa)-=1
+          }
           if(fast && c==0) fastEmits+=1
         }
       }
@@ -394,6 +396,7 @@ object TestTop_L2PrefetchOvernight extends App with ChiselSim {
       dn.stepWithCredits(cycle); cycle+=1
     }
     check()
+    cdpLedger.finish(s"slices=$slices seed=$seed")
     assert(allowed(0).values.forall(_==0),"successful translation/fast allocation did not emit exactly once")
     assert(transactions.isEmpty && terminals.isEmpty && modelDone==actualDone && modelDrops==actualDrops && modelRetries==actualRetries,
       s"TLB ledger done=$modelDone/$actualDone retries=$modelRetries/$actualRetries drops=$modelDrops/$actualDrops live=$transactions terminals=$terminals")
