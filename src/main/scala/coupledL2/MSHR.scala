@@ -47,7 +47,89 @@ import xscache.coupledL2.MetaData._
 import xscache.coupledL2.prefetch.PfSource
 import xscache.coupledL2.prefetch.PrefetchTrain
 
+// Tokens identify one prepared operation of one allocation. Reuse is fenced
+// until its terminal local event and registered lease-return acknowledgment.
+class MainpipeLeaseToken(implicit p: Parameters) extends CoupledL2Bundle {
+  val generation = UInt(8.W)
+  val sequence = UInt(8.W)
+}
+class MainpipeLeaseDone(implicit p: Parameters) extends CoupledL2Bundle {
+  val mshrId = UInt(mshrBits.W)
+  val mshrContext = UInt(2.W)
+  val token = new MainpipeLeaseToken
+}
+class MainpipeLeaseIO(implicit p: Parameters) extends CoupledL2Bundle {
+  val prepare = Flipped(ValidIO(new MainpipeLeaseToken))
+  val held = Flipped(ValidIO(new MainpipeLeaseToken))
+  val cancel = ValidIO(new MainpipeLeaseToken)
+  val release = Flipped(ValidIO(new MainpipeLeaseToken))
+  val released = ValidIO(new MainpipeLeaseToken)
+  val canPrepare = Output(Bool())
+}
+object MainpipeLeaseIO {
+  // Freeze the entire operation at the same edge as the controller snapshot.
+  // Owner events continue to apply. Before issue, an event revokes this exact
+  // lease immediately and latches cancellation until its registered return /
+  // acknowledgment drains. Thus cancellation never grants a one-cycle grace
+  // period, and neither source state nor a live task mux chooses fire effects.
+  def freeze(port: MainpipeLeaseIO, intent: DecoupledIO[TaskBundle],
+      output: DecoupledIO[TaskBundle], variant: UInt, invalidate: Bool): UInt = {
+    val task = Reg(chiselTypeOf(intent.bits))
+    val operation = Reg(UInt(4.W))
+    val token = Reg(chiselTypeOf(port.prepare.bits))
+    val issued = RegInit(false.B)
+    val canceled = RegInit(false.B)
+    when(port.prepare.valid) {
+      assert(!port.held.valid && intent.valid, "prepare must capture an unleased source intent")
+      task := intent.bits
+      operation := variant
+      token := port.prepare.bits
+      issued := false.B
+      canceled := invalidate
+    }.elsewhen(!port.held.valid) {
+      issued := false.B
+      canceled := false.B
+    }.elsewhen(!issued && invalidate) {
+      canceled := true.B
+    }
+    port.cancel.valid := port.held.valid && !issued && (canceled || invalidate)
+    port.cancel.bits := token
+    output.valid := Mux(port.held.valid, !issued && !port.cancel.valid, intent.valid)
+    output.bits := Mux(port.held.valid, task, intent.bits)
+    intent.ready := false.B
+    when(output.fire) {
+      assert(port.held.valid && !port.cancel.valid, "issue must own an uncanceled frozen variant")
+      issued := true.B
+    }
+    when(port.held.valid) {
+      assert(token.asUInt === port.held.bits.asUInt, "source snapshot and controller lease must match")
+    }
+    operation
+  }
+
+  def acknowledge(port: MainpipeLeaseIO, active: Bool, allocating: Bool, issue: Bool): Unit = {
+    port.released := RegNext(port.release, 0.U.asTypeOf(port.release))
+    when(port.held.valid) {
+      assert(active, "prepared lease must pin a live source allocation")
+      assert(!allocating, "source allocation cannot be reused before lease return acknowledgment")
+    }
+    when(port.release.valid) {
+      assert(port.held.valid && port.release.bits.asUInt === port.held.bits.asUInt,
+        "lease return must name the held operation")
+    }
+    when(port.released.valid) {
+      assert(port.held.valid && port.released.bits.asUInt === port.held.bits.asUInt,
+        "lease acknowledgment must retain its source and version")
+    }
+    when(issue) {
+      assert(port.held.valid, "MainPipe source issue requires a prepared lifetime lease")
+    }
+  }
+}
+
 class MSHRTasks(implicit p: Parameters) extends CoupledL2Bundle {
+  val preparedLease = new MainpipeLeaseIO
+
   // outer
   val txreq = DecoupledIO(new CHIREQ) // TODO: no need to use decoupled Shandshake
   val txrsp = DecoupledIO(new CHIRSP) // TODO: no need to use decoupled handshake
@@ -201,6 +283,10 @@ abstract class MSHRContextBase(implicit p: Parameters) extends CoupledL2Module w
 
 class MSHR(implicit p: Parameters) extends MSHRContextBase {
   val io = IO(new MSHRIO)
+  val mainpipeIntent = Wire(Decoupled(new TaskBundle))
+  val mainpipeVariant = Wire(UInt(4.W))
+  val mainpipeIssuedVariant = Wire(UInt(4.W))
+  val mainpipeInvalidate = Wire(Bool())
 
   require(chiOpt.isDefined)
 
@@ -794,7 +880,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   // "one CAgent got T on non-INVALID in other agents").
   val mp_cmometaw_valid = !state.s_cmometaw && dirResult.hit &&
     (!cmo_cbo || state.s_release)
-  io.tasks.mainpipe.valid :=
+  mainpipeIntent.valid :=
     mp_release_valid ||
       mp_probeack_valid ||
       mp_repl_read_valid ||
@@ -817,7 +903,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   when(!io.alloc.valid) {
     when(nestedReleaseDirtyThisCycle) {
       nestedReleaseRefillPending := true.B
-    }.elsewhen(io.tasks.mainpipe.fire && mp_normal_refill_commit_valid) {
+    }.elsewhen(io.tasks.mainpipe.fire && mainpipeIssuedVariant === 3.U) {
       nestedReleaseRefillPending := false.B
     }
   }
@@ -1512,7 +1598,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     mp_normal_refill_revalidate.replTask := true.B
     mp_normal_refill_revalidate
   }
-  when(io.tasks.mainpipe.fire && mp_normal_refill_revalidate_valid) {
+  when(io.tasks.mainpipe.fire && mainpipeIssuedVariant === 2.U) {
     assert(
       mp_normal_refill_revalidate.normalRefillRevalidate &&
         mp_normal_refill_revalidate.refillOnly && mp_normal_refill_revalidate.deferRefillWrite &&
@@ -1661,7 +1747,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     mp_grant.meta := mp_normal_refill_commit.meta
   }
 
-  when(io.tasks.mainpipe.fire && mp_normal_refill_commit_valid && nestedReleaseRefillPending) {
+  when(io.tasks.mainpipe.fire && mainpipeIssuedVariant === 3.U && nestedReleaseRefillPending) {
     assert(
       Mux(
         releaseDataDirectWriteSeen,
@@ -1672,11 +1758,11 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       "ReleaseData(TtoN) must have exactly one C-path or normal-refill DS/meta commit owner"
     )
   }
-  when(io.tasks.mainpipe.fire && mp_normal_refill_commit_valid && probeDirty) {
+  when(io.tasks.mainpipe.fire && mainpipeIssuedVariant === 3.U && probeDirty) {
     assert(normalRefillDroppedByToN || mp_normal_refill_commit.meta.dirty,
       "normal refill commit must preserve dirty ProbeAckData")
   }
-  when(io.tasks.mainpipe.fire && mp_grant_valid && !cmo_cbo) {
+  when(io.tasks.mainpipe.fire && mainpipeIssuedVariant === 1.U && !cmo_cbo) {
     assert(
       mergeInstallWithGrant ||
         (!mp_grant.refillOnly && mp_grant.deferRefillWrite &&
@@ -1684,7 +1770,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       "normal L1-visible grant must not update DataStorage or Directory"
     )
   }
-  when(io.tasks.mainpipe.fire && mp_grant_valid && !cmo_cbo && mergeInstallWithGrant) {
+  when(io.tasks.mainpipe.fire && mainpipeIssuedVariant === 1.U && !cmo_cbo && mergeInstallWithGrant) {
     assert(
       !mp_grant.refillOnly && mp_grant.deferRefillWrite &&
         (denied || releaseDataAlreadyCommitted ||
@@ -1696,8 +1782,8 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   // the grant fire) and the common S3-combinational merge (folded replacer
   // read returning a no-probe victim in the grant pass itself).
   XSPerfAccumulate("merged_grant_install_cnt",
-    (io.tasks.mainpipe.fire && mp_grant_valid && mergeInstallWithGrant) || io.grantInstallDone)
-  when(io.tasks.mainpipe.fire && mp_normal_refill_commit_valid) {
+    (io.tasks.mainpipe.fire && mainpipeIssuedVariant === 1.U && mergeInstallWithGrant) || io.grantInstallDone)
+  when(io.tasks.mainpipe.fire && mainpipeIssuedVariant === 3.U) {
     assert(
       mp_normal_refill_commit.refillOnly &&
         !mp_normal_refill_commit.deferRefillWrite &&
@@ -1833,7 +1919,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     mp_cmometaw
   }
 
-  io.tasks.mainpipe.bits := ParallelPriorityMux(
+  mainpipeIntent.bits := ParallelPriorityMux(
     Seq(
       mp_repl_read_valid -> mp_repl_read,
       mp_grant_valid -> mp_grant,
@@ -1846,8 +1932,14 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       mp_cmometaw_valid -> mp_cmometaw
     )
   )
-  io.tasks.mainpipe.bits.reqSource := req.reqSource
-  io.tasks.mainpipe.bits.isKeyword.foreach(_ := req.isKeyword.getOrElse(false.B))
+  mainpipeIntent.bits.reqSource := req.reqSource
+  mainpipeIntent.bits.isKeyword.foreach(_ := req.isKeyword.getOrElse(false.B))
+  mainpipeVariant := PriorityEncoder(VecInit(Seq(
+    mp_repl_read_valid, mp_grant_valid, mp_normal_refill_revalidate_valid,
+    mp_normal_refill_commit_valid, mp_release_valid, mp_cbwrdata_valid,
+    mp_probeack_valid, mp_dct_valid, mp_cmometaw_valid)).asUInt)
+  mainpipeIssuedVariant := MainpipeLeaseIO.freeze(io.tasks.preparedLease,
+    mainpipeIntent, io.tasks.mainpipe, mainpipeVariant, mainpipeInvalidate)
 
   val mp_valid = io.tasks.mainpipe.valid
   val mp = io.tasks.mainpipe.bits
@@ -1946,12 +2038,12 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   // never issued and leave the context waiting for a response that cannot
   // arrive.
   when(io.tasks.mainpipe.fire) {
-    when(mp_repl_read_valid) {
+    when(mainpipeIssuedVariant === 0.U) {
       state.s_retry := true.B
       replReadInFlight := true.B
-    }.elsewhen(mp_normal_refill_revalidate_valid) {
+    }.elsewhen(mainpipeIssuedVariant === 2.U) {
       normalRefillRevalidateInFlight := true.B
-    }.elsewhen(mp_grant_valid) {
+    }.elsewhen(mainpipeIssuedVariant === 1.U) {
       // L1 may observe the response immediately, but the RefillBuf remains
       // owned by this normal MSHR until the install reaches S3 -- which in
       // merge mode is this very pass, in split mode mp_normal_refill_commit.
@@ -1968,10 +2060,10 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
         refillWritePending := !(denied || releaseDataAlreadyCommitted)
         mergedGrantInstalled := true.B
       }
-      when(mp_grant.replTask) {
+      when(io.tasks.mainpipe.bits.replTask) {
         replReadInFlight := true.B
       }
-      when(mp_grant.opcode === CBOAck) {
+      when(io.tasks.mainpipe.bits.opcode === CBOAck) {
         state.s_cmoresp := true.B
       }
       when(!cmo_cbo) {
@@ -1980,27 +2072,27 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
         grantMergedNeedsTLatched := mergedGrantNeedsT
         grantMergedAliasLatched.foreach(_ := mergedAlias.getOrElse(0.U))
       }
-    }.elsewhen(mp_normal_refill_commit_valid) {
+    }.elsewhen(mainpipeIssuedVariant === 3.U) {
       normalRefillCommitIssued := true.B
       refillWritePending := true.B
-    }.elsewhen(mp_release_valid) {
-      req_released_chiOpcode := mp_release.chiOpcode.get
-      req_released_likelyShared := mp_release.likelyshared.get
+    }.elsewhen(mainpipeIssuedVariant === 4.U) {
+      req_released_chiOpcode := io.tasks.mainpipe.bits.chiOpcode.get
+      req_released_likelyShared := io.tasks.mainpipe.bits.likelyshared.get
       state.s_release := true.B
       state.s_cbwrdata.get := isEvict
       when(isEvict) {
         meta.state := INVALID
         meta.dirty := false.B
       }
-    }.elsewhen(mp_cbwrdata_valid) {
+    }.elsewhen(mainpipeIssuedVariant === 5.U) {
       state.s_cbwrdata.get := true.B
       meta.state := INVALID
       meta.dirty := false.B
-    }.elsewhen(mp_probeack_valid) {
+    }.elsewhen(mainpipeIssuedVariant === 6.U) {
       state.s_probeack := true.B
-    }.elsewhen(mp_dct_valid) {
+    }.elsewhen(mainpipeIssuedVariant === 7.U) {
       state.s_dct.get := true.B
-    }.elsewhen(mp_cmometaw_valid) {
+    }.elsewhen(mainpipeIssuedVariant === 8.U) {
       state.s_cmometaw := true.B
     }
   }
@@ -2022,7 +2114,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   }
 
   val commitDeferralCycles = timer - grantTimerCycle
-  val commitDeferralFire = io.tasks.mainpipe.fire && mp_normal_refill_commit_valid
+  val commitDeferralFire = io.tasks.mainpipe.fire && mainpipeIssuedVariant === 3.U
   XSPerfHistogram("commit_deferral", commitDeferralCycles, commitDeferralFire,
     0, 512, 16)
 
@@ -2363,7 +2455,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   // ReplacerResult returns at S3 of that same pass, two cycles after the
   // fire, so the registered merge decision can never apply to them.
   XSPerfAccumulate("grant_folded_replread_cnt",
-    io.tasks.mainpipe.fire && mp_grant_valid && mp_grant.replTask)
+    io.tasks.mainpipe.fire && mainpipeIssuedVariant === 1.U && mp_grant.replTask)
 
   when(req_valid) {
     timer := timer + 1.U
@@ -2383,10 +2475,16 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       (state.w_releaseack || sidecarDetached) && state.w_replResp
   // A normal context cannot retire until its one RefillBuf-to-DS/Directory
   // commit task has been accepted, irrespective of whether a victim existed.
-  val will_free = no_schedule && no_wait &&
+  val mayRetire = no_schedule && no_wait &&
     (cmo_cbo || normalRefillCommitIssued) &&
     !refillWritePending && !refillWayCommitPending && !readTxnInFlight &&
     !replLookupInFlight && !io.postGrantReleaseSnoopActive
+  val retirementPending = RegInit(false.B)
+  retirementPending := mayRetire && !io.tasks.preparedLease.held.valid && !mainpipeInvalidate
+  val will_free = retirementPending && mayRetire &&
+    !io.tasks.preparedLease.held.valid && !mainpipeInvalidate
+  io.tasks.preparedLease.canPrepare := req_valid && !mayRetire && !retirementPending
+  MainpipeLeaseIO.acknowledge(io.tasks.preparedLease, req_valid, io.alloc.valid, io.tasks.mainpipe.fire)
   io.replaceParentRelease := will_free && req_valid && !cmo_cbo
   when(will_free && req_valid) {
     req_valid := false.B
@@ -2616,7 +2714,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     !(lostLocalHit && (readTxnInFlight || gotGrantData || probeDirty || grantIssued || io.grantSent)),
     "lostLocalHit must be a pre-read, pre-grant local-hit invalidation"
   )
-  when(io.tasks.mainpipe.fire && mp_normal_refill_commit_valid &&
+  when(io.tasks.mainpipe.fire && mainpipeIssuedVariant === 3.U &&
     (normalRefillDroppedByToN || postGrantReleaseSnoopConsumed)) {
     assert(
       !mp_normal_refill_commit.metaWen && !mp_normal_refill_commit.tagWen &&
@@ -2669,6 +2767,23 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   //
   // deadlock check
   //
+  val leaseOwnerControls = Cat(io.replaceActive, io.replaceLive, io.replaceAccepted,
+    io.replaceDetached, io.replaceRefillReady, io.deferGrant,
+    io.postGrantReleaseSnoopActive, io.blockReplRead)
+  val leaseOwnerControlsChanged = leaseOwnerControls =/=
+    RegNext(leaseOwnerControls, 0.U(leaseOwnerControls.getWidth.W))
+  val leaseNestedEvent = io.nestedwb.c_set_dirty || io.nestedwb.c_set_tip ||
+    io.nestedwb.b_inv_dirty || io.nestedwb.b_toN.getOrElse(false.B) ||
+    io.nestedwb.b_toB.getOrElse(false.B) || io.nestedwb.b_toClean.getOrElse(false.B)
+  mainpipeInvalidate := io.alloc.valid || io.resps.sinkC.valid || io.resps.rxrsp.valid ||
+    io.resps.rxdat.valid || io.replResp.valid || io.aMergeTask.valid ||
+    io.replaceDone || io.refillWriteDone || io.grantSent ||
+    io.releaseDataBeforeProbeAck || io.postGrantReleaseData ||
+    io.postGrantReleaseSnoopToN || io.postGrantReleaseSnoopToB ||
+    io.postGrantReleaseSnoopToClean || io.releaseDataDirectWrite || io.grantInstallDone ||
+    io.pCrd.grant || leaseNestedEvent || leaseOwnerControlsChanged ||
+    io.tasks.txreq.fire || io.tasks.txrsp.fire || io.tasks.source_b.fire
+
   val validCnt = RegInit(0.U(64.W))
   when(io.alloc.valid) {
     validCnt := 0.U

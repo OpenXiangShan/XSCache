@@ -46,9 +46,15 @@ class ReplaceMSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   // Pulsed only for data which may be newer than the L2 DS image and thus
   // requires a data-bearing lower-level writeback.
   val victimDataNeedsWriteback = Input(Bool())
+  val nestedReleaseWritePending = Input(Bool())
+  // An issued data-bearing release still owns its unsent CopyBack payload.
+  val acceptsLateReleaseData = Output(Bool())
   // A same-line B has handshaken into RequestArb before the sidecar released
   // its victim. B owns the first data-return opportunity in this case.
   val snoopStarted = Input(Bool())
+  // Registered local admission phase protects a possible B capture before
+  // its exact same-line service reservation is applied on the following edge.
+  val localReservationHold = Input(Bool())
   // The whole nested snoop has completed, including forwarded CompData.
   val snoopDone = Input(Bool())
   // Keep the snapshot current so a later CMO commit cannot restore stale
@@ -83,6 +89,7 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   val releaseSent = RegInit(false.B)
   val releaseAck = RegInit(false.B)
   val copyBackSent = RegInit(false.B)
+  val copyBackComplete = RegInit(false.B)
   // A Comp for an outstanding WriteEvictOrEvict means the HN did not keep a
   // copy and never wants the data.  This must outlive the transient
   // compAckPending: once the CompAck is accepted, a non-sticky cancel would
@@ -170,6 +177,7 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   // WriteEvictOrEvict has no such flow, so nothing may wait on copyBackDone.
   val activeReleaseNeedsData = Mux(releaseSent, releaseNeedsData, needsData)
   val needsCopyBack = Mux(isCmoInval, false.B, activeReleaseNeedsData) && !copyBackCancelled
+  io.acceptsLateReleaseData := valid && releaseSent && needsCopyBack && !copyBackSent
   val releaseOpcode = Mux(isCmoClean, WriteCleanFull,
     Mux(isCmoInval, Evict,
       Mux(victimWriteBackFull, WriteBackFull,
@@ -190,6 +198,7 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     releaseSent := false.B
     releaseAck := false.B
     copyBackSent := false.B
+    copyBackComplete := false.B
     releaseNeedsData := false.B
     postSnoopToInval := false.B
     snoopConsumed := false.B
@@ -359,20 +368,22 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   // DS capture occurs only after all client probes complete and only when none
   // returned ProbeAckData. It is the fallback snapshot for every valid victim;
   // a clean L1 client can correctly respond with a data-less ProbeAck.
-  val captureTaskValid = valid && captureFromDS && probeDone && !probeAckDataRecv && !captureIssued
+  val captureTaskValid = valid && captureFromDS && probeDone && !probeAckDataRecv && !captureIssued &&
+    !io.nestedReleaseWritePending
   // Before release enters RequestArb, a matching B has priority. Once this
   // task has fired it becomes an irreversible lower-level transaction, and
   // RXSNP must instead wait for the final CopyBackWrData beat.
   val releaseTaskValid = valid && probeDone && !releaseSent && !snoopConsumed &&
     !snoopInFlight && !io.snoopStarted && !releaseDataPending && !io.releaseDataSeen &&
-    (!releaseBufRequired || releaseBufCaptured)
+    (!releaseBufRequired || releaseBufCaptured) && !io.nestedReleaseWritePending
   // A late snoop has priority over CopyBackWrData issue. Its final state must
   // be reflected in the WriteData response, so never freeze CopyBackWrData
   // with the pre-snoop UD state in the same cycle that B enters RequestArb.
   // releaseAck already implies the release left via TXREQ; the explicit skid
   // hold keeps the request-before-data ordering independent of that argument.
   val copyBackTaskValid = valid && releaseAck && needsCopyBack && !copyBackSent &&
-    !snoopInFlight && !io.snoopStarted && !io.txreqPending
+    !snoopInFlight && !io.snoopStarted && !io.txreqPending &&
+    !releaseDataPending && !io.releaseDataSeen && !io.nestedReleaseWritePending && releaseBufCaptured
   // Victim-mode writeback requests (WriteBackFull etc.) are control-only
   // flits: they need no DS/Directory work.  Send them on the direct
   // MSHR->TXREQ path instead of occupying a MainPipe pass.  CMO-mode releases
@@ -395,11 +406,21 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   // exactly as it did when the task sat in RequestArb.
   io.tasks.txdat.valid := copyBackTaskValid && mode === ReplaceMSHRMode.victim
   io.tasks.txdat.bits := copyBackTask
-  io.tasks.mainpipe.valid := captureTaskValid ||
+  val mainpipeIntent = Wire(Decoupled(new TaskBundle))
+  mainpipeIntent.valid := captureTaskValid ||
     (copyBackTaskValid && mode =/= ReplaceMSHRMode.victim) ||
     (releaseTaskValid && mode =/= ReplaceMSHRMode.victim)
-  io.tasks.mainpipe.bits := Mux(captureTaskValid, captureTask,
+  mainpipeIntent.bits := Mux(captureTaskValid, captureTask,
     Mux(copyBackTaskValid, copyBackTask, releaseTask))
+  val mainpipeInvalidate = io.alloc.valid || io.sinkC.valid || io.rxrsp.valid ||
+    io.releaseDataSeen || io.victimDataCaptured || io.victimDataNeedsWriteback ||
+    io.nestedReleaseWritePending ||
+    io.snoopStarted || io.snoopDone || io.snoopMeta.valid || io.snoopToInvalDone ||
+    io.copyBackDone || io.parentRelease || io.tasks.source_b.fire ||
+    io.tasks.txreq.fire || io.tasks.txdat.fire || io.tasks.txrsp.fire
+  val mainpipeIssuedVariant = MainpipeLeaseIO.freeze(io.tasks.preparedLease,
+    mainpipeIntent, io.tasks.mainpipe,
+    Mux(captureTaskValid, 0.U(4.W), Mux(copyBackTaskValid, 1.U(4.W), 2.U(4.W))), mainpipeInvalidate)
   // Comp for WriteEvictOrEvict is the only response that owes CompAck.  The
   // flit stays valid until TXRSP accepts it; retiring earlier would drop it.
   val compAckRsp = io.tasks.txrsp.bits
@@ -440,12 +461,12 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     copyBackSent := true.B
   }
   when (io.tasks.mainpipe.fire) {
-    when (captureTaskValid) {
+    when (mainpipeIssuedVariant === 0.U) {
       captureIssued := true.B
-    }.elsewhen (releaseTaskValid) {
+    }.elsewhen (mainpipeIssuedVariant === 2.U) {
       releaseSent := true.B
       releaseNeedsData := needsData || victimWriteEvictOrEvict
-    }.elsewhen (copyBackTaskValid) {
+    }.elsewhen (mainpipeIssuedVariant === 1.U) {
       // CMO-mode copyback still travels via MainPipe.
       copyBackSent := true.B
     }
@@ -464,6 +485,7 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     // dirty ownership alongside the ReleaseBuf data.
     victim.meta.dirty := true.B
   }
+  when (io.copyBackDone) { copyBackComplete := true.B }
   when (io.snoopStarted) {
     assert(valid && !copyBackSent,
       "a nested snoop must reserve ReplaceMSHR before CopyBackWrData is issued")
@@ -540,14 +562,22 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   // the skid has handed the release flit to TXREQ.  For the first branch
   // !releaseSent already implies an empty skid; the explicit term documents
   // the invariant.  The releaseAck branch implies the flit left long ago.
-  when (valid && (snoopConsumed || io.snoopToInvalDone) && !releaseSent &&
-    !io.txreqPending && snoopInFlightNext === 0.U) {
-    valid := false.B
-    victim.valid := false.B
-    donePulse := true.B
-  }.elsewhen (valid && releaseAck && !compAckPending && (!needsCopyBack || io.copyBackDone) &&
-    !snoopInFlight && !io.snoopStarted && !io.txreqPending) {
-    when (needsCopyBack) {
+  val consumedRetire = (snoopConsumed || io.snoopToInvalDone) && !releaseSent &&
+    !io.txreqPending && snoopInFlightNext === 0.U
+  val transportRetire = releaseAck && !compAckPending &&
+    (!needsCopyBack || copyBackComplete || io.copyBackDone) &&
+    !snoopInFlight && !io.snoopStarted && !io.txreqPending
+  val retireEligible = valid && (consumedRetire || transportRetire) &&
+    !io.nestedReleaseWritePending
+  val mayRetire = retireEligible && !io.localReservationHold
+  val retirementPending = RegInit(false.B)
+  retirementPending := retireEligible && !io.tasks.preparedLease.held.valid && !mainpipeInvalidate
+  val willFree = retirementPending && mayRetire &&
+    !io.tasks.preparedLease.held.valid && !mainpipeInvalidate
+  io.tasks.preparedLease.canPrepare := valid && !retireEligible && !retirementPending
+  MainpipeLeaseIO.acknowledge(io.tasks.preparedLease, valid, io.alloc.valid, io.tasks.mainpipe.fire)
+  when (willFree) {
+    when (!consumedRetire && needsCopyBack) {
       assert(copyBackSent, "CopyBackWrData completed without being issued by ReplaceMSHR")
     }
     valid := false.B
@@ -560,8 +590,9 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   io.info.bits.releaseStarted := releaseSent
   io.info.bits.copyBackIssued := copyBackSent
   io.info.bits.awaitingProbeAck := valid && needProbe && probeSent && !probeAck
-  io.info.bits.releaseBufReady := releaseBufCaptured
-  io.info.bits.refillReady := probeDone && (!releaseBufRequired || releaseBufCaptured)
+  io.info.bits.releaseBufReady := releaseBufCaptured && !io.nestedReleaseWritePending
+  io.info.bits.refillReady := probeDone && (!releaseBufRequired || releaseBufCaptured) &&
+    !io.nestedReleaseWritePending
   io.done.valid := donePulse
   io.done.bits.parentId := victim.parentId
   io.done.bits.parentEpoch := victim.parentEpoch

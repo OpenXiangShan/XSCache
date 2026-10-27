@@ -51,6 +51,8 @@ class SnoopMSHRIO(implicit p: Parameters) extends MSHRIO {
   val allocPairedNormalId = Flipped(ValidIO(UInt(mshrBits.W)))
   // MainPipe finished RefillBuf[N] -> ReleaseBuf[S] for this snoop.
   val releaseBufCopyDone = Input(Bool())
+  val nestedReleaseWritePending = Input(Bool())
+  val nestedReleaseWriteDone = Input(Bool())
   // Export the exact B-side state transition to the paired normal context.
   // The normal may have started as a Directory miss and cannot infer this
   // from its own stale Directory snapshot.
@@ -200,7 +202,8 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
     normalPostGrantReleasePayloadLatched
   // Post-Grant SnpRespData always reads this snoop's ReleaseBuf, after nestedwb
   // dual-write or a late RefillBuf[N]->ReleaseBuf[S] copy.
-  val normalPostGrantReleasePayload = normalPostGrantReleasePending && releaseBufPayloadReady
+  val normalPostGrantReleasePayload = normalPostGrantReleasePending && releaseBufPayloadReady &&
+    !io.nestedReleaseWritePending
   val normalRefillPayload = normalProbePayload || normalPostGrantReleasePayload
   val doRespData = (shouldRespData || normalRefillPayload) && !neverRespData
   val needLateRefillToReleaseCopy =
@@ -267,7 +270,9 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
     (state.w_pprobeacklast || normalPostGrantReleasePayload) &&
     (!normalPostGrantReleasePending || normalPostGrantReleasePayload)
   val mpDctValid = valid && !state.s_dct.getOrElse(true.B) && state.s_probeack
-  io.tasks.mainpipe.valid := mpCopyValid || mpProbeAckValid || mpDctValid
+  val mainpipeIntent = Wire(Decoupled(new TaskBundle))
+  mainpipeIntent.valid := (mpCopyValid || mpProbeAckValid || mpDctValid) &&
+    !io.nestedReleaseWritePending
 
   // Late copy: RefillBuf[pairedNormalId] -> ReleaseBuf[io.id]. No CHI side effect.
   val copyTask = WireInit(0.U.asTypeOf(new TaskBundle))
@@ -377,28 +382,44 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   dctTask.snpHitReleaseWithData := req.snpHitReleaseWithData
   dctTask.snpHitReleaseIdx := req.snpHitReleaseIdx
   dctTask.snpHitReleaseMeta := req.snpHitReleaseMeta
-  io.tasks.mainpipe.bits := Mux(mpCopyValid, copyTask,
+  mainpipeIntent.bits := Mux(mpCopyValid, copyTask,
     Mux(mpProbeAckValid, probeAckTask, dctTask))
-  val postGrantReleaseResponseFire = io.tasks.mainpipe.fire && mpProbeAckValid &&
+  val leaseOwnerControls = Cat(io.normalRefillPayloadFromProbeAck,
+    io.normalRefillPostGrantReleasePending, io.normalRefillPayloadFromPostGrantRelease,
+    io.pairedNormalId.valid, Mux(io.pairedNormalId.valid, io.pairedNormalId.bits, 0.U))
+  val leaseOwnerControlsChanged = leaseOwnerControls =/=
+    RegNext(leaseOwnerControls, 0.U(leaseOwnerControls.getWidth.W))
+  val leaseNestedEvent = io.nestedwb.c_set_dirty || io.nestedwb.c_set_tip ||
+    io.nestedwb.b_inv_dirty || io.nestedwb.b_toN.getOrElse(false.B) ||
+    io.nestedwb.b_toB.getOrElse(false.B) || io.nestedwb.b_toClean.getOrElse(false.B)
+  val mainpipeInvalidate = io.alloc.valid || io.resps.sinkC.valid ||
+    io.resps.rxrsp.valid || io.resps.rxdat.valid || io.releaseBufCopyDone ||
+    io.snpRespDone || io.dctDone || leaseNestedEvent || leaseOwnerControlsChanged ||
+    io.nestedReleaseWritePending || io.nestedReleaseWriteDone ||
+    io.tasks.source_b.fire
+  val mainpipeIssuedVariant = MainpipeLeaseIO.freeze(io.tasks.preparedLease,
+    mainpipeIntent, io.tasks.mainpipe,
+    Mux(mpCopyValid, 0.U(4.W), Mux(mpProbeAckValid, 1.U(4.W), 2.U(4.W))), mainpipeInvalidate)
+  val postGrantReleaseResponseFire = io.tasks.mainpipe.fire && mainpipeIssuedVariant === 1.U &&
     normalPostGrantReleasePayload
   io.postGrantReleaseResponseToN := postGrantReleaseResponseFire &&
-    probeAckTask.meta.state === INVALID
+    io.tasks.mainpipe.bits.meta.state === INVALID
   io.postGrantReleaseResponseToB := postGrantReleaseResponseFire &&
-    probeAckTask.meta.state === BRANCH
+    io.tasks.mainpipe.bits.meta.state === BRANCH
   io.postGrantReleaseResponseToClean := postGrantReleaseResponseFire &&
-    !probeAckTask.meta.dirty
+    !io.tasks.mainpipe.bits.meta.dirty
 
-  when (io.tasks.mainpipe.fire && mpProbeAckValid && postGrantUsesReleaseBuf) {
+  when (io.tasks.mainpipe.fire && mainpipeIssuedVariant === 1.U && postGrantUsesReleaseBuf) {
     assert(probeAckTask.txChannel === CHIChannel.TXDAT &&
       probeAckTask.useProbeData && !probeAckTask.readRefillData,
       "post-Grant ReleaseData must return as SnpRespData from ReleaseBuf")
   }
-  when (io.tasks.mainpipe.fire && mpProbeAckValid && probeAckUsesRefillBuf) {
+  when (io.tasks.mainpipe.fire && mainpipeIssuedVariant === 1.U && probeAckUsesRefillBuf) {
     assert(probeAckTask.txChannel === CHIChannel.TXDAT &&
       probeAckTask.readRefillData && !probeAckTask.useProbeData,
       "paired ProbeAckData RefillBuf payload must return as SnpRespData")
   }
-  when (io.tasks.mainpipe.fire && mpProbeAckValid && probeDirty &&
+  when (io.tasks.mainpipe.fire && mainpipeIssuedVariant === 1.U && probeDirty &&
     !normalRefillPayload && !shouldRespData) {
     assert(probeAckTask.txChannel === CHIChannel.TXRSP,
       "standalone ProbeAckData must not force SnpRespData")
@@ -409,14 +430,14 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
     sourceBProbeIssued := true.B
   }
   when (io.tasks.mainpipe.fire) {
-    when (mpCopyValid) {
+    when (mainpipeIssuedVariant === 0.U) {
       // ReleaseBuf write completes later in MainPipe S5; releaseBufCopyDone
       // (or nestedwb claim) marks local residency ready.
       releaseBufCopyInFlight := true.B
-    }.elsewhen (mpProbeAckValid) {
+    }.elsewhen (mainpipeIssuedVariant === 1.U) {
       state.s_probeack := true.B
       when (normalPostGrantReleasePayload) { state.s_pprobe := true.B }
-    }.elsewhen (mpDctValid) {
+    }.elsewhen (mainpipeIssuedVariant === 2.U) {
       state.s_dct.get := true.B
     }
   }
@@ -451,8 +472,14 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
     }
   }
 
-  val willFree = state.s_pprobe && state.s_probeack && state.s_dct.getOrElse(true.B) &&
-    snpRespDone && (!doFwd || dctDone)
+  val mayRetire = state.s_pprobe && state.s_probeack && state.s_dct.getOrElse(true.B) &&
+    snpRespDone && (!doFwd || dctDone) && !io.nestedReleaseWritePending
+  val retirementPending = RegInit(false.B)
+  retirementPending := mayRetire && !io.tasks.preparedLease.held.valid && !mainpipeInvalidate
+  val willFree = retirementPending && mayRetire &&
+    !io.tasks.preparedLease.held.valid && !mainpipeInvalidate
+  io.tasks.preparedLease.canPrepare := valid && !mayRetire && !retirementPending
+  MainpipeLeaseIO.acknowledge(io.tasks.preparedLease, valid, io.alloc.valid, io.tasks.mainpipe.fire)
   when (valid && willFree) { valid := false.B }
 
   io.status.valid := valid
@@ -524,9 +551,12 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
       meta.clients := Fill(clientBits, false.B)
     }
   }
-  // Early dual-write: claim nestedwb dirty into this snoop's ReleaseBuf even on
-  // Directory miss, as long as a post-Grant ReleaseData is pending for this line.
-  when (!io.alloc.valid && nestedwbPostGrantMatch && io.nestedwb.c_set_dirty) {
+  // The whole nested descriptor completes after both physical writes. Keep
+  // the old residency unavailable while the newer payload is in flight.
+  when (!io.alloc.valid && io.nestedReleaseWritePending) {
+    releaseBufPayloadReady := false.B
+  }
+  when (!io.alloc.valid && io.nestedReleaseWriteDone) {
     releaseBufPayloadReady := true.B
   }
   io.nestedwbData := (nestedwbMatch || nestedwbPostGrantMatch) && io.nestedwb.c_set_dirty

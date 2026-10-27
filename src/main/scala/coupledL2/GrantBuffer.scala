@@ -69,7 +69,7 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
     val fromReqArb = Input(new Bundle() {
       val status_s1 = new PipeEntranceStatus
     })
-    val pipeStatusVec = Flipped(Vec(5, ValidIO(new PipeStatus)))
+    val pipeStatusVec = Flipped(Vec(6, ValidIO(new PipeStatus)))
     val toReqArb = Output(new Bundle() {
       val blockSinkReqEntrance = new BlockInfo()
       val blockMSHRReqEntrance = Bool()
@@ -290,31 +290,30 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   io.e.ready := true.B
 
   // =========== handle blocking - capacity conflict ===========
-  // count the number of valid blocks + those in pipe that might use GrantBuf
-  // so that GrantBuffer will not exceed capacity [back pressure]
-  val noSpaceForSinkReq = PopCount(VecInit(io.pipeStatusVec.tail.map { case s =>
-    s.valid && (s.bits.fromA || s.bits.fromC)
-  }).asUInt) + grantQueueCnt >= mshrsAll.U
-  val noSpaceWaitSinkEForSinkReq = PopCount(VecInit(io.pipeStatusVec.tail.map { case s =>
-    s.valid && s.bits.fromA
-  }).asUInt) + PopCount(VecInit(inflightGrant.map(x => x.valid))) >= mshrsAll.U
-  // for timing consideration, drop s1 info, so always reserve one entry for it
-  val noSpaceForMSHRReq = PopCount(VecInit(io.pipeStatusVec.tail.map { case s =>
-    s.valid && (s.bits.fromA || s.bits.fromC)
-  }).asUInt) + grantQueueCnt >= (mshrsAll-1).U
-  val noSpaceWaitSinkEForMSHRReq = PopCount(VecInit(io.pipeStatusVec.tail.map { case s =>
-    s.valid && s.bits.fromA
-  }).asUInt) + PopCount(VecInit(inflightGrant.map(x => x.valid))) >= (mshrsAll - 1).U
-  // pftRespQueue also requires back pressure to ensure that it will not exceed capacity
-  // Ideally, it should only block Prefetch from entering MainPipe
-  // But since it is extremely rare that pftRespQueue of 10 would be full, we just block all Entrance here, simpler logic
-  // TODO: consider optimize this
-  val noSpaceForSinkPft = prefetchOpt.map(_ => PopCount(VecInit(io.pipeStatusVec.tail.map { case s =>
-    s.valid && s.bits.fromA
-  }).asUInt) + pftRespQueue.get.io.count >= pftQueueLen.U)
-  val noSpaceForMSHRPft = prefetchOpt.map(_ => PopCount(VecInit(io.pipeStatusVec.tail.map { case s =>
-    s.valid && s.bits.fromA
-  }).asUInt) + pftRespQueue.get.io.count >= (pftQueueLen-1).U)
+  // Credits include every admitted pipeline reservation, including S1.
+  // A registered result never lends a same-cycle dequeue/GrantAck to a new
+  // request. RequestArb's bounded local slot prevents a second admission
+  // before the first is visible in this ledger (including its S0 MSHR hold).
+  val grantReservations = PopCount(VecInit(io.pipeStatusVec.map(s =>
+    s.valid && (s.bits.fromA || s.bits.fromC))).asUInt)
+  val ackReservations = PopCount(VecInit(io.pipeStatusVec.map(s =>
+    s.valid && s.bits.fromA)).asUInt)
+  def registeredCredit(used: UInt, capacity: Int): UInt = {
+    val credit = RegInit(0.U(log2Ceil(capacity + 1).W))
+    credit := Mux(used >= capacity.U, 0.U, capacity.U - used)
+    credit
+  }
+  val grantCredit = registeredCredit(grantQueueCnt +& grantReservations, mshrsAll)
+  val ackCredit = registeredCredit(PopCount(inflightGrant.map(_.valid)) +& ackReservations, mshrsAll)
+  val noSpaceForSinkReq = grantCredit === 0.U
+  val noSpaceWaitSinkEForSinkReq = ackCredit === 0.U
+  // Keep the extra MSHR-ingress margin used by the original S0 path.
+  val noSpaceForMSHRReq = grantCredit <= 1.U
+  val noSpaceWaitSinkEForMSHRReq = ackCredit <= 1.U
+  val pftCredit = prefetchOpt.map(_ =>
+    registeredCredit(pftRespQueue.get.io.count +& ackReservations, pftQueueLen))
+  val noSpaceForSinkPft = pftCredit.map(_ === 0.U)
+  val noSpaceForMSHRPft = pftCredit.map(_ <= 1.U)
 
   io.toReqArb.blockSinkReqEntrance.blockA_s1 := noSpaceForSinkReq || noSpaceWaitSinkEForSinkReq || noSpaceForSinkPft.getOrElse(false.B)
   io.toReqArb.blockSinkReqEntrance.blockB_s1 := Cat(inflightGrant.map(g => g.valid &&

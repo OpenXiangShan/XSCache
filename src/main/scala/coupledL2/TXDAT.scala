@@ -41,7 +41,8 @@ class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     val directSpace = Output(Bool())
     val out = DecoupledIO(new CHIDAT())
 
-    val pipeStatusVec = Flipped(Vec(5, ValidIO(new PipeStatusWithCHI)))
+    val pipeStatusVec = Flipped(Vec(6, ValidIO(new PipeStatusWithCHI)))
+    val reservedB = Input(Bool())
     val toReqArb = Output(new TXDATBlockBundle)
     // Pulse only after the final data beat leaves the TXDAT channel.
     val done = ValidIO(new TaskBundle)
@@ -68,14 +69,14 @@ class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   val queueCnt = queue.io.count
   // TODO: this may be imprecise, review this later
   val pipeStatus_s1_s5 = io.pipeStatusVec
-  val pipeStatus_s1_s3 = pipeStatus_s1_s5.take(3)
+  val pipeStatus_s1_s3 = pipeStatus_s1_s5.take(4)
   val pipeStatus_s2_s3 = pipeStatus_s1_s3.tail
-  val pipeStatus_s4_s5 = pipeStatus_s1_s5.drop(3)
+  val pipeStatus_s4_s5 = pipeStatus_s1_s5.drop(4)
   // inflightCnt equals the number of reqs on s2~s5 that may flow into TXDAT soon, plus queueCnt.
   // The calculation of inflightCnt might be imprecise and leads to false positive back pressue.
   val inflightCnt = PopCount(Cat(pipeStatus_s4_s5.map(s => s.valid && s.bits.toTXDAT && (s.bits.fromB || s.bits.mshrTask)))) +
     PopCount(Cat(pipeStatus_s2_s3.map(s => s.valid && Mux(s.bits.mshrTask, s.bits.toTXDAT, s.bits.fromB)))) +
-    queueCnt
+    queueCnt + io.reservedB.asUInt
 
   assert(inflightCnt <= (2 * mshrsAll + 4).U, "in-flight overflow at TXDAT")
 

@@ -36,7 +36,7 @@ class TXREQ(implicit p: Parameters) extends CoupledL2Module {
     val mshrReq = Flipped(DecoupledIO(new CHIREQ()))
     val out = DecoupledIO(new CHIREQ())
 
-    val pipeStatusVec = Flipped(Vec(5, ValidIO(new PipeStatusWithCHI)))
+    val pipeStatusVec = Flipped(Vec(6, ValidIO(new PipeStatusWithCHI)))
     val toReqArb = Output(new TXBlockBundle)
 
     // Committed ReplaceMSHR releases waiting in the per-context TXREQ skids.

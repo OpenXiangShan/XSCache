@@ -39,7 +39,7 @@ class ReqEntry(entries: Int = 4)(implicit p: Parameters) extends L2Bundle() {
   * [1] by stage3
   * [0] block release flag
   */
-  val waitMP  = UInt(4.W)
+  val waitMP  = UInt(5.W)
 
   /* which MSHR the entry is waiting for
   * We need to compare req.tag AND dirResult.tag (if replacement)
@@ -91,12 +91,12 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     // its Directory update or response is still in flight.
     val snoopInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo)))
     val aMergeTask = ValidIO(new AMergeTask)
-    val mainPipeBlock = Input(Vec(2, Bool()))
+    val mainPipeBlock = Input(Vec(3, Bool()))
     /* Snoop task from arbiter at stage 2 */
     val taskFromArb_s2 = Flipped(ValidIO(new TaskBundle()))
 
     /* status of s2 and s3 */
-    val pipeStatusVec = Flipped(Vec(2, ValidIO(new PipeStatus)))
+    val pipeStatusVec = Flipped(Vec(3, ValidIO(new PipeStatus)))
 
     val ATag        = Output(UInt(tagBits.W))
     val ASet        = Output(UInt(setBits.W))
@@ -217,13 +217,15 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   def noFreeWayForSet(set: UInt): Bool = {
     val task_s2 = io.taskFromArb_s2
     val sameSet_s2 = task_s2.valid && task_s2.bits.fromA && !task_s2.bits.mshrTask && task_s2.bits.set === set
-    val sameSet_s3 = RegNext(task_s2.valid && task_s2.bits.fromA && !task_s2.bits.mshrTask) &&
-      RegEnable(task_s2.bits.set, task_s2.valid) === set
+    val normalA_capture = RegNext(task_s2.valid && task_s2.bits.fromA && !task_s2.bits.mshrTask, false.B)
+    val set_capture = RegEnable(task_s2.bits.set, task_s2.valid)
+    val sameSet_s3 = normalA_capture && set_capture === set
+    val sameSet_apply = RegNext(normalA_capture, false.B) && RegNext(set_capture) === set
     // This interface carries normal contexts only. A normal MSHR with a live
     // ReplaceMSHR child still reserves its own destination way.
     val sameSetCnt = PopCount(VecInit(io.mshrInfo.map(s =>
       s.valid && s.bits.set === set && s.bits.fromA) :+
-      sameSet_s2 :+ sameSet_s3).asUInt)
+      sameSet_s2 :+ sameSet_s3 :+ sameSet_apply).asUInt)
     val noFreeWay = sameSetCnt >= cacheParams.ways.U
     noFreeWay
   }
@@ -294,6 +296,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
         s1Block,
         io.mainPipeBlock(0),
         io.mainPipeBlock(1),
+        io.mainPipeBlock(2),
         0.U(1.W))
       entry.waitMS  := conflictMask(in)
       entry.timer   := 1.U
@@ -361,7 +364,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
       val s1B_Block = io.s1Entrance.valid && io.s1Entrance.bits.set === e.task.set
       val s1_Block  = s1A_Block || s1B_Block
       when(s1_Block) {
-        e.waitMP := (e.waitMP >> 1) | "b0100".U // fired-req at s2 next cycle
+        e.waitMP := (e.waitMP >> 1) | "b01000".U // fired request reaches S3 apply in three cycles
       }
 
       // update info

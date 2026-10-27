@@ -37,6 +37,7 @@ class RXSNP(
     val refillInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo())))
     val snoopInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo())))
     val replaceInfo = Vec(mshrsAll, Flipped(ValidIO(new ReplaceMSHRInfo)))
+    val refillVictimDelegated = Input(UInt(mshrsAll.W))
     val replaceAlloc = Vec(4, Flipped(ValidIO(new ReplacementAllocAddress)))
   })
 
@@ -113,11 +114,11 @@ class RXSNP(
     !s.bits.willFree &&
     s.bits.set === task.set && s.bits.reqTag === task.tag
   )).asUInt
-  val replaceBlockSnpMask = VecInit(io.refillInfo.map(s =>
-    s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag && !s.bits.dirHit && isValid(s.bits.meta.state) &&
+  val replaceBlockSnpMask = VecInit(io.refillInfo.zipWithIndex.map { case (s, i) =>
+    !io.refillVictimDelegated(i) && s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag && !s.bits.dirHit && isValid(s.bits.meta.state) &&
     s.bits.s_cmoresp && s.bits.w_replResp && (!s.bits.w_rprobeacklast || s.bits.w_releaseack || !RegNext(s.bits.w_replResp)) &&
     !s.bits.willFree
-  )).asUInt
+  }).asUInt
   val replaceBlockSnp = replaceBlockSnpMask.orR
   // Share the same-line sidecar compare between the nest and block paths.
   // Both feed the same-cycle RXSNP admission cone, so this is a pure
@@ -141,36 +142,27 @@ class RXSNP(
   // snapshot whenever nesting applies, so the CMO block yields to nesting.
   val cmoBlockSnp = cmoBlockSnpMask.orR && !sidecarNestSnpMask.orR
 
-  // '!s.bits.dirHit'     : Nesting a Cache Replacement subsequent release
-  // '!s.bits.s_cmoresp'  : Nesting a CMO subsequent release
-  val normalReplaceNestSnpMask = VecInit(io.refillInfo.map(s =>
-      s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag &&
+  // Normal's legacy victim flags describe an unresolved handoff, not a
+  // ReleaseBuf owner. All victim release traffic now belongs to ReplaceMSHR.
+  // Before delegation, wait for that owner to register. Once delegation is
+  // sticky, an absent child means its writeback has completed: do not revive
+  // the old normal index or wait for a replacement child. Read Directory.
+  val normalVictimAwaitingOwnerMask = VecInit(io.refillInfo.zipWithIndex.map { case (s, i) =>
+    !io.refillVictimDelegated(i) && s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag &&
       (!s.bits.dirHit || !s.bits.s_cmoresp) && s.bits.meta.state =/= INVALID &&
       RegNext(s.bits.w_replResp) && s.bits.w_rprobeacklast && !s.bits.w_releaseack
-    )).asUInt
-  // A sidecar is the sole ReleaseBuf owner after the parent has delegated a
-  // victim. Do not count that same replacement through both representations.
-  val replaceNestSnpMask = Mux(
-    sidecarNestSnpMask.orR,
-    sidecarNestSnpMask,
-    normalReplaceNestSnpMask
-  )
-  val releaseToInvalNestSnpMask = VecInit((0 until mshrsAll).map { i =>
-    replaceNestSnpMask(i) && Mux(sidecarNestSnpMask(i),
-      !io.replaceInfo(i).bits.releaseToClean, !io.refillInfo(i).bits.releaseToClean)
   }).asUInt
-  val releaseToCleanNestSnpMask = VecInit((0 until mshrsAll).map { i =>
-    replaceNestSnpMask(i) && Mux(sidecarNestSnpMask(i),
-      io.replaceInfo(i).bits.releaseToClean, io.refillInfo(i).bits.releaseToClean)
-  }).asUInt
-  // A sidecar's ReleaseBuf snapshot is the only legal source once its parent
-  // can reuse the victim DS way. For an older normal-MSHR replacement path,
-  // retain the existing data-bearing-release predicate.
-  val nestedSnoopDataMask = VecInit((0 until mshrsAll).map { i =>
-    Mux(sidecarNestSnpMask(i),
-      io.replaceInfo(i).bits.releaseBufReady && !io.replaceInfo(i).bits.snoopInvalidated,
-      io.refillInfo(i).bits.replaceData)
-  }).asUInt
+  val normalVictimAwaitingOwner = normalVictimAwaitingOwnerMask.orR && !sidecarLineMask.orR
+  // RXSNP.task.valid is low while unresolved, so RequestArb never captures
+  // the B or holds a B reservation fence. Replacement/CMO owner allocation
+  // therefore progresses independently of this waiting snoop.
+  val replaceNestSnpMask = sidecarNestSnpMask
+  val releaseToInvalNestSnpMask = VecInit(io.replaceInfo.map(s =>
+    !s.bits.releaseToClean)).asUInt & replaceNestSnpMask
+  val releaseToCleanNestSnpMask = VecInit(io.replaceInfo.map(s =>
+    s.bits.releaseToClean)).asUInt & replaceNestSnpMask
+  val nestedSnoopDataMask = VecInit(io.replaceInfo.map(s =>
+    s.bits.releaseBufReady && !s.bits.snoopInvalidated)).asUInt
   val sidecarAlreadyInvalidMask = VecInit(io.replaceInfo.map(s =>
     s.valid && s.bits.snoopInvalidated
   )).asUInt
@@ -181,9 +173,7 @@ class RXSNP(
 
   val replaceNestSnpMeta = ParallelOR((0 until mshrsAll).map { i =>
     Mux(replaceNestSnpMask(i),
-      Mux(sidecarNestSnpMask(i),
-        Mux(io.replaceInfo(i).bits.snoopInvalidated, MetaEntry(), io.replaceInfo(i).bits.meta),
-        io.refillInfo(i).bits.meta),
+      Mux(io.replaceInfo(i).bits.snoopInvalidated, MetaEntry(), io.replaceInfo(i).bits.meta),
       MetaEntry())
   })
 
@@ -207,7 +197,8 @@ class RXSNP(
   val allocatingSidecarBlockSnp = allocatingSidecarMatch && !sidecarNestSnpMask.orR
   val sidecarBlockSnp = (sidecarLineMask & ~sidecarNestSnpMask).orR ||
     allocatingSidecarBlockSnp
-  val stall = reqBlockSnp || replaceBlockSnp || cmoBlockSnp || sidecarBlockSnp || snoopContextBlock
+  val stall = reqBlockSnp || replaceBlockSnp || cmoBlockSnp || sidecarBlockSnp ||
+    normalVictimAwaitingOwner || snoopContextBlock
   io.task.valid := rxsnp.valid && !stall
   io.task.bits := task
   rxsnp.ready := io.task.ready && !stall
@@ -247,6 +238,11 @@ class RXSNP(
   assert(allocBlockCnt =/= ALLOC_BLOCK_CNT_MAX,
     "a snoop blocked only by an allocating sidecar must eventually be admitted")
 
+  when(io.task.fire && task.snpHitRelease) {
+    assert(sidecarNestSnpMask.orR &&
+      (UIntToOH(task.snpHitReleaseIdx, mshrsAll) & sidecarNestSnpMask).orR,
+      "captured nested snoop must reference its registered ReleaseBuf owner")
+  }
   assert(!(stall && rxsnp.fire))
 
   def fromSnpToTaskBundle(snp: CHISNP): TaskBundle = {

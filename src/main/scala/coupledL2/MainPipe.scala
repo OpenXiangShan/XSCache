@@ -34,6 +34,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val io = IO(new Bundle() {
     /* receive task from arbiter at stage 2 */
     val taskFromArb_s2 = Flipped(ValidIO(new TaskBundle()))
+    val taskLeaseToken_s2 = Input(new MainpipeLeaseToken)
     /* status from arbiter at stage1  */
     val mshrHintQInfo = Flipped(ValidIO(new TaskBundle))
     val sinkCHintQInfo = Flipped(ValidIO(new TaskBundle))
@@ -46,15 +47,15 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val toReqArb = Output(new BlockInfo())
 
     /* block A at Entrance */
-    val toReqBuf = Output(Vec(2, Bool()))
+    val toReqBuf = Output(Vec(3, Bool()))
     // A refill-only commit must wait behind older data-bearing SourceD work
     // before it starts a shared RefillBuf read in RequestArb.
     val blockRefillOnlyCommit = Output(Bool())
 
     /* handle capacity conflict of GrantBuffer */
-    val status_vec_toD = Vec(3, ValidIO(new PipeStatus))
+    val status_vec_toD = Vec(4, ValidIO(new PipeStatus))
     /* handle capacity conflict of TX channels */
-    val status_vec_toTX = Vec(3, ValidIO(new PipeStatusWithCHI))
+    val status_vec_toTX = Vec(4, ValidIO(new PipeStatusWithCHI))
 
     /* get dir result at stage 3 */
     val dirResp_s3 = Input(new DirResult())
@@ -69,6 +70,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
     /* send task to MSHRCtl at stage 3 */
     val toMSHRCtl = new Bundle() {
+      val mainpipeLeaseDone = ValidIO(new MainpipeLeaseDone)
       val mshr_alloc_s3 = ValidIO(new MSHRRequest())
       // Replacement metadata can synthesize a logical snoop hit even when
       // Directory misses. Only the original hit owns the reported DS way.
@@ -82,7 +84,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       // A normal Grant/AccessAckData refill is visible to a later snoop only
       // after its S3 Directory/DS commit, not when its MSHR task first enters
       // RequestArb. This also covers metadata-only normal refill commits.
-      val refillWriteDone = ValidIO(UInt(mshrBits.W))
+      val refillWriteDone = ValidIO(new MainpipeLeaseDone)
       // A normal MSHR's L1-visible Grant/AccessAckData actually handshook
       // with GrantBuffer. MainPipe can drop an accepted MSHR task on retry,
       // so this must be generated at SourceD fire rather than task ingress.
@@ -113,9 +115,6 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       val postGrantReleaseHolds = Flipped(Vec(mshrsAll, ValidIO(new MSHRInfo())))
       // Registered paired-snoop result for a normal refill-only task that may
       // already have been accepted by RequestArb.
-      val normalRefillLateSnoopToN = Input(Vec(mshrsAll, Bool()))
-      val normalRefillLateSnoopToB = Input(Vec(mshrsAll, Bool()))
-      val normalRefillLateSnoopToClean = Input(Vec(mshrsAll, Bool()))
       // The ReplacerResult returning for the S3 refill task selects a
       // no-probe victim (invalid or client-less) with a live sidecar slot
       // reservation and no ownership conflict, so the grant pass may merge
@@ -204,12 +203,18 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val reqWayOH_s2 = UIntToOH(task_s2.bits.way, cacheParams.ways)
 
   /* ======== Stage 3 ======== */
-  val task_s3 = RegInit(0.U.asTypeOf(Valid(new TaskBundle)))
-  task_s3.valid := task_s2.valid
-  when (task_s2.valid) {
-    task_s3.bits := task_s2.bits
-  }
-  val reqWayOH_s3 = RegEnable(reqWayOH_s2, task_s2.valid)
+  // The fixed Directory read returns in this capture stage. Slice registers
+  // its entire result and all buffer payloads at the same edge as task_s3.
+  // Admission reserves this always-consumed result slot before issuing S1.
+  val task_s3_capture = RegInit(0.U.asTypeOf(Valid(new TaskBundle)))
+  task_s3_capture.valid := task_s2.valid
+  when(task_s2.valid) { task_s3_capture.bits := task_s2.bits }
+  val task_s3 = RegNext(task_s3_capture, 0.U.asTypeOf(task_s3_capture))
+  val leaseToken_s3_capture = RegEnable(io.taskLeaseToken_s2, task_s2.valid)
+  val leaseToken_s3 = RegEnable(leaseToken_s3_capture, task_s3_capture.valid)
+  val reqWayOH_s3 = UIntToOH(task_s3.bits.way, cacheParams.ways)
+  assert(PopCount(Seq(task_s2.valid, task_s3_capture.valid, task_s3.valid)) <= 1.U,
+    "the local Directory/result/apply execution slot must have one owner")
 
   /* ======== Enchantment ======== */
   val dirResult_s3    = io.dirResp_s3
@@ -294,23 +299,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // stays suppressed exactly as before.
   val mshr_defer_refill_write_s3 = mshr_refill_s3 && req_s3.deferRefillWrite &&
     !(req_s3.dsWen || req_s3.tagWen || req_s3.metaWen)
-  // The normal commit task carries the meta/write enables sampled when it
-  // entered RequestArb. A paired SnoopMSHR may resolve while that task is in
-  // flight, so select the registered normal-context outcome again at S3.
-  val normalRefillOnlyCommit_s3 = task_s3.valid && mshr_refill_only_s3 &&
-    req_s3.mshrContext === 0.U
-  val normalRefillLateSnoopToN_s3 = normalRefillOnlyCommit_s3 &&
-    io.fromMSHRCtl.normalRefillLateSnoopToN.zipWithIndex.map {
-      case (outcome, i) => outcome && req_s3.mshrId === i.U
-    }.reduce(_ || _)
-  val normalRefillLateSnoopToB_s3 = normalRefillOnlyCommit_s3 &&
-    io.fromMSHRCtl.normalRefillLateSnoopToB.zipWithIndex.map {
-      case (outcome, i) => outcome && req_s3.mshrId === i.U
-    }.reduce(_ || _)
-  val normalRefillLateSnoopToClean_s3 = normalRefillOnlyCommit_s3 &&
-    io.fromMSHRCtl.normalRefillLateSnoopToClean.zipWithIndex.map {
-      case (outcome, i) => outcome && req_s3.mshrId === i.U
-    }.reduce(_ || _)
+  // The registered owner applies all older completion events before prepare.
+  // Its frozen task is the one final metadata/data commit proposal. The short
+  // local execution reservation excludes a newer B through physical S3 apply;
+  // no live normal-owner outcome may rewrite an already issued proposal here.
   val mshr_replace_capture_s3 = mshr_req_s3 && req_s3.replaceCapture
   val mshr_refill_to_release_copy_s3 = mshr_req_s3 && req_s3.refillToReleaseCopy
   val replResp_valid_hold = io.replResp.bits.validHold
@@ -634,7 +626,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val externalRefillBufConsumer_s3 = !mshr_refill_only_s3 &&
     (mshr_grantdata_s3 || mshr_accessackdata_s3 || mergedAData_s3)
   val internalRefillBufConsumer_s3 = mshr_refill_only_s3 &&
-    req_s3.dsWen && req_s3.readRefillData && !normalRefillLateSnoopToN_s3
+    req_s3.dsWen && req_s3.readRefillData
   val mshrRefillToReleaseCopy_s3 = task_s3.valid && mshr_refill_to_release_copy_s3
   val mshrRefillBufConsumer_s3 = task_s3.valid && mshr_req_s3 &&
     !useReleaseBufData_s3 && !req_s3.readDataFromDS &&
@@ -662,7 +654,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val wen_c = sinkC_req_s3 && isParamFromT(req_s3.param) && req_s3.opcode(0) && dirResult_s3.hit
   io.toMSHRCtl.orphanReleaseData := task_s3.valid && sinkC_req_s3 &&
     req_s3.opcode === ReleaseData && isParamFromT(req_s3.param) && !dirResult_s3.hit
-  val wen_mshr = req_s3.dsWen && !normalRefillLateSnoopToN_s3 && (
+  val wen_mshr = req_s3.dsWen && (
     mshr_snpRespX_s3 || mshr_snpRespDataX_s3 ||
     mshr_writeCleanFull_s3 || mshr_writeBackFull_s3 || 
     mshr_writeEvictFull_s3 || mshr_writeEvictOrEvict_s3 || mshr_evict_s3 ||
@@ -683,9 +675,15 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     assert(!normalRefillOverlapsSnoopHold,
       "normal refill must not overwrite a DS way held for SnoopMSHR data")
   }
-  io.toMSHRCtl.refillWriteDone.valid := task_s3.valid && mshr_refill_s3 &&
+  val normalCommitApplied = Wire(Valid(new MainpipeLeaseDone))
+  normalCommitApplied.valid := task_s3.valid && mshr_refill_s3 &&
     req_s3.mshrContext === 0.U && !need_repl && !retry && !mshr_defer_refill_write_s3
-  io.toMSHRCtl.refillWriteDone.bits := req_s3.mshrId
+  normalCommitApplied.bits.mshrId := req_s3.mshrId
+  normalCommitApplied.bits.mshrContext := 0.U
+  normalCommitApplied.bits.token := leaseToken_s3
+  // Physical DS/tag/meta requests apply at this edge. Owner bookkeeping sees
+  // that application as a registered versioned event on the following cycle.
+  io.toMSHRCtl.refillWriteDone := RegNext(normalCommitApplied, 0.U.asTypeOf(normalCommitApplied))
   // The merged grant install (victim snapshot read + Directory install)
   // physically happened in this pass; the parent and the sidecar both key
   // off this single source.
@@ -759,7 +757,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // MSHR writes use their reserved way; dirResult_s3 is not a lookup for
   // these tasks. Sidecar ordering cancels a consumed CMO before release,
   // and CopyBack tasks carry no Directory/DS write enables.
-  val metaW_valid_s3_mshr = mshr_req_s3 && !normalRefillLateSnoopToN_s3 && (
+  val metaW_valid_s3_mshr = mshr_req_s3 && (
     req_s3.metaWen && !(mshr_refill_s3 && (retry || mshr_defer_refill_write_s3)) ||
       grantMergeInstall_s3
   )
@@ -810,14 +808,6 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
   // use merge_meta if mergeA
   val metaW_s3_mshr = WireInit(Mux(req_s3.mergeA, req_s3.aMergeTask.meta, req_s3.meta))
-  when(normalRefillLateSnoopToB_s3) {
-    metaW_s3_mshr.dirty := false.B
-    metaW_s3_mshr.state := BRANCH
-    metaW_s3_mshr.clients := Fill(clientBits, false.B)
-  }.elsewhen(normalRefillLateSnoopToClean_s3) {
-    metaW_s3_mshr.dirty := false.B
-    metaW_s3_mshr.clients := Fill(clientBits, false.B)
-  }
   metaW_s3_mshr.tagErr := req_s3.denied
   metaW_s3_mshr.dataErr := req_s3.corrupt
   val metaW_s3_cmo  = MetaEntry()   // invalid the block
@@ -844,27 +834,12 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
   io.tagWReq.valid := task_s3.valid && (
     req_s3.tagWen && mshr_refill_s3 &&
-      !normalRefillLateSnoopToN_s3 && !retry && !mshr_defer_refill_write_s3 ||
+      !retry && !mshr_defer_refill_write_s3 ||
       grantMergeInstall_s3
   )
   io.tagWReq.bits.set := req_s3.set
   io.tagWReq.bits.wayOH := Mux(commitReplWay, replWayOH_s3, reqWayOH_s3)
   io.tagWReq.bits.wtag := req_s3.tag
-
-  when(normalRefillLateSnoopToN_s3) {
-    assert(!wen_mshr && !metaW_valid_s3_mshr && !io.tagWReq.valid,
-      "toN-consumed post-Grant refill must not reinstall DS/meta")
-  }
-  when(normalRefillLateSnoopToB_s3 && !need_repl && !retry && !mshr_defer_refill_write_s3) {
-    assert(wen_mshr && metaW_valid_s3_mshr && metaW_s3_mshr.state === BRANCH &&
-      !metaW_s3_mshr.dirty && !metaW_s3_mshr.clients.orR,
-      "toB-consumed post-Grant refill must commit clean BRANCH")
-  }
-  when(normalRefillLateSnoopToClean_s3 && !need_repl && !retry && !mshr_defer_refill_write_s3) {
-    assert(wen_mshr && metaW_valid_s3_mshr && !metaW_s3_mshr.dirty &&
-      !metaW_s3_mshr.clients.orR,
-      "clean-consumed post-Grant refill must commit clean metadata")
-  }
 
   sink_resp_s3_b_metaWen := metaW_valid_s3_b
   sink_resp_s3_b_meta := metaW_s3_b
@@ -1056,6 +1031,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     Seq(GrantData, Grant, AccessAckData).map(_ === task_s4.bits.opcode).reduce(_ || _))
 
   task_s4.valid := task_s3.valid && !req_drop_s3
+  val leaseToken_s4 = RegEnable(leaseToken_s3, task_s3.valid && !req_drop_s3)
 
   when (task_s3.valid && !req_drop_s3) {
     task_s4.bits := source_req_s3
@@ -1113,6 +1089,23 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val l2TagError_s5 = RegInit(false.B)
 
   task_s5.valid := task_s4.valid && !req_drop_s4
+  val leaseToken_s5 = RegEnable(leaseToken_s4, task_s4.valid && !req_drop_s4)
+  // Return the source lease only after its final local task/buffer reference.
+  // A source accepted at S0 may stall in RequestArb S1; actual pipeline
+  // terminal events, rather than a fixed countdown, determine this boundary.
+  val leaseEnds = Seq(
+    (task_s3.valid && task_s3.bits.mshrTask && req_drop_s3, task_s3.bits, leaseToken_s3),
+    (task_s4.valid && task_s4.bits.mshrTask && req_drop_s4, task_s4.bits, leaseToken_s4),
+    (task_s5.valid && task_s5.bits.mshrTask, task_s5.bits, leaseToken_s5)
+  )
+  val leaseDone = Wire(Valid(new MainpipeLeaseDone))
+  leaseDone.valid := VecInit(leaseEnds.map(_._1)).asUInt.orR
+  leaseDone.bits.mshrId := Mux1H(leaseEnds.map(x => x._1 -> x._2.mshrId))
+  leaseDone.bits.mshrContext := Mux1H(leaseEnds.map(x => x._1 -> x._2.mshrContext))
+  leaseDone.bits.token := Mux1H(leaseEnds.map(x => x._1 -> x._3))
+  assert(PopCount(leaseEnds.map(_._1)) <= 1.U,
+    "one local execution slot cannot complete two source leases in the same cycle")
+  io.toMSHRCtl.mainpipeLeaseDone := RegNext(leaseDone, 0.U.asTypeOf(leaseDone))
 
   when (task_s4.valid && !req_drop_s4) {
     task_s5.bits := task_s4.bits
@@ -1139,10 +1132,18 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // TODO: check this
   val customL1Hint = Module(new CustomL1Hint)
 
-  customL1Hint.io.mshrHintQInfo := io.mshrHintQInfo
-  customL1Hint.io.sinkCHintQInfo := io.sinkCHintQInfo
-  customL1Hint.io.retry_s2 := io.retryFastFwd_s2 && task_s2.valid
-  io.hint_s1QueueFull := customL1Hint.io.hint_s1QueueFull
+  // The complete S3 event adds one response stage. Advance the full early
+  // hint transaction and its following retry with that same stage, retaining
+  // their relative timing and source identity under hint backpressure.
+  val mshrHintEvent = RegNext(io.mshrHintQInfo, 0.U.asTypeOf(io.mshrHintQInfo))
+  val sinkCHintEvent = RegNext(io.sinkCHintQInfo, 0.U.asTypeOf(io.sinkCHintQInfo))
+  customL1Hint.io.mshrHintQInfo := mshrHintEvent
+  customL1Hint.io.sinkCHintQInfo := sinkCHintEvent
+  customL1Hint.io.retry_s2 := RegNext(io.retryFastFwd_s2 && task_s2.valid, false.B)
+  // The local transition slot permits only one new hint event before this
+  // register drains. Count it as reserved capacity at the ingress too.
+  io.hint_s1QueueFull := customL1Hint.io.hint_s1QueueFull ||
+    mshrHintEvent.valid || sinkCHintEvent.valid
 
   customL1Hint.io.s3.task      := task_s3
   // overwrite opcode: if sinkReq can respond, use sink_resp_s3.bits.opcode = Grant/GrantData
@@ -1251,22 +1252,26 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   }
 
   io.toReqBuf(0) := task_s2.valid && s23Block('a', task_s2.bits)
-  io.toReqBuf(1) := task_s3.valid && s23Block('a', task_s3.bits)
+  io.toReqBuf(1) := task_s3_capture.valid && s23Block('a', task_s3_capture.bits)
+  io.toReqBuf(2) := task_s3.valid && s23Block('a', task_s3.bits)
 
-  io.toReqArb.blockC_s1 := task_s2.valid && s23Block('c', task_s2.bits)
+  io.toReqArb.blockC_s1 := task_s2.valid && s23Block('c', task_s2.bits) ||
+    task_s3_capture.valid && s23Block('c', task_s3_capture.bits)
 
   io.toReqArb.blockB_s1 :=
     task_s2.valid && bBlock(task_s2.bits) ||
+    task_s3_capture.valid && bBlock(task_s3_capture.bits) ||
     task_s3.valid && bBlock(task_s3.bits) ||
     task_s4.valid && bBlock(task_s4.bits, tag = true) ||
     task_s5.valid && bBlock(task_s5.bits, tag = true)
   
   io.toReqArb.blockA_s1 := false.B
 
-  io.toReqArb.blockG_s1 := task_s2.valid && s23Block('g', task_s2.bits)
+  io.toReqArb.blockG_s1 := task_s2.valid && s23Block('g', task_s2.bits) ||
+    task_s3_capture.valid && s23Block('g', task_s3_capture.bits)
 
   /* ======== Pipeline Status ======== */
-  require(io.status_vec_toD.size == 3)
+  require(io.status_vec_toD.size == 4)
   io.status_vec_toD(0).valid := task_s3.valid && Mux(
     mshr_req_s3,
     mshr_refill_s3 && !retry && !mshr_refill_only_s3,
@@ -1282,12 +1287,15 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.status_vec_toD(1).bits.channel := task_s4.bits.channel
   io.status_vec_toD(2).valid        := d_s5.valid
   io.status_vec_toD(2).bits.channel := task_s5.bits.channel
+  // Keep this pre-apply stage visible even when S3 later chooses retry.
+  io.status_vec_toD(3).valid := task_s3_capture.valid
+  io.status_vec_toD(3).bits.channel := task_s3_capture.bits.channel
 
   // capacity control of TX channels
   val tx_task_s3 = Wire(Valid(new TaskBundle))
   tx_task_s3.valid := task_s3.valid // TODO: review this
   tx_task_s3.bits := req_s3
-  val tasks = Seq(tx_task_s3, task_s4, task_s5)
+  val tasks = Seq(task_s3_capture, tx_task_s3, task_s4, task_s5)
   io.status_vec_toTX.zip(tasks).foreach { case (status, task) =>
     status.valid := task.valid
     status.bits.channel := task.bits.channel
