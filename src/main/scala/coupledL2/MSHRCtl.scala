@@ -1743,41 +1743,33 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val bc = groupBestClass(g, v)
     v & VecInit(cs.map(_ === bc)).asUInt
   }
-  val mshrTaskGroupRrMask = Seq.fill(nMshrTaskGroups)(RegInit(0.U(mshrTaskGroupSize.W)))
-  // Registered arbitration decision.  The choice is made from this cycle's
-  // valids and classes, but the source is consumed only when mshrTask
-  // actually fires, so every MSHR evaluates its ordering guards in the same
-  // cycle the task leaves.  A source that withdraws before the grant
-  // invalidates the decision instead of issuing a stale task.
-  val mshrTaskGroupValid = Seq.fill(nMshrTaskGroups)(RegInit(false.B))
-  val mshrTaskGroupClass = Seq.fill(nMshrTaskGroups)(RegInit(0.U(3.W)))
-  val mshrTaskGroupIdx = Seq.fill(nMshrTaskGroups)(RegInit(0.U(log2Up(mshrTaskGroupSize).W)))
-  // R3: snapshot the selected source payload at the same edge as the group
-  // decision.  This register ends the source-bits -> 16:1 group mux cone, so
-  // the RequestArb S1 payload no longer carries either that mux or the live
-  // final-valid gate (mshrTaskGroupReady -> selected source valid ->
-  // bFire/snoopStarted).
-  val mshrTaskGroupBits = Seq.fill(nMshrTaskGroups)(
-    RegInit(0.U.asTypeOf(new TaskBundle())))
-  // A held decision blocks its group until the cross-group stage drains it.
-  // Promote it after the same 63-cycle bound as a source so a low-class
-  // decision cannot hold back a promoted source behind it.
+  // Capture a revocable prepared task without acknowledging its MSHR.  The
+  // MSHR remains the owner and evaluates its ordering/cancellation guards
+  // until the final RequestArb handshake.  A group is refilled only while
+  // empty, so neither issue nor cancellation feeds back into its arbiter.
+  class MSHRPreparedTask extends Bundle {
+    val task = new TaskBundle()
+    val source = UInt(log2Up(mshrTaskGroupSize).W)
+    val qosClass = UInt(3.W)
+  }
+  class MSHRTaskTicket extends Bundle {
+    val group = UInt(log2Up(nMshrTaskGroups).W)
+    val source = UInt(log2Up(mshrTaskGroupSize).W)
+    val qosClass = UInt(3.W)
+  }
+  val mshrTaskPreparedValid = Seq.fill(nMshrTaskGroups)(RegInit(false.B))
+  val mshrTaskPrepared = Seq.fill(nMshrTaskGroups)(
+    RegInit(0.U.asTypeOf(new MSHRPreparedTask)))
   val mshrTaskGroupWait = Seq.fill(nMshrTaskGroups)(RegInit(0.U(6.W)))
   val mshrTaskGroupClassEff = (0 until nMshrTaskGroups).map { g =>
-    Mux(mshrTaskGroupWait(g) === 63.U, 0.U(3.W), mshrTaskGroupClass(g))
+    Mux(mshrTaskGroupWait(g) === 63.U, 0.U(3.W), mshrTaskPrepared(g).qosClass)
   }
   val mshrTaskGroupSrcValid = (0 until nMshrTaskGroups).map { g =>
-    VecInit(groupOf(g).map(_.valid))(mshrTaskGroupIdx(g))
+    VecInit(groupOf(g).map(_.valid))(mshrTaskPrepared(g).source)
   }
-  // R3: the payload is a snapshot taken when the decision was made.  A source
-  // may keep valid high while a higher-priority task variant becomes ready
-  // (e.g. grant -> repl_read/revalidate share the same MSHR output), which
-  // changes the payload without a valid gap.  Firing the snapshot then would
-  // disagree with the source's own fire side effects (replTask/refillOnly),
-  // so the decision is only usable while the live task type still matches.
-  // Only the control/type fields are compared; the wide address/data fields
-  // are stable within a variant.  A mismatch drops the decision and the
-  // group re-decides from the freshly presented bits next cycle.
+  // A valid MSHR output can switch task variants while waiting.  Revoke the
+  // snapshot on that change so its fire side effects always describe the
+  // same task as the payload accepted by RequestArb.
   def mshrTaskType(t: TaskBundle): UInt = Cat(
     t.opcode, t.txChannel, t.mshrContext,
     t.replTask.asUInt, t.refillOnly.asUInt, t.deferRefillWrite.asUInt,
@@ -1792,91 +1784,106 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     t.expCompAck.getOrElse(false.B).asUInt,
     t.likelyshared.getOrElse(false.B).asUInt)
   val mshrTaskGroupPayloadStable = (0 until nMshrTaskGroups).map { g =>
-    mshrTaskType(mshrTaskGroupBits(g)) ===
-      VecInit(groupOf(g).map(s => mshrTaskType(s.bits)))(mshrTaskGroupIdx(g))
+    mshrTaskType(mshrTaskPrepared(g).task) ===
+      VecInit(groupOf(g).map(s => mshrTaskType(s.bits)))(mshrTaskPrepared(g).source)
   }
   val mshrTaskGroupReady = (0 until nMshrTaskGroups).map { g =>
-    mshrTaskGroupValid(g) && mshrTaskGroupSrcValid(g) && mshrTaskGroupPayloadStable(g)
+    mshrTaskPreparedValid(g) && mshrTaskGroupSrcValid(g) && mshrTaskGroupPayloadStable(g)
   }
 
-  // Cross-group arbitration over the three held decisions.
-  val mshrTaskFinalClassMasks = (0 until 5).map { c =>
-    VecInit((0 until nMshrTaskGroups).map(g => mshrTaskGroupReady(g) && mshrTaskGroupClassEff(g) === c.U)).asUInt
+  // The cross-group arbiter transports only a narrow ticket.  Register that
+  // ticket before selecting a prepared payload, so live source-valid/type
+  // checks and the class/RR selection do not drive the wide output mux.
+  val mshrTaskTicketValid = RegInit(false.B)
+  val mshrTaskTicket = RegInit(0.U.asTypeOf(new MSHRTaskTicket))
+  val mshrTaskTicketOut = Wire(Decoupled(new MSHRTaskTicket))
+  val mshrTaskFinalBestClass = PriorityEncoder(VecInit((0 until 5).map { c =>
+    VecInit((0 until nMshrTaskGroups).map { g =>
+      mshrTaskGroupReady(g) && mshrTaskGroupClassEff(g) === c.U
+    }).asUInt.orR
+  }).asUInt)
+  val mshrTaskTicketInputs = (0 until nMshrTaskGroups).map { g =>
+    val ticket = Wire(Decoupled(new MSHRTaskTicket))
+    ticket.valid := mshrTaskGroupReady(g) && mshrTaskGroupClassEff(g) === mshrTaskFinalBestClass
+    ticket.bits.group := g.U
+    ticket.bits.source := mshrTaskPrepared(g).source
+    ticket.bits.qosClass := mshrTaskGroupClassEff(g)
+    ticket
   }
-  val mshrTaskFinalBestClass = PriorityEncoder(VecInit(mshrTaskFinalClassMasks.map(_.orR)).asUInt)
-  val mshrTaskFinalCandidates = VecInit((0 until nMshrTaskGroups).map(g =>
-    mshrTaskGroupReady(g) && mshrTaskGroupClassEff(g) === mshrTaskFinalBestClass)).asUInt
-  val mshrTaskFinalRrMask = RegInit(0.U(nMshrTaskGroups.W))
-  val mshrTaskFinalRrCand = mshrTaskFinalRrMask & mshrTaskFinalCandidates
-  val mshrTaskFinalSelOH = Mux(mshrTaskFinalRrCand.orR, MaskToOH(mshrTaskFinalRrCand),
-    MaskToOH(mshrTaskFinalCandidates))
-  // R3: only the three registered group payloads reach the output mux.  The
-  // payload is don't-care while valid is low, so it is no longer gated by
-  // mshrTask.valid; the live valid cone now stops at mshrTask.valid and does
-  // not ripple through every TaskBundle bit.
-  mshrTask.valid := mshrTaskFinalCandidates.orR
-  mshrTask.bits := Mux1H(mshrTaskFinalSelOH, mshrTaskGroupBits)
-  // Every group has mshrsAll slots, so the decided index is the physical
-  // MSHR id for refill, snoop and replace alike.
-  mshrTask.bits.mshrId := Mux1H(mshrTaskFinalSelOH, mshrTaskGroupIdx)
-  mshrTask.bits.qosClass := mshrTaskFinalBestClass
-  assert(!mshrTask.valid ||
-    mshrTaskFinalBestClass === Mux1H(mshrTaskFinalSelOH, mshrTaskGroupClassEff),
-    "selected task must belong to the best effective QoS class")
+  ArbPerf(twoLevelArb(mshrTaskTicketInputs, mshrTaskTicketOut, Some("mshr_task_ticket")),
+    "mshr_task_ticket_arb")
+  mshrTaskTicketOut.ready := !mshrTaskTicketValid
+  val mshrTaskTicketGroupOH = UIntToOH(mshrTaskTicket.group, nMshrTaskGroups)
+  val mshrTaskTicketReady = Mux1H(mshrTaskTicketGroupOH, (0 until nMshrTaskGroups).map { g =>
+    mshrTaskGroupReady(g) && mshrTaskPrepared(g).source === mshrTaskTicket.source
+  })
+  mshrTask.valid := mshrTaskTicketValid && mshrTaskTicketReady
+  mshrTask.bits := Mux1H(mshrTaskTicketGroupOH, mshrTaskPrepared.map(_.task))
+  mshrTask.bits.mshrId := mshrTaskTicket.source
+  mshrTask.bits.qosClass := mshrTaskTicket.qosClass
+  when(mshrTaskTicketOut.fire) {
+    mshrTaskTicketValid := true.B
+    mshrTaskTicket := mshrTaskTicketOut.bits
+    assert(mshrTaskTicketOut.bits.qosClass === mshrTaskFinalBestClass,
+      "selected ticket must belong to the best effective QoS class")
+  }.elsewhen(mshrTaskTicketValid && (!mshrTaskTicketReady || mshrTask.fire)) {
+    // Cancellation consumes no source.  Do not reload on issue/cancel: the
+    // next ticket observes the updated ownership and task variant.
+    mshrTaskTicketValid := false.B
+  }.elsewhen(mshrTaskTicketValid &&
+    Mux1H(mshrTaskTicketGroupOH, mshrTaskGroupWait.map(_ === 63.U))) {
+    // RequestArb may defer class-4 tasks while sinks have work.  Keep the
+    // existing age promotion alive after ticket capture, otherwise a held
+    // background ticket could prevent every group from making progress.
+    // Only this narrow QoS register changes; the owner and payload stay held.
+    mshrTaskTicket.qosClass := 0.U
+  }
 
   (0 until nMshrTaskGroups).foreach { g =>
-    // R3: the source granted in this cycle is consumed by mshrTask.fire and
-    // its bits are the task currently leaving.  Mask it out of the reload:
-    // sampling it here would capture the pre-fire payload and, if the source
-    // keeps valid high for its next task, re-issue the same task.  The group
-    // then re-decides from freshly presented bits one cycle later.
-    val granted = mshrTask.fire && mshrTaskFinalSelOH(g)
-    val grantedOH = Mux(granted, UIntToOH(mshrTaskGroupIdx(g), mshrTaskGroupSize), 0.U)
-    val loadValids = groupValids(g) & ~grantedOH
-    val loadCand = groupCandidates(g, loadValids)
-    val loadRrCand = mshrTaskGroupRrMask(g) & loadCand
-    val loadSelOH = Mux(loadRrCand.orR, MaskToOH(loadRrCand), MaskToOH(loadCand))
-    val loadSelIdx = OHToUInt(loadSelOH)
-    val load = (!mshrTaskGroupValid(g) || granted) && loadCand.orR
-    when(load) {
-      mshrTaskGroupValid(g) := true.B
-      mshrTaskGroupClass(g) := groupBestClass(g, loadValids)
-      mshrTaskGroupIdx(g) := loadSelIdx
-      mshrTaskGroupBits(g) := VecInit(groupOf(g).map(_.bits))(loadSelIdx)
+    val preparedOut = Wire(Decoupled(new MSHRPreparedTask))
+    val candidates = groupCandidates(g, groupValids(g))
+    val preparedInputs = groupOf(g).zipWithIndex.map { case (s, i) =>
+      val in = Wire(Decoupled(new MSHRPreparedTask))
+      in.valid := candidates(i)
+      in.bits.task := s.bits
+      in.bits.source := i.U
+      in.bits.qosClass := groupClasses(g)(i)
+      in
+    }
+    ArbPerf(twoLevelArb(preparedInputs, preparedOut, Some(s"mshr_task_group_$g")),
+      s"mshr_task_group_${g}_arb")
+    preparedOut.ready := !mshrTaskPreparedValid(g)
+    val granted = mshrTask.fire && mshrTaskTicketGroupOH(g)
+    when(preparedOut.fire) {
+      mshrTaskPreparedValid(g) := true.B
+      mshrTaskPrepared(g) := preparedOut.bits
       mshrTaskGroupWait(g) := 0.U
-      mshrTaskGroupRrMask(g) := Mux(loadRrCand.orR,
-        LowerMaskPrefix(loadRrCand), LowerMaskPrefix(loadCand))
-    }.elsewhen(granted) {
-      mshrTaskGroupValid(g) := false.B
+    }.elsewhen(mshrTaskPreparedValid(g) && (granted || !mshrTaskGroupReady(g))) {
+      mshrTaskPreparedValid(g) := false.B
       mshrTaskGroupWait(g) := 0.U
-    }.elsewhen(mshrTaskGroupValid(g) &&
-      (!mshrTaskGroupSrcValid(g) || !mshrTaskGroupPayloadStable(g))) {
-      // Source withdrawn or switched task variant under the held payload:
-      // drop the decision without consuming the source.
-      mshrTaskGroupValid(g) := false.B
-      mshrTaskGroupWait(g) := 0.U
-    }.elsewhen(mshrTaskGroupValid(g)) {
+    }.elsewhen(mshrTaskPreparedValid(g)) {
       mshrTaskGroupWait(g) := Mux(mshrTaskGroupWait(g) === 63.U, 63.U, mshrTaskGroupWait(g) + 1.U)
     }
     groupOf(g).zipWithIndex.foreach { case (s, i) =>
-      s.ready := mshrTask.fire && mshrTaskFinalSelOH(g) && mshrTaskGroupIdx(g) === i.U
+      // Preparing a task/ticket is revocable; only final issue transfers
+      // ownership and advances the source's task state machine.
+      s.ready := granted && mshrTaskTicket.source === i.U
     }
+    assert(!preparedOut.fire || !mshrTaskPreparedValid(g),
+      "a prepared task must drain or cancel before the group can reload")
   }
-  // R3 exactly-once: a source is consumed only by mshrTask.fire (its ready
-  // above), and the reload masks the granted source.  Therefore two
-  // consecutive cycles cannot grant the same source; a valid that survives
-  // the fire is a new task and must pass through a fresh decision (and a
-  // fresh payload snapshot) before it can be granted again.
+  // The preparation/ticket stages cannot consume a source.  An issued task
+  // clears its prepared entry and must be prepared anew before another fire.
   val mshrTaskGrantSrc = VecInit((0 until nMshrTaskGroups).map { g =>
-    Mux(mshrTask.fire && mshrTaskFinalSelOH(g),
-      UIntToOH(mshrTaskGroupIdx(g), mshrTaskGroupSize), 0.U)
+    Mux(mshrTask.fire && mshrTaskTicketGroupOH(g),
+      UIntToOH(mshrTaskTicket.source, mshrTaskGroupSize), 0.U)
   }).asUInt
   val mshrTaskGrantSrcLast = RegNext(mshrTaskGrantSrc, 0.U(nMshrTaskSrc.W))
   assert(!(mshrTaskGrantSrcLast & mshrTaskGrantSrc).orR,
-    "an MSHR task source must not be granted twice without a re-decision")
+    "an MSHR task source must not be granted twice without fresh preparation")
   when(mshrTask.fire) {
-    mshrTaskFinalRrMask := Mux(mshrTaskFinalRrCand.orR,
-      LowerMaskPrefix(mshrTaskFinalRrCand), LowerMaskPrefix(mshrTaskFinalCandidates))
+    assert(PopCount(VecInit(mshrTaskSources.map(_.fire))) === 1.U,
+      "issuing an MSHR task must consume exactly its owning source")
   }
   ArbPerf(mshrTaskSources.map(_.valid), mshrTaskSources.map(_.ready), mshrTask.ready, "mshr_task_arb")
   XSPerfAccumulate(
@@ -1910,9 +1917,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   XSPerfAccumulate("qos_starve_promote_cnt",
     PopCount(Cat((0 until nMshrTaskSrc).map(i =>
       mshrTaskSrcValids(i) && mshrTaskWaitCnt(i) === 63.U))))
-  // The groups all have mshrsAll slots, so the cross-group winner already
-  // carries its physical MSHR id in mshrTaskGroupIdx; no index translation
-  // is needed here.
+  // Every ticket carries the physical slot index for its context group.
   io.mshrTask <> mshrTask
 
   /* releaseBuf link to MSHR id */
