@@ -186,7 +186,7 @@ class CDPC4Harness(val checkFixedCycle: Boolean = true)(implicit p: Parameters) 
   val fields = Seq(
     io.candidate(57), read(prod.allocate), read(prod.duplicate), read(prod.fullDrop), read(prod.freeEntryIdx),
     read(prod.translationDrop).asUInt, read(prod.filterDrop), read(prod.idx2),
-    prod.io.out.valid, prod.io.out.bits.paddr, prod.io.out.bits.pfDepth, read(prod.output.io.deq.bits.index), txn,
+    prod.io.out.valid, prod.io.out.bits.paddr, prod.io.out.bits.pfDepth, read(prod.idx2), txn,
     prod.io.ftQueryReq.fire, read(prod.pftArb.io.chosen), read(prod.pftArb.io.out.bits.paddr), read(prod.pftArb.io.out.bits.pfDepth),
     read(reference.entryHit), read(reference.hasFreeEntry), read(reference.freeEntryIdx), refDrops.asUInt,
     read(reference.pft_s2_valid) && !read(reference.canPft), read(reference.pft_s2_chosen_idx),
@@ -222,12 +222,11 @@ object TestTop_OceanusCDPC4 extends App with ChiselSim {
     val live = Array.fill(2)(mutable.Map.empty[Int,Item])
     val results = Array.fill(2)(mutable.ArrayBuffer.empty[String])
     val discarded = Array.fill(2)(mutable.ArrayBuffer.empty[String])
-    val issueOrder = mutable.Queue.empty[(BigInt,Int,Int)]
+    val issueOrder = mutable.Queue.empty[(Int,BigInt,Int,Int,Boolean)]
     val pageAttempts = mutable.Map.empty[BigInt,Int].withDefaultValue(0)
     val misses = mutable.Map.empty[BigInt,Int]
     val activePages = mutable.Set.empty[BigInt]
     var tickNo = 0; var inputID = 0
-    var held: Option[(BigInt,Int)] = None
     var currentTrace: java.io.BufferedWriter = null
     var vbAccepted = 0; var vbCompleted = 0
     var fixedBridge = false
@@ -287,18 +286,20 @@ object TestTop_OceanusCDPC4 extends App with ChiselSim {
           if(side==0)count("filter-drop")
         }
       }
+      val dueQuery=if(issueOrder.headOption.exists(_._1==tickNo))Some(issueOrder.dequeue())else None
+      val allowedQuery=dueQuery.filter(_._5)
+      assert(ov==allowedQuery.nonEmpty,"two-cycle Filter output schedule")
+      allowedQuery.foreach { case(_,p,d,i,_)=>assert((opa,od,oi)==((p,d,i)),"query/requery identity") }
+      assert(fd==dueQuery.exists(q=> !q._5),"two-cycle Filter rejection")
       if(qf) {
         val it=live(0)(qi)
         assert(qpa==pa(it.va) && qd==it.depth && !deny(it.va))
-        if(!blocked(it.va,filter)) issueOrder.enqueue((qpa,qd,qi))
+        issueOrder.enqueue((tickNo+2,qpa,qd,qi,!blocked(it.va,filter)))
         count("physical-query")
       }
-      held.foreach {case(p,d)=>assert(ov && opa==p && od==d,"output changed under backpressure")}
-      held=if(ov && !ready)Some((opa,od))else None
       if(ov && ready) {
         val it=live(0).remove(oi).get
         assert(!deny(it.va) && !blocked(it.va,filter) && opa==pa(it.va) && od==it.depth)
-        assert(issueOrder.dequeue()==((opa,od,oi)),"query/completion FIFO order")
         assert((txn>>4)==9 && ((txn>>2)&3)==od)
         results(0) += s"${it.id}:$opa:$od";count("output");count("depth-"+od)
       }
@@ -351,7 +352,7 @@ object TestTop_OceanusCDPC4 extends App with ChiselSim {
       dut.reset.poke(true);dut.clock.step(3);dut.reset.poke(false)
       live.foreach(_.clear());results.foreach(_.clear());discarded.foreach(_.clear())
       issueOrder.clear();pageAttempts.clear();misses.clear();activePages.clear()
-      held=None;tickNo=0;inputID=0;vbAccepted=0;vbCompleted=0
+      tickNo=0;inputID=0;vbAccepted=0;vbCompleted=0
       ordering.reset(label)
     }
     def finish(compare: Boolean, compareSet: Boolean=false): Unit = {
@@ -436,7 +437,7 @@ object TestTop_OceanusCDPC4 extends App with ChiselSim {
       (0 to 10).map("kind-"+_)++(0 to 3).map("depth-"+_)++(1 to 7).map("delay-"+_)++(2 to 9).map("drop-kind-"+_)
     required.foreach(k=>assert(coverage(k)>0,s"missing coverage $k"))
     coverage.toSeq.sortBy(_._1).foreach{case(k,v)=>println(s"CDP_C4_COVER $k=$v")}
-    println(s"CDP_C4_ORDER_RESULT independentScheduleChecked=true illegalPermutationRejected=true fullMultisetsRetained=true contractApproval=D5-accepted-reordering scenes=$scenes")
+    println(s"CDP_C4_ORDER_RESULT independentScheduleChecked=true illegalPermutationRejected=true fullMultisetsRetained=true contractApproval=D5-translation-only scenes=$scenes")
     println(s"CDP_C4_RESULT pass=true seeds=$seeds cycles=$totalCycles scenes=$scenes reference_epochs=$comparisons request_and_drop_mismatches=0")
   }
 }

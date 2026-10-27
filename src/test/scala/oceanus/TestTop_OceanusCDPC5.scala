@@ -106,7 +106,7 @@ class TestTopCDPC5(cfg: L2Configuration)(implicit p: Parameters) extends TestTop
     "va" -> Cat(entries(read(s.pftArb.io.chosen)).vTag, 0.U(6.W)),
     "pa" -> read(s.pftArb.io.out.bits).paddr)
   event("h2.query2", s.pftS2, "index" -> s.idx2, "canPft" -> s.canPft)
-  add("h2.queue", s.output.io.count)
+  fields += "h2.queue" -> 0.U(5.W) // Removed queue: keep legacy trace width, without boring a literal.
   add("resident", PopCount(read(s.valids)))
   add("candidatePending", c.c4Input.valid)
   val boundary = IO(Output(UInt(fields.map(_._2.getWidth).sum.W)))

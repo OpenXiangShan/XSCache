@@ -10,7 +10,7 @@ import utility._
 import java.nio.file.{Files,Paths}
 
 // Test-only real Filter tables receive the same committed train write. The
-// senders and the verbatim ReferenceCDP remain unchanged.
+// production sender uses reference requery; ReferenceCDP remains verbatim.
 class CDPH1Harness(implicit p:Parameters) extends CDPC4OrderingHarness(false) {
   val training=IO(new Bundle {
     val live=Input(Bool());val valid=Input(Bool());val saturation=Input(UInt(2.W))
@@ -93,13 +93,13 @@ object TestTop_OceanusCDPH1 extends App with ChiselSim {
     // and can otherwise phase-lock against a period-three ready pattern.
     initialise("h1-output-backpressure",fixed=true)
     for(c<-0 until 256)tick(c,if(c<16)Some(BigInt(0x30000)+c*64)else None,c%4,c>=32,1,c>=64 && c%3!=0)
-    assert(model.sides(0).live.isEmpty && model.sides(1).live.size==1 && model.sides(1).live.contains(4),
+    assert(model.sides.forall(s=>s.live.size==1 && s.live.contains(4)),
       "period-three prefix no longer demonstrates the reference requery phase lock")
     val stalled=model.sides(1).live(4)
     assert(model.sides(1).records(stalled.id)("queries").arr.takeRight(5).forall(q=>(q(0).num.toInt+2)%3==0))
-    println("CDP_H1_PHASE_LOCK observed=true originalPrefixCycles=256 dutLive=0 referenceLive=1 tailReadyCycles=32")
+    println("CDP_H1_PHASE_LOCK observed=true originalPrefixCycles=256 dutLive=1 referenceLive=1 tailReadyCycles=32")
     for(c<-256 until 288)tick(c,None,0,true,1,true)
-    assert(finish("output-backpressure"),"fixture did not distinguish completion queue/requery")
+    assert(!finish("output-backpressure"),"shared requery mechanism reordered fixed-translation outputs")
     for((id,d)<-model.sides(0).records)assert(d("qualificationCycle")==model.sides(1).records(id)("qualificationCycle"),"backpressure fixture changed translation timing")
     initialise("h1-fixed-ready-control",fixed=true)
     for(c<-0 until 256)tick(c,if(c<16)Some(BigInt(0x30000)+c*64)else None,c%4,c>=32,1,true)
@@ -114,21 +114,21 @@ object TestTop_OceanusCDPH1 extends App with ChiselSim {
     }
     assert(translationDifferences>0)
     // Concurrent real table train, same fixed translation, common ready. A
-    // saturated write after queries but before output fire distinguishes the
-    // immutable DUT completion decision from the reference's stalled requery.
+    // saturated write after queries but before output fire must be re-queried
+    // by both senders while stalled, producing the same four rejections.
     initialise("h1-filter-training",fixed=true,live=true)
     for(c<-0 until 256)tick(c,if(c<4)Some(BigInt(0x30000)+c*64)else None,c%4,c>=32,1,c>=110,live=true)
-    finish("filter-training",expectedEqual=false)
-    assert(model.sides(0).observed.size==4 && model.sides(1).observed.isEmpty)
-    assert(model.sides(0).records.values.count(_.obj.contains("filterDropCycle"))==0)
+    finish("filter-training")
+    assert(model.sides.forall(_.observed.isEmpty))
+    assert(model.sides(0).records.values.count(_.obj.contains("filterDropCycle"))==4)
     assert(model.sides(1).records.values.count(_.obj.contains("filterDropCycle"))==4)
     for((id,d)<-model.sides(0).records)assert(d("qualificationCycle")==model.sides(1).records(id)("qualificationCycle"))
     // Random concurrent legal committed Filter writes. Counts use input IDs,
     // including PA/depth, so timing/reordering alone cannot create a difference.
     assert(scala.util.Try(CDPD5Policy.cause(false,false)).isFailure)
     assert(CDPD5Policy.cause(true,false)=="translation")
-    assert(CDPD5Policy.cause(false,true)=="output-queue")
-    assert(CDPD5Policy.cause(true,true)=="translation-and-output-queue")
+    assert(scala.util.Try(CDPD5Policy.cause(false,true)).isFailure)
+    assert(scala.util.Try(CDPD5Policy.cause(true,true)).isFailure)
     val randomSeeds=args.find(_.startsWith("--filter-seeds=")).map(_.split("=")(1).toInt).getOrElse(1000)
     var dutTotal=0L;var refTotal=0L;var unionTotal=0L;var extraTotal=0L;var missingTotal=0L;var changed=0
     def measure(name:String,seed:Int):ujson.Obj={
@@ -178,10 +178,10 @@ object TestTop_OceanusCDPH1 extends App with ChiselSim {
       "unionOutputs"->ujson.Num(unionTotal.toDouble),"dutExtra"->ujson.Num(extraTotal.toDouble),"dutMissing"->ujson.Num(missingTotal.toDouble),"differentFractionOfUnion"->fraction,
       "differentFractionOfBothOutputCounts"->(if(dutTotal+refTotal==0)0.0 else (extraTotal+missingTotal).toDouble/(dutTotal+refTotal)),
       "threshold"->0.01,"thresholdExceeded"->(fraction>0.01 || directed("differentFractionOfUnion").num>0.01),
-      "directed"->directed,"random"->randomRows,"RTLchanged"->false,"comparisonKey"->"inputID:PA:depth; multiset difference",
+      "directed"->directed,"random"->randomRows,"RTLchanged"->true,"comparisonKey"->"inputID:PA:depth; multiset difference",
       "stimulusScope"->"real FilterTable concurrent committed legal single-offset used/unused writes; FtTrain upstream not instantiated")
     Files.writeString(dest.resolve("filter-quantification.json"),summary.render(2))
     println(s"CDP_H1_FILTER_QUANTIFIED seeds=$randomSeeds dut=$dutTotal reference=$refTotal extra=$extraTotal missing=$missingTotal union=$unionTotal fraction=$fraction")
-    println(s"CDP_H1_OBSERVATIONS verified=true groups=3 translationCases=7 translationDifferences=$translationDifferences filterDutOutputs=4 filterReferenceOutputs=0 RTLchanged=false D5reorderingAccepted=true dynamicFilterDecisionRequired=true")
+    println(s"CDP_H1_OBSERVATIONS verified=true groups=3 translationCases=7 translationDifferences=$translationDifferences filterDutOutputs=0 filterReferenceOutputs=0 RTLchanged=true D5translationOnly=true residualDispositionsRequireExplanation=true")
   }
 }

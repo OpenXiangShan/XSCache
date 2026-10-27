@@ -18,11 +18,11 @@ class CDPC4OrderingHarness(checkFixed: Boolean = true)(implicit p: org.chipsalli
     observe(n+".inflight",s.reqInflight);observe(n+".query",s.io.ftQueryReq.fire)
     observe(n+".queryIndex",s.pftArb.io.chosen);observe(n+".queryReady",s.io.ftQueryReq.ready)
     observe(n+".drop",s.translationDrop);observe(n+".filterDrop",s.filterDrop);observe(n+".filterIndex",s.idx2)
-    observe(n+".out",s.io.out.valid);observe(n+".outIndex",s.output.io.deq.bits.index)
+    observe(n+".out",s.io.out.valid);observe(n+".outIndex",s.idx2)
     observe(n+".outPA",s.io.out.bits.paddr);observe(n+".outDepth",s.io.out.bits.pfDepth)
     observe(n+".request",s.io.tlb.req.fire);observe(n+".requestVA",s.io.tlb.req.bits)
     observe(n+".terminal",s.io.tlb.resp.fire);observe(n+".terminalVA",s.io.tlb.resp.bits.vaddr)
-    observe(n+".terminalDrop",s.io.tlb.resp.bits.dropped);observe(n+".queue",s.output.io.count)
+    observe(n+".terminalDrop",s.io.tlb.resp.bits.dropped)
   }
   val rs=reference
   observe("r.valid",rs.valids);observe("r.pa",VecInit((0 until 16).map(i=>read(rs.valids)(i) && read(rs.entries)(i).paddrValid)))
@@ -61,12 +61,12 @@ class CDPOrderRR {
   }
 }
 
-// Accepted D5 is restricted to exactly these independently demonstrated causes.
+// After the output mechanism is aligned, only independently reconstructed
+// translation qualification may explain D5. Output-only/unknown causes fail.
 object CDPD5Policy {
   def cause(translation:Boolean,output:Boolean):String={
-    require(translation || output,"D5 rejects unexplained same-source reordering")
-    if(translation && output)"translation-and-output-queue"
-    else if(translation)"translation" else "output-queue"
+    require(translation && !output,"D5 permits translation qualification only")
+    "translation"
   }
 }
 
@@ -75,7 +75,7 @@ class CDPOrderingTracker(dut:CDPC4OrderingHarness,dir:Path) extends chisel3.simu
   case class Query(due:Int,item:Item,allow:Boolean)
   class Side {
     val live=mutable.Map.empty[Int,Item];val pa=mutable.Set.empty[Int];val inflight=mutable.Set.empty[Int]
-    val pipeline=mutable.Queue.empty[Query];val completed=mutable.Queue.empty[Item];val rr=new CDPOrderRR
+    val pipeline=mutable.Queue.empty[Query];val rr=new CDPOrderRR
     val predicted=mutable.ArrayBuffer.empty[String];val observed=mutable.ArrayBuffer.empty[String];val records=mutable.Map.empty[Int,ujson.Obj]
     val requests=mutable.Map.empty[BigInt,Int].withDefaultValue(0)
   }
@@ -104,8 +104,7 @@ class CDPOrderingTracker(dut:CDPC4OrderingHarness,dir:Path) extends chisel3.simu
       if(qfire)need(v("queryIndex")==chosen,"independent RR selection")
       val due=if(s.pipeline.headOption.exists(_.due==cycle))Some(s.pipeline.dequeue())else None
       val accept=due.filter(_.allow);val reject=due.filterNot(_.allow)
-      if(n=="d")accept.foreach(q=>s.completed.enqueue(q.item))
-      val output=if(n=="d")s.completed.headOption else accept.map(_.item)
+      val output=accept.map(_.item)
       need(yes("out")==output.nonEmpty,"output schedule")
       output.foreach{it=>need(v("outIndex")==it.slot && v("outPA")==physical(it.va) && v("outDepth")==it.depth,"output identity/order")}
       need(yes("filterDrop")==reject.nonEmpty,"Filter decision snapshot")
@@ -116,9 +115,8 @@ class CDPOrderingTracker(dut:CDPC4OrderingHarness,dir:Path) extends chisel3.simu
         s.predicted += s"${it.id}:${physical(it.va)}:${it.depth}"
         val observedItem=s.live(v("outIndex").toInt);s.observed += s"${observedItem.id}:${v("outPA")}:${v("outDepth")}"
         s.records(it.id)("outputCycle")=ujson.Num(cycle);retired += it.slot
-        if(n=="d")s.completed.dequeue()
       }
-      if(n=="r")due.foreach(q=>s.inflight -= q.item.slot)
+      due.foreach(q=>s.inflight -= q.item.slot)
       if(qfire){
         val it=s.live(chosen);val allow=allowOverride.map(_(it.va)).getOrElse(!filter || (((physical(it.va)>>12)&63).toInt%5!=0))
         s.pipeline.enqueue(Query(cycle+2,it,allow));s.inflight += chosen
@@ -154,9 +152,9 @@ class CDPOrderingTracker(dut:CDPC4OrderingHarness,dir:Path) extends chisel3.simu
   }
   // Counterfactual schedule, using raw-terminal qualification witnesses and
   // independent RR state. No observed chosen/output fields drive this replay.
-  private def replay(items:Vector[ujson.Obj],queued:Boolean,alwaysReady:Boolean):Vector[String]={
+  private def replay(items:Vector[ujson.Obj],alwaysReady:Boolean):Vector[String]={
     val rr=new CDPOrderRR;val live=mutable.Map.empty[Int,ujson.Obj];val inflight=mutable.Set.empty[Int]
-    val pipe=mutable.Queue.empty[(Int,ujson.Obj,Boolean)];val completed=mutable.Queue.empty[ujson.Obj]
+    val pipe=mutable.Queue.empty[(Int,ujson.Obj,Boolean)]
     val result=mutable.ArrayBuffer.empty[String]
     val arrivals=items.groupBy(_("inputCycle").num.toInt)
     for(e<-environment){
@@ -164,9 +162,8 @@ class CDPOrderingTracker(dut:CDPC4OrderingHarness,dir:Path) extends chisel3.simu
       val eligible=live.collect{case(slot,it) if it.obj.get("qualificationCycle").exists(_.num<=c) && !inflight(slot)=>slot}
       val fire=eligible.nonEmpty && query;val chosen=rr.choose(mask(eligible).toInt,fire)
       val due=if(pipe.headOption.exists(_._1==c))Some(pipe.dequeue())else None
-      if(queued)due.filter(_._3).foreach(q=>completed.enqueue(q._2))
-      val out=if(queued)completed.headOption else due.filter(_._3).map(_._2)
-      if(!queued)due.foreach(q=>inflight -= q._2("slot").num.toInt)
+      val out=due.filter(_._3).map(_._2)
+      due.foreach(q=>inflight -= q._2("slot").num.toInt)
       val pending=if(fire){
         val it=live(chosen);val pa=physical(BigInt(it("va").str,16))
         val allow= !filt || ((pa>>12)&63).toInt%5!=0
@@ -176,7 +173,6 @@ class CDPOrderingTracker(dut:CDPC4OrderingHarness,dir:Path) extends chisel3.simu
       out.filter(_=>ready).foreach{it=>
         result += s"${it("id").num.toInt}:${physical(BigInt(it("va").str,16))}:${it("depth").num.toInt}"
         val slot=it("slot").num.toInt;live.remove(slot);inflight -= slot
-        if(queued)completed.dequeue()
       }
       pending.foreach(pipe.enqueue(_))
       for(it<-arrivals.getOrElse(c,Vector.empty)){
@@ -184,14 +180,14 @@ class CDPOrderingTracker(dut:CDPC4OrderingHarness,dir:Path) extends chisel3.simu
         live(slot)=it
       }
     }
-    assert(pipe.isEmpty && completed.isEmpty,s"D5 counterfactual unfinished $label")
+    assert(pipe.isEmpty,s"D5 counterfactual unfinished $label")
     result.toVector
   }
   def finish(actual:Seq[Seq[String]],compareSet:Boolean,save:Boolean=false,requireSourceOrder:Boolean=false):Unit={
     for(i<-0 to 1) {
       assert(actual(i)==sides(i).predicted.toSeq,s"ordering $label side=$i output permutation outside the independent schedule")
-      assert(sides(i).live.isEmpty && sides(i).pipeline.isEmpty && sides(i).completed.isEmpty,
-        s"ordering unfinished label=$label side=$i live=${sides(i).live.toVector} pa=${sides(i).pa} inflight=${sides(i).inflight} pipe=${sides(i).pipeline.toVector} completed=${sides(i).completed.toVector} lastQueries=${sides(i).live.values.toVector.map(it=>it.id -> sides(i).records(it.id)("queries").arr.takeRight(5))}")
+      assert(sides(i).live.isEmpty && sides(i).pipeline.isEmpty,
+        s"ordering unfinished label=$label side=$i live=${sides(i).live.toVector} pa=${sides(i).pa} inflight=${sides(i).inflight} pipe=${sides(i).pipeline.toVector} lastQueries=${sides(i).live.values.toVector.map(it=>it.id -> sides(i).records(it.id)("queries").arr.takeRight(5))}")
       // Mutation check: exchanging a same-source pair keeps its multiset,
       // yet must violate the independently predicted order.
       if(actual(i).size>=2){val mutated=actual(i).updated(0,actual(i)(1)).updated(1,actual(i)(0));assert(mutated.sorted==actual(i).sorted && mutated!=sides(i).predicted.toSeq)}
@@ -207,13 +203,25 @@ class CDPOrderingTracker(dut:CDPC4OrderingHarness,dir:Path) extends chisel3.simu
       }
       if(actual(0)!=actual(1)){
         val items=sides.map(_.records.toVector.sortBy(_._1).map(_._2))
-        for(i<-0 to 1)assert(replay(items(i),i==0,false)==actual(i),"D5 original schedule replay")
-        val translation=sides.indices.map(i=>replay(items(i),i==0,true))
-        val output=Seq(true,false).map(q=>replay(items(1),q,false))
-        val control=Seq(true,false).map(q=>replay(items(1),q,true))
-        assert(control(0)==control(1),"D5 unexplained same-qualification/always-ready difference")
-        for(sequence<-translation++output)assert(sequence.sorted==actual(0).sorted,"D5 counterfactual changes complete output set")
-        acceptedCause=CDPD5Policy.cause(translation(0)!=translation(1),output(0)!=output(1))
+        for(i<-0 to 1)assert(replay(items(i),false)==actual(i),"D5 original requery schedule replay")
+        // With the same raw-terminal qualification witnesses, both sides use
+        // exactly the same output/RR rule under the original ready schedule.
+        val refByID=items(1).map(it=>it("id").num.toInt -> it).toMap
+        val common=items(0).map { it=>
+          val r=refByID(it("id").num.toInt)
+          for(k<-Seq("id","va","depth","source","inputCycle","slot"))
+            assert(it(k)==r(k),s"D5 changes non-translation state key=$k")
+          val copy=ujson.read(it.render()).obj
+          r.obj.get("qualificationCycle") match {
+            case Some(q)=>copy("qualificationCycle")=q
+            case None=>copy.remove("qualificationCycle")
+          }
+          ujson.Obj.from(copy)
+        }
+        assert(replay(common,false)==actual(1),"D5 same qualification retained an output mechanism difference")
+        val qualificationDiff=items(0).map(it=>it("id").num.toInt -> it.obj.get("qualificationCycle")).toMap !=
+          items(1).map(it=>it("id").num.toInt -> it.obj.get("qualificationCycle")).toMap
+        acceptedCause=CDPD5Policy.cause(qualificationDiff,false)
       }
       if(requireSourceOrder){
         for(source<-outputIDs.map(i=>sides(0).records(i)("source").num.toInt).distinct){
@@ -228,8 +236,8 @@ class CDPOrderingTracker(dut:CDPC4OrderingHarness,dir:Path) extends chisel3.simu
         "completeMultisetEqual"->(actual(0).sorted==actual(1).sorted),"cycles"->cycle,"environment"->ujson.Arr.from(environment),
         "dut"->ujson.Obj("predicted"->ujson.Arr.from(sides(0).predicted),"items"->ujson.Arr.from(sides(0).records.toVector.sortBy(_._1).map(_._2))),
         "reference"->ujson.Obj("predicted"->ujson.Arr.from(sides(1).predicted),"items"->ujson.Arr.from(sides(1).records.toVector.sortBy(_._1).map(_._2))),
-        "allowedSwapRule"->"same source/input identity/page; qualification explained by raw page terminal; both orders must match independent RR/completion replay",
-        "independentOrderChecked"->true,"mutationRejected"->true,"policyApproval"->(if(compareSet)"D5-accepted-reordering"else "dynamic-filter-pending"),
+        "allowedSwapRule"->"same source/input identity/page; qualification explained by raw page terminal; both orders must match the same independent RR/requery replay; only raw-terminal qualification may differ",
+        "independentOrderChecked"->true,"mutationRejected"->true,"policyApproval"->(if(compareSet)"D5-accepted-reordering"else "dynamic-filter-disposition-audit"),
         "acceptedReorderingCause"->acceptedCause).render())
     }
   }

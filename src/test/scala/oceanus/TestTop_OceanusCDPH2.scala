@@ -43,7 +43,7 @@ class CDPH2Harness(implicit p: Parameters) extends CDPC4Harness() {
   add("d.drop",prod.filterDrop); add("d.dropIndex",prod.idx2)
   add("r.drop",read(reference.pft_s2_valid) && !read(reference.canPft)); add("r.dropIndex",reference.pft_s2_chosen_idx)
   add("d.out",prod.io.out.fire); add("r.out",reference.io.out.fire)
-  add("d.queue",prod.output.io.count)
+  debugFields += "d.queue" -> 0.U(5.W) // Removed queue: retain legacy trace width without boring a literal.
   val debug = IO(Output(UInt(debugFields.map(_._2.getWidth).sum.W)))
   debug := Cat(debugFields.map(_._2).reverse.toSeq)
   val debugWidths = debugFields.map {case(n,d) => n -> d.getWidth}.toVector
