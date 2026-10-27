@@ -30,6 +30,59 @@ object L2TopDownstreamOpcodes {
 }
 
 class L2TopDownstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim {
+  // pf-v2 transaction/ordering checks observe actual interface flits, never
+  // the host queue's intentions. Enabled for every user of this HN model.
+  val chiOrdering = new AuditHNCHIOrdering
+  private var chiRequester = BigInt(dut.l2cfg.nodeId)
+  private def chiViolation(ok: Boolean, detail: => String): Unit =
+    if (!ok) throw new IllegalStateException("HN_CHI_FIELD_VIOLATION " + detail)
+  private def sampleCHI(cycle: Int): Unit = {
+    def value(d: UInt): BigInt = d.peek().litValue
+    def flag(d: Bool): Boolean = d.peek().litToBoolean
+    if (flag(dut.io.chi.txreq.flitv)) {
+      val f = dut.io.chi.txreq.flit
+      val fields = f.elements.toSeq.flatMap { case (n, x) => x match {
+        case u: UInt => Seq(n -> value(u))
+        case _ => Seq.empty
+      }}
+      val op = value(f.Opcode.get)
+      chiRequester = value(f.SrcID.get)
+      println(s"HN_CHI_REQ cycle=$cycle " + fields.map { case(n,v) => s"$n=0x${v.toString(16)}" }.mkString(" "))
+      if (op == L2TopDownstreamOpcodes.ReadNotSharedDirty) {
+        val bad = Seq(
+          Option.when(value(f.SnpAttr_DoDWT.get) != 1)("SnpAttr=0 required=1"),
+          Option.when(value(f.ExpCompAck.get) != 1)("ExpCompAck=0 required=1")
+        ).flatten
+        chiViolation(bad.isEmpty, s"cycle=$cycle opcode=ReadNotSharedDirty " + bad.mkString("; "))
+      }
+      if (isEvictReq(op)) chiOrdering.eviction(value(f.SrcID.get), value(f.TxnID.get), value(f.Addr.get))
+      else chiOrdering.request(value(f.SrcID.get), value(f.TxnID.get), value(f.Addr.get), value(f.ExpCompAck.get) != 0)
+    }
+    if (flag(dut.io.chi.rxsnp.flitv)) {
+      val f = dut.io.chi.rxsnp.flit
+      // This link is attached to the configured single RN, shared by slices.
+      chiOrdering.snoop(chiRequester, value(f.SrcID.get), value(f.TxnID.get), value(f.Addr.get) << 3, cycle)
+    }
+    if (flag(dut.io.chi.rxdat.flitv)) {
+      val f = dut.io.chi.rxdat.flit
+      chiViolation(value(f.Opcode.get) == L2TopDownstreamOpcodes.CompData, s"unsupported RXDAT opcode cycle=$cycle")
+      chiOrdering.data(value(f.TgtID.get), value(f.TxnID.get), value(f.DataID.get).toInt, cycle)
+    }
+    if (flag(dut.io.chi.rxrsp.flitv)) {
+      val f = dut.io.chi.rxrsp.flit
+      chiOrdering.completion(value(f.TgtID.get), value(f.TxnID.get),
+        value(f.DBID_PGroupID_StashGroupID_TagGroupID.get), value(f.Opcode.get).toInt, cycle)
+    }
+    if (flag(dut.io.chi.txrsp.flitv)) {
+      val f = dut.io.chi.txrsp.flit
+      chiOrdering.response(value(f.SrcID.get), value(f.TgtID.get), value(f.TxnID.get), value(f.Opcode.get).toInt, cycle)
+    }
+    if (flag(dut.io.chi.txdat.flitv)) {
+      val f = dut.io.chi.txdat.flit
+      chiViolation(value(f.Opcode.get) == L2TopDownstreamOpcodes.CopyBackWrData, s"unsupported TXDAT opcode cycle=$cycle")
+      chiOrdering.writeData(value(f.SrcID.get), value(f.TxnID.get), value(f.DataID.get).toInt, cycle)
+    }
+  }
   // Sample the actual exported REQ handshake before each simulation edge.
   val trainChecker = new L2TopTrainChecker(dut)
   private val credit = spec.dn.creditPolicy
@@ -284,6 +337,7 @@ class L2TopDownstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim
     try {
       advanceTxLCredits(cycle)
       advanceRxLCredits(cycle)
+      sampleCHI(cycle)
       trainChecker.sample(cycle)
       dut.clock.step(1)
     } catch {
