@@ -66,6 +66,16 @@ class TestTopCDPRawAudit(cfg: L2Configuration)(implicit p: Parameters) extends T
     "mmio" -> result.bits.mmio, "uncache" -> result.bits.uncache, "drop" -> result.bits.dropped)
   event("externalReq", fire(a.io.tlb.req), "va" -> a.io.tlb.req.bits.vaddr,
     "owner" -> read(a.owner)(read(a.issue)), "retry" -> read(a.retried)(read(a.issue)))
+  event("adapterClient0Req",fire(a.io.clients(0).req),"va"->a.io.clients(0).req.bits)
+  event("adapterClient0Resp",fire(a.io.clients(0).resp),"va"->a.io.clients(0).resp.bits.vaddr,"pa"->a.io.clients(0).resp.bits.paddr,
+    "retry"->a.io.clients(0).resp.bits.retried,"miss"->a.io.clients(0).resp.bits.miss,"drop"->a.io.clients(0).resp.bits.dropped)
+  add("adapterAlloc",a.alloc)
+  add("externalReq.index",a.issue)
+  add("externalResponse.pa",a.io.tlb.resp.bits.paddr.head)
+  add("externalResponse.miss",a.io.tlb.resp.bits.miss)
+  for(i<-0 until 8) {
+    add(s"adapterSlot$i.state",a.state(i));add(s"adapterSlot$i.va",a.address(i));add(s"adapterSlot$i.owner",a.owner(i))
+  }
   add("externalResponse", a.io.tlb.resp.valid)
   add("externalResponseBits", a.io.tlb.resp.bits)
   add("externalPMP", a.io.tlb.pmp_resp)
@@ -121,6 +131,15 @@ class TestTopCDPRawAudit(cfg: L2Configuration)(implicit p: Parameters) extends T
       .asInstanceOf[scala.collection.Seq[AnyRef]]
     val q=children.collectFirst { case x:L2CDPHalfQueue=>x }.get
     add(s"halfCount$bank",q.io.occupancy)
+  }
+  val topChildren=module.getClass.getMethods.find(_.getName=="getIds").get.invoke(module)
+    .asInstanceOf[scala.collection.Seq[AnyRef]]
+  val topQueues=topChildren.collect {case q:OverwriteQueue[_]=>q}
+  for(b<-0 until cfg.sliceNum) {
+    val q=topQueues(b*9+8).asInstanceOf[OverwriteQueue[oceanus.compactchi.FlitREQ]]
+    event(s"source9enq$b",fire(q.io.enq),"pa"->q.io.enq.bits.Addr,"txn"->q.io.enq.bits.TxnID)
+    event(s"source9deq$b",fire(q.io.deq),"pa"->q.io.deq.bits.Addr,"txn"->q.io.deq.bits.TxnID)
+    add(s"source9overwrite$b",q.io.overwrite)
   }
   val raw=IO(Output(Vec(cfg.sliceNum,Vec(8,new CDPRawLifecycle))))
   for ((slice,bank)<-module.slices.zipWithIndex; (t,i)<-CDPAuditReflect.field[Seq[L2TSHR]](slice,"tshrs").zipWithIndex) {

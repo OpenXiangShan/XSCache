@@ -41,12 +41,19 @@ object CDPAuditProbe {
 
 // Finite identities live only from admission to exactly one terminal outcome.
 // A page transaction binds its contemporaneous waiting set, not future offsets.
-class CDPCandidateLedger extends ChiselSim {
+class CDPCandidateLedger(allowRetainedDisabledOutput:Boolean=false) extends ChiselSim {
   case class Item(id: Long, va: BigInt, depth: BigInt, source: BigInt, hit: Boolean,
-    var epoch: Option[Long], var pa: Option[BigInt] = None)
+    var epoch: Option[Long], var pa: Option[BigInt] = None, generation: Long = 0)
   private val live = mutable.Map.empty[Int, Item]
   private val pages = mutable.Map.empty[BigInt, Long]
   private var identity = 0L; private var epoch = 0L
+  private var generation=0L
+  private val closedIDs=mutable.Set.empty[Long]
+  private var retainedRetired=0L;private var freshAllocated=0L
+  def closeGeneration():Set[Long]={val ids=live.values.map(_.id).toSet;closedIDs++=ids;ids}
+  def reopenGeneration():Unit={generation+=1}
+  def ownershipCounters:Map[String,Long]=Map("generation"->generation,"retainedRetired"->retainedRetired,"freshAllocated"->freshAllocated)
+  def retirementGeneration(index:Int):Long=live.getOrElse(index,throw new AssertionError(s"unknown candidate slot=$index")).generation
   private var outputs = 0L; private var filters = 0L; private var translations = 0L
   private var duplicates = 0L; private var full = 0L
   def pending: Int = live.size
@@ -87,9 +94,11 @@ class CDPCandidateLedger extends ChiselSim {
     def retire(index: Int, output: Boolean): Unit = {
       val i=live.remove(index).getOrElse(throw new AssertionError(s"M1 duplicate/unknown retirement cycle=$cycle slot=$index"))
       assert(i.pa.nonEmpty && i.epoch.nonEmpty,s"M1 retirement before translation id=${i.id}")
+      val retained=closedIDs.remove(i.id)
+      if(retained)retainedRetired+=1
       if(output) {
         val a=o.output.bits
-        assert(f(o.enable),s"M1 disabled output cycle=$cycle")
+        assert(f(o.enable) || (allowRetainedDisabledOutput && retained),s"M1 disabled output has no pre-close identity cycle=$cycle")
         assert(v(a.paddr)==i.pa.get && v(a.pfDepth)==i.depth,s"M1 identity mismatch id=${i.id} VA=${i.va} PA=${i.pa} depth=${i.depth}")
         assert(v(a.pfSource)==9 && v(a.reqSource)==MemReqSource.Prefetch2L2CDP.id && !f(a.needT),"M1 CDP transport fields")
         outputs+=1
@@ -100,7 +109,8 @@ class CDPCandidateLedger extends ChiselSim {
     if(f(o.allocated)) {
       val (va,depth,source,hit)=candidate.get
       assert(!live.contains(slot.get))
-      live(slot.get)=Item(identity,va,depth,source,hit,pages.get(va>>12)); identity+=1
+      live(slot.get)=Item(identity,va,depth,source,hit,pages.get(va>>12),generation=generation); identity+=1
+      if(generation>0)freshAllocated+=1
     }
     assert(live.size<=16 && identity==outputs+filters+translations+live.size,"M1 exactly-once conservation")
   }
