@@ -24,6 +24,12 @@ case object PrefetchKey extends ControlKey[Bool](name = "needHint")
 
 case class PrefetchField() extends BundleField[Bool](PrefetchKey, Output(Bool()), _ := false.B)
 
+// Marks an AcquirePerm for the CoupledL2 early-permission response path.
+// The bit is carried in the TileLink A-channel user fields.
+case object EarlyCompKey extends ControlKey[Bool](name = "earlyComp")
+
+case class EarlyCompField() extends BundleField[Bool](EarlyCompKey, Output(Bool()), _ := false.B)
+
 case object DirtyKey extends ControlKey[Bool](name = "dirty")
 
 case class DirtyField() extends BundleField[Bool](DirtyKey, Output(Bool()), _ := false.B)

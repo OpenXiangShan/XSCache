@@ -164,6 +164,7 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   val req_needB = needB(req.opcode, req.param)
   val req_acquire = req.opcode === AcquireBlock && req.fromA || req.opcode === AcquirePerm // AcquireBlock and Probe share the same opcode
   val req_acquirePerm = req.opcode === AcquirePerm
+  val req_earlyComp = req_acquirePerm && req.earlyComp
   val req_get = req.opcode === Get
   val req_prefetch = req.opcode === Hint
   val req_isDemandOrPrefetch = req_acquire || req_get || req_prefetch
@@ -283,21 +284,36 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   val mp_release_valid = release_valid1
   val mp_cbwrdata_valid = !state.s_cbwrdata.getOrElse(true.B) && state.w_releaseack
   val mp_probeack_valid = !state.s_probeack && state.w_pprobeacklast
-  val pending_grant_valid = (!state.s_refill || (!state.s_cmoresp && state.w_releaseack && state.s_cbwrdata.get)) &&
+
+  val pending_grant_valid = !req_earlyComp &&
+    (!state.s_grantSent || (!state.s_cmoresp && state.w_releaseack && state.s_cbwrdata.get)) &&
     state.w_grantlast && state.w_grant && state.w_rprobeacklast
-  val mp_grant_valid = pending_grant_valid && (retryTimes < backoffThreshold.U || backoffTimer === backoffCycles.U)
+
+  // For earlyComp
+  val early_grant_valid = req_earlyComp && !state.s_earlyCompSent && state.w_grant &&
+    state.w_rprobeacklast && !denied && !corrupt &&
+    (retryTimes < backoffThreshold.U || backoffTimer === backoffCycles.U)
+
+  // For data refill after earlyComp
+  val mp_refill_valid = req_earlyComp && state.s_earlyCompSent && state.s_grantSent && !state.s_refillCommit &&
+    state.w_grantlast && state.w_grant && !denied && !corrupt &&
+    (retryTimes < backoffThreshold.U || backoffTimer === backoffCycles.U)
+
+  val mp_grant_valid = (pending_grant_valid || early_grant_valid) &&
+    (retryTimes < backoffThreshold.U || backoffTimer === backoffCycles.U)
   val mp_dct_valid = !state.s_dct.getOrElse(true.B) && state.s_probeack
   val mp_cmometaw_valid = !state.s_cmometaw
   io.tasks.mainpipe.valid :=
     mp_release_valid  ||
     mp_probeack_valid ||
     mp_grant_valid    ||
+    mp_refill_valid   ||
     mp_cbwrdata_valid ||
     mp_dct_valid      ||
     mp_cmometaw_valid
   // io.tasks.prefetchTrain.foreach(t => t.valid := !state.s_triggerprefetch.getOrElse(true.B))
 
-  assert(state.s_refill || state.s_cmoresp, "refill not allowed on CMO operation")
+  assert(state.s_grantSent || state.s_cmoresp, "refill not allowed on CMO operation")
 
   when (
     pending_grant_valid &&
@@ -388,6 +404,7 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
       req_cboClean                                       -> CleanShared,
       req_cboFlush                                       -> CleanInvalid,
       req_cboInval                                       -> MakeInvalid,
+      req_earlyComp                                      -> ReadUnique,
       req_acquirePerm                                    -> MakeUnique,
       req_needT                                          -> ReadUnique,
       req_needB /* Default */                            -> ReadNotSharedDirty
@@ -452,7 +469,7 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     ob
   }
 
-  val mp_release, mp_probeack, mp_grant, mp_cbwrdata, mp_dct, mp_cmometaw = WireInit(0.U.asTypeOf(new TaskBundle))
+  val mp_release, mp_probeack, mp_grant, mp_refill, mp_cbwrdata, mp_dct, mp_cmometaw = WireInit(0.U.asTypeOf(new TaskBundle))
   val mp_release_task = {
     mp_release.channel := req.channel
     mp_release.txChannel := CHIChannel.TXREQ
@@ -719,6 +736,7 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
 
 
   val mergeA = RegInit(false.B)
+  val merge_task = RegEnable(io.aMergeTask.bits, 0.U.asTypeOf(new TaskBundle), io.aMergeTask.valid)
   when (io.aMergeTask.valid) {
     mergeA := true.B
   }.elsewhen (io.alloc.valid) {
@@ -733,6 +751,9 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     mp_grant.alias.foreach(_ := 0.U)
     mp_grant.vaddr.foreach(_ := 0.U)
     mp_grant.isKeyword.foreach(_ := req.isKeyword.getOrElse(false.B))
+    // Early permission is represented by a no-data TileLink Grant.  The
+    // completed data is committed by mp_refill below and never produces a
+    // second L1 response.
     mp_grant.opcode := odOpGen(req.opcode)
     mp_grant.param := Mux(
       req_get || req_prefetch,
@@ -797,12 +818,16 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
       accessed = req_acquire || req_get,
       cdpPfDepth = req.cdpPfDepth.getOrElse(0.U)
     )
-    mp_grant.metaWen := !cmo_cbo && !denied
-    mp_grant.tagWen := !cmo_cbo && !dirResult.hit && !denied
-    mp_grant.dsWen := (gotGrantData || probeDirty && (req_get || req.aliasTask.getOrElse(false.B))) && !denied
+    mp_grant.metaWen := !cmo_cbo && !denied && !req_earlyComp
+    mp_grant.tagWen := !cmo_cbo && !dirResult.hit && !denied && !req_earlyComp
+    mp_grant.dsWen := (gotGrantData || probeDirty && (req_get || req.aliasTask.getOrElse(false.B))) &&
+      !denied && !req_earlyComp
     mp_grant.fromL2pft.foreach(_ := req.fromL2pft.get)
     mp_grant.needHint.foreach(_ := false.B)
-    mp_grant.replTask := !dirResult.hit && !state.w_replResp && !denied
+    // The permission-only Grant must not wait for a replacement way; the
+    // refill-only task below performs replacement selection before committing
+    // the line into L2.
+    mp_grant.replTask := !req_earlyComp && !dirResult.hit && !state.w_replResp && !denied
     mp_grant.cmoTask := cmo_cbo
     mp_grant.wayMask := 0.U(cacheParams.ways.W)
     mp_grant.mshrRetry := !state.s_retry
@@ -810,8 +835,6 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
 
     // Add merge grant task for Acquire and late Prefetch
     mp_grant.mergeA := mergeA
-
-    val merge_task = RegEnable(io.aMergeTask.bits, 0.U.asTypeOf(new TaskBundle), io.aMergeTask.valid)
 
     mp_grant.aMergeTask.off := merge_task.off
     mp_grant.aMergeTask.alias.foreach(_ := merge_task.alias.getOrElse(0.U))
@@ -843,6 +866,130 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     mp_grant.aMergeTask.pc.foreach(_ := merge_task.pc.getOrElse(0.U))
 
     mp_grant
+  }
+
+  val mp_refill_task = {
+    // Commit the completed refill without generating another channel response.
+    mp_refill.channel := req.channel
+    mp_refill.txChannel := 0.U
+    mp_refill.tag := req.tag
+    mp_refill.set := req.set
+    mp_refill.off := req.off
+    mp_refill.sourceId := req.sourceId
+    mp_refill.vaddr.foreach(_ := 0.U)
+    mp_refill.pc.foreach(_ := 0.U)
+    mp_refill.isKeyword.foreach(_ := req.isKeyword.getOrElse(false.B))
+    mp_refill.opcode := GrantData
+    mp_refill.param := Mux(
+      req_get || req_prefetch,
+      0.U,
+      MuxLookup(req.param, req.param)(Seq(
+        NtoB -> Mux(req_promoteT, toT, toB),
+        BtoT -> toT,
+        NtoT -> toT
+      ))
+    )
+    mp_refill.size := 0.U(msgSizeBits.W)
+    mp_refill.bufIdx := 0.U(bufIdxBits.W)
+    mp_refill.needProbeAckData := false.B
+    mp_refill.denied := denied
+    mp_refill.corrupt := corrupt
+    mp_refill.mshrTask := true.B
+    mp_refill.mshrId := io.id
+    mp_refill.way := dirResult.way
+    val aliasFinal = Mux(req_get || req_prefetch, meta.alias.getOrElse(0.U), req.alias.getOrElse(0.U))
+    mp_refill.alias.foreach(_ := aliasFinal)
+    mp_refill.aliasTask.foreach(_ := req.aliasTask.getOrElse(false.B))
+    mp_refill.useProbeData := (dirResult.hit && req_get) ||
+      (req.aliasTask.getOrElse(false.B) && !(dirResult.meta.state === BRANCH && req_needT))
+    mp_refill.readProbeDataDown := false.B
+    mp_refill.mshrRetry := !state.s_retry
+    mp_refill.earlyComp := false.B
+    mp_refill.refillOnly := true.B
+    mp_refill.fromL2pft.foreach(_ := req.fromL2pft.get)
+    mp_refill.needHint.foreach(_ := false.B)
+    mp_refill.cdpPfDepth.foreach(_ := 0.U)
+    mp_refill.dirty := false.B
+
+    mp_refill.meta := MetaEntry(
+      dirty = gotDirty || dirResult.hit && meta.dirty,
+      state = Mux(
+        req_get,
+        Mux(
+          dirResult.hit,
+          Mux(isT(meta.state), TIP, BRANCH),
+          Mux(req_promoteT, TIP, BRANCH)
+        ),
+        Mux(req_promoteT || req_needT, Mux(req_prefetch, TIP, TRUNK), BRANCH)
+      ),
+      clients = Mux(
+        req_prefetch,
+        Mux(dirResult.hit, meta.clients, Fill(clientBits, false.B)),
+        Fill(clientBits, !(req_get && (!dirResult.hit || meta_no_client)))
+      ),
+      alias = Some(aliasFinal),
+      prefetch = req_prefetch || dirResult.hit && meta_pft,
+      pfsrc = PfSource.fromMemReqSource(req.reqSource),
+      accessed = req_acquire || req_get,
+      cdpPfDepth = req.cdpPfDepth.getOrElse(0.U)
+    )
+    mp_refill.metaWen := !cmo_cbo && !denied
+    mp_refill.tagWen := !cmo_cbo && !dirResult.hit && !denied
+    mp_refill.dsWen := !denied
+    mp_refill.wayMask := 0.U(cacheParams.ways.W)
+    mp_refill.replTask := !dirResult.hit && !state.w_replResp && !denied
+    mp_refill.cmoTask := cmo_cbo
+    mp_refill.cmoAll := false.B
+    mp_refill.reqSource := req.reqSource
+    mp_refill.mergeA := mergeA
+    mp_refill.aMergeTask.off := merge_task.off
+    mp_refill.aMergeTask.alias.foreach(_ := merge_task.alias.getOrElse(0.U))
+    mp_refill.aMergeTask.vaddr.foreach(_ := merge_task.vaddr.getOrElse(0.U))
+    mp_refill.aMergeTask.isKeyword.foreach(_ := merge_task.isKeyword.getOrElse(false.B))
+    mp_refill.aMergeTask.opcode := odOpGen(merge_task.opcode)
+    mp_refill.aMergeTask.param := MuxLookup(merge_task.param, merge_task.param)(Seq(
+      NtoB -> Mux(req_promoteT, toT, toB),
+      BtoT -> toT,
+      NtoT -> toT
+    ))
+    mp_refill.aMergeTask.sourceId := merge_task.sourceId
+    mp_refill.aMergeTask.meta := MetaEntry(
+      dirty = gotDirty || dirResult.hit && meta.dirty,
+      state = Mux(req_promoteT || needT(merge_task.opcode, merge_task.param), TRUNK, BRANCH),
+      clients = Fill(clientBits, true.B),
+      alias = Some(merge_task.alias.getOrElse(0.U)),
+      prefetch = false.B,
+      accessed = true.B
+    )
+    mp_refill.aMergeTask.pc.foreach(_ := merge_task.pc.getOrElse(0.U))
+
+    mp_refill.snpHitRelease := false.B
+    mp_refill.snpHitReleaseToInval := false.B
+    mp_refill.snpHitReleaseToClean := false.B
+    mp_refill.snpHitReleaseWithData := false.B
+    mp_refill.snpHitReleaseIdx := 0.U
+    mp_refill.snpHitReleaseMeta := 0.U.asTypeOf(new MetaEntry)
+
+    // Internal refill tasks do not generate CHI messages.
+    mp_refill.tgtID.foreach(_ := 0.U)
+    mp_refill.srcID.foreach(_ := 0.U)
+    mp_refill.txnID.foreach(_ := 0.U)
+    mp_refill.homeNID.foreach(_ := 0.U)
+    mp_refill.dbID.foreach(_ := 0.U)
+    mp_refill.fwdNID.foreach(_ := 0.U)
+    mp_refill.fwdTxnID.foreach(_ := 0.U)
+    mp_refill.chiOpcode.foreach(_ := 0.U)
+    mp_refill.resp.foreach(_ := 0.U)
+    mp_refill.fwdState.foreach(_ := 0.U)
+    mp_refill.pCrdType.foreach(_ := 0.U)
+    mp_refill.retToSrc.foreach(_ := false.B)
+    mp_refill.likelyshared.foreach(_ := false.B)
+    mp_refill.expCompAck.foreach(_ := false.B)
+    mp_refill.allowRetry.foreach(_ := false.B)
+    mp_refill.memAttr.foreach(_ := 0.U.asTypeOf(new MemAttr))
+    mp_refill.traceTag.foreach(_ := false.B)
+
+    mp_refill
   }
 
   val mp_dct_task = {
@@ -974,6 +1121,7 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
 
   io.tasks.mainpipe.bits := ParallelPriorityMux(
     Seq(
+      mp_refill_valid        -> mp_refill,
       mp_grant_valid         -> mp_grant,
       mp_release_valid       -> mp_release,
       mp_cbwrdata_valid      -> mp_cbwrdata,
@@ -1048,9 +1196,14 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     state.s_rprobe := true.B
   }
   when (io.tasks.mainpipe.ready) {
-    when (mp_grant_valid) {
-      state.s_refill := true.B
+    when (mp_refill_valid) {
+      state.s_refillCommit := true.B
+    }.elsewhen (mp_grant_valid) {
+      state.s_grantSent := true.B
       state.s_retry := true.B
+      when (early_grant_valid) {
+        state.s_earlyCompSent := true.B
+      }
       when (mp_grant.opcode === CBOAck) {
         state.s_cmoresp := true.B
       }
@@ -1257,8 +1410,11 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   // replay
   val replResp = io.replResp.bits
   when (io.replResp.valid && replResp.retry) {
-    state.s_refill := false.B
+    // A replacement retry applies to the refill commit.  Preserve the fact
+    // that the permission-only Grant was already sent.
+    state.s_grantSent := req_earlyComp && state.s_earlyCompSent
     state.s_retry := false.B
+    state.s_refillCommit := false.B
     dirResult.way := replResp.way
     when (retryTimes < backoffThreshold.U) {
       retryTimes := retryTimes + 1.U
@@ -1295,14 +1451,15 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     timer := timer + 1.U
   }
 
-  val no_schedule = state.s_refill && state.s_probeack && state.s_release &&
+  val no_schedule = state.s_grantSent && state.s_probeack && state.s_release &&
     state.s_rcompack.getOrElse(true.B) &&
     state.s_wcompack.getOrElse(true.B) &&
     state.s_cbwrdata.getOrElse(true.B) &&
     state.s_reissue.getOrElse(true.B) &&
     state.s_dct.getOrElse(true.B) &&
     state.s_cmoresp &&
-    state.s_cmometaw
+    state.s_cmometaw &&
+    (!req_earlyComp || state.s_refillCommit)
   val no_wait = state.w_rprobeacklast && state.w_pprobeacklast && state.w_grantlast && state.w_grant &&
     state.w_releaseack && state.w_replResp
   val will_free = no_schedule && no_wait
@@ -1357,7 +1514,7 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   io.msInfo.bits.w_grantlast := state.w_grantlast
   io.msInfo.bits.w_grant := state.w_grant
   io.msInfo.bits.s_release := state.s_release
-  io.msInfo.bits.s_refill := state.s_refill
+  io.msInfo.bits.s_grantSent := state.s_grantSent
   io.msInfo.bits.s_cmoresp := state.s_cmoresp
   io.msInfo.bits.s_cmometaw := state.s_cmometaw
   io.msInfo.bits.w_releaseack := state.w_releaseack

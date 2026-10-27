@@ -25,7 +25,7 @@ import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLHints._
 import xscache.coupledL2.prefetch.PrefetchReq
 import utility.{MemReqSource, XSPerfAccumulate}
-import xscache.common.{AliasKey, PrefetchKey}
+import xscache.common.{AliasKey, EarlyCompKey, PrefetchKey}
 
 class SinkA(implicit p: Parameters) extends L2Module {
   val io = IO(new Bundle() {
@@ -72,6 +72,8 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task.aliasTask.foreach(_ := false.B)
     task.useProbeData := false.B
     task.mshrRetry := false.B
+    task.earlyComp := a.user.lift(EarlyCompKey).getOrElse(false.B) && a.opcode === AcquirePerm
+    task.refillOnly := false.B
     task.fromL2pft.foreach(_ := false.B)
     task.needHint.foreach(_ := a.user.lift(PrefetchKey).getOrElse(false.B))
     task.dirty := false.B
@@ -115,6 +117,8 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task.fromL2pft.foreach(_ := req.needAck)
     task.cdpPfDepth.foreach(_ := req.cdpPfDepth.getOrElse(0.U))
     task.mshrRetry := false.B
+    task.earlyComp := false.B
+    task.refillOnly := false.B
     task.needHint.foreach(_ := false.B)
     task.dirty := false.B
     task.way := 0.U(wayBits.W)

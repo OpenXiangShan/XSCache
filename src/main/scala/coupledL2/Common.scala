@@ -82,6 +82,10 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   val aliasTask = aliasBitsOpt.map(_ => Bool()) // Anti-alias
   val useProbeData = Bool()               // data source, true for ReleaseBuf and false for RefillBuf
   val mshrRetry = Bool()                  // is retry task for mshr conflict
+  // AcquirePerm special bit: return permission before the separated data refill.
+  val earlyComp = Bool()
+  // Internal task which commits a completed refill without producing a channel response.
+  val refillOnly = Bool()
 
   val readProbeDataDown = Bool()          // whether data from ReleaseBuf was needed on mainpipe by downward operations
                                           // reads by upwards was handled in RequestArb by 'mshrTask_s2_a_upwards'
@@ -267,7 +271,8 @@ class MSHRInfo(implicit p: Parameters) extends L2Bundle with HasTLChannelBits {
   val w_grantlast = Bool()
   val w_grant = Bool()
   val s_release = Bool()
-  val s_refill = Bool()
+  // Grant response task has been issued upwards.
+  val s_grantSent = Bool()
   val s_cmoresp = Bool()
   val s_cmometaw = Bool()
   val w_releaseack = Bool()
@@ -317,7 +322,12 @@ class FSMState(implicit p: Parameters) extends L2Bundle {
   val s_pprobe = Bool()   // probe upwards, casued by probe
   val s_release = Bool()  // release downwards
   val s_probeack = Bool() // respond probeack downwards
-  val s_refill = Bool()   // respond grant upwards
+  // Grant response task has been issued upwards.
+  // This is separate from s_refillCommit for early-completion AcquirePerm.
+  val s_grantSent = Bool()
+  val s_earlyCompSent = Bool() // permission-only Grant has been issued
+  // Internal refill commit has been issued after an early permission Grant.
+  val s_refillCommit = Bool()
   // val s_grantack = Bool() // respond grantack downwards, moved to GrantBuf
   // val s_triggerprefetch = prefetchOpt.map(_ => Bool())
   val s_retry = Bool()    // need retry when conflict

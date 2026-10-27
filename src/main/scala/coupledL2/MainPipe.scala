@@ -179,11 +179,15 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val req_cbo_flush_s3          = sinkA_req_s3 && req_s3.opcode === CBOFlush && !cmoHitInvalid
   val req_cbo_inval_s3          = sinkA_req_s3 && req_s3.opcode === CBOInval
 
-  val mshr_grant_s3             = mshr_req_s3 && req_s3.fromA && (req_s3.opcode === Grant || req_s3.opcode === GrantData)
-  val mshr_grantdata_s3         = mshr_req_s3 && req_s3.fromA && req_s3.opcode === GrantData
+  val mshr_grant_s3             = mshr_req_s3 && req_s3.fromA && !req_s3.refillOnly && (req_s3.opcode === Grant || req_s3.opcode === GrantData)
+  val mshr_grantdata_s3         = mshr_req_s3 && req_s3.fromA && !req_s3.refillOnly && req_s3.opcode === GrantData
   val mshr_accessackdata_s3     = mshr_req_s3 && req_s3.fromA && req_s3.opcode === AccessAckData
   val mshr_hintack_s3           = mshr_req_s3 && req_s3.fromA && req_s3.opcode === HintAck
   val mshr_cmoresp_s3           = mshr_req_s3 && req_s3.fromA && req_s3.opcode === CBOAck
+
+  // Refill-only is an internal task: it uses RefillBuffer/DS/meta write paths,
+  // but is excluded from all channel-response classification above.
+  val mshr_refillOnly_s3        = mshr_req_s3 && req_s3.refillOnly
 
   val mshr_snpResp_s3           = mshr_req_s3 && req_s3.toTXRSP && req_s3.chiOpcode.get === SnpResp
   val mshr_snpRespFwded_s3      = mshr_req_s3 && req_s3.toTXRSP && req_s3.chiOpcode.get === SnpRespFwded
@@ -234,7 +238,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val dataError_s3              = meta_s3.dataErr
   val l2Error_s3                = io.dirResp_s3.error
 
-  val mshr_refill_s3 = mshr_accessackdata_s3 || mshr_hintack_s3 || mshr_grant_s3 // needs refill to L2 DS
+  val mshr_refill_s3 = mshr_accessackdata_s3 || mshr_hintack_s3 || mshr_grant_s3 || mshr_refillOnly_s3 // needs refill to L2 DS
   val replResp_valid_hold = io.replResp.bits.validHold
   val retry = replResp_valid_hold && io.replResp.bits.retry
   val need_repl = replResp_valid_hold && io.replResp.bits.meta.state =/= INVALID && req_s3.replTask
@@ -641,12 +645,12 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val txdat_s3_latch = true
   val isD_s3 = Mux(
     mshr_req_s3,
-    mshr_cmoresp_s3 && !io.cmoAllBlock.getOrElse(false.B) || mshr_refill_s3 && !retry,
+    mshr_cmoresp_s3 && !io.cmoAllBlock.getOrElse(false.B) || mshr_refill_s3 && !req_s3.refillOnly && !retry,
     req_s3.fromC || req_s3.fromA && !need_mshr_s3_a && !data_unready_s3_tl && req_s3.opcode =/= Hint && !io.cmoAllBlock.getOrElse(false.B)
   )
   val isD_s3_ready = Mux(
     mshr_req_s3,
-    mshr_cmoresp_s3 && !io.cmoAllBlock.getOrElse(false.B) || mshr_refill_s3 && !retry,
+    mshr_cmoresp_s3 && !io.cmoAllBlock.getOrElse(false.B) || mshr_refill_s3 && !req_s3.refillOnly && !retry,
     req_s3.fromC || req_s3.fromA && !need_mshr_s3_a && !data_unready_s3_tl && req_s3.opcode =/= Hint && !d_s3_latch.B
   )
   val isTXRSP_s3 = Mux(
@@ -985,7 +989,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   require(io.status_vec_toD.size == 3)
   io.status_vec_toD(0).valid := task_s3.valid && Mux(
     mshr_req_s3,
-    mshr_refill_s3 && !retry,
+    mshr_refill_s3 && !req_s3.refillOnly && !retry,
     true.B
     // TODO:
     // To consider grantBuffer capacity conflict, only " req_s3.fromC || req_s3.fromA && !need_mshr_s3 " is needed
@@ -1017,7 +1021,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // Initial state assignment
   // ! Caution: s_ and w_ are false-as-valid
   when (req_s3.fromA) {
-    alloc_state.s_refill := cmo_cbo_s3
+    alloc_state.s_grantSent := cmo_cbo_s3
+    alloc_state.s_earlyCompSent := !req_s3.earlyComp
+    // EarlyComp requests need a second, internal refill-commit task after
+    // their permission Grant.  Keep the MSHR allocated until that task runs.
+    alloc_state.s_refillCommit := !req_s3.earlyComp
     alloc_state.w_replResp := cmo_cbo_s3 || dirResult_s3.hit
     // need Acquire downwards
     when (need_acquire_s3_a) {
