@@ -85,7 +85,7 @@ object TestTop_OceanusCDPH1 extends App with ChiselSim {
       model.finish(actual,compareSet=expectedEqual,save=true)
       assert(equal==expectedEqual)
       val different=actual(0)!=actual(1)
-      println(s"CDP_H1_DIRECTED scene=$name independentOrderChecked=true multisetEqual=$equal orderDifferent=$different strictComparatorPassed=${equal && !different} candidateOrderModelPassed=true contractApproval=D5-pending")
+      println(s"CDP_H1_DIRECTED scene=$name independentOrderChecked=true multisetEqual=$equal orderDifferent=$different strictComparatorPassed=${equal && !different} candidateOrderModelPassed=true contractApproval=${if(equal)"D5-accepted-reordering"else "dynamic-filter-pending"}")
       different
     }
     // Fixed translation timing, common static Filter, only output backpressure.
@@ -123,6 +123,65 @@ object TestTop_OceanusCDPH1 extends App with ChiselSim {
     assert(model.sides(0).records.values.count(_.obj.contains("filterDropCycle"))==0)
     assert(model.sides(1).records.values.count(_.obj.contains("filterDropCycle"))==4)
     for((id,d)<-model.sides(0).records)assert(d("qualificationCycle")==model.sides(1).records(id)("qualificationCycle"))
-    println(s"CDP_H1_OBSERVATIONS verified=true groups=3 translationCases=7 translationDifferences=$translationDifferences filterDutOutputs=4 filterReferenceOutputs=0 RTLchanged=false D5decisionRequired=true")
+    // Random concurrent legal committed Filter writes. Counts use input IDs,
+    // including PA/depth, so timing/reordering alone cannot create a difference.
+    assert(scala.util.Try(CDPD5Policy.cause(false,false)).isFailure)
+    assert(CDPD5Policy.cause(true,false)=="translation")
+    assert(CDPD5Policy.cause(false,true)=="output-queue")
+    assert(CDPD5Policy.cause(true,true)=="translation-and-output-queue")
+    val randomSeeds=args.find(_.startsWith("--filter-seeds=")).map(_.split("=")(1).toInt).getOrElse(1000)
+    var dutTotal=0L;var refTotal=0L;var unionTotal=0L;var extraTotal=0L;var missingTotal=0L;var changed=0
+    def measure(name:String,seed:Int):ujson.Obj={
+      val outs=model.sides.map(_.observed.toVector)
+      val extra=outs(0).diff(outs(1));val missing=outs(1).diff(outs(0));val union=outs(0).size+missing.size
+      ujson.Obj("label"->name,"seed"->seed,"dutOutputs"->outs(0).size,"referenceOutputs"->outs(1).size,
+        "unionOutputs"->union,"dutExtra"->extra.size,"dutMissing"->missing.size,
+        "differentFractionOfUnion"->(if(union==0)0.0 else (extra.size+missing.size).toDouble/union),
+        "extraIdentities"->ujson.Arr.from(extra),"missingIdentities"->ujson.Arr.from(missing))
+    }
+    val directed=measure("filter-training",-1)
+    Files.writeString(dest.resolve("filter-directed-summary.json"),directed.render(2))
+    val randomRows=ujson.Arr()
+    for(seed<-0 until randomSeeds){
+      // Mix adjacent seed IDs before the first bounded draw.
+      val random=new scala.util.Random(new scala.util.Random(0xD50000L+seed).nextLong())
+      val count=1+random.nextInt(16);val gate=24+random.nextInt(17);val delay=1+random.nextInt(7)
+      val train=gate+2+random.nextInt(55);val release=random.nextInt(120);val fixed=random.nextBoolean()
+      initialise(s"h1-filter-random-$seed",fixed=fixed,live=true)
+      for(c<-0 until 256){
+        val va=if(c<count)Some(BigInt(0x30000)+c*64)else None
+        val encoded=va.map(a=>(BigInt(1)<<57)|(a<<7)|(BigInt(c%4)<<5)|(BigInt(9)<<1)).getOrElse(BigInt(0))
+        val ready=c>=128 || (c>=release && random.nextInt(4)!=0)
+        dut.io.candidate.poke(encoded);dut.io.gate.poke(c>=gate);dut.io.delay.poke(delay)
+        dut.io.ready.poke(ready);dut.io.queryReady.poke(true)
+        dut.training.valid.poke(c==train);dut.training.saturation.poke(if(c>=train)3 else 2)
+        if(c==train)assert(dut.training.ready.peek().litToBoolean)
+        model.sample(encoded,ready,false,c!=train,Some((_:BigInt)=>c<=train))
+        dut.clock.step()
+      }
+      val actual=model.sides.map(_.observed.toVector).toVector
+      model.finish(actual,compareSet=false,save=true)
+      for(i<-0 to 1){
+        val filtered=model.sides(i).records.values.count(_.obj.contains("filterDropCycle"))
+        assert(model.sides(i).records.size==count && actual(i).size+filtered==count,"dynamic Filter identity/count conservation")
+      }
+      val row=measure(s"h1-filter-random-$seed",seed)
+      row("fixedTranslation")=ujson.Bool(fixed);row("candidateCount")=ujson.Num(count)
+      row("gateCycle")=ujson.Num(gate);row("trainCycle")=ujson.Num(train);row("releaseCycle")=ujson.Num(release)
+      randomRows.arr+=row;dutTotal+=actual(0).size;refTotal+=actual(1).size
+      unionTotal+=row("unionOutputs").num.toLong;extraTotal+=row("dutExtra").num.toLong;missingTotal+=row("dutMissing").num.toLong
+      if(row("dutExtra").num+row("dutMissing").num>0)changed+=1
+      if(seed%100==99)println(s"CDP_H1_FILTER_PROGRESS seeds=${seed+1} dut=$dutTotal reference=$refTotal extra=$extraTotal missing=$missingTotal")
+    }
+    val fraction=if(unionTotal==0)0.0 else (extraTotal+missingTotal).toDouble/unionTotal
+    val summary=ujson.Obj("seeds"->randomSeeds,"changedScenarios"->changed,"dutOutputs"->ujson.Num(dutTotal.toDouble),"referenceOutputs"->ujson.Num(refTotal.toDouble),
+      "unionOutputs"->ujson.Num(unionTotal.toDouble),"dutExtra"->ujson.Num(extraTotal.toDouble),"dutMissing"->ujson.Num(missingTotal.toDouble),"differentFractionOfUnion"->fraction,
+      "differentFractionOfBothOutputCounts"->(if(dutTotal+refTotal==0)0.0 else (extraTotal+missingTotal).toDouble/(dutTotal+refTotal)),
+      "threshold"->0.01,"thresholdExceeded"->(fraction>0.01 || directed("differentFractionOfUnion").num>0.01),
+      "directed"->directed,"random"->randomRows,"RTLchanged"->false,"comparisonKey"->"inputID:PA:depth; multiset difference",
+      "stimulusScope"->"real FilterTable concurrent committed legal single-offset used/unused writes; FtTrain upstream not instantiated")
+    Files.writeString(dest.resolve("filter-quantification.json"),summary.render(2))
+    println(s"CDP_H1_FILTER_QUANTIFIED seeds=$randomSeeds dut=$dutTotal reference=$refTotal extra=$extraTotal missing=$missingTotal union=$unionTotal fraction=$fraction")
+    println(s"CDP_H1_OBSERVATIONS verified=true groups=3 translationCases=7 translationDifferences=$translationDifferences filterDutOutputs=4 filterReferenceOutputs=0 RTLchanged=false D5reorderingAccepted=true dynamicFilterDecisionRequired=true")
   }
 }

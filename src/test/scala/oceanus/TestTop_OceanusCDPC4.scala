@@ -436,7 +436,7 @@ object TestTop_OceanusCDPC4 extends App with ChiselSim {
       (0 to 10).map("kind-"+_)++(0 to 3).map("depth-"+_)++(1 to 7).map("delay-"+_)++(2 to 9).map("drop-kind-"+_)
     required.foreach(k=>assert(coverage(k)>0,s"missing coverage $k"))
     coverage.toSeq.sortBy(_._1).foreach{case(k,v)=>println(s"CDP_C4_COVER $k=$v")}
-    println(s"CDP_C4_ORDER_RESULT independentScheduleChecked=true illegalPermutationRejected=true fullMultisetsRetained=true contractApproval=D5-pending scenes=$scenes")
+    println(s"CDP_C4_ORDER_RESULT independentScheduleChecked=true illegalPermutationRejected=true fullMultisetsRetained=true contractApproval=D5-accepted-reordering scenes=$scenes")
     println(s"CDP_C4_RESULT pass=true seeds=$seeds cycles=$totalCycles scenes=$scenes reference_epochs=$comparisons request_and_drop_mismatches=0")
   }
 }

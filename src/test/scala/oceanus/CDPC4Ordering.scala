@@ -61,6 +61,15 @@ class CDPOrderRR {
   }
 }
 
+// Accepted D5 is restricted to exactly these independently demonstrated causes.
+object CDPD5Policy {
+  def cause(translation:Boolean,output:Boolean):String={
+    require(translation || output,"D5 rejects unexplained same-source reordering")
+    if(translation && output)"translation-and-output-queue"
+    else if(translation)"translation" else "output-queue"
+  }
+}
+
 class CDPOrderingTracker(dut:CDPC4OrderingHarness,dir:Path) extends chisel3.simulator.ChiselSim {
   case class Item(id:Int,va:BigInt,depth:Int,source:Int,allocated:Int,slot:Int)
   case class Query(due:Int,item:Item,allow:Boolean)
@@ -143,6 +152,41 @@ class CDPOrderingTracker(dut:CDPC4OrderingHarness,dir:Path) extends chisel3.simu
     if(offered)nextID+=1
     cycle+=1
   }
+  // Counterfactual schedule, using raw-terminal qualification witnesses and
+  // independent RR state. No observed chosen/output fields drive this replay.
+  private def replay(items:Vector[ujson.Obj],queued:Boolean,alwaysReady:Boolean):Vector[String]={
+    val rr=new CDPOrderRR;val live=mutable.Map.empty[Int,ujson.Obj];val inflight=mutable.Set.empty[Int]
+    val pipe=mutable.Queue.empty[(Int,ujson.Obj,Boolean)];val completed=mutable.Queue.empty[ujson.Obj]
+    val result=mutable.ArrayBuffer.empty[String]
+    val arrivals=items.groupBy(_("inputCycle").num.toInt)
+    for(e<-environment){
+      val c=e(0).num.toInt;val ready=alwaysReady || e(1).bool;val filt=e(2).bool;val query=e(3).bool
+      val eligible=live.collect{case(slot,it) if it.obj.get("qualificationCycle").exists(_.num<=c) && !inflight(slot)=>slot}
+      val fire=eligible.nonEmpty && query;val chosen=rr.choose(mask(eligible).toInt,fire)
+      val due=if(pipe.headOption.exists(_._1==c))Some(pipe.dequeue())else None
+      if(queued)due.filter(_._3).foreach(q=>completed.enqueue(q._2))
+      val out=if(queued)completed.headOption else due.filter(_._3).map(_._2)
+      if(!queued)due.foreach(q=>inflight -= q._2("slot").num.toInt)
+      val pending=if(fire){
+        val it=live(chosen);val pa=physical(BigInt(it("va").str,16))
+        val allow= !filt || ((pa>>12)&63).toInt%5!=0
+        inflight += chosen;Some((c+2,it,allow))
+      }else None
+      due.filterNot(_._3).foreach{q=>val slot=q._2("slot").num.toInt;live.remove(slot);inflight -= slot}
+      out.filter(_=>ready).foreach{it=>
+        result += s"${it("id").num.toInt}:${physical(BigInt(it("va").str,16))}:${it("depth").num.toInt}"
+        val slot=it("slot").num.toInt;live.remove(slot);inflight -= slot
+        if(queued)completed.dequeue()
+      }
+      pending.foreach(pipe.enqueue(_))
+      for(it<-arrivals.getOrElse(c,Vector.empty)){
+        val slot=it("slot").num.toInt;assert(!live.contains(slot),s"D5 counterfactual slot collision $label cycle=$c")
+        live(slot)=it
+      }
+    }
+    assert(pipe.isEmpty && completed.isEmpty,s"D5 counterfactual unfinished $label")
+    result.toVector
+  }
   def finish(actual:Seq[Seq[String]],compareSet:Boolean,save:Boolean=false,requireSourceOrder:Boolean=false):Unit={
     for(i<-0 to 1) {
       assert(actual(i)==sides(i).predicted.toSeq,s"ordering $label side=$i output permutation outside the independent schedule")
@@ -152,6 +196,7 @@ class CDPOrderingTracker(dut:CDPC4OrderingHarness,dir:Path) extends chisel3.simu
       // yet must violate the independently predicted order.
       if(actual(i).size>=2){val mutated=actual(i).updated(0,actual(i)(1)).updated(1,actual(i)(0));assert(mutated.sorted==actual(i).sorted && mutated!=sides(i).predicted.toSeq)}
     }
+    var acceptedCause="same-order"
     if(compareSet){
       assert(actual(0).sorted==actual(1).sorted,"complete output multiset")
       val outputIDs=actual(0).map(_.takeWhile(_!=':').toInt)
@@ -160,10 +205,20 @@ class CDPOrderingTracker(dut:CDPC4OrderingHarness,dir:Path) extends chisel3.simu
         for(k<-Seq("id","va","depth","source","inputCycle","page"))assert(d(k)==r(k),s"reorder changed input identity $label id=$id key=$k")
         for(record<-Seq(d,r))assert(record.obj.contains("pageTransaction") && record.obj.contains("qualificationCycle"),"reorder lacks a page qualification witness")
       }
+      if(actual(0)!=actual(1)){
+        val items=sides.map(_.records.toVector.sortBy(_._1).map(_._2))
+        for(i<-0 to 1)assert(replay(items(i),i==0,false)==actual(i),"D5 original schedule replay")
+        val translation=sides.indices.map(i=>replay(items(i),i==0,true))
+        val output=Seq(true,false).map(q=>replay(items(1),q,false))
+        val control=Seq(true,false).map(q=>replay(items(1),q,true))
+        assert(control(0)==control(1),"D5 unexplained same-qualification/always-ready difference")
+        for(sequence<-translation++output)assert(sequence.sorted==actual(0).sorted,"D5 counterfactual changes complete output set")
+        acceptedCause=CDPD5Policy.cause(translation(0)!=translation(1),output(0)!=output(1))
+      }
       if(requireSourceOrder){
         for(source<-outputIDs.map(i=>sides(0).records(i)("source").num.toInt).distinct){
           val bySource=actual.map(_.filter(v=>sides(0).records(v.takeWhile(_!=':').toInt)("source").num.toInt==source))
-          assert(bySource(0)==bySource(1),s"same-source contract requires a D5 decision label=$label source=$source")
+          assert(bySource(0)==bySource(1),s"strict same-source order differs within accepted D5 label=$label source=$source")
         }
       }
     }
@@ -174,7 +229,8 @@ class CDPOrderingTracker(dut:CDPC4OrderingHarness,dir:Path) extends chisel3.simu
         "dut"->ujson.Obj("predicted"->ujson.Arr.from(sides(0).predicted),"items"->ujson.Arr.from(sides(0).records.toVector.sortBy(_._1).map(_._2))),
         "reference"->ujson.Obj("predicted"->ujson.Arr.from(sides(1).predicted),"items"->ujson.Arr.from(sides(1).records.toVector.sortBy(_._1).map(_._2))),
         "allowedSwapRule"->"same source/input identity/page; qualification explained by raw page terminal; both orders must match independent RR/completion replay",
-        "independentOrderChecked"->true,"mutationRejected"->true,"policyApproval"->"D5-pending").render())
+        "independentOrderChecked"->true,"mutationRejected"->true,"policyApproval"->(if(compareSet)"D5-accepted-reordering"else "dynamic-filter-pending"),
+        "acceptedReorderingCause"->acceptedCause).render())
     }
   }
 }
