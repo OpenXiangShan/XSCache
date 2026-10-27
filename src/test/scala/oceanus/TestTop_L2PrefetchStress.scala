@@ -97,6 +97,57 @@ class TestTopStress(cfg: L2Configuration)(implicit p: Parameters) extends Stress
   cc("degreeDrop",VecInit(cdp.detectFrontend.degreeQueues.map(q=>Mux(read(q.io.enq.head.valid),3.U-PopCount(read(q.accepted)),0.U))).reduce(_+&_))
   cc("vpnTrainDrop",(read(cdp.vpnTrainReqBuf.io.enq.valid)&& !read(cdp.vpnTrainReqBuf.io.enq.ready)).asUInt)
   cdp.filterTraining.foreach(f=>cc("filterTrainDrop",(read(f.queue.io.enq.valid)&& !read(f.queue.io.enq.ready)).asUInt))
+  // Read-only S12 diagnostics. Slot occupancy is the union of active CDP
+  // REQ execution and a queued CDP REQ, qualified by physical TSHR valid.
+  // Origin-lifetime is reported separately: it also includes later demand/SNP
+  // work in the same CDP-allocated slot, so it is not the primary metric.
+  val analysisCounters=mutable.ArrayBuffer.empty[(String,UInt)]
+  def ac(name:String,n:UInt):Unit={val x=RegInit(0.U(64.W));x:=x+n;analysisCounters+=name->x}
+  val cdpSlots=module.slices.flatMap(_.tshrs).map {t=>
+    val pendingCDP=RegInit(false.B)
+    when(read(t.tshr_enter_REQ)) {
+      pendingCDP:=read(t.io.UpRXREQ.SrcID)===cfg.pfSrcID.U &&
+        L2PrefetchTxnID.decode(read(t.io.UpRXREQ.TxnID))===L2PfSource.CDP.U
+    }
+    read(t.tshr_valid) && ((read(t.vPipeREQ.io.bopPerf.activePrefetch) &&
+      read(t.vPipeREQ.io.bopPerf.activePrefetchSource)===L2PfSource.CDP.U) ||
+      (read(t.rbeREQ.io.valid) && pendingCDP))
+  }
+  val originSlots=module.slices.flatMap(_.tshrs).map {t=>
+    val cdpOrigin=RegInit(false.B)
+    when(read(t.io.fromAlloc.alloc.REQ)) {
+      cdpOrigin:=read(t.io.UpRXREQ.SrcID)===cfg.pfSrcID.U &&
+        L2PrefetchTxnID.decode(read(t.io.UpRXREQ.TxnID))===L2PfSource.CDP.U
+    }
+    when(read(t.tshr_dealloc)){cdpOrigin:=false.B}
+    read(t.tshr_valid) && cdpOrigin
+  }
+  ac("cdpSlotCycles",PopCount(cdpSlots));ac("cdpAnyCycles",VecInit(cdpSlots).asUInt.orR.asUInt)
+  ac("cdpOriginSlotCycles",PopCount(originSlots))
+  ac("allSlotCycles",PopCount(module.slices.flatMap(_.tshrs).map(t=>read(t.tshr_valid))))
+  for((name,idx)<-L2BOPPerf.names.zipWithIndex) {
+    ac(name,PopCount(module.slices.flatMap(_.tshrs).map(t=>
+      read(t.io.bopPerf(idx)) && read(t.io.bopPerfSource(idx))===L2PfSource.CDP.U)))
+  }
+  ac("cdpNewAlloc",PopCount(module.slices.flatMap(_.tshrs).map(t=>
+    read(t.io.fromAlloc.alloc.REQ) && read(t.io.UpRXREQ.SrcID)===cfg.pfSrcID.U &&
+      L2PrefetchTxnID.decode(read(t.io.UpRXREQ.TxnID))===L2PfSource.CDP.U)))
+  cdp.filterTraining.foreach {f=>
+    val ft=f.pipe
+    ac("filterTrainAccepted",(read(f.queue.io.enq.valid)&&read(f.queue.io.enq.ready)).asUInt)
+    ac("filterUpdates",(read(ft.io.trainReq.valid)&&read(ft.io.trainReq.ready)).asUInt)
+    ac("filterUpdatesUsed",(read(ft.io.trainReq.valid)&&read(ft.io.trainReq.ready)&&read(ft.s3_task.isUsed)).asUInt)
+    ac("filterUpdatesEvict",(read(ft.io.trainReq.valid)&&read(ft.io.trainReq.ready)&&read(ft.s3_task.isEvict)).asUInt)
+    for(v<-0 to 3) ac("filterUpdatedSat"+v,PopCount((0 until cdp.cdpParams.filterEntryBlks).map(i=>
+      read(ft.io.trainReq.valid)&&read(ft.io.trainReq.ready)&&read(ft.io.trainReq.bits.sat)(i)===v.U)))
+  }
+  ac("filterSenderQuery",read(send.pftS2).asUInt)
+  val senderFilterHit=VecInit(send.hitVec.map(v=>read(v))).asUInt.orR
+  ac("filterSenderHit",(read(send.pftS2)&&senderFilterHit).asUInt)
+  for(v<-0 to 3) ac("filterSenderSat"+v,(read(send.pftS2)&&senderFilterHit &&
+    read(send.rsp2.satVec)(PriorityEncoder(VecInit(send.hitVec.map(v=>read(v)))))(send.getFilterOffset(read(send.req2.paddr)))===v.U).asUInt)
+  val analysisPacked=IO(Output(UInt((64*analysisCounters.size).W)))
+  analysisPacked:=Cat(analysisCounters.reverse.map(_._2).toSeq)
   val cdpEntryProbe=IO(Output(Vec(16,UInt(88.W))))
   for(i<-0 until 16) cdpEntryProbe(i):=Cat(read(send.valids)(i),read(send.entries)(i).paddrValid,read(send.entries)(i).vTag,read(send.entries)(i).pTag)
   val cdpSendEvents=IO(Output(UInt(128.W)))
@@ -407,7 +458,9 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
   val traceWindow=opt("--trace-window","0").toInt
   val prefetchMode=opt("--prefetch-mode","all")
   require(Set("all","none","bop","vbop","recv","cdp")(prefetchMode))
-  def enabled(source:String):Boolean=prefetchMode=="all" || prefetchMode==source
+  val cdpEnabled=opt("--cdp-enable","true").toBoolean
+  val analysis=opt("--cdp-analysis","false").toBoolean
+  def enabled(source:String):Boolean=(prefetchMode=="all" || prefetchMode==source) && (source!="cdp" || cdpEnabled)
   val recordTape=opt("--record-tape","false").toBoolean
   val replayPath=opt("--replay-tape","")
   val snapshotCycles=opt("--snapshot-cycles","").split(",").filter(_.nonEmpty).map(_.toInt).toSet
@@ -480,6 +533,18 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
     def cdpSnapshot(closed:Boolean):Unit={
       val raw=dut.cdpCountPacked.peek().litValue
       println(s"STRESS_CDP_SNAPSHOT caseId=$caseId seed=$seed cycle=$cycle closed=$closed " + dut.cdpCounters.indices.map(i=>dut.cdpCounters(i)._1+"="+((raw>>(64*i))&((BigInt(1)<<64)-1))).mkString(" "))
+    }
+    val analysisMask=(BigInt(1)<<64)-1
+    var analysisLast=Map.empty[String,BigInt];var analysisLastCompleted=0;var analysisStart=0
+    def analysisCounts():Map[String,BigInt]={
+      val raw=dut.analysisPacked.peek().litValue;val c=dut.cdpCountPacked.peek().litValue
+      dut.analysisCounters.indices.map(i=>dut.analysisCounters(i)._1->((raw>>(64*i))&analysisMask)).toMap ++
+        dut.cdpCounters.indices.map(i=>("cdp_"+dut.cdpCounters(i)._1)->((c>>(64*i))&analysisMask)).toMap
+    }
+    def analysisWindow(end:Int):Unit=if(analysis && end>analysisStart) {
+      val now=analysisCounts();val delta=now.toSeq.sortBy(_._1).map{case(k,v)=>k+"="+(v-analysisLast.getOrElse(k,BigInt(0)))}.mkString(" ")
+      println(s"STRESS_CDP_WINDOW caseId=$caseId seed=$seed enabled=$cdpEnabled start=$analysisStart end=$end samples=${end-analysisStart} completed=${driver.completed-analysisLastCompleted} $delta")
+      analysisLast=now;analysisLastCompleted=driver.completed;analysisStart=end
     }
     def qos():Unit={cdpSnapshot(false);println(s"STRESS_QOS caseId=$caseId seed=$seed cycle=$cycle completed=${driver.completed} submitted=$submitted maxDemandNoCompletion=$maxDemandNoCompletion maxUpReqBlocked=$maxUpReqBlocked lastDemandCompleteCycle=$lastDemandCompleteCycle stimulusSnoops=$stimulusSnoops snpSent=$snpSent snpDone=$snpDone maxActiveNoCompletion=$activeNoCompletion snoopOffers=$snoopOffers pendingOffers=${offeredSnoops.size}")}
     val retryLive=mutable.Map.empty[DnTxnID,(BigInt,BigInt,BigInt)]
@@ -591,6 +656,7 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
     for(c <- -300 until 0) dn.stepWithCredits(c)
     var quiet=0; var stimulus=true; var activeCycles=0
     while(quiet<64 && cycle<minimum+1000000) {
+      if(analysis && cycle<=minimum && cycle>0 && (cycle%1000==0 || cycle==minimum)) analysisWindow(cycle)
       up.clearResponses(); dn.clearResponses()
       stimulus=cycle<minimum
       if(stimulus) activeCycles+=1
@@ -933,6 +999,10 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
         throw t
       }
       cycle+=1
+    }
+    if(analysis) {
+      val totals=analysisCounts().toSeq.sortBy(_._1).map{case(k,v)=>k+"="+v}.mkString(" ")
+      println(s"STRESS_CDP_ANALYSIS caseId=$caseId seed=$seed enabled=$cdpEnabled cycle=$cycle $totals")
     }
     val cpacked=value(dut.cdpCountPacked)
     val ccvals=dut.cdpCounters.indices.map(i=>dut.cdpCounters(i)._1->((cpacked>>(64*i))&((BigInt(1)<<64)-1))).toMap
