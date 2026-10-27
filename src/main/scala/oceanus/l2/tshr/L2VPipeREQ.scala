@@ -1301,7 +1301,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // --------------------------------
   val repl_tshr_meta_wr = p_prefill && io.repl_done
-
   val tshr_meta_wr_state_UU = meta_wr_state_UU && !p_prefill
   val tshr_meta_wr_state_US = meta_wr_state_US && !p_prefill
   val tshr_meta_wr_state_S = meta_wr_state_S && !p_prefill
@@ -1323,6 +1322,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val tshr_meta_wr_alias = !p_prefill && meta_wr_alias ||
                            repl_tshr_meta_wr
+
+  val tshr_meta_wr_prefetch = repl_tshr_meta_wr ||
+                              (!p_prefill && tshr_meta_wr_state &&
+                               (p_rxreq_readshared || p_rxreq_readunique || p_rxreq_makeunique))
 
   val tshr_tag_wr = repl_tshr_meta_wr
 
@@ -1355,6 +1358,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   io.tshr_meta_write_en.alias := tshr_meta_wr_alias
   io.tshr_meta_write_meta.alias := Mux(p_prefill, p_prefill_meta.alias, p_rxreq.TagAlias)
+  io.tshr_meta_write_en.prefetch := tshr_meta_wr_prefetch
+  io.tshr_meta_write_meta.prefetch := Mux(p_prefill, p_prefill_meta.prefetch, false.B)
   // ----------------------------------------------------------------
 
   // -- Interactions with TSHR local data and Data Storage Read
@@ -1601,6 +1606,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   when (rxreq_fire) {
     p_prefill := expect_replace
     p_prefill_meta := 0.U.asTypeOf(p_prefill_meta)
+    p_prefill_meta.prefetch := expect_replace && (rxreq_stashshared || rxreq_stashunique)
   }
 
   // If the replacer picked an INVALID way whose stale tag aliases this very request (the line

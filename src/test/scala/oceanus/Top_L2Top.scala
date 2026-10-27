@@ -27,7 +27,7 @@ import scala.collection.mutable.ArrayBuffer
  * MFC_ARGS), so the generated Verilog carries no location-info comments and no
  * shared port declarations, and is parseable by XiangShan scripts/parser.py.
  */
-class Top_L2Top(val l2cfg: L2Configuration)(implicit val p: Parameters) extends Module with HasL2Params {
+class Top_L2Top(val l2cfg: L2Configuration, val withPerf: Boolean = false)(implicit val p: Parameters) extends Module with HasL2Params {
 
   val module = Module(new L2Top(l2cfg))
 
@@ -42,6 +42,33 @@ class Top_L2Top(val l2cfg: L2Configuration)(implicit val p: Parameters) extends 
   // genBroadCastBundleTop and forwards io.dft).
   val dft = IO(Input(new SramBroadcastBundle))
   SramHelper.genBroadCastBundleTop() := dft
+
+  // Performance instrumentation (--perf): same collect pattern as
+  // TestTop_L2Top. The perf counter registers elaborate only when
+  // enablePerfPrint is set, which the App ties to withPerf.
+  if (withPerf) {
+    val log = IO(new Bundle {
+      val dump = Input(Bool())
+      val clean = Input(Bool())
+    })
+
+    val timer = WireDefault(0.U(64.W))
+    val logEnable = WireDefault(false.B)
+    val clean = WireDefault(false.B)
+    val dump = WireDefault(false.B)
+
+    timer := 0.U
+    logEnable := true.B
+    clean := log.clean
+    dump := log.dump
+
+    dontTouch(timer)
+    dontTouch(logEnable)
+    dontTouch(clean)
+    dontTouch(dump)
+
+    XSLog.collect(timer, logEnable, clean, dump)
+  }
 }
 
 object Top_L2Top extends App {
@@ -53,6 +80,20 @@ Usage: Top_L2Top [<--option> <values>]
                                 external SAM supports 1 to 4 slices
       --tshr <tshr_num>         specify the number of TSHRs (mshrSize), 32 by
                                 default; must be >= 4, power of two recommended
+      --l2-drrip-release-update <0|1>
+                                enable DRRIP release updates through DirRel,
+                                1 (on) by default
+      --l2-drrip-use-sram <0|1> select the RRIP SRAM+CAM backend (1, default)
+                                or the FF backend (0)
+      --l2-origin-use-sram <0|1>
+                                use origin SRAM (1, default) or origin FF (0)
+      --l2-dirrel-arbitration <mode>
+                                dirrel-high, rr (default), or dirrel-low
+      --l2-dirrel-single-cycle <0|1>
+                                enable single-cycle DirRel (0, default); requires
+                                RRIP SRAM with origin FF
+      --perf                    enable all performance counters (XSPerf) and
+                                expose the log dump/clean pins; off by default
   """
 
   if (args.contains("--help"))
@@ -61,15 +102,38 @@ Usage: Top_L2Top [<--option> <values>]
     System.exit(0)
   }
 
-  var varArgs = ArrayBuffer(args.toIndexedSeq:_*)
+  // --perf is a bare flag; drop it before the sliding two-arg option parse
+  val genPerf = args.contains("--perf")
+  val optArgs = if (genPerf) args.filterNot(_ == "--perf") else args
+
+  var varArgs = ArrayBuffer(optArgs.toIndexedSeq:_*)
   var varArgsDropped = 0
 
   var numSlices = 4
   var numTshr = 32
+  var drripUseSRAM = true
+  var originUseSRAM = true
+  var enableDRRIPReleaseUpdate = true
+  var dirRelArbitration = "rr"
+  var dirRelSingleCycle = false
 
-  val varArgsToDrop = args.sliding(2, 1).zipWithIndex.collect {
+  def parseBoolean(option: String, value: String): Boolean = {
+    require(value == "0" || value == "1", s"$option expects 0 or 1, got $value")
+    value == "1"
+  }
+
+  val varArgsToDrop = optArgs.sliding(2, 1).zipWithIndex.collect {
     case (Array("--slices", value), i) => (numSlices = value.toInt, i)
     case (Array("--tshr", value), i) => (numTshr = value.toInt, i)
+    case (Array("--l2-drrip-release-update", value), i) =>
+      (enableDRRIPReleaseUpdate = parseBoolean("--l2-drrip-release-update", value), i)
+    case (Array("--l2-drrip-use-sram", value), i) =>
+      (drripUseSRAM = parseBoolean("--l2-drrip-use-sram", value), i)
+    case (Array("--l2-dirrel-arbitration", value), i) => (dirRelArbitration = value, i)
+    case (Array("--l2-origin-use-sram", value), i) =>
+      (originUseSRAM = parseBoolean("--l2-origin-use-sram", value), i)
+    case (Array("--l2-dirrel-single-cycle", value), i) =>
+      (dirRelSingleCycle = parseBoolean("--l2-dirrel-single-cycle", value), i)
   }
 
   varArgsToDrop.map(_._2).foreach(i => {
@@ -96,11 +160,16 @@ Usage: Top_L2Top [<--option> <values>]
       sets = 1024,
       replacement = "drrip",
       blockBytes = 64,
-      dataSRAMSplit = 8,
+      dataSRAMSplit = 4,
       enableDataECC = true,
       hasMbist = true,
       hasSramCtl = false,
-      dataECC = Some("secded")
+      dataECC = Some("secded"),
+      drripUseSRAM = drripUseSRAM,
+      originUseSRAM = originUseSRAM,
+      enableDRRIPReleaseUpdate = enableDRRIPReleaseUpdate,
+      dirRelArbitration = dirRelArbitration,
+      dirRelSingleCycle = dirRelSingleCycle
     )
     case CHIParametersKey => CHIParameters (
       issue = EnumCHIIssue.E,
@@ -111,11 +180,11 @@ Usage: Top_L2Top [<--option> <values>]
     case CCHIParametersKey => CCHIParameters()
     case LogUtilsOptionsKey => LogUtilsOptions(
       enableDebug = false,
-      enablePerf = false,
+      enablePerf = genPerf,
       fpgaPlatform = false
     )
     case PerfCounterOptionsKey => PerfCounterOptions (
-      enablePerfPrint = false,
+      enablePerfPrint = genPerf,
       enablePerfDB = false,
       perfLevel = XSPerfLevel.VERBOSE,
       0
@@ -130,5 +199,5 @@ Usage: Top_L2Top [<--option> <values>]
   )
 
   (new ChiselStage).execute(varArgs.toArray,
-    ChiselGeneratorAnnotation(() => new Top_L2Top(l2cfg)(config)) +: releaseFirtoolOptions)
+    ChiselGeneratorAnnotation(() => new Top_L2Top(l2cfg, genPerf)(config)) +: releaseFirtoolOptions)
 }

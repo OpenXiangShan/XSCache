@@ -116,6 +116,7 @@ class DataStorageSRAM(implicit val p: Parameters) extends Module with HasL2Param
     hasMbist      = paramL2.hasMbist,
     hasSramCtl    = paramL2.hasSramCtl,
     extraHold     = true,
+    suffix        = Some("l2_dat"),
     withClockGate = true
   ))
   array.io_en := io.en

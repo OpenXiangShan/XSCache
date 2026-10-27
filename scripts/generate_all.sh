@@ -9,7 +9,7 @@ work_dir=""
 
 usage() {
   cat <<EOF
-Usage: ${0##*/} (--coupledl2 | --oceanus) [--tshr N]...
+Usage: ${0##*/} (--coupledl2 | --oceanus) [--tshr N]... [Oceanus options]
 
 Generate and package one CoupledL2 or Oceanus L2 release RTL configuration.
 
@@ -19,6 +19,17 @@ Generate and package one CoupledL2 or Oceanus L2 release RTL configuration.
   --tshr N  Generate Oceanus L2 with N TSHRs per slice. Repeat for multiple
             configurations. Defaults to 32; N must be at least 4. Only valid
             with --oceanus.
+  --l2-drrip-use-sram <0|1>
+            Use the RRIP SRAM+CAM backend (1, default) or FF backend (0).
+  --l2-origin-use-sram <0|1>
+            Use origin SRAM (1, default) or origin FF (0).
+  --l2-drrip-release-update <0|1>
+            Enable DRRIP release updates through DirRel (1, default).
+  --l2-dirrel-arbitration <mode>
+            Select dirrel-high, rr (default), or dirrel-low arbitration.
+  --l2-dirrel-single-cycle <0|1>
+            Enable single-cycle DirRel (0, default); requires RRIP SRAM and
+            origin FF. All --l2-* options are only valid with --oceanus.
   -h, --help
             Show this help.
 
@@ -26,6 +37,7 @@ Examples:
   ${0##*/} --oceanus
   ${0##*/} --coupledl2
   ${0##*/} --oceanus --tshr 48 --tshr 64
+  ${0##*/} --oceanus --l2-origin-use-sram 0 --l2-dirrel-single-cycle 1
 
 Releases and tar.gz archives are written to $output_dir.
 EOF
@@ -107,6 +119,12 @@ trap cleanup EXIT
 
 target=""
 tshrs=()
+oceanus_options_seen=false
+l2_drrip_use_sram=1
+l2_origin_use_sram=1
+l2_drrip_release_update=1
+l2_dirrel_arbitration=rr
+l2_dirrel_single_cycle=0
 while (( $# > 0 )); do
   case "$1" in
     --coupledl2|--oceanus)
@@ -125,6 +143,41 @@ while (( $# > 0 )); do
         exit 2
       fi
       tshrs+=("$2")
+      shift 2
+      ;;
+    --l2-drrip-use-sram|--l2-origin-use-sram|--l2-drrip-release-update|--l2-dirrel-single-cycle)
+      if (( $# < 2 )); then
+        printf 'Missing value for %s\n' "$1" >&2
+        usage >&2
+        exit 2
+      fi
+      if [[ "$2" != 0 && "$2" != 1 ]]; then
+        printf 'Invalid value for %s (expected 0 or 1): %s\n' "$1" "$2" >&2
+        exit 2
+      fi
+      oceanus_options_seen=true
+      case "$1" in
+        --l2-drrip-use-sram) l2_drrip_use_sram=$2 ;;
+        --l2-origin-use-sram) l2_origin_use_sram=$2 ;;
+        --l2-drrip-release-update) l2_drrip_release_update=$2 ;;
+        --l2-dirrel-single-cycle) l2_dirrel_single_cycle=$2 ;;
+      esac
+      shift 2
+      ;;
+    --l2-dirrel-arbitration)
+      if (( $# < 2 )); then
+        printf 'Missing value for --l2-dirrel-arbitration\n' >&2
+        usage >&2
+        exit 2
+      fi
+      case "$2" in
+        dirrel-high|rr|dirrel-low) l2_dirrel_arbitration=$2 ;;
+        *)
+          printf 'Invalid DirRel arbitration mode: %s\n' "$2" >&2
+          exit 2
+          ;;
+      esac
+      oceanus_options_seen=true
       shift 2
       ;;
     -h|--help)
@@ -149,8 +202,18 @@ if [[ "$target" == coupledl2 ]] && (( ${#tshrs[@]} > 0 )); then
   usage >&2
   exit 2
 fi
+if [[ "$target" == coupledl2 && "$oceanus_options_seen" == true ]]; then
+  printf '%s\n' 'Oceanus --l2-* options are only valid with --oceanus' >&2
+  usage >&2
+  exit 2
+fi
 if [[ "$target" == oceanus ]] && (( ${#tshrs[@]} == 0 )); then
   tshrs=(32)
+fi
+if (( l2_dirrel_single_cycle == 1 )) &&
+    (( l2_drrip_use_sram == 0 || l2_origin_use_sram == 1 )); then
+  printf '%s\n' 'Single-cycle DirRel requires --l2-drrip-use-sram 1 and --l2-origin-use-sram 0' >&2
+  exit 2
 fi
 
 normalized_tshrs=()
@@ -174,6 +237,26 @@ for tshr in "${tshrs[@]}"; do
 done
 tshrs=("${normalized_tshrs[@]}")
 
+oceanus_variant=()
+if (( l2_drrip_use_sram == 0 )); then
+  oceanus_variant+=(ff)
+elif (( l2_origin_use_sram == 0 )); then
+  oceanus_variant+=(orgff)
+fi
+if (( l2_dirrel_single_cycle == 1 )); then
+  oceanus_variant+=(sc)
+fi
+if (( l2_drrip_release_update == 0 )); then
+  oceanus_variant+=(norel)
+fi
+if [[ "$l2_dirrel_arbitration" != rr ]]; then
+  oceanus_variant+=("$l2_dirrel_arbitration")
+fi
+oceanus_variant_suffix=""
+for descriptor in "${oceanus_variant[@]}"; do
+  oceanus_variant_suffix+="-$descriptor"
+done
+
 for command in make mill python3 tar mktemp date; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'Required command not found: %s\n' "$command" >&2
@@ -194,7 +277,8 @@ if [[ "$target" == coupledl2 ]]; then
   check_destination "bosc_TopCoupledL2-Release-DefaultConfig_sram-$release_date"
 else
   for tshr in "${tshrs[@]}"; do
-    check_destination "bosc_Top_L2Top-Release-DefaultConfig-T${tshr}_sram-$release_date"
+    config="DefaultConfig-T${tshr}${oceanus_variant_suffix}_sram"
+    check_destination "bosc_Top_L2Top-Release-${config}-$release_date"
   done
 fi
 
@@ -210,10 +294,18 @@ if [[ "$target" == coupledl2 ]]; then
   package_release TopCoupledL2 DefaultConfig_sram "$rtl_dir" "$log"
 else
   for tshr in "${tshrs[@]}"; do
-    rtl_dir="$work_dir/rtl/l2top_t$tshr"
-    log="$work_dir/generate_Top_L2Top-T$tshr.log"
-    printf 'Generating Oceanus L2 release RTL with %s TSHRs per slice\n' "$tshr"
-    make -C "$repo_root" gen-top-l2top TSHR="$tshr" BUILD_DIR_TOP_L2TOP="$rtl_dir" 2>&1 | tee "$log"
-    package_release Top_L2Top "DefaultConfig-T${tshr}_sram" "$rtl_dir" "$log"
+    config="DefaultConfig-T${tshr}${oceanus_variant_suffix}_sram"
+    rtl_dir="$work_dir/rtl/l2top_t${tshr}${oceanus_variant_suffix}"
+    log="$work_dir/generate_Top_L2Top-T${tshr}${oceanus_variant_suffix}.log"
+    printf 'Generating Oceanus L2 release RTL with %s TSHRs per slice (%s)\n' "$tshr" "$config"
+    make -C "$repo_root" gen-top-l2top \
+      TSHR="$tshr" L2_SLICES=4 TOP_L2TOP_PERF=0 \
+      L2_DRRIP_USE_SRAM="$l2_drrip_use_sram" \
+      L2_ORIGIN_USE_SRAM="$l2_origin_use_sram" \
+      L2_DRRIP_RELEASE_UPDATE="$l2_drrip_release_update" \
+      L2_DIRREL_ARBITRATION="$l2_dirrel_arbitration" \
+      L2_DIRREL_SINGLE_CYCLE="$l2_dirrel_single_cycle" \
+      BUILD_DIR_TOP_L2TOP="$rtl_dir" 2>&1 | tee "$log"
+    package_release Top_L2Top "$config" "$rtl_dir" "$log"
   done
 fi

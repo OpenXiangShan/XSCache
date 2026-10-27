@@ -48,12 +48,11 @@ class L2VPipeEVT(
     val EVT_data_pending = Output(Bool())
     val evtDataReadyOut = Output(Bool())
 
-    // DRRIP release-type update (commit path): single-cycle pulse at this
-    // episode's validated release commit. WayValid-entered episodes are dropped
-    // here unconditionally — they train at the allocation entrance instead (or
-    // not at all when the entrance update is disabled; no DirRel fallback).
-    // Elaborated only when the DirRel path is enabled.
-    val tshr_repl_release = if (paramL2.enableDRRIPReleaseUpdate) Some(Output(Bool())) else None
+    // Single DirRel issue point for every eligible EVT: acceptance into this
+    // vPipe. WayValid supplies the exact way directly; other episodes use the
+    // way returned by their sole DirRd.
+    val tshr_repl_release = if (enableRRIPReleaseUpdate) Some(Output(Bool())) else None
+    val tshr_repl_way = if (enableRRIPReleaseUpdate) Some(Output(UInt(wayBits.W))) else None
 
     val blockRBE = Output(new L2RBE.PathVPipeBlock)
     val free = Output(Bool())
@@ -74,7 +73,6 @@ class L2VPipeEVT(
   val pTxnId = Reg(UInt(8.W))
   val pTraceTag = Reg(UInt(1.W))
   val pReqWay = Reg(UInt(4.W))
-  val pWayValid = RegInit(false.B) // entrance-time flit WayValid (DirRel suppression)
   val pEntState = Reg(UInt(2.W)) // entrance-time directory state (assertion use only)
   val dataArmed = RegInit(false.B)
   val dirHit = RegInit(false.B)
@@ -100,6 +98,13 @@ class L2VPipeEVT(
   val opcode = io.UpRXEVT.bits.Opcode
   val isEvict = opcode === CCHIOpcode.Evict.U
   val isWbFull = opcode === CCHIOpcode.WriteBackFull.U
+  val evtAccept = state === sIdle && io.UpRXEVT.valid
+  val evtReleaseWay = Mux(io.UpRXEVT.bits.WayValid,
+    io.UpRXEVT.bits.Way(wayBits - 1, 0), dirResult.way)
+  val evtRelease = evtAccept && (isEvict || isWbFull) &&
+    (io.UpRXEVT.bits.WayValid || dirResult.hit)
+  io.tshr_repl_release.foreach(_ := evtRelease)
+  io.tshr_repl_way.foreach(_ := evtReleaseWay)
 
   val copyBackWrDataMatch =
     dataArmed &&
@@ -121,13 +126,12 @@ class L2VPipeEVT(
   // peer meta.state write owned the handshake cycle.
   val wbCommitNow = pIsWbFull && (wbCommitFire || commitPending) && !commitStall
 
-  when (state === sIdle && io.UpRXEVT.valid) {
+  when (evtAccept) {
     pIsWbFull := isWbFull
     pTxnId := io.UpRXEVT.bits.TxnID
     pSrcId := io.UpRXEVT.bits.SrcID
     pTraceTag := io.UpRXEVT.bits.TraceTag
-    pReqWay := dirResult.way
-    pWayValid := io.UpRXEVT.bits.WayValid
+    pReqWay := evtReleaseWay
     pEntState := dirResult.state
     dirHit := dirResult.hit
     dataArmed := false.B
@@ -221,6 +225,7 @@ class L2VPipeEVT(
   metaMask.dirty := false.B
   metaMask.alias := false.B
   metaMask.clients.foreach(_ := false.B)
+  metaMask.prefetch := false.B
   // Commit points: WriteBackFull at the CompDBIDResp handshake (wbCommitNow);
   // clean Evict at sWaitCommit as before. A WriteBackFull directory miss still
   // drives the mask (the assertion below forbids that case).
@@ -235,14 +240,6 @@ class L2VPipeEVT(
 
   io.tshr_meta_write_en := metaMask
   io.tshr_meta_write_meta := newMeta
-
-  // DRRIP release train (commit path): pulse at this episode's validated
-  // release commit — metaMask.state is asserted exactly at the commit points
-  // above. WayValid-entered episodes are dropped unconditionally: they train
-  // at the allocation entrance instead (or not at all when the entrance
-  // update is disabled; no DirRel fallback by design).
-  io.tshr_repl_release.foreach(_ := metaMask.state && !pWayValid &&
-    (paramL2.replacement == "drrip").B)
 
   assert(!(copyBackWrDataMatch && evtDataReady), "EVT: unexpected extra CopyBackWrData after evtDataReady")
   assert(!(state === sWaitData && !dataArmed), "EVT: data arrived before CompDBIDResp armed reception")
