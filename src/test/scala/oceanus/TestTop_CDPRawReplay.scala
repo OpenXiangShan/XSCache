@@ -78,6 +78,14 @@ class CDPRawReplayReference(implicit p:Parameters) extends Module {
   add("filterPLRU",read(ft.replacer.asInstanceOf[freechips.rocketchip.util.SetAssocLRU].state_vec))
   event("filterTrainWrite",(read(table.io.trainReq.valid) && read(table.io.trainReq.ready)),"bits"->table.io.trainReq.bits)
 
+  add("debug.valids", read(s.valids).asUInt)
+  add("debug.freeIndex", read(s.freeEntryIdx))
+  event("debug.terminal", read(s.tlb_s3_valid) && read(s.tlb_s3_rsp_valid) && !read(s.tlb_s3_rsp_bits).miss,
+    "va" -> s.tlb_s3_addr)
+  for(i <- 0 until 16) {
+    add(s"debug.slot$i.va", Cat(entries(i).vTag, 0.U(6.W)))
+    add(s"debug.slot$i.paValid", entries(i).paddrValid)
+  }
   val observationBits = IO(Output(UInt(fields.map(_._2.getWidth).sum.W)))
   observationBits := Cat(fields.map(_._2).reverse.toSeq)
   val widths = fields.map { case (n, v) => n -> v.getWidth }.toVector
@@ -85,15 +93,25 @@ class CDPRawReplayReference(implicit p:Parameters) extends Module {
 
 object TestTop_CDPRawReplay extends App with ChiselSim {
   Constantin.init(false)
+  val diagnose = args.contains("--diagnose")
   val path = Paths.get(args.head)
   val input = Source.fromInputStream(new GZIPInputStream(Files.newInputStream(path)))
   val lines = input.getLines()
   val header = ujson.read(lines.next())
   val widths = header("widths").arr.toVector.map(x => x(0).str -> x(1).num.toInt)
+  // Decode the replay inputs and compared outputs only. The raw system trace
+  // also contains thousands of cache lifecycle fields unused by this oracle.
+  val names = Set("enable", "candidate", "allocated", "duplicate", "full", "vpnAccepted", "vpnDropped",
+    "filterAccepted", "filterDropped", "filterQueueCount", "filterPLRU", "filterTrainWrite", "filterTrainWrite.bits", "resident")
+  val prefixes = Seq("terminal", "vpn", "filter", "half", "candidate", "out", "filterDrop") ++ (0 until 16).map(i => s"translationDrop$i")
+  var offset = 0
+  val selected = widths.flatMap { case(n,w) =>
+    val at=offset; offset+=w
+    Option.when(names(n) || prefixes.exists(p => n == p || n.startsWith(p+".")))((n,at,(BigInt(1)<<w)-1))
+  }
   case class Row(cycle: Int, epoch: Int, gate: Boolean, bits: BigInt) {
     lazy val values: Map[String, BigInt] = {
-      var v = bits
-      widths.map { case (n, w) => val x = v & ((BigInt(1) << w) - 1); v >>= w; n -> x }.toMap
+      selected.map { case(n,at,mask) => n -> ((bits >> at) & mask) }.toMap
     }
   }
   val rows = lines.map { line => val a = ujson.read(line); Row(a(0).num.toInt, a(1).num.toInt, a(2).bool, BigInt(a(3).str, 16)) }.toVector
@@ -155,6 +173,8 @@ object TestTop_CDPRawReplay extends App with ChiselSim {
     var previousEpoch = -2
     val attempts = mutable.Map.empty[BigInt, Int].withDefaultValue(0)
     var requestCount = 0
+    val diagnostic = mutable.ArrayBuffer.empty[ujson.Value]
+    var admissionDifferences = 0
     rows.foreach { row =>
       val r = row.values; val e = row.epoch
       if(e != previousEpoch) { attempts.clear(); previousEpoch = e }
@@ -187,8 +207,16 @@ object TestTop_CDPRawReplay extends App with ChiselSim {
       val output = decode(dut.observationBits.peek().litValue)
       // The detection/training boundaries retain exact cycle identity. D1 is
       // limited to translated outputs/drops, compared as complete epoch bags.
+      if(diagnose && row.cycle >= 11860 && row.cycle <= 11960) {
+        diagnostic += ujson.Obj("cycle"->row.cycle,"epoch"->e,
+          "dut"->ujson.Obj.from(r.map { case(k,v)=>k->ujson.Str(v.toString(16)) }),
+          "reference"->ujson.Obj.from(output.map { case(k,v)=>k->ujson.Str(v.toString(16)) }))
+      }
       for(k <- Seq("candidate", "allocated", "duplicate", "full", "vpnAccepted", "vpnDropped", "filterAccepted", "filterDropped", "filterQueueCount", "filterPLRU", "filterTrainWrite", "filterTrainWrite.bits"))
-        assert(output(k) == r(k), s"cycle=${row.cycle} epoch=$e $k DUT=${r(k)} reference=${output(k)}")
+        if(diagnose && Set("allocated","duplicate","full")(k) && output(k)!=r(k)) {
+          admissionDifferences+=1
+          println(s"CDP_REPLAY_DIAGNOSTIC cycle=${row.cycle} epoch=$e $k DUT=${r(k)} reference=${output(k)} va=0x${r("candidate.va").toString(16)}")
+        } else assert(output(k) == r(k), s"cycle=${row.cycle} epoch=$e $k DUT=${r(k)} reference=${output(k)}")
       if(r("candidate") != 0) for(k <- Seq("candidate.va", "candidate.depth"))
         assert(output(k) == r(k), s"cycle=${row.cycle} epoch=$e $k")
       if(r("candidate") != 0) {
@@ -198,15 +226,25 @@ object TestTop_CDPRawReplay extends App with ChiselSim {
       outcomes(output, list(actual, e)); admission(output, list(referenceAccepted, e))
       dut.clock.step()
     }
+    if(diagnose) {
+      val dest=Paths.get(sys.props("oceanus.c5.trace")).resolve("m4-diagnostic.json")
+      Files.writeString(dest,ujson.Obj("head"->sys.props("oceanus.c5.head"),"admissionFieldDifferences"->admissionDifferences,
+        "acceptance"->false,"rows"->ujson.Arr.from(diagnostic)).render())
+      println(s"CDP_REPLAY_DIAGNOSTIC_RESULT acceptance=false fieldDifferences=$admissionDifferences file=$dest")
+    }
     var orderDifferences = 0
     for(e <- expected.keys.toVector.sorted) {
       val d = list(expected, e).toVector; val r = list(actual, e).toVector
-      assert(d.sorted == r.sorted, s"epoch=$e full output/drop multiset mismatch DUT=$d reference=$r")
-      assert(list(accepted, e) == list(referenceAccepted, e), s"epoch=$e accepted identities differ")
+      if(diagnose) println(s"CDP_REPLAY_DIAGNOSTIC_BAG epoch=$e same=${d.sorted==r.sorted} dut=${d.size} reference=${r.size} admittedDUT=${list(accepted,e).size} admittedReference=${list(referenceAccepted,e).size}")
+      else {
+        assert(d.sorted == r.sorted, s"epoch=$e full output/drop multiset mismatch DUT=$d reference=$r")
+        assert(list(accepted, e) == list(referenceAccepted, e), s"epoch=$e accepted identities differ")
+      }
       if(d != r) orderDifferences += 1
     }
     val outputCount = expected.values.flatten.count(_.startsWith("out:"))
     assert(outputCount > 0 && requestCount > 0)
-    println(s"CDP_RAW_REPLAY_RESULT pass=true seeds=${header("seeds").num.toInt} slices=${header("slices").num.toInt} cycles=${rows.size} outputs=$outputCount outcomes=${expected.values.map(_.size).sum} epochs=${expected.size} d1OrderDifferences=$orderDifferences missing=0 extra=0 referenceBody=unmodified trace=$path")
+    if(diagnose) println(s"CDP_RAW_REPLAY_DIAGNOSTIC_COMPLETE acceptance=false cycles=${rows.size} admissionFieldDifferences=$admissionDifferences referenceBody=unmodified trace=$path")
+    else println(s"CDP_RAW_REPLAY_RESULT pass=true seeds=${header("seeds").num.toInt} slices=${header("slices").num.toInt} cycles=${rows.size} outputs=$outputCount outcomes=${expected.values.map(_.size).sum} epochs=${expected.size} d1OrderDifferences=$orderDifferences missing=0 extra=0 referenceBody=unmodified trace=$path")
   }
 }

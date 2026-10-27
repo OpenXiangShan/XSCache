@@ -513,7 +513,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
       assert(reference.coverage("ReadOnce")-roBefore==1,"M3 legal ReadOnce execution absent")
       val legalHit=reference.directory.values.exists(x=>x._1==roPA && x._2.state!=0)
       assert(legalHit,"M3 ReadOnce must be L2 hit; miss is base known limitation")
-      println(s"CDP_READONCE_RESULT legalClientI=true L2Hit=true eligibilityChecked=1 returnedBeats=${beats-roBeats} outstanding=${demandAddresses.size} miss=BASE_KNOWN_LIMITATION hitResponse=BASE_KNOWN_LIMITATION")
+      println(s"CDP_READONCE_RESULT legalClientI=true L2Hit=true eligibilityChecked=1 returnedBeats=${beats-roBeats} outstanding=${demandAddresses.size} miss=KNOWN_ISSUE hitResponse=KNOWN_ISSUE countedFailure=false label=base 已知问题(见 readonce-base-note.md)")
       trace.close()
       println("CDP_M3_COVERAGE "+reference.coverage.toSeq.sortBy(_._1).map {case(k,v)=>s"$k=$v"}.mkString(" "))
       reference.requireCoverage(Seq("crossSliceTrain","vpnFilterDifferent","captureSimultaneous","ReadOnce","L1DataPrefetch","trainEnable0") ++
