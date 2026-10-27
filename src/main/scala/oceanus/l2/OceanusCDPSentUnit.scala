@@ -10,10 +10,10 @@ import utility.TwoLevelRRArbiter
 // adapter alone owns miss/retry/PMP. A page stays reserved through its terminal
 // response, including retry; late entries share that transaction. This extends
 // reference's fixed s1/s2/s3 sharing window and its late-arrival retry behavior.
-// :1220-1317 retains two-level RR and the physical Filter pipeline. A flow
-// completion queue holds the accepted Filter decision under backpressure; the
-// entry remains occupied until external fire (total capacity is still 16).
-// Unlike reference's stalled-output requery, a completed decision is immutable.
+// :1220-1317 retains two-level RR and the physical Filter pipeline. As in
+// CDP.scala:1293-1307, each completed query releases reqInflight. An allowed
+// request under output backpressure stays live and re-enters arbitration to
+// query the current Filter; only a Filter rejection or external fire retires it.
 class OceanusCDPSentUnit(implicit p: Parameters) extends OceanusCDPModule {
   require(retryInterval == 10, "C4 uses the existing adapter's ten-cycle retry")
   val io = IO(new Bundle {
@@ -118,23 +118,11 @@ class OceanusCDPSentUnit(implicit p: Parameters) extends OceanusCDPModule {
   val canPft = if (useFilterTable) !VecInit(hitVec).asUInt.orR ||
     rsp2.satVec(PriorityEncoder(hitVec))(getFilterOffset(req2.paddr)) =/= 3.U else true.B
   val filterDrop = pftS2 && !canPft
-  class Completed extends Bundle {
-    val request = new OceanusCDPRequest
-    val index = UInt(log2Ceil(reqFilterEntryNum).W)
-  }
-  val output = Module(new Queue(new Completed, reqFilterEntryNum, flow = true))
-  output.io.enq.valid := pftS2 && canPft
-  output.io.enq.bits.request := req2
-  output.io.enq.bits.index := idx2
-  when(output.io.enq.valid) { assert(output.io.enq.ready, "CDP output capacity was not reserved") }
-  io.out.valid := output.io.deq.valid
-  io.out.bits := output.io.deq.bits.request
-  output.io.deq.ready := io.out.ready
-  when(filterDrop) { valids(idx2) := false.B; reqInflight(idx2) := false.B }
-  when(io.out.fire) {
-    val i = output.io.deq.bits.index
-    valids(i) := false.B
-    reqInflight(i) := false.B
+  io.out.valid := pftS2 && canPft
+  io.out.bits := req2
+  when(pftS2) {
+    reqInflight(idx2) := false.B
+    when(!canPft || io.out.fire) { valids(idx2) := false.B }
   }
   for (i <- 0 until reqFilterEntryNum) {
     when(translating(i)) { assert(valids(i) && !entries(i).paddrValid) }
