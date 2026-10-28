@@ -34,6 +34,11 @@ class L2TopDownstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim
   // pf-v2 transaction/ordering checks observe actual interface flits, never
   // the host queue's intentions. Enabled for every user of this HN model.
   val chiOrdering = new AuditHNCHIOrdering
+  // The default HN uses merged CompData with DBID==request TxnID. An external
+  // HN pin adapter owns the richer DCT/split/Retry ordering checks instead.
+  // Link-credit, request-field and training checks remain common to both.
+  private var externalCHIOrdering = false
+  def useExternalCHIOrdering(): Unit = { externalCHIOrdering = true }
   private var chiRequester = BigInt(dut.l2cfg.nodeId)
   private def chiViolation(ok: Boolean, detail: => String): Unit =
     if (!ok) throw new IllegalStateException("HN_CHI_FIELD_VIOLATION " + detail)
@@ -56,31 +61,33 @@ class L2TopDownstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim
         ).flatten
         chiViolation(bad.isEmpty, s"cycle=$cycle opcode=ReadNotSharedDirty " + bad.mkString("; "))
       }
-      if (op == L2TopDownstreamOpcodes.MakeUnique)
-        chiOrdering.requestNoData(value(f.SrcID.get), value(f.TxnID.get), value(f.Addr.get), value(f.ExpCompAck.get) != 0)
-      else if (isEvictReq(op)) chiOrdering.eviction(value(f.SrcID.get), value(f.TxnID.get), value(f.Addr.get))
-      else chiOrdering.request(value(f.SrcID.get), value(f.TxnID.get), value(f.Addr.get), value(f.ExpCompAck.get) != 0)
+      if (!externalCHIOrdering) {
+        if (op == L2TopDownstreamOpcodes.MakeUnique)
+          chiOrdering.requestNoData(value(f.SrcID.get), value(f.TxnID.get), value(f.Addr.get), value(f.ExpCompAck.get) != 0)
+        else if (isEvictReq(op)) chiOrdering.eviction(value(f.SrcID.get), value(f.TxnID.get), value(f.Addr.get))
+        else chiOrdering.request(value(f.SrcID.get), value(f.TxnID.get), value(f.Addr.get), value(f.ExpCompAck.get) != 0)
+      }
     }
-    if (flag(dut.io.chi.rxsnp.flitv)) {
+    if (!externalCHIOrdering && flag(dut.io.chi.rxsnp.flitv)) {
       val f = dut.io.chi.rxsnp.flit
       // This link is attached to the configured single RN, shared by slices.
       chiOrdering.snoop(chiRequester, value(f.SrcID.get), value(f.TxnID.get), value(f.Addr.get) << 3, cycle)
     }
-    if (flag(dut.io.chi.rxdat.flitv)) {
+    if (!externalCHIOrdering && flag(dut.io.chi.rxdat.flitv)) {
       val f = dut.io.chi.rxdat.flit
       chiViolation(value(f.Opcode.get) == L2TopDownstreamOpcodes.CompData, s"unsupported RXDAT opcode cycle=$cycle")
       chiOrdering.data(value(f.TgtID.get), value(f.TxnID.get), value(f.DataID.get).toInt, cycle)
     }
-    if (flag(dut.io.chi.rxrsp.flitv)) {
+    if (!externalCHIOrdering && flag(dut.io.chi.rxrsp.flitv)) {
       val f = dut.io.chi.rxrsp.flit
       chiOrdering.completion(value(f.TgtID.get), value(f.TxnID.get),
         value(f.DBID_PGroupID_StashGroupID_TagGroupID.get), value(f.Opcode.get).toInt, cycle)
     }
-    if (flag(dut.io.chi.txrsp.flitv)) {
+    if (!externalCHIOrdering && flag(dut.io.chi.txrsp.flitv)) {
       val f = dut.io.chi.txrsp.flit
       chiOrdering.response(value(f.SrcID.get), value(f.TgtID.get), value(f.TxnID.get), value(f.Opcode.get).toInt, cycle)
     }
-    if (flag(dut.io.chi.txdat.flitv)) {
+    if (!externalCHIOrdering && flag(dut.io.chi.txdat.flitv)) {
       val f = dut.io.chi.txdat.flit
       chiViolation(value(f.Opcode.get) == L2TopDownstreamOpcodes.CopyBackWrData, s"unsupported TXDAT opcode cycle=$cycle")
       chiOrdering.writeData(value(f.SrcID.get), value(f.TxnID.get), value(f.DataID.get).toInt, cycle)

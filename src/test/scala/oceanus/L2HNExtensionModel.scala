@@ -74,7 +74,11 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
       q.enqueue((c,name))
     }
   }
+  // Called only after the actual source-9 slice request acceptance. This is
+  // an observational event; it never offers traffic or changes HN scheduling.
+  def observeCDPPrefetch(pa:BigInt,c:Int):Unit=event("cdpPrefetch",pa,c)
   private def category(n:String):Option[String]=n match {
+    case "cdpPrefetch"=>Some("cdpPrefetch")
     case "retryAck"|"retryReissue"=>Some("retry")
     case "fwdSnoop"=>Some("forward")
     case "dctForwardComplete"=>Some("actualForward")

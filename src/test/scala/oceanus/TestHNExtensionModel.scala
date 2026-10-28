@@ -8,6 +8,24 @@ object TestHNExtensionModel extends App {
   def q(id:Int=0,a:BigInt=pa)=HNExtReq(Map("SrcID"->rn,"TgtID"->BigInt(0),"TxnID"->BigInt(id),
     "Addr"->a,"Opcode"->BigInt(1),"Size"->BigInt(6),"ExpCompAck"->BigInt(1),
     "AllowRetry"->BigInt(1),"PCrdType"->BigInt(0),"MemAttr"->BigInt(15)))
+  // Same line (including byte offsets), inclusive 512-cycle boundary,
+  // and no accidental overlap with an adjacent cacheline.
+  val windowModel=new L2HNExtensionModel(HNExtConfig(0,0,0),OvernightMemory.beat _)
+  windowModel.observeCDPPrefetch(pa+7,0)
+  windowModel.rxSnp(HNExtSnp(rn,0,0x91,pa,7,0,1,0,0),511)
+  windowModel.recordOverlaps(511)
+  assert(windowModel.overlapWindows("cdpPrefetch+normalSnoop")==1)
+  windowModel.recordOverlaps(512)
+  assert(windowModel.overlapCycles("cdpPrefetch+normalSnoop")==1)
+  windowModel.observeCDPPrefetch(pa+64,512)
+  windowModel.recordOverlaps(512)
+  assert(windowModel.overlapWindows("cdpPrefetch+normalSnoop")==1)
+  windowModel.observeCDPPrefetch(pa,513)
+  windowModel.recordOverlaps(513)
+  assert(windowModel.overlapWindows("cdpPrefetch+normalSnoop")==2)
+  windowModel.snoopResponse(rn,0,0x91,1,0,0,None,None,514)
+  windowModel.finish()
+  println("HN_EXT_UNIT_CDP_WINDOW pass=true boundary=512 adjacentLineExcluded=true")
   var negatives=0
   def rejects(body: =>Unit):Unit={
     var rejected=false

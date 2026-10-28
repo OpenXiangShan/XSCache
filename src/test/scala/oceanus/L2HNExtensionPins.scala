@@ -10,6 +10,9 @@ class L2HNExtensionPins(dut:TestTop_L2Top,dn:L2TopDownstreamModel,
   val onRequest:(HNExtReq,Int)=>Unit=(_:HNExtReq,_:Int)=>(),
   val onData:(HNExtDat,Int)=>Unit=(_:HNExtDat,_:Int)=>(),
   val onSnoopDone:(BigInt,Int)=>Unit=(_:BigInt,_:Int)=>()) extends ChiselSim {
+  // This adapter checks every observed CHI flit with L2HNExtensionModel,
+  // including independent DBID/HomeNID, split responses and Fwd transactions.
+  dn.useExternalCHIOrdering()
   private def v(x:UInt)=x.peek().litValue
   private def f(x:Bool)=x.peek().litToBoolean
   private var driven=HNExtDrive(None,None,None,Seq.empty)

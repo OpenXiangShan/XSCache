@@ -91,13 +91,25 @@ class TestTopConflict(cfg: L2Configuration)(implicit p: Parameters) extends Test
   for(s<-0 until cfg.sliceNum) enterPA(s):=read(module.slices(s).io.UpRXREQ.bits.Addr)
   val tf=IO(Output(UInt((cfg.sliceNum*8*12).W)))
   val qf=IO(Output(UInt((cfg.sliceNum*10*4).W)))
+  // Final CDP replaces the legacy single-request stub. Drain every accepted
+  // training/detection/candidate stage, including Filter re-query pipelines.
+  val cdp=module.cdp.get
+  val frontend=cdp.detectFrontend
+  val send=cdp.sentUnit.get
+  val cdpBusy=read(cdp.vpnTrainReqBuf.io.deq.valid) || read(cdp.vtTrainPipe.stage_valid).asUInt.orR ||
+    read(frontend.v1) || read(frontend.v2) ||
+    frontend.lanes.map(l=>read(l.s1_req.valid)||read(l.s2_req.valid)||read(l.s3_req.valid)).reduce(_||_) ||
+    frontend.degreeQueues.map(q=>read(q.io.deq.valid)).reduce(_||_) ||
+    read(send.valids).asUInt.orR || read(send.tlbHeld) || read(send.pftS1) || read(send.pftS2) ||
+    cdp.filterTraining.map(f=>read(f.queue.io.deq.valid)||read(f.pipe.s1_valid)||
+      read(f.pipe.s2_valid)||read(f.pipe.s3_valid)).getOrElse(false.B)
   val algorithmBusy=IO(Output(Bool()))
   algorithmBusy:=read(module.vbopStub.get.input.io.deq.valid)||read(module.vbopStub.get.reqFilter.valids).asUInt.orR||
     read(module.vbopStub.get.reqFilter.allocValid)||read(module.vbopStub.get.delayQueue.valids).asUInt.orR||
-    read(module.cdpStub.get.input.io.deq.valid)||read(module.cdpStub.get.waiting)||
+    cdpBusy||
     module.slices.map(s=>read(s.io.cdpData.valid)).reduce(_||_)
   val moduleEvictions=IO(Output(UInt(64.W)))
-  moduleEvictions:=read(module.cdpStub.get.evictions)
+  moduleEvictions:=read(module.cdpEvents.get.evictions)
   val clientValid=IO(Output(UInt(2.W)))
   val slots=IO(Output(UInt(24.W)))
   val slotAges=IO(Output(UInt(32.W)))
@@ -371,6 +383,7 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
       }))
   }
   var sourceMode="all"
+  var cdpEnable=true
   var fullHistory=false
   var hnFlitsOnly=false
   var tapeWriter:Option[java.io.PrintWriter]=None
@@ -416,7 +429,10 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
   val translations=mutable.Map.empty[(Int,BigInt),Int]
   val terminals=mutable.Map.empty[(Int,BigInt),Translation]
   val replies=mutable.Queue.empty[Translation]
-  val permits=Seq.fill(2)(mutable.Map.empty[BigInt,Int].withDefaultValue(0))
+  // VBOP emits one line per translation. Final CDP shares one page result
+  // among candidates and retires by Filter/drop/output, checked by its ledger.
+  val permits=Seq.fill(1)(mutable.Map.empty[BigInt,Int].withDefaultValue(0))
+  val cdpLedger=new CDPCandidateLedger
   var modelRetry=0;var modelDrop=0;var retired=0;var actualRetry=0;var actualDrop=0
   var tlbRequests=0;var recvInputs=0;var submitted=0;var cycle=0;var snoopID=1;var snoopDone=0
   var latency=35;var hold=false;var trainEnable=true;var tlbReady=true;var harsh=false
@@ -438,7 +454,7 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
     ctrl.l2_pf_recv_en.poke((sourceMode=="all"||sourceMode=="recv").B)
     ctrl.l2_pbop_en.poke((b&&(sourceMode=="all"||sourceMode=="bop")).B)
     ctrl.l2_vbop_en.poke((v&&(sourceMode=="all"||sourceMode=="vbop")).B)
-    ctrl.l2_cdp_en.poke((c&&(sourceMode=="all"||sourceMode=="cdp")).B)
+    ctrl.l2_cdp_en.poke((c&&cdpEnable&&(sourceMode=="all"||sourceMode=="cdp")).B)
   }
   def enqueue(pa:BigInt,enabled:Boolean=true,stash:Boolean=false):Unit={
     trainEnable=enabled
@@ -488,7 +504,7 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
     replies.headOption.filter(_.due<=cycle).foreach{t=>
       replies.dequeue();tlb.resp.valid.poke(true.B);tlb.resp.bits.paddr.head.poke(t.va.U)
       tlb.resp.bits.miss.poke(t.miss.B);tlb.resp.bits.excp.head.pf.ld.poke(t.fault.B)
-      if(!t.miss || t.attempt==2) {terminals((t.owner,t.va))=t;if(t.miss||t.fault) modelDrop+=1 else permits(t.owner)(t.va)+=1}
+      if(!t.miss || t.attempt==2) {terminals((t.owner,t.va))=t;if(t.miss||t.fault) modelDrop+=1 else if(t.owner==0) permits(0)(t.va)+=1}
       else modelRetry+=1
     }
     // Complete inbound channel stimulus before observing combinational
@@ -637,7 +653,12 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
       chosenTlbDelay=frame.map(_.tlbDelay).getOrElse(Seq(1,3,7)(random.nextInt(3)))
       replies.enqueue(Translation(owner,va,cycle+chosenTlbDelay,attempt,miss,fault));tlbRequests+=1
     }
-    for(c<-0 until 2) {val a=dut.probe.algorithm(c);if(flag(a.valid)) {val pa=value(a.bits);assert(permits(c)(pa)>0,s"unlicensed emit owner=$c pa=$pa");permits(c)(pa)-=1}}
+    cdpLedger.sample(dut.cdpAudit,cycle)
+    val vbop=dut.probe.algorithm(0)
+    if(flag(vbop.valid)) {
+      val pa=value(vbop.bits)
+      assert(permits(0)(pa)>0,s"unlicensed VBOP emit pa=$pa");permits(0)(pa)-=1
+    }
     val qflags=value(dut.qf)
     for(s<-0 until slices if !hold && sources.forall(src=>qModels(queueIndex(s,src)).nonEmpty))
       hit("C08_release",s"slice=$s fourSourcesValid=true issueAllowed=true")
@@ -669,6 +690,7 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
         val src=value(dut.probe.entered(s).bits).toInt;entered(s)(src)+=1
         val addr=value(dut.enterPA(s))
         entries+=((cycle,addr,src))
+        if(src==9) extension.foreach(_.model.observeCDPPrefetch(addr,cycle))
         record(s"PF_ENTER cycle=$cycle slice=$s pa=0x${addr.toString(16)} source=$src")
       }
     }
@@ -774,6 +796,7 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
     hold=false;tlbReady=true;paused.clear();drain();ledgerCheck()
     assert(driver.pending==0&&driver.completed==submitted&&driver.checkedBeats==submitted*2,"data scoreboard closure")
     assert(translations.isEmpty&&terminals.isEmpty&&permits.forall(_.values.forall(_==0)),"TLB permits/inflight closure")
+    cdpLedger.finish(s"conflict seed=$seed slices=$slices")
     assert(modelRetry==actualRetry&&modelDrop==actualDrop,"TLB retry/drop closure")
     assert(sentSnps.isEmpty&&receivedData.isEmpty&&value(dut.slots)==0&&qModels.forall(_.isEmpty),"final occupancy zero")
     assert(hnOrdering.empty&&snoopOffers.isEmpty,"HN ordering closure")
@@ -844,6 +867,7 @@ object TestTop_L2PrefetchConflict extends App with ChiselSim {
       println(s"CONFLICT_BEGIN seed=$seed slices=$slices mode=$mode case=$scenario level=$level cycles=$cycles ablation=$ablation")
       println(s"CONFLICT_ISOLATION_BEGIN seed=$seed slices=$slices level=$level sources=$activeMode phase=$phase")
       val r=new ConflictRun(dut,seed,slices,mode=="random")
+      r.cdpEnable=opt("--cdp-enable","true").toBoolean
       r.sourceMode=activeMode;r.fullHistory=fullHistory;r.hnFlitsOnly=opt("--hn-flits-only","false").toBoolean
       if(opt("--hn-extension","false").toBoolean) {
         require(requestedRecordTape.isEmpty&&requestedReplayTape.isEmpty&&autoIsolation.isEmpty,"HN extension uses event trace instead of legacy-only tape")
@@ -859,7 +883,7 @@ object TestTop_L2PrefetchConflict extends App with ChiselSim {
         val path=java.nio.file.Paths.get(recordTape.replace("{seed}",seed.toString))
         require(!java.nio.file.Files.exists(path),s"refuse overwrite tape $path")
         r.tapeWriter=Some(new java.io.PrintWriter(java.nio.file.Files.newBufferedWriter(path)))
-        r.tapeWriter.get.println(s"# HEAD=8a99c4684ccab046573667fca6d0fd3252591ac4 seed=$seed slices=$slices level=$level")
+        r.tapeWriter.get.println(s"# HEAD=${sys.env.getOrElse("PF_VALIDATION_HEAD","unrecorded")} seed=$seed slices=$slices level=$level")
       }
       if(replayTape.nonEmpty) {
         val input=scala.io.Source.fromFile(replayTape.replace("{seed}",seed.toString))
