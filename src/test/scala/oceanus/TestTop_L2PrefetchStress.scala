@@ -150,8 +150,10 @@ class TestTopStress(cfg: L2Configuration)(implicit p: Parameters) extends Stress
   analysisPacked:=Cat(analysisCounters.reverse.map(_._2).toSeq)
   val cdpEntryProbe=IO(Output(Vec(16,UInt(88.W))))
   for(i<-0 until 16) cdpEntryProbe(i):=Cat(read(send.valids)(i),read(send.entries)(i).paddrValid,read(send.entries)(i).vTag,read(send.entries)(i).pTag)
+  // Requery output fires directly from query stage 2; idx2 identifies the
+  // retiring slot. A stalled allowed query keeps its existing live ledger.
   val cdpSendEvents=IO(Output(UInt(128.W)))
-  cdpSendEvents:=Cat(read(send.allocate),read(send.freeEntryIdx),read(send.io.in.bits.pfVAddr),read(send.filterDrop),read(send.idx2),read(send.io.out.valid)&&read(send.io.out.ready),read(send.output.io.deq.bits.index),read(send.translationDrop).asUInt)
+  cdpSendEvents:=Cat(read(send.allocate),read(send.freeEntryIdx),read(send.io.in.bits.pfVAddr),read(send.filterDrop),read(send.idx2),read(send.io.out.valid)&&read(send.io.out.ready),read(send.idx2),read(send.translationDrop).asUInt)
   val cdpCountPacked=IO(Output(UInt((64*cdpCounters.size).W)));cdpCountPacked:=Cat(cdpCounters.reverse.map(_._2).toSeq)
   module.slices.zipWithIndex.foreach { case(s,bank)=>
     add(s"slice$bank.active",PopCount(s.tshrs.map(t=>read(t.tshr_valid))),nMSHR)
