@@ -1133,6 +1133,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     incomingReplaceProbeAckDataCapture || activeReplaceProbeAckDataCapture
   val mirroredReplaceProbeAckDataOH =
     Mux(activeReplaceProbeAckDataCapture, activeReplaceProbeAckDataOH, replRespReservationOHCapture)
+  val mirroredReplaceProbeAckDataDoneOH = Wire(UInt(mshrsAll.W))
+  val mirroredReplaceProbeAckDataPendingOH = Wire(UInt(mshrsAll.W))
   when(activeReplaceProbeAckDataCapture) {
     assert(PopCount(activeReplaceProbeAckDataOH) === 1.U, "ProbeAckData matches multiple active ReplaceMSHRs")
   }
