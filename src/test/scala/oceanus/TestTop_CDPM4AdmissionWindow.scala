@@ -1,7 +1,8 @@
 package oceanus
 
 // Diagnostic counterexample: translation residency can change full/admission.
-// No production or reference algorithm is changed. Never a differential PASS.
+// Registered D7: the strict admission mismatch remains an expected failure.
+// Boundary acceptance only prevents the recorded capacity loss from worsening.
 import chisel3._
 import chisel3.util._
 import chisel3.simulator.{ChiselSim, HasSimulator}
@@ -39,6 +40,7 @@ object TestTop_CDPM4AdmissionWindow extends App with ChiselSim {
     case PerfCounterOptionsKey=>PerfCounterOptions(enablePerfPrint=false,enablePerfDB=false,perfLevel=XSPerfLevel.VERBOSE,0)
   })
   implicit val simulator:HasSimulator=CDPAuditSimulator.bounded
+  val strict = args.contains("--strict")
   val dest=Paths.get(sys.props("oceanus.c5.trace"));Files.createDirectories(dest)
   simulate(new CDPM4AdmissionWindowHarness()(params)){dut=>
     def scene(keep:Set[Int],fixed:Boolean=false,save:Boolean=false):Boolean={
@@ -48,6 +50,7 @@ object TestTop_CDPM4AdmissionWindow extends App with ChiselSim {
       dut.reset.poke(true);dut.clock.step(4);dut.reset.poke(false)
       var mismatch=false;val rows=mutable.ArrayBuffer.empty[ujson.Value]
       val allocated=Array.fill(2)(0);val retired=Array.fill(2)(0);val full=Array.fill(2)(0)
+      val outputs=Array.fill(2)(0)
       for(c<-0 until 160){
         val va=BigInt(0x300000)+(c%4)*0x10000+(c/4)*64
         val bits=if(keep(c))(BigInt(1)<<57)|(va<<7)|(BigInt(3)<<5)|(BigInt(9)<<1) else BigInt(0)
@@ -57,6 +60,7 @@ object TestTop_CDPM4AdmissionWindow extends App with ChiselSim {
         if(keep(c) && row("d.full")==1 && row("r.allocate")==1)mismatch=true
         for((side,prefix)<-Seq(0->"d",1->"r")){
           allocated(side)+=row(prefix+".allocate").toInt
+          outputs(side)+=row(prefix+".out").toInt
           retired(side)+=(row(prefix+".out")+row(prefix+".drop")).toInt
           full(side)+=row(prefix+".full").toInt
         }
@@ -65,13 +69,22 @@ object TestTop_CDPM4AdmissionWindow extends App with ChiselSim {
         if(c==159)assert(row("d.valids")==0 && row("r.valids")==0 && allocated.sameElements(retired),"nonconserving minimum")
         dut.clock.step()
       }
+      if(save) {
+        assert(outputs(0) >= 16, s"D7 boundary regressed: DUT outputs=${outputs(0)} < 16")
+        assert(outputs(1)-outputs(0) <= 1,
+          s"D7 minimum gap regressed: DUT=${outputs(0)} reference=${outputs(1)} > 1")
+        println(s"CDP_D7_MINIMUM_BOUNDARY pass=true dut=${outputs(0)} reference=${outputs(1)} minDut=16 maxGap=1 strictEquivalent=false")
+      }
       if(save)Files.writeString(dest.resolve("m4-minimum.json"),ujson.Obj("head"->sys.props("oceanus.c5.head"),
         "kept"->ujson.Arr.from(keep.toVector.sorted),"mismatchPreserved"->mismatch,"allocated"->ujson.Arr.from(allocated),
-        "full"->ujson.Arr.from(full),"rows"->ujson.Arr.from(rows)).render())
+        "full"->ujson.Arr.from(full),"outputs"->ujson.Arr.from(outputs),
+        "deviation"->"D7","strictExpectedFailure"->true,"rows"->ujson.Arr.from(rows)).render())
       mismatch
     }
     val keep=(0 until 17).toSet
-    assert(scene(keep,save=true),"full-versus-allocate minimum absent")
+    val reproduced=scene(keep,save=true)
+    assert(reproduced,"full-versus-allocate minimum absent")
+    if(strict) assert(!reproduced,"Registered deviation D7: strict full/allocate mismatch; expected failure")
     assert(!scene(keep,fixed=true),"fixed translation retained full mismatch")
     for(i<-keep)assert(!scene(keep-i),s"not one-minimal remove=$i")
     println("CDP_M4_ADMISSION_MINIMUM reproduced=true differentialPass=false candidates=17 oneMinimal=true fixedTranslationAligned=true scope=full-versus-allocate")

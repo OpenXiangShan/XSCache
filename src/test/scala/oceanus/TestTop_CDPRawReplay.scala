@@ -94,6 +94,8 @@ class CDPRawReplayReference(implicit p:Parameters) extends Module {
 object TestTop_CDPRawReplay extends App with ChiselSim {
   Constantin.init(false)
   val diagnose = args.contains("--diagnose")
+  val d7Boundary = args.contains("--d7-boundary")
+  require(!d7Boundary || diagnose, "D7 boundary uses a separately labelled diagnostic; strict replay remains unchanged")
   val path = Paths.get(args.head)
   val input = Source.fromInputStream(new GZIPInputStream(Files.newInputStream(path)))
   val lines = input.getLines()
@@ -175,6 +177,31 @@ object TestTop_CDPRawReplay extends App with ChiselSim {
     var requestCount = 0
     val diagnostic = mutable.ArrayBuffer.empty[ujson.Value]
     var admissionDifferences = 0
+    // Preserve allocation identity until actual output, so a timestamp shift
+    // cannot move an older output into the next admission window's count.
+    val d7Windows = Seq(("precloseHalf", 11874, 11898), ("newRequestHalf", 11979, 12003))
+    val d7Candidates = Array.fill(d7Windows.size)(0)
+    val d7Outputs = Array.fill(d7Windows.size, 2)(0)
+    val d7Pending = Vector.fill(2)(mutable.Map.empty[(BigInt, BigInt), mutable.Queue[Int]])
+    def d7Sample(cycle: Int, epoch: Int, r: Map[String, BigInt], side: Int): Unit = {
+      def key(va: BigInt, depth: BigInt): (BigInt, BigInt) =
+        (pages((epoch, va >> 12)).pa | (va & 4032), depth)
+      if(r("out") != 0) {
+        val k = (r("out.pa"), r("out.depth"))
+        d7Pending(side).get(k).foreach { q =>
+          d7Outputs(q.dequeue())(side) += 1
+          if(q.isEmpty) d7Pending(side).remove(k)
+        }
+      }
+      if(epoch == 1000 && r("candidate") != 0) {
+        d7Windows.zipWithIndex.find { case ((_, first, end), _) => cycle >= first && cycle < end }.foreach {
+          case (_, window) =>
+            if(side == 0) d7Candidates(window) += 1
+            if(r("allocated") != 0)
+              d7Pending(side).getOrElseUpdate(key(r("candidate.va"), r("candidate.depth")), mutable.Queue.empty[Int]).enqueue(window)
+        }
+      }
+    }
     rows.foreach { row =>
       val r = row.values; val e = row.epoch
       if(e != previousEpoch) { attempts.clear(); previousEpoch = e }
@@ -205,6 +232,10 @@ object TestTop_CDPRawReplay extends App with ChiselSim {
         requestCount += 1
       }
       val output = decode(dut.observationBits.peek().litValue)
+      if(d7Boundary) {
+        d7Sample(row.cycle, e, r, 0)
+        d7Sample(row.cycle, e, output, 1)
+      }
       // The detection/training boundaries retain exact cycle identity. D1 is
       // limited to translated outputs/drops, compared as complete epoch bags.
       if(diagnose && row.cycle >= 11860 && row.cycle <= 11960) {
@@ -225,6 +256,15 @@ object TestTop_CDPRawReplay extends App with ChiselSim {
       }
       outcomes(output, list(actual, e)); admission(output, list(referenceAccepted, e))
       dut.clock.step()
+    }
+    if(d7Boundary) {
+      assert(d7Pending.forall(_.isEmpty), "D7 window contains unretired allocations")
+      for(((name, _, _), i) <- d7Windows.zipWithIndex) {
+        assert(d7Candidates(i) == 24, s"D7 $name window changed candidate scope: ${d7Candidates(i)}")
+        assert(d7Outputs(i)(0) >= 16, s"D7 $name DUT output below 16: ${d7Outputs(i)(0)}")
+        assert(d7Outputs(i)(1)-d7Outputs(i)(0) <= 8, s"D7 $name output gap exceeds 8")
+        println(s"CDP_D7_WINDOW_BOUNDARY pass=true window=$name candidates=${d7Candidates(i)} dut=${d7Outputs(i)(0)} reference=${d7Outputs(i)(1)} minDut=16 maxGap=8 strictEquivalent=false deviation=D7")
+      }
     }
     if(diagnose) {
       val dest=Paths.get(sys.props("oceanus.c5.trace")).resolve("m4-diagnostic.json")
