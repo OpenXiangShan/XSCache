@@ -18,6 +18,7 @@ case class PendingDnComp(dnTxnID: DnTxnID, srcId: BigInt, due: Int, beat: Int, r
 case class PendingDnRsp(dnTxnID: DnTxnID, srcId: BigInt, due: Int, opcode: BigInt)
 
 object L2TopDownstreamOpcodes {
+  val MakeUnique = 0x0c
   val CompData = 0x04
   val Comp = 0x04
   val CompDBIDResp = 0x05
@@ -55,7 +56,9 @@ class L2TopDownstreamModel(dut: TestTop_L2Top, spec: CaseSpec) extends ChiselSim
         ).flatten
         chiViolation(bad.isEmpty, s"cycle=$cycle opcode=ReadNotSharedDirty " + bad.mkString("; "))
       }
-      if (isEvictReq(op)) chiOrdering.eviction(value(f.SrcID.get), value(f.TxnID.get), value(f.Addr.get))
+      if (op == L2TopDownstreamOpcodes.MakeUnique)
+        chiOrdering.requestNoData(value(f.SrcID.get), value(f.TxnID.get), value(f.Addr.get), value(f.ExpCompAck.get) != 0)
+      else if (isEvictReq(op)) chiOrdering.eviction(value(f.SrcID.get), value(f.TxnID.get), value(f.Addr.get))
       else chiOrdering.request(value(f.SrcID.get), value(f.TxnID.get), value(f.Addr.get), value(f.ExpCompAck.get) != 0)
     }
     if (flag(dut.io.chi.rxsnp.flitv)) {

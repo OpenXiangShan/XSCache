@@ -2,12 +2,15 @@ package oceanus
 
 import scala.collection.mutable
 
-// Exact pf-v2 ordering checker; field checks are sampled by L2TopDownstreamModel.
+// pf-v2 ordering base plus explicit MakeUnique Comp/CompAck transactions.
+// Field checks are sampled by L2TopDownstreamModel.
 class AuditHNCHIOrdering {
   private case class Read(line:BigInt,expAck:Boolean,var started:Boolean=false,
     var acked:Boolean=false,var beats:Set[Int]=Set.empty)
   private val reads=mutable.Map.empty[(BigInt,BigInt),Read]
   private val snoops=mutable.Map.empty[(BigInt,BigInt),(BigInt,BigInt)]
+  private case class NoData(line:BigInt,expAck:Boolean,var completed:Boolean=false)
+  private val noData=mutable.Map.empty[(BigInt,BigInt),NoData]
   private val evictions=mutable.Map.empty[(BigInt,BigInt),BigInt]
   private case class CopyBack(line:BigInt,var beats:Set[Int]=Set.empty)
   private val copybacks=mutable.Map.empty[(BigInt,BigInt),CopyBack]
@@ -18,26 +21,41 @@ class AuditHNCHIOrdering {
   def canSnoop(rn:BigInt,pa:BigInt):Boolean=
     !reads.exists{case((src,_),r)=>src==rn&&r.line==line(pa)&&r.started&&
       (r.beats.size<2||(r.expAck&& !r.acked))} &&
-    !copybacks.exists{case((src,_),w)=>src==rn&&w.line==line(pa)}
+    !copybacks.exists{case((src,_),w)=>src==rn&&w.line==line(pa)} &&
+    !noData.exists{case((src,_),r)=>src==rn&&r.line==line(pa)&&r.completed&&r.expAck}
   def request(rn:BigInt,txn:BigInt,pa:BigInt,expAck:Boolean):Unit={
-    check(!reads.contains((rn,txn)),s"read identity reused rn=$rn txn=$txn")
+    check(!reads.contains((rn,txn)) && !noData.contains((rn,txn)),s"read identity reused rn=$rn txn=$txn")
     reads((rn,txn))=Read(line(pa),expAck)
   }
   def eviction(rn:BigInt,txn:BigInt,pa:BigInt):Unit={
-    check(!evictions.contains((rn,txn)),s"eviction identity reused rn=$rn txn=$txn")
+    check(!evictions.contains((rn,txn)) && !noData.contains((rn,txn)),s"eviction identity reused rn=$rn txn=$txn")
     evictions((rn,txn))=line(pa)
+  }
+  def requestNoData(rn:BigInt,txn:BigInt,pa:BigInt,expAck:Boolean):Unit={
+    val key=(rn,txn)
+    check(!noData.contains(key) && !reads.contains(key) && !evictions.contains(key),
+      s"dataless identity reused rn=$rn txn=$txn")
+    noData(key)=NoData(line(pa),expAck)
   }
   def completion(rn:BigInt,txn:BigInt,dbid:BigInt,opcode:Int,cycle:Int):Unit={
     val key=(rn,txn)
-    check(evictions.contains(key),s"unmatched eviction completion cycle=$cycle rn=$rn txn=$txn")
-    val pa=evictions(key)<<6
-    check(canData(rn,pa),s"eviction completion while SnpResp pending cycle=$cycle rn=$rn txn=$txn line=0x${pa.toString(16)}")
-    check(Set(4,5)(opcode),s"unexpected eviction response opcode=$opcode")
-    if(opcode==5) {
-      check(!copybacks.contains((rn,dbid)),s"CopyBack DBID reused rn=$rn dbid=$dbid")
-      copybacks((rn,dbid))=CopyBack(line(pa))
+    if(noData.contains(key)) {
+      val r=noData(key)
+      check(!r.completed && opcode==4,s"invalid dataless Comp cycle=$cycle rn=$rn txn=$txn opcode=$opcode")
+      check(canData(rn,r.line<<6),s"dataless Comp while SnpResp pending cycle=$cycle rn=$rn txn=$txn")
+      r.completed=true
+      if(!r.expAck) noData.remove(key)
+    } else {
+      check(evictions.contains(key),s"unmatched eviction completion cycle=$cycle rn=$rn txn=$txn")
+      val pa=evictions(key)<<6
+      check(canData(rn,pa),s"eviction completion while SnpResp pending cycle=$cycle rn=$rn txn=$txn line=0x${pa.toString(16)}")
+      check(Set(4,5)(opcode),s"unexpected eviction response opcode=$opcode")
+      if(opcode==5) {
+        check(!copybacks.contains((rn,dbid)),s"CopyBack DBID reused rn=$rn dbid=$dbid")
+        copybacks((rn,dbid))=CopyBack(line(pa))
+      }
+      evictions.remove(key)
     }
-    evictions.remove(key)
   }
   def writeData(rn:BigInt,dbid:BigInt,beat:Int,cycle:Int):Unit={
     val key=(rn,dbid)
@@ -70,10 +88,16 @@ class AuditHNCHIOrdering {
       snoops.remove((hn,txn))
     case 2 =>
       val key=(rn,txn)
-      check(reads.get(key).exists(r=>r.expAck&&r.started&& !r.acked),s"unmatched CompAck cycle=$cycle rn=$rn txn=$txn")
-      reads(key).acked=true;retire(key)
+      if(noData.contains(key)) {
+        val r=noData(key)
+        check(r.expAck && r.completed,s"early dataless CompAck cycle=$cycle rn=$rn txn=$txn")
+        noData.remove(key)
+      } else {
+        check(reads.get(key).exists(r=>r.expAck&&r.started&& !r.acked),s"unmatched CompAck cycle=$cycle rn=$rn txn=$txn")
+        reads(key).acked=true;retire(key)
+      }
     case _ => ()
   }
-  def empty:Boolean=reads.isEmpty&&snoops.isEmpty&&evictions.isEmpty&&copybacks.isEmpty
+  def empty:Boolean=reads.isEmpty&&snoops.isEmpty&&evictions.isEmpty&&copybacks.isEmpty&&noData.isEmpty
 }
 
