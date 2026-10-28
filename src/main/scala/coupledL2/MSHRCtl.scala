@@ -93,6 +93,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       // the reserved sidecar ReleaseBuf slot for the victim snapshot.
       val grantInstallOK = Output(Bool())
       val grantInstallSlot = Output(UInt(mshrBits.W))
+      val grantInstallGeneration = Output(UInt(8.W))
+      val replParentGeneration = Output(UInt(8.W))
+      val replParentEpoch = Output(Bool())
     }
 
     // Final external TXDAT/TXRSP handshakes. A sidecar cannot release its
@@ -400,13 +403,13 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // replacer read to retry until the CMO retires, mirroring the sidecar and
   // snoop conflicts. Keep even a retiring CMO until its req_valid register
   // clears; a same-cycle will_free exemption fed allocation back into retry.
-  val replRespCmoConflict = VecInit(refillMshrs.map { refill =>
+  val replRespCmoConflictCapture = VecInit(refillMshrs.map { refill =>
     replRespHasVictim && refill.io.status.valid && refill.io.status.bits.isCmo &&
       refill.io.status.bits.set === io.replResp.bits.set &&
       refill.io.status.bits.reqTag === io.replResp.bits.tag
   }).asUInt.orR
-  val replRespOwnerConflict = replRespSidecarConflict || replRespSnoopConflict
-  val replRespParentOH = UIntToOH(io.replResp.bits.mshrId, mshrsAll)
+  val replRespOwnerConflictCapture = replRespSidecarConflict || replRespSnoopConflict
+  val replRespParentOHCapture = UIntToOH(io.replResp.bits.mshrId, mshrsAll)
   val replaceParentMatches = Seq.tabulate(mshrsAll) { parent =>
     VecInit(
       replaceMshrs.map(m =>
@@ -420,6 +423,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // A ReplacerResult has no backpressure. Reserve an S/R-mutual ReleaseBuf
   // slot before a normal MSHR may issue the lookup, then transfer that
   // reservation atomically to ReplaceMSHR when the victim is valid.
+  val replResponseApplied = Wire(Valid(new ReplacerResult))
   val replaceReserveValid = RegInit(VecInit(Seq.fill(mshrsAll)(false.B)))
   val replaceReserveSlot = Reg(Vec(mshrsAll, UInt(mshrBits.W)))
   val replaceReserveSlotOHByParent = Seq.tabulate(mshrsAll) { parent =>
@@ -480,8 +484,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val snoopCandidateSeen = RegNext(io.fromReqArb.status_s1.bCandidateValid, false.B)
   val snoopEntering_s2 = RegNext(io.fromReqArb.status_s1.bFire, false.B)
   val snoopEntering_s3 = RegNext(snoopEntering_s2, false.B)
-  val snoopEnteringApply = RegNext(snoopEntering_s3, false.B)
-  val snoopEnteringCount = PopCount(Seq(snoopEntering_s2, snoopEntering_s3, snoopEnteringApply))
+  val snoopEnteringDecision = RegNext(snoopEntering_s3, false.B)
+  val snoopEnteringApply = RegNext(snoopEnteringDecision, false.B)
+  val snoopEnteringCount = PopCount(Seq(
+    snoopEntering_s2, snoopEntering_s3, snoopEnteringDecision, snoopEnteringApply))
   when(snoopEnteringApply) {
     assert(snoopServiceValid, "B result applied without its reserved service slot")
     snoopServiceValid := false.B
@@ -501,7 +507,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     }
   }
   val snoopReservationFence = snoopCandidateSeen ||
-    snoopEntering_s2 || snoopEntering_s3 || snoopEnteringApply
+    snoopEntering_s2 || snoopEntering_s3 || snoopEnteringDecision || snoopEnteringApply
   val replaceReserveNeedParentOH = VecInit(refillMshrs.zipWithIndex.map {
     case (refill, i) => refill.io.replReadWanted && !replaceReserveValid(i)
   }).asUInt
@@ -517,7 +523,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     replaceReserveValid(parent)
   }
   (0 until mshrsAll).foreach { parent =>
-    val reserveResponse = io.replResp.valid && io.replResp.bits.mshrId === parent.U
+    val reserveResponse = replResponseApplied.valid && replResponseApplied.bits.mshrId === parent.U
     val reserveStale = replaceReserveValid(parent) && !refillMshrs(parent).io.status.valid &&
       !refillMshrs(parent).io.replReadWanted && !refillMshrs(parent).io.replReadInFlight
     when(reserveResponse || reserveStale) {
@@ -532,14 +538,14 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // parent has already delegated a victim to ReplaceMSHR.  It must be retried
   // after that child completes; allocating it now would give one parent two
   // ReleaseBuf-owning children.
-  val replRespParentConflict = replRespHasVictim &&
-    Mux1H(replRespParentOH, replaceActiveForParent)
-  val replRespNeedsReplaceRaw = replRespHasVictim && !replRespOwnerConflict && !replRespParentConflict
-  val replRespReservationOH = Mux1H(replRespParentOH, replaceReserveSlotOHByParent)
-  val replRespNoReplaceSlot = replRespNeedsReplaceRaw && !replRespReservationOH.orR
-  val replRespNeedsReplace = replRespNeedsReplaceRaw && !replRespNoReplaceSlot
-  io.toMainPipe.replRespRetry := replRespSnoopConflict || replRespParentConflict || replRespNoReplaceSlot ||
-    replRespCmoConflict
+  val replRespParentConflictCapture = replRespHasVictim &&
+    Mux1H(replRespParentOHCapture, replaceActiveForParent)
+  val replRespNeedsReplaceRawCapture = replRespHasVictim && !replRespOwnerConflictCapture && !replRespParentConflictCapture
+  val replRespReservationOHCapture = Mux1H(replRespParentOHCapture, replaceReserveSlotOHByParent)
+  val replRespNoReplaceSlotCapture = replRespNeedsReplaceRawCapture && !replRespReservationOHCapture.orR
+  val replRespNeedsReplaceCapture = replRespNeedsReplaceRawCapture && !replRespNoReplaceSlotCapture
+  io.toMainPipe.replRespRetry := replRespSnoopConflict || replRespParentConflictCapture || replRespNoReplaceSlotCapture ||
+    replRespCmoConflictCapture
   // A refill grant pass may merge the refill install when its folded
   // ReplacerResult selects a no-probe victim.  The victim/slot/ownership
   // side of that decision lives here (single source); MainPipe adds the
@@ -547,11 +553,62 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val replRespNoProbeVictim = io.replResp.valid && !io.replResp.bits.hit && !io.replResp.bits.retry &&
     (io.replResp.bits.meta.state === INVALID || !io.replResp.bits.meta.clients.orR)
   io.toMainPipe.grantInstallOK := replRespNoProbeVictim &&
-    !replRespOwnerConflict && !replRespParentConflict && !replRespCmoConflict &&
-    (io.replResp.bits.meta.state === INVALID || replRespReservationOH.orR)
-  io.toMainPipe.grantInstallSlot := OHToUInt(replRespReservationOH)
+    !replRespOwnerConflictCapture && !replRespParentConflictCapture && !replRespCmoConflictCapture &&
+    (io.replResp.bits.meta.state === INVALID || replRespReservationOHCapture.orR)
+  io.toMainPipe.grantInstallSlot := OHToUInt(replRespReservationOHCapture)
   when(replRespSnoopConflict) {
     assert(PopCount(replRespSnoopConflictOH) === 1.U, "replacement victim matches multiple active snoop contexts")
+  }
+  // The action, response, reservation and old parent identity form one
+  // execution record. No conflict/slot decision is recomputed at apply.
+  class ReplacerDecision extends Bundle {
+    val response = new ReplacerResult
+    val parentGeneration = UInt(8.W)
+    val parentEpoch = Bool()
+    val reservation = UInt(mshrsAll.W)
+    val slotGeneration = UInt(8.W)
+    val needsReplace = Bool()
+    val ownerConflict = Bool()
+    val parentConflict = Bool()
+    val noReplaceSlot = Bool()
+    val cmoConflict = Bool()
+  }
+  val replDecision = RegInit(0.U.asTypeOf(Valid(new ReplacerDecision)))
+  replDecision.valid := io.replResp.valid
+  when(io.replResp.valid) {
+    replDecision.bits.response := io.replResp.bits
+    replDecision.bits.parentGeneration := Mux1H(replRespParentOHCapture, mshrTaskGenerations(0))
+    replDecision.bits.parentEpoch := Mux1H(replRespParentOHCapture, refillMshrs.map(_.io.allocEpoch))
+    replDecision.bits.reservation := replRespReservationOHCapture
+    replDecision.bits.slotGeneration := Mux1H(replRespReservationOHCapture, mshrTaskGenerations(2))
+    replDecision.bits.needsReplace := replRespNeedsReplaceCapture
+    replDecision.bits.ownerConflict := replRespOwnerConflictCapture
+    replDecision.bits.parentConflict := replRespParentConflictCapture
+    replDecision.bits.noReplaceSlot := replRespNoReplaceSlotCapture
+    replDecision.bits.cmoConflict := replRespCmoConflictCapture
+  }
+  io.toMainPipe.replParentGeneration := Mux1H(replRespParentOHCapture, mshrTaskGenerations(0))
+  io.toMainPipe.replParentEpoch := Mux1H(replRespParentOHCapture, refillMshrs.map(_.io.allocEpoch))
+  io.toMainPipe.grantInstallGeneration :=
+    Mux1H(replRespReservationOHCapture, mshrTaskGenerations(2)) + replRespNeedsReplaceCapture.asUInt
+  val replRespParentOH = UIntToOH(replDecision.bits.response.mshrId, mshrsAll)
+  val replDecisionCurrent = Mux1H(replRespParentOH, refillMshrs.map(_.io.status.valid)) &&
+    Mux1H(replRespParentOH, mshrTaskGenerations(0)) === replDecision.bits.parentGeneration &&
+    Mux1H(replRespParentOH, refillMshrs.map(_.io.allocEpoch)) === replDecision.bits.parentEpoch
+  replResponseApplied.valid := replDecision.valid && replDecisionCurrent
+  replResponseApplied.bits := replDecision.bits.response
+  val replSlotCurrent = !replDecision.bits.needsReplace ||
+    (replDecision.bits.reservation.orR &&
+      Mux1H(replDecision.bits.reservation, mshrTaskGenerations(2)) === replDecision.bits.slotGeneration)
+  val replRespNeedsReplace = replResponseApplied.valid && replDecision.bits.needsReplace && replSlotCurrent
+  val replRespReservationOH = replDecision.bits.reservation
+  val replRespOwnerConflict = replDecision.bits.ownerConflict
+  val replRespParentConflict = replDecision.bits.parentConflict
+  val replRespNoReplaceSlot = replDecision.bits.noReplaceSlot
+  val replRespCmoConflict = replDecision.bits.cmoConflict
+  when(replDecision.valid) {
+    assert(replDecisionCurrent, "replacer decision lost its retained normal parent")
+    assert(replSlotCurrent, "replacer decision lost its retained sidecar slot generation")
   }
   // An invalid victim may become dirty when a nested C ReleaseData reaches
   // MainPipe after the replacer selected it.  Allocate a sidecar in that same
@@ -611,7 +668,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // pipeline entry in pipeContextCount, so merely excluding S3 allocation
   // allows it to consume the last S/R slot in the B's S1 handshake cycle.
   // The parent's registered request remains pending until this fence clears.
-  val cmoSidecarAlloc = cmoSidecarReqOH.orR && !io.replResp.valid &&
+  val cmoSidecarAlloc = cmoSidecarReqOH.orR && !io.replResp.valid && !replResponseApplied.valid &&
     !nestedReleaseNeedsReplace && !orphanReleaseData && !snoopReservationFence &&
     !snoopAllocRequest &&
     replaceSlotIdle.orR
@@ -642,10 +699,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   nestedVictim.replacerInfo := 0.U.asTypeOf(new ReplacerInfo)
   val incomingVictim = WireInit(nestedVictim)
   when(replRespNeedsReplace) {
-    incomingVictim.tag := io.replResp.bits.tag
-    incomingVictim.set := io.replResp.bits.set
-    incomingVictim.way := io.replResp.bits.way
-    incomingVictim.meta := io.replResp.bits.meta
+    incomingVictim.tag := replResponseApplied.bits.tag
+    incomingVictim.set := replResponseApplied.bits.set
+    incomingVictim.way := replResponseApplied.bits.way
+    incomingVictim.meta := replResponseApplied.bits.meta
   }
   when(cmoSidecarAlloc) {
     // The CMO's own hit line plays the victim role: way/meta come from the
@@ -669,7 +726,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
 
   val incomingReplaceReq = WireInit(0.U.asTypeOf(new ReplaceRequest))
   incomingReplaceReq.parentId := replaceParentId
-  incomingReplaceReq.parentEpoch := Mux1H(replaceParentOH, refillMshrs.map(_.io.allocEpoch))
+  incomingReplaceReq.parentEpoch := Mux(replRespNeedsReplace, replDecision.bits.parentEpoch,
+    Mux1H(replaceParentOH, refillMshrs.map(_.io.allocEpoch)))
   incomingReplaceReq.parentAttached := !orphanReleaseData
   incomingReplaceReq.dirResult := incomingVictim
   incomingReplaceReq.mode := Mux(cmoSidecarAlloc,
@@ -747,7 +805,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     replaceParentMatches(parent) |
       Mux(replaceNestedAllocParentOH(parent), replaceNestedSlotOH, 0.U(mshrsAll.W))
   }
-  assert(!(io.replResp.valid && io.nestedwb.c_set_dirty),
+  assert(!(replResponseApplied.valid && io.nestedwb.c_set_dirty),
     "refill result and nested C must correspond to distinct shared-S3 tasks")
   when(nestedReleaseNeedsReplace || cmoSidecarAlloc) {
     assert(replaceNestedSlotOH === selectedReplaceSlotOH,
@@ -788,7 +846,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // can never block that sidecar's own nested snoop.
   val replaceAllocSnoopSources = Seq(
     (nestedReleaseNeedsReplace, nestedVictim.set, nestedVictim.tag),
-    (replRespNeedsReplace, io.replResp.bits.set, io.replResp.bits.tag),
+    (replRespNeedsReplace, replResponseApplied.bits.set, replResponseApplied.bits.tag),
     (cmoSidecarAlloc,
       Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.set)),
       Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.reqTag))),
@@ -846,7 +904,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val mshrFull = snoopMshrFull
   val a_mshrFull = normalMshrFull
   val mshrSelector = Module(new MSHRSelector())
-  val selectedMSHROH = mshrSelector.io.out.bits
+  // An empty selector's priority default is not an allocation. Never let
+  // those bits consume or overwrite a context, even if an invariant fails.
+  val selectedMSHROH = Mux(mshrSelector.io.out.valid,
+    mshrSelector.io.out.bits, 0.U(mshrsAll.W))
 
   io.l2Miss := Cat(refillMshrs.map { m =>
     m.io.status.valid && m.io.status.bits.channel(0) && (
@@ -1005,7 +1066,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val incomingReplaceProbeAckDataCapture = io.resps.sinkC.valid &&
     io.resps.sinkC.respInfo.last &&
     io.resps.sinkC.respInfo.opcode === ProbeAckData &&
-    replRespNeedsReplace && replaceAllocValid &&
+    replRespNeedsReplaceCapture && replRespReservationOHCapture.orR &&
     io.resps.sinkC.set === io.replResp.bits.set &&
     io.resps.sinkC.tag === io.replResp.bits.tag
   // A sidecar can already be live while a snoop owns the ProbeAckData for the
@@ -1024,7 +1085,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val mirroredReplaceProbeAckDataCapture =
     incomingReplaceProbeAckDataCapture || activeReplaceProbeAckDataCapture
   val mirroredReplaceProbeAckDataOH =
-    Mux(activeReplaceProbeAckDataCapture, activeReplaceProbeAckDataOH, selectedReplaceSlotOH)
+    Mux(activeReplaceProbeAckDataCapture, activeReplaceProbeAckDataOH, replRespReservationOHCapture)
   when(activeReplaceProbeAckDataCapture) {
     assert(PopCount(activeReplaceProbeAckDataOH) === 1.U, "ProbeAckData matches multiple active ReplaceMSHRs")
   }
@@ -1181,8 +1242,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       refill.io.resps.rxrsp.valid := refill.io.status.valid && io.resps.rxrsp.valid &&
         io.resps.rxrsp.mshrId === i.U && !rxrspEpochMismatch
       refill.io.resps.rxrsp.bits := io.resps.rxrsp.respInfo
-      refill.io.replResp.valid := io.replResp.valid && io.replResp.bits.mshrId === i.U
-      val replRespForRefill = WireInit(io.replResp.bits)
+      refill.io.replResp.valid := replResponseApplied.valid && replResponseApplied.bits.mshrId === i.U
+      val replRespForRefill = WireInit(replResponseApplied.bits)
       when(replRespOwnerConflict || replRespParentConflict || replRespNoReplaceSlot ||
         replRespCmoConflict) {
         replRespForRefill.retry := true.B
@@ -1512,7 +1573,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       snoop.io.resps.rxrsp.valid := false.B
       snoop.io.resps.rxrsp.bits := io.resps.rxrsp.respInfo
       snoop.io.replResp.valid := false.B
-      snoop.io.replResp.bits := io.replResp.bits
+      snoop.io.replResp.bits := replResponseApplied.bits
       snoop.io.tasks.txreq.ready := false.B
       snoop.io.tasks.txdat.ready := false.B
       snoop.io.pCrd.grant := false.B
@@ -1772,7 +1833,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   XSPerfAccumulate("cmo_sidecar_alloc_cnt",
     replaceNeedsAlloc && cmoSidecarAlloc && replaceAllocValid)
   XSPerfAccumulate("replresp_cmo_conflict_retry_cnt",
-    io.replResp.valid && replRespCmoConflict)
+    replResponseApplied.valid && replRespCmoConflict)
   XSPerfAccumulate("txdat_direct_copyback_cnt", io.toTXDAT.fire)
   XSPerfAccumulate("txdat_direct_abort_cnt", cbPresent && !cbSelStillValid)
   XSPerfAccumulate("txdat_direct_wait_sum",
@@ -2337,20 +2398,25 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     }
   }
 
+  // Raw C ownership/payload is first held in a reservation register. The
+  // descriptor and physical writes consume the registered record one edge
+  // later, so raw pending and done cannot cross or lose the first beat.
+  val nestedReleaseReserved = RegInit(0.U.asTypeOf(Valid(new NestedReleaseMasks)))
+  nestedReleaseReserved := nestedReleaseMasks
   val nestedReleaseWrite = RegInit(0.U.asTypeOf(Valid(new NestedReleaseWrite)))
-  nestedReleaseWrite.valid := nestedReleaseMasks.valid
-  val registeredMask = nestedReleaseMasks.bits.snoop | nestedReleaseMasks.bits.replace
+  nestedReleaseWrite.valid := nestedReleaseReserved.valid
+  val registeredMask = nestedReleaseReserved.bits.snoop | nestedReleaseReserved.bits.replace
   val nestedFirstOH = PriorityEncoderOH(registeredMask)
   val nestedSecondOH = PriorityEncoderOH(registeredMask & ~nestedFirstOH)
-  when(nestedReleaseMasks.valid) {
-    nestedReleaseWrite.bits.data := nestedReleaseMasks.bits.data
-    nestedReleaseWrite.bits.beatMask := nestedReleaseMasks.bits.beatMask
+  when(nestedReleaseReserved.valid) {
+    nestedReleaseWrite.bits.data := nestedReleaseReserved.bits.data
+    nestedReleaseWrite.bits.beatMask := nestedReleaseReserved.bits.beatMask
     Seq(nestedFirstOH, nestedSecondOH).zipWithIndex.foreach { case (targetOH, port) =>
       val target = nestedReleaseWrite.bits.targets(port)
       target.valid := targetOH.orR
       target.bits.id := OHToUInt(targetOH)
-      target.bits.replacement := (targetOH & nestedReleaseMasks.bits.replace).orR
-      target.bits.generation := Mux1H(targetOH, nestedReleaseMasks.bits.generations)
+      target.bits.replacement := (targetOH & nestedReleaseReserved.bits.replace).orR
+      target.bits.generation := Mux1H(targetOH, nestedReleaseReserved.bits.generations)
     }
   }
   def nestedTargetMatches(target: ValidIO[NestedReleaseTarget]): Bool = {
@@ -2396,9 +2462,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   (0 until 2).foreach { context =>
     val replacement = context == 1
     val raw = if(replacement) nestedReplaceMask else nestedSnoopMask
-    val captured = Mux(nestedReleaseMasks.valid,
+    val captured = Mux(nestedReleaseReserved.valid,
+      if(replacement) nestedReleaseReserved.bits.replace else nestedReleaseReserved.bits.snoop, 0.U(mshrsAll.W))
+    val masks = Mux(nestedReleaseMasks.valid,
       if(replacement) nestedReleaseMasks.bits.replace else nestedReleaseMasks.bits.snoop, 0.U(mshrsAll.W))
-    nestedReleasePending(context) := raw | captured |
+    nestedReleasePending(context) := raw | masks | captured |
       descriptorMask(nestedReleaseWrite, replacement) | descriptorMask(nestedReleaseValidated, replacement) |
       descriptorMask(nestedReleaseApplied, replacement)
     nestedReleaseDone(context) := descriptorMask(nestedReleaseApplied, replacement)

@@ -122,6 +122,9 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       // (i.e. sidecar) slot, valid when grantInstallOK && victim is valid.
       val grantInstallOK = Input(Bool())
       val grantInstallSlot = Input(UInt(mshrBits.W))
+      val grantInstallGeneration = Input(UInt(8.W))
+      val replParentGeneration = Input(UInt(8.W))
+      val replParentEpoch = Input(Bool())
     }
 
     /* read C-channel Release Data and write into DS */
@@ -209,19 +212,81 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val task_s3_capture = RegInit(0.U.asTypeOf(Valid(new TaskBundle)))
   task_s3_capture.valid := task_s2.valid
   when(task_s2.valid) { task_s3_capture.bits := task_s2.bits }
-  val task_s3 = RegNext(task_s3_capture, 0.U.asTypeOf(task_s3_capture))
+  val task_s3_decide = RegNext(task_s3_capture, 0.U.asTypeOf(task_s3_capture))
   val leaseToken_s3_capture = RegEnable(io.taskLeaseToken_s2, task_s2.valid)
-  val leaseToken_s3 = RegEnable(leaseToken_s3_capture, task_s3_capture.valid)
+  val leaseToken_s3_decide = RegEnable(leaseToken_s3_capture, task_s3_capture.valid)
+  // Decide from the aligned result transaction, then apply ONLY this record.
+  // The controller captures the same replacer decision at this edge; its
+  // reservation remains owned until both the sidecar and physical commit apply.
+  class S3Decision extends Bundle {
+    val task = new TaskBundle
+    val token = new MainpipeLeaseToken
+    val dir = new DirResult
+    val repl = Valid(new ReplacerResult)
+    val metaOnHit = new MetaEntry
+    val errOnSnp = Bool()
+    val wayOH = UInt(cacheParams.ways.W)
+    val replWayOH = UInt(cacheParams.ways.W)
+    val cmoHitInvalid = Bool()
+    val cPayload = new PipeBufferResp
+    val refill = Valid(new MSHRBufResp)
+    val release = Valid(new DSBlock)
+    val retry = Bool()
+    val normalRetry = Bool()
+    val grantInstall = Bool()
+    val grantInstallSlot = UInt(mshrBits.W)
+    val grantInstallGeneration = UInt(8.W)
+    val parentGeneration = UInt(8.W)
+    val parentEpoch = Bool()
+  }
+  val s3Decision = RegInit(0.U.asTypeOf(Valid(new S3Decision)))
+  val retryDecision = io.replResp.bits.validHold &&
+    (io.replResp.bits.retry || io.fromMSHRCtl.replRespRetry)
+  s3Decision.valid := task_s3_decide.valid
+  when(task_s3_decide.valid) {
+    s3Decision.bits.task := task_s3_decide.bits
+    s3Decision.bits.token := leaseToken_s3_decide
+    s3Decision.bits.dir := io.dirResp_s3
+    s3Decision.bits.repl := io.replResp
+    s3Decision.bits.metaOnHit := io.metaOnHit_s3
+    s3Decision.bits.errOnSnp := io.errOnSnp_s3
+    s3Decision.bits.wayOH := io.dirWayOH_s3
+    s3Decision.bits.replWayOH := io.dirReplWayOH_s3
+    s3Decision.bits.cmoHitInvalid := io.cmoHitInvalid
+    s3Decision.bits.cPayload := io.bufResp
+    s3Decision.bits.refill := io.refillBufResp_s3
+    s3Decision.bits.release := io.releaseBufResp_s3
+    s3Decision.bits.retry := retryDecision
+    s3Decision.bits.normalRetry := retryDecision && task_s3_decide.bits.mshrTask &&
+      task_s3_decide.bits.mshrContext === 0.U
+    s3Decision.bits.grantInstall := io.fromMSHRCtl.grantInstallOK
+    s3Decision.bits.grantInstallSlot := io.fromMSHRCtl.grantInstallSlot
+    s3Decision.bits.grantInstallGeneration := io.fromMSHRCtl.grantInstallGeneration
+    s3Decision.bits.parentGeneration := io.fromMSHRCtl.replParentGeneration
+    s3Decision.bits.parentEpoch := io.fromMSHRCtl.replParentEpoch
+  }
+  val task_s3 = Wire(Valid(new TaskBundle))
+  task_s3.valid := s3Decision.valid
+  task_s3.bits := s3Decision.bits.task
+  val leaseToken_s3 = s3Decision.bits.token
+  val preApplyTask = Wire(Valid(new TaskBundle))
+  preApplyTask.valid := task_s3_capture.valid || task_s3_decide.valid
+  preApplyTask.bits := Mux(task_s3_decide.valid, task_s3_decide.bits, task_s3_capture.bits)
+  when(task_s3.valid && task_s3.bits.mshrTask && task_s3.bits.mshrContext === 0.U &&
+      s3Decision.bits.repl.valid) {
+    assert(s3Decision.bits.parentGeneration === leaseToken_s3.generation,
+      "S3 decision must retain the normal parent generation")
+  }
   val reqWayOH_s3 = UIntToOH(task_s3.bits.way, cacheParams.ways)
-  assert(PopCount(Seq(task_s2.valid, task_s3_capture.valid, task_s3.valid)) <= 1.U,
+  assert(PopCount(Seq(task_s2.valid, task_s3_capture.valid, task_s3_decide.valid, task_s3.valid)) <= 1.U,
     "the local Directory/result/apply execution slot must have one owner")
 
   /* ======== Enchantment ======== */
-  val dirResult_s3    = io.dirResp_s3
+  val dirResult_s3    = s3Decision.bits.dir
   val meta_s3         = dirResult_s3.meta
-  val metaOnHit_s3    = io.metaOnHit_s3
+  val metaOnHit_s3    = s3Decision.bits.metaOnHit
   val req_s3          = task_s3.bits
-  val cmoHitInvalid   = io.cmoAllBlock.getOrElse(false.B) && io.cmoHitInvalid
+  val cmoHitInvalid   = io.cmoAllBlock.getOrElse(false.B) && s3Decision.bits.cmoHitInvalid
 
   val mshr_req_s3     = req_s3.mshrTask
   val sink_req_s3     = !mshr_req_s3
@@ -288,9 +353,9 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     nestable_dirResult_s3.tag   := req_s3.tag
   }
 
-  val tagError_s3               = io.dirResp_s3.error || meta_s3.tagErr
+  val tagError_s3               = s3Decision.bits.dir.error || meta_s3.tagErr
   val dataError_s3              = meta_s3.dataErr
-  val l2Error_s3                = io.dirResp_s3.error
+  val l2Error_s3                = s3Decision.bits.dir.error
 
   val mshr_refill_s3 = mshr_accessackdata_s3 || mshr_hintack_s3 || mshr_grant_s3 // needs refill to L2 DS
   val mshr_refill_only_s3 = mshr_refill_s3 && req_s3.refillOnly
@@ -305,9 +370,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // no live normal-owner outcome may rewrite an already issued proposal here.
   val mshr_replace_capture_s3 = mshr_req_s3 && req_s3.replaceCapture
   val mshr_refill_to_release_copy_s3 = mshr_req_s3 && req_s3.refillToReleaseCopy
-  val replResp_valid_hold = io.replResp.bits.validHold
-  val retry = replResp_valid_hold && (io.replResp.bits.retry || io.fromMSHRCtl.replRespRetry)
-  val need_repl = replResp_valid_hold && io.replResp.bits.meta.state =/= INVALID && req_s3.replTask
+  val replResp_valid_hold = s3Decision.bits.repl.bits.validHold
+  val retry = Mux(mshr_req_s3 && req_s3.mshrContext === 0.U,
+    s3Decision.bits.normalRetry, s3Decision.bits.retry)
+  val need_repl = replResp_valid_hold && s3Decision.bits.repl.bits.meta.state =/= INVALID && req_s3.replTask
   // A refill grant whose folded replacer read returns a no-probe victim this
   // very pass merges the install: the victim DS snapshot is read here (and
   // lands in the sidecar ReleaseBuf at S5) and Directory tag/meta are
@@ -319,21 +385,21 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // can never trigger an install.
   val grantReplResp_s3 = replResp_valid_hold && mshr_refill_s3 && !req_s3.refillOnly &&
     req_s3.mshrContext === 0.U && req_s3.replTask && req_s3.grantInstallEn &&
-    io.replResp.bits.mshrId === req_s3.mshrId
-  val grantMergeInstall_s3 = task_s3.valid && grantReplResp_s3 && io.fromMSHRCtl.grantInstallOK
-  val grantVictimCap_s3 = grantMergeInstall_s3 && io.replResp.bits.meta.state =/= INVALID
+    s3Decision.bits.repl.bits.mshrId === req_s3.mshrId
+  val grantMergeInstall_s3 = task_s3.valid && grantReplResp_s3 && s3Decision.bits.grantInstall
+  val grantVictimCap_s3 = grantMergeInstall_s3 && s3Decision.bits.repl.bits.meta.state =/= INVALID
   // RequestArb can hold a Grant task for several cycles while the directory
   // response is already available. In that window req_s3.way is the old
   // pre-replacer way; use the matching ReplacerResult way for every commit
   // path, otherwise the old Grant and the later refill-only task can install
   // the same tag in two different ways.
   val replRespForTask = replResp_valid_hold && mshr_req_s3 &&
-    io.replResp.bits.mshrId === req_s3.mshrId &&
-    io.replResp.bits.meta.state =/= INVALID && !io.replResp.bits.retry
+    s3Decision.bits.repl.bits.mshrId === req_s3.mshrId &&
+    s3Decision.bits.repl.bits.meta.state =/= INVALID && !s3Decision.bits.repl.bits.retry
   val commitReplWay = mshr_refill_s3 && (req_s3.replTask || replRespForTask)
-  val replWayOH_s3 = UIntToOH(io.replResp.bits.way, cacheParams.ways)
+  val replWayOH_s3 = UIntToOH(s3Decision.bits.repl.bits.way, cacheParams.ways)
   when (replRespForTask) {
-    assert(io.replResp.bits.set === req_s3.set,
+    assert(s3Decision.bits.repl.bits.set === req_s3.set,
       "ReplacerResult set must match the MSHR commit task")
   }
 
@@ -384,7 +450,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // whether L2 should do forwarding or not
   val expectFwd = isSnpXFwd(req_s3.chiOpcode.get)
   val canFwd = nestable_dirResult_s3.hit &&
-    !(Mux(req_s3.snpHitRelease, req_s3.snpHitReleaseMeta.tagErr, io.metaOnHit_s3.tagErr) || io.errOnSnp_s3)
+    !(Mux(req_s3.snpHitRelease, req_s3.snpHitReleaseMeta.tagErr, s3Decision.bits.metaOnHit.tagErr) || s3Decision.bits.errOnSnp)
   val doFwd = expectFwd && canFwd
   val need_pprobe_s3_b_snpStable = req_s3.fromB && (
     isSnpOnceX(req_s3.chiOpcode.get) || isSnpQuery(req_s3.chiOpcode.get) || isSnpStashX(req_s3.chiOpcode.get)
@@ -398,7 +464,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     req_s3.chiOpcode.get === SnpCleanInvalid ||
     isSnpMakeInvalidX(req_s3.chiOpcode.get)
   ) && dirResult_s3.hit && metaOnHit_has_clients_s3
-  val need_pprobe_s3_b_snpNDERR = req_s3.fromB && (io.errOnSnp_s3 || io.metaOnHit_s3.tagErr) && dirResult_s3.hit
+  val need_pprobe_s3_b_snpNDERR = req_s3.fromB && (s3Decision.bits.errOnSnp || s3Decision.bits.metaOnHit.tagErr) && dirResult_s3.hit
   val need_pprobe_s3_b = need_pprobe_s3_b_snpStable || need_pprobe_s3_b_snpToB ||
     need_pprobe_s3_b_snpToN || need_pprobe_s3_b_snpNDERR
   // Forwarding requires both the snoop response to the HN and CompData to
@@ -614,8 +680,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // normal snoop may deliberately read normal RefillBuf ProbeAckData.
   val useReleaseBufData_s3 = req_s3.useProbeData ||
     req_s3.fromB && req_s3.snpHitReleaseWithData
-  val data_s3 = Mux(useReleaseBufData_s3 && io.releaseBufResp_s3.valid,
-    io.releaseBufResp_s3.bits.data, io.refillBufResp_s3.bits.data.data)
+  val data_s3 = Mux(useReleaseBufData_s3 && s3Decision.bits.release.valid,
+    s3Decision.bits.release.bits.data, s3Decision.bits.refill.bits.data.data)
   // Directory-only internal tasks retain the response opcode copied from
   // mp_grant, but do not consume RefillBuf. Only an L1-visible data response
   // or a refill-only task that actually writes DS requires this read result.
@@ -634,11 +700,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   when(mshrRefillBufConsumer_s3) {
     val expectedRefillId = Mux(req_s3.refillToReleaseCopy, req_s3.refillBufReadId, req_s3.mshrId)
     assert(
-      io.refillBufResp_s3.valid && io.refillBufResp_s3.bits.id === expectedRefillId,
+      s3Decision.bits.refill.valid && s3Decision.bits.refill.bits.id === expectedRefillId,
       "RefillBuf response must match the consuming MSHR"
     )
   }
-  val c_releaseData_s3 = io.bufResp.data.asUInt
+  val c_releaseData_s3 = s3Decision.bits.cPayload.data.asUInt
   val hasData_s3_tl = source_req_s3.opcode(0) // whether to respond data to TileLink-side
   val hasData_s3_chi = source_req_s3.toTXDAT // whether to respond data to CHI-side
   val hasData_s3 = hasData_s3_tl || hasData_s3_chi
@@ -669,7 +735,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     !mshr_defer_refill_write_s3
   val normalRefillOverlapsSnoopHold = io.fromMSHRCtl.snoopDataHolds.map { snoop =>
     snoop.valid && snoop.bits.blockRefill && snoop.bits.set === req_s3.set &&
-      snoop.bits.way === Mux(commitReplWay, io.replResp.bits.way, req_s3.way)
+      snoop.bits.way === Mux(commitReplWay, s3Decision.bits.repl.bits.way, req_s3.way)
   }.reduce(_ || _)
   when (normalRefillDSWrite) {
     assert(!normalRefillOverlapsSnoopHold,
@@ -698,7 +764,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.toDS.req_s3.valid := io.toDS.en_s3
   io.toDS.req_s3.bits.way := Mux(
     commitReplWay,
-    io.replResp.bits.way,
+    s3Decision.bits.repl.bits.way,
     Mux(mshr_req_s3, req_s3.way, dirResult_s3.way)
   )
   io.toDS.req_s3.bits.set := req_s3.set
@@ -708,8 +774,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     c_releaseData_s3,
     Mux(
       req_s3.replaceTask || req_s3.useProbeData,
-      io.releaseBufResp_s3.bits.data,
-      io.refillBufResp_s3.bits.data.data
+      s3Decision.bits.release.bits.data,
+      s3Decision.bits.refill.bits.data.data
     )
   )
 
@@ -815,7 +881,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val metaW_wayOH = Mux(
     commitReplWay,
     replWayOH_s3,
-    Mux(mshr_req_s3, reqWayOH_s3, io.dirWayOH_s3)
+    Mux(mshr_req_s3, reqWayOH_s3, s3Decision.bits.wayOH)
   )
 
   io.metaWReq.valid := !resetFinish || task_s3.valid && (
@@ -944,8 +1010,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val refillVictim = task_s3.valid && mshr_req_s3 && mshr_refill_s3 && !retry && need_repl && req_s3.fromA
     u.valid := refillVictim && replResp_valid_hold
     u.bits.reqSource := req_s3.reqSource
-    u.bits.victimPAddr := Cat(io.replResp.bits.tag, req_s3.set, 0.U(offsetBits.W))
-    u.bits.victimPfSource := io.replResp.bits.meta.prefetchSrc.getOrElse(PfSource.NoWhere.id.U)
+    u.bits.victimPAddr := Cat(s3Decision.bits.repl.bits.tag, req_s3.set, 0.U(offsetBits.W))
+    u.bits.victimPfSource := s3Decision.bits.repl.bits.meta.prefetchSrc.getOrElse(PfSource.NoWhere.id.U)
   }
 
   io.prefetchTrain.foreach {
@@ -961,9 +1027,9 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
       // Evict a unused CDP prefetched block
       val cdp_filter_train_evict = task_s3.valid && mshr_refill_s3 && req_s3.replTask &&
-        !io.replResp.bits.retry && !io.replResp.bits.meta.accessed && 
-        io.replResp.bits.meta.prefetch.getOrElse(false.B) && 
-        io.replResp.bits.meta.prefetchSrc.getOrElse(false.B) === PfSource.CDP.id.U
+        !s3Decision.bits.repl.bits.retry && !s3Decision.bits.repl.bits.meta.accessed &&
+        s3Decision.bits.repl.bits.meta.prefetch.getOrElse(false.B) &&
+        s3Decision.bits.repl.bits.meta.prefetchSrc.getOrElse(false.B) === PfSource.CDP.id.U
 
       if (hasCDP) {
         train.bits.cdp_vpn_train_valid.get  := cdp_vpn_train_valid
@@ -1006,8 +1072,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       }
 
       if (hasCDP) {
-        train.bits.evict_tag.get := io.replResp.bits.tag
-        train.bits.evict_set.get := io.replResp.bits.set
+        train.bits.evict_tag.get := s3Decision.bits.repl.bits.tag
+        train.bits.evict_set.get := s3Decision.bits.repl.bits.set
       }
   }
 
@@ -1046,7 +1112,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     need_write_releaseBuf_s4 := need_write_releaseBuf
     need_write_refillBuf_s4 := need_write_refillBuf
     grantVictimCap_s4 := grantVictimCap_s3
-    grantVictimSlot_s4 := io.fromMSHRCtl.grantInstallSlot
+    grantVictimSlot_s4 := s3Decision.bits.grantInstallSlot
     isD_s4 := isD_s3
     isTXREQ_s4 := isTXREQ_s3
     isTXRSP_s4 := isTXRSP_s3
@@ -1135,15 +1201,17 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // The complete S3 event adds one response stage. Advance the full early
   // hint transaction and its following retry with that same stage, retaining
   // their relative timing and source identity under hint backpressure.
-  val mshrHintEvent = RegNext(io.mshrHintQInfo, 0.U.asTypeOf(io.mshrHintQInfo))
-  val sinkCHintEvent = RegNext(io.sinkCHintQInfo, 0.U.asTypeOf(io.sinkCHintQInfo))
+  val mshrHintCapture = RegNext(io.mshrHintQInfo, 0.U.asTypeOf(io.mshrHintQInfo))
+  val mshrHintEvent = RegNext(mshrHintCapture, 0.U.asTypeOf(mshrHintCapture))
+  val sinkCHintCapture = RegNext(io.sinkCHintQInfo, 0.U.asTypeOf(io.sinkCHintQInfo))
+  val sinkCHintEvent = RegNext(sinkCHintCapture, 0.U.asTypeOf(sinkCHintCapture))
   customL1Hint.io.mshrHintQInfo := mshrHintEvent
   customL1Hint.io.sinkCHintQInfo := sinkCHintEvent
-  customL1Hint.io.retry_s2 := RegNext(io.retryFastFwd_s2 && task_s2.valid, false.B)
+  customL1Hint.io.retry_s2 := RegNext(RegNext(io.retryFastFwd_s2 && task_s2.valid, false.B), false.B)
   // The local transition slot permits only one new hint event before this
   // register drains. Count it as reserved capacity at the ingress too.
   io.hint_s1QueueFull := customL1Hint.io.hint_s1QueueFull ||
-    mshrHintEvent.valid || sinkCHintEvent.valid
+    mshrHintCapture.valid || sinkCHintCapture.valid || mshrHintEvent.valid || sinkCHintEvent.valid
 
   customL1Hint.io.s3.task      := task_s3
   // overwrite opcode: if sinkReq can respond, use sink_resp_s3.bits.opcode = Grant/GrantData
@@ -1210,7 +1278,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
     val is_refill_trigger_s3 = task_s3.valid && (mshr_grantdata_s3 || mshr_hintack_s3)
     val is_refill_trigger_s5 = RegNextN(is_refill_trigger_s3, 2)
-    val refill_trigger_data_s3  = Mux(req_s3.useProbeData, io.releaseBufResp_s3.bits.data, io.refillBufResp_s3.bits.data.data)
+    val refill_trigger_data_s3  = Mux(req_s3.useProbeData, s3Decision.bits.release.bits.data, s3Decision.bits.refill.bits.data.data)
     val refill_trigger_data_s5  = RegNextN(refill_trigger_data_s3, 2)
     val refill_trigger_depth_s5 = RegNextN(metaW_s3_mshr.cdpPfDepth.getOrElse(0.U), 2)
     val refill_trigger_pfsrc_s5 = RegNextN(metaW_s3_mshr.prefetchSrc.getOrElse(0.U), 2)

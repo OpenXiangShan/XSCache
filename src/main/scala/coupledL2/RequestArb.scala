@@ -107,7 +107,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   // Reserve the fixed-latency Directory result/apply slot before S1. This
   // short local execution slot ends after S3 applies; response collection,
   // ProbeAck/GrantAck and outgoing queues remain independent of it.
-  val localTransitionCycles = RegInit(0.U(2.W))
+  val localTransitionCycles = RegInit(0.U(3.W))
   val localTransitionIdle = localTransitionCycles === 0.U
   // Registered admission turns keep the two ingress handshakes exclusive.
   // A live MSHR valid must not decide B.ready: B reserves a sidecar whose
@@ -128,7 +128,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     admitMshrTurn := !admitMshrTurn
   }
   when(s1_fire) {
-    localTransitionCycles := 3.U
+    localTransitionCycles := 4.U
   }.elsewhen(!localTransitionIdle) {
     localTransitionCycles := localTransitionCycles - 1.U
   }
