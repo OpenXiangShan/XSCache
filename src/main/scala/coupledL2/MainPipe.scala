@@ -47,7 +47,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val toReqArb = Output(new BlockInfo())
 
     /* block A at Entrance */
-    val toReqBuf = Output(Vec(3, Bool()))
+    val toReqBuf = Output(Vec(4, Bool()))
     // A refill-only commit must wait behind older data-bearing SourceD work
     // before it starts a shared RefillBuf read in RequestArb.
     val blockRefillOnlyCommit = Output(Bool())
@@ -1321,14 +1321,15 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
   io.toReqBuf(0) := task_s2.valid && s23Block('a', task_s2.bits)
   io.toReqBuf(1) := task_s3_capture.valid && s23Block('a', task_s3_capture.bits)
-  io.toReqBuf(2) := task_s3.valid && s23Block('a', task_s3.bits)
+  io.toReqBuf(2) := task_s3_decide.valid && s23Block('a', task_s3_decide.bits)
+  io.toReqBuf(3) := task_s3.valid && s23Block('a', task_s3.bits)
 
   io.toReqArb.blockC_s1 := task_s2.valid && s23Block('c', task_s2.bits) ||
-    task_s3_capture.valid && s23Block('c', task_s3_capture.bits)
+    preApplyTask.valid && s23Block('c', preApplyTask.bits)
 
   io.toReqArb.blockB_s1 :=
     task_s2.valid && bBlock(task_s2.bits) ||
-    task_s3_capture.valid && bBlock(task_s3_capture.bits) ||
+    preApplyTask.valid && bBlock(preApplyTask.bits) ||
     task_s3.valid && bBlock(task_s3.bits) ||
     task_s4.valid && bBlock(task_s4.bits, tag = true) ||
     task_s5.valid && bBlock(task_s5.bits, tag = true)
@@ -1336,7 +1337,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.toReqArb.blockA_s1 := false.B
 
   io.toReqArb.blockG_s1 := task_s2.valid && s23Block('g', task_s2.bits) ||
-    task_s3_capture.valid && s23Block('g', task_s3_capture.bits)
+    preApplyTask.valid && s23Block('g', preApplyTask.bits)
 
   /* ======== Pipeline Status ======== */
   require(io.status_vec_toD.size == 4)
@@ -1356,14 +1357,14 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.status_vec_toD(2).valid        := d_s5.valid
   io.status_vec_toD(2).bits.channel := task_s5.bits.channel
   // Keep this pre-apply stage visible even when S3 later chooses retry.
-  io.status_vec_toD(3).valid := task_s3_capture.valid
-  io.status_vec_toD(3).bits.channel := task_s3_capture.bits.channel
+  io.status_vec_toD(3).valid := preApplyTask.valid
+  io.status_vec_toD(3).bits.channel := preApplyTask.bits.channel
 
   // capacity control of TX channels
   val tx_task_s3 = Wire(Valid(new TaskBundle))
   tx_task_s3.valid := task_s3.valid // TODO: review this
   tx_task_s3.bits := req_s3
-  val tasks = Seq(task_s3_capture, tx_task_s3, task_s4, task_s5)
+  val tasks = Seq(preApplyTask, tx_task_s3, task_s4, task_s5)
   io.status_vec_toTX.zip(tasks).foreach { case (status, task) =>
     status.valid := task.valid
     status.bits.channel := task.bits.channel
