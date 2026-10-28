@@ -36,6 +36,7 @@ object ConflictFrame {
 }
 
 class ConflictTshrProbe(implicit val p: Parameters) extends Bundle {
+  val requestWaits=UInt(6.W)
   val flags=UInt(12.W)
   val pa=UInt(48.W)
   val inputPA=UInt(48.W)
@@ -109,6 +110,8 @@ class TestTopConflict(cfg: L2Configuration)(implicit p: Parameters) extends Test
       read(t.rbeSNP.io.in.valid)&&read(t.rbeSNP.io.in.ready),read(t.rbeSNP.io.valid),read(t.rbeSNP.io.out.valid),
       read(t.io.cdpData.valid),read(t.io.cdpEvict.valid),read(en))
     o.flags:=Cat(flags.reverse)
+    o.requestWaits:=Cat(read(t.vPipeREQ.w_evict_peer_commit_dir),read(t.vPipeREQ.w_evict_dn_compdbid),
+      read(t.vPipeREQ.w_unlock_ds),read(t.vPipeREQ.w_unlock_dir),read(t.vPipeREQ.w_dn_pcrdgrant),read(t.vPipeREQ.s_dn_txreq))
     o.pa:=read(t.vPipeREQ.io.tshr_paddr)
     o.inputPA:=read(module.slices(si).io.UpRXREQ.bits.Addr)
     o.inputSource:=read(r.in.bits.req.SrcID)
@@ -170,12 +173,14 @@ class ConflictDemandDriver(dut: TestTop_L2Top, upstream: L2TopUpstreamModel) ext
   var checkedBeats = 0
   var maxOutstanding = 0
   var trace: String => Unit = _ => ()
+  var validateData:(UpRequestSpec,Int,Int)=>Unit=(_:UpRequestSpec,_:Int,_:Int)=>()
   var dumpTrace: () => Unit = () => ()
   var demandOfferCycles = 0L
   var demandBlockedCycles = 0L
   def outstanding: Int = active.size
   def pending: Int = active.size + held.size + queues.values.map(_.size).sum + acks.size
   def queued: Int = held.size + queues.values.map(_.size).sum
+  def pendingSummary:String=s"active=${active.toSeq.map{case(k,r)=>(k,r.req.addr.toString(16),r.beats.toSeq)}} held=$held queues=${queues.toSeq.map{case(k,q)=>(k,q.size)}} acks=$acks"
   def enqueue(requests: Seq[UpRequestSpec]): Unit = requests.foreach(r => queues(r.master).enqueue(r))
   def drive(cycle: Int): Unit = {
     upstream.clearUpReq()
@@ -236,6 +241,7 @@ class ConflictDemandDriver(dut: TestTop_L2Top, upstream: L2TopUpstreamModel) ext
         assert(data.bits.Opcode.peek().litValue == CCHIOpcode.CompData.opcode)
         val beat = data.bits.DataID.peek().litValue.toInt
         assert(Set(0, 1).contains(beat) && !read.beats(beat), s"duplicate/invalid beat: $key beat=$beat")
+        validateData(read.req,beat,cycle)
         val actual = data.bits.Data.peek().litValue
         val expected = OvernightMemory.beat(read.req.addr, beat)
         trace(s"UP_DAT cycle=$cycle master=$master txn=$id dbid=${data.bits.DBID.peek().litValue} slice=${data.bits.SrcID.peek().litValue} pa=0x${read.req.addr.toString(16)} beat=$beat actual=0x${actual.toString(16)} expected=0x${expected.toString(16)}")
@@ -347,6 +353,23 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
   val up=new L2TopUpstreamModel(dut,spec)
   val dn=new L2TopDownstreamModel(dut,spec)
   val driver=new ConflictDemandDriver(dut,up)
+  var extension:Option[L2HNExtensionPins]=None
+  def enableHNExtension(config:HNExtConfig):Unit={
+    val model=new L2HNExtensionModel(config,OvernightMemory.beat _,record _)
+    driver.validateData=(q,b,c)=>model.upstreamData(q.addr,b,c)
+    extension=Some(new L2HNExtensionPins(dut,dn,model,hnRequester,
+      (req,c)=>{
+        val id=DnTxnID(req.txn)
+        if(req.op!=5) {
+          live(id)=req.addr
+          if(dut.observation.dirProbeBySlice.flatten.exists(p=>flag(p.reqActive)&&flag(p.pRxReqIsPrefetch)&&value(p.tshrPaddr)==req.addr))livePrefetch+=id
+          if(!L2HNExtensionModel.isWrite(req.op))readRequests+=((c,req.addr))
+        }
+      },(d,c)=>{
+        val id=DnTxnID(d.txn);receivedData(id)|=(1<<(d.beat/2))
+        if(receivedData(id)==3){live.remove(id);livePrefetch-=id;receivedData-=id}
+      }))
+  }
   var sourceMode="all"
   var fullHistory=false
   var tapeWriter:Option[java.io.PrintWriter]=None
@@ -470,6 +493,8 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
     // Complete inbound channel stimulus before observing combinational
     // metadata/eviction/line events. Sampling before RXRSP missed same-cycle
     // victim invalidations even though the production counter saw the edge.
+    if(extension.nonEmpty)extension.get.drive(cycle,paused.contains _)
+    else {
     def dataLegal(d:PendingDnComp)=hnOrdering.canData(d.srcId,d.addr)
     if(data.exists(d=>d.due<=cycle&& !dataLegal(d))) dataOrderStalls+=1
     val selected=frame match {
@@ -492,6 +517,7 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
       chosenResponsePA=Some(live(r.dnTxnID))
       record(s"DN_RSP cycle=$cycle rn=${r.srcId} txn=${r.dnTxnID.v} pa=0x${live(r.dnTxnID).toString(16)} opcode=${r.opcode}")
       dn.driveDnRsp(r);dn.noteResponse(r.dnTxnID,true,cycle);assert(live.remove(r.dnTxnID).nonEmpty);livePrefetch-=r.dnTxnID
+    }
     }
     if(!flag(dut.io.t1p.head.UpRSP.valid)) snps.headOption.foreach{case(id,src)=>up.driveUpSnpResp(id,src);if(flag(dut.io.t1p.head.UpRSP.ready)) snps.dequeue()}
     if(flag(dut.io.t1p.head.DnSNP.valid)) snps.enqueue((SnpTxnID(value(dut.io.t1p.head.DnSNP.bits.TxnID)),value(dut.io.t1p.head.DnSNP.bits.SrcID)))
@@ -559,6 +585,9 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
     if(trainSlices.size>=2) hit("C06",s"trainSlices=${trainSlices.toSeq.sorted.mkString(",")}")
     if(trainSlices.nonEmpty && disabled) hit("C06_mixed",s"enabledSlices=${trainSlices.toSeq.sorted.mkString(",")} disabledRaw=true")
     // Exact-credit snoop injection, after observing demand execution this cycle.
+    if(extension.nonEmpty) {
+      snpNext.foreach(extension.get.offer(_));snpNext=None
+    } else {
     snpNext.foreach(snoopOffers.enqueue(_));snpNext=None
     def snoopLegal(addr:BigInt)=hnOrdering.canSnoop(hnRequester,addr)&&
       !chosenData.exists(d=>(d.addr>>6)==(addr>>6)&&d.srcId==hnRequester)&&
@@ -580,6 +609,7 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
       val id=value(dut.io.chi.txrsp.flit.TxnID.get)
       val addr=sentSnps.remove(id).getOrElse(throw new AssertionError(s"unexpected snoop response $id"));writes.remove(addr);snoopDone+=1
       record(s"SNP_RESP cycle=$cycle pa=0x${addr.toString(16)} id=$id")
+    }
     }
     if(cycle%64==0) ledgerCheck()
     for(c<-0 until 2) {
@@ -643,6 +673,11 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
     }
     if(recvNext.nonEmpty) recvInputs+=1
     recvNext=None
+    if(extension.nonEmpty) {
+      extension.get.sample(cycle)
+      val m=extension.get.model
+      if(m.empty){live.clear();livePrefetch.clear()}
+    } else {
     if(flag(dut.io.chi.txreq.flitv)) {
       val f=dut.io.chi.txreq.flit;val id=DnTxnID(value(f.TxnID.get));val src=value(f.SrcID.get);val op=value(f.Opcode.get);val addr=value(f.Addr.get)
       assert(!live.contains(id));live(id)=addr
@@ -686,6 +721,7 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
       hnOrdering.writeData(value(f.SrcID.get),value(f.TxnID.get),value(f.DataID.get).toInt,cycle)
       record(s"COPYBACK_DATA cycle=$cycle rn=${value(f.SrcID.get)} dbid=${value(f.TxnID.get)} beat=${value(f.DataID.get)}")
     }
+    }
     assert(!flag(dut.io.t1p.head.DnRSP.valid),"unexpected response (external Stash is silent)")
     tapeWriter.foreach{out=>
       out.println(ConflictFrame(cycle,frameHold,frameTrain,rawRecv,rawSnp,readyNow,
@@ -706,7 +742,7 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
       assert(cycle-start<40000,s"drain watchdog seed=$seed cycle=$cycle live=$live slots=${value(dut.slots)} tlb=$translations")
       tick()
       val empty=driver.pending==0 && data.isEmpty && rsp.isEmpty && live.isEmpty && snps.isEmpty && replies.isEmpty && sentSnps.isEmpty &&
-        snoopOffers.isEmpty && snpNext.isEmpty && hnOrdering.empty &&
+        snoopOffers.isEmpty && snpNext.isEmpty && hnOrdering.empty && extension.forall(_.model.empty) &&
         !pendingTshrs && (if(queues) qModels.forall(_.isEmpty)&&value(dut.slots)==0&&translations.isEmpty&& !flag(dut.algorithmBusy) else true)
       quiet=if(empty) quiet+1 else 0
     }
@@ -721,6 +757,18 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
     dut.reset.poke(true.B);dut.clock.step(8);dut.reset.poke(false.B);dn.activateRxLink()
     for(c<- -300 until 0) dn.stepWithCredits(c)
   }
+  def dumpFailure():Unit={
+    println(s"CONFLICT_FAILURE_STATE cycle=$cycle driver=${driver.pendingSummary} live=$live receivedData=$receivedData snps=$snps sentSnps=$sentSnps hold=$hold pendingTshrs=$pendingTshrs algorithmBusy=${flag(dut.algorithmBusy)} queues=${qModels.map(_.size)} slots=${value(dut.slots)} translations=$translations replies=$replies hnOrderingEmpty=${hnOrdering.empty}")
+    extension.foreach{e=>
+      println(s"HN_EXT_FAILURE_STATE cycle=$cycle ${e.model.pendingSummary}")
+      e.model.counts.toSeq.sortBy(_._1).foreach{case(k,n)=>println(s"HN_EXT_FAILURE_COVER seed=$seed slices=$slices cycle=$cycle name=$k count=$n")}
+      e.model.overlapWindows.toSeq.sortBy(_._1).foreach{case(k,n)=>println(s"HN_EXT_FAILURE_OVERLAP seed=$seed slices=$slices name=$k windows=$n cycles=${e.model.overlapCycles(k)} windowLength=512")}
+    }
+    for(s<-0 until slices;t<-0 until 8){val p=dut.ct(s)(t)
+      println(s"CONFLICT_FAILURE_TSHR slice=$s tshr=$t flags=${value(p.flags)} requestWaits=${value(p.requestWaits)} pa=${value(p.pa).toString(16)} metaFlags=${value(p.metaFlags)} localState=${value(p.localState)} directoryState=${value(p.directoryState)} requestState=${value(p.requestState)} snoopState=${value(p.snoopState)}")
+    }
+    eventHistory.foreach(x=>println("CONFLICT_HISTORY "+x))
+  }
   def finish():Unit={
     hold=false;tlbReady=true;paused.clear();drain();ledgerCheck()
     assert(driver.pending==0&&driver.completed==submitted&&driver.checkedBeats==submitted*2,"data scoreboard closure")
@@ -728,6 +776,12 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
     assert(modelRetry==actualRetry&&modelDrop==actualDrop,"TLB retry/drop closure")
     assert(sentSnps.isEmpty&&receivedData.isEmpty&&value(dut.slots)==0&&qModels.forall(_.isEmpty),"final occupancy zero")
     assert(hnOrdering.empty&&snoopOffers.isEmpty,"HN ordering closure")
+    extension.foreach{e=>
+      e.model.finish()
+      e.model.counts.toSeq.sortBy(_._1).foreach{case(k,n)=>println(s"HN_EXT_COVER seed=$seed slices=$slices name=$k count=$n")}
+      e.model.overlapWindows.toSeq.sortBy(_._1).foreach{case(k,n)=>println(s"HN_EXT_OVERLAP seed=$seed slices=$slices name=$k windows=$n cycles=${e.model.overlapCycles(k)} windowLength=512")}
+      println(s"HN_EXT_CLOSURE pass=true seed=$seed slices=$slices pending=0 credits=0")
+    }
     println(s"HN_CHI_ORDER_CHECK pass=true seed=$seed pending=0 dataStallCycles=$dataOrderStalls snoopStallCycles=$snoopOrderStalls responseStallCycles=$responseOrderStalls")
     println(s"CONFLICT_CLOSURE pass=true seed=$seed slices=$slices cycles=$cycle demands=$submitted checkedBeats=${driver.checkedBeats} stashes=${driver.stashes} recv=$recvInputs tlbRequests=$tlbRequests tlbRetired=$retired retries=$actualRetry drops=$actualDrop snoops=$snoopDone pending=0")
     Seq("C01","C01_enter","C01_wait","C01_hit","C02","C03a","C03b","C03c","C04","C05","C06","C06_mixed","C07","C08","C08_release","C09","C09_simultaneous","C10").foreach(k=>if(!evidence.contains(k)) evidence(k)=0)
@@ -782,6 +836,12 @@ object TestTop_L2PrefetchConflict extends App with ChiselSim {
       println(s"CONFLICT_ISOLATION_BEGIN seed=$seed slices=$slices level=$level sources=$activeMode phase=$phase")
       val r=new ConflictRun(dut,seed,slices,mode=="random")
       r.sourceMode=activeMode;r.fullHistory=fullHistory
+      if(opt("--hn-extension","false").toBoolean) {
+        require(requestedRecordTape.isEmpty&&requestedReplayTape.isEmpty&&autoIsolation.isEmpty,"HN extension uses event trace instead of legacy-only tape")
+        r.enableHNExtension(HNExtConfig(retryPercent=opt("--retry-percent","30").toInt,
+          splitPercent=opt("--split-percent","50").toInt,dctPercent=opt("--dct-percent","50").toInt,
+          seed=0x484e0000L+seed*100+slices))
+      }
       if(recordTape.nonEmpty) {
         val path=java.nio.file.Paths.get(recordTape.replace("{seed}",seed.toString))
         require(!java.nio.file.Files.exists(path),s"refuse overwrite tape $path")
@@ -821,6 +881,22 @@ object TestTop_L2PrefetchConflict extends App with ChiselSim {
             r.paused-=a;r.drain()
             println(s"CONFLICT_MINIMAL_PHASE firstReadComplete=true pa=0x${a.toString(16)} cycle=${r.cycle} sources=$activeMode")
             r.enqueue(a,enabled=false);r.drain()
+          case "hn-extension" =>
+            require(r.extension.nonEmpty)
+            val a=BigInt(0x220040)
+            for(op<-L2HNExtensionModel.fwdOps++L2HNExtensionModel.stashOps++L2HNExtensionModel.normalOps) {
+              r.enqueue(a,enabled=false);r.drain()
+              r.extension.get.offer(a,Some(op));r.drain()
+              r.enqueue(a,enabled=false);r.drain()
+            }
+            for(batch<-0 until 12) {
+              for(i<-0 until 12)r.enqueue(BigInt(0x400000+(batch*16+i)*64),enabled=false)
+              for(t<-0 until 400) {
+                if(t%19==0&&r.live.nonEmpty)r.extension.get.offer(r.live.values.head)
+                r.tick()
+              }
+              r.drain()
+            }
           case "lifecycle" =>
             // Recv is a genuine internal prefetch source. No data are returned
             // before the queued demand has demonstrated actual RBE waiting.
@@ -919,6 +995,10 @@ object TestTop_L2PrefetchConflict extends App with ChiselSim {
             val addr=if(r.random.nextInt(3)==0&&r.live.nonEmpty) r.live.values.head else BigInt(0x210000+r.random.nextInt(512)*64)
             r.recvNext=Some(addr)
           }
+          if(r.extension.nonEmpty&&t%11==0) {
+            val target=if(r.live.nonEmpty)r.live.values.head else BigInt(0x210000+r.random.nextInt(512)*64)
+            r.extension.get.offer(target)
+          }
           // Sparse precision snoops, never a storm; one outstanding at most.
           if(t%991==0 && r.sentSnps.isEmpty && r.live.nonEmpty) r.snpNext=Some(r.live.values.head)
           r.tick()
@@ -937,6 +1017,7 @@ object TestTop_L2PrefetchConflict extends App with ChiselSim {
         // terminate this JVM and are resumed by the external matrix runner.
         case e: java.lang.AssertionError if mode=="random" =>
           hostFailures+=1
+          r.dumpFailure()
           println(s"CONFLICT_RESULT pass=false seed=$seed slices=$slices mode=$mode case=$scenario level=$level sources=$activeMode cycle=${r.cycle} error=${e.getMessage}")
       } finally r.tapeWriter.foreach(_.close())
     }
