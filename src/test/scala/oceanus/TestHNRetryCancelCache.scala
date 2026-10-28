@@ -37,6 +37,8 @@ object TestHNRetryCancelCache extends App with ChiselSim {
   System.setProperty("oceanus.phase1a.ports","false")
   Constantin.init(false)
   val cancel= !args.contains("--control")
+  val expectBaseIssue=args.contains("--expect-base-issue")
+  require(!expectBaseIssue||cancel,"known-base mode requires the cancel case")
   val cfg=new L2Configuration(8,true,0 until 1)
   val params=new Config((_,_,_)=>{
     case L2ParamsKey=>L2Params(mshrSize=8,ways=4,sets=16)
@@ -115,7 +117,20 @@ object TestHNRetryCancelCache extends App with ChiselSim {
     else {for(i<-0 until 80)tick()}
     val remaining=(0 until 8).filter(i=>v(d.locks(i))!=0).map(i=>s"$i:${v(d.addresses(i)).toString(16)}:${v(d.locks(i))}").mkString(",")
     println(s"CACHE_CANCEL_RESULT cancel=$cancel cycle=$cycle stashRequests=$issued HNEmpty=${model.empty} creditReturns=${model.counts("creditReturn")} occupancy=${v(d.occupancy)} remainingLocks=$remaining")
-    model.finish()
-    assert(v(d.occupancy)==0,s"cache retains TSHR occupancy after CHI closure: $remaining")
+    if(expectBaseIssue) {
+      // Only these independently observed signatures are expected. Model CHI
+      // checks remain enabled, and an unrelated exception still fails the run.
+      val stuck=(0 until 8).exists(i=>v(d.addresses(i))==target.get&&v(d.locks(i))==12)
+      assert(model.empty&&model.counts("creditReturn")==1&&issued==5,
+        "known-base cancellation did not close the expected CHI sequence")
+      assert(v(d.occupancy)==2&&stuck,"known-base lock signature changed")
+      assert(model.counts("dutProtocolErrors")==1,"known-base TxnID signature changed")
+      try {model.finish();throw new AssertionError("expected PCrdReturn TxnID violation")}
+      catch {case e:IllegalStateException if e.getMessage.startsWith("L2_CHI_PROTOCOL_VIOLATION")=>()}
+      println("RETRY_BASE_KNOWN status=XFAIL issues=locks,PCrdReturn.TxnID base 已知问题(见 retry-base-note.md)")
+    } else {
+      model.finish()
+      assert(v(d.occupancy)==0,s"cache retains TSHR occupancy after CHI closure: $remaining")
+    }
   }
 }

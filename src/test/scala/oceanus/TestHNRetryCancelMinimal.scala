@@ -23,6 +23,8 @@ class HNRetryCancelMinimal(implicit p:Parameters) extends L2VPipeREQ(Seq.empty,1
 object TestHNRetryCancelMinimal extends App with ChiselSim {
   Constantin.init(false)
   val cancel= !args.contains("--control")
+  val expectBaseIssue=args.contains("--expect-base-issue")
+  require(!expectBaseIssue||cancel,"known-base mode requires the cancel case")
   val params=new Config((_,_,_)=>{
     case L2ParamsKey=>L2Params(mshrSize=8,ways=4,sets=128)
     case CHIParametersKey=>CHIParameters(issue=EnumCHIIssue.E,nodeIdWidth=11,reqAddrWidth=48,dataWidth=256)
@@ -81,6 +83,9 @@ object TestHNRetryCancelMinimal extends App with ChiselSim {
     for(i<-0 until 16)step()
     val free=d.io.free.peek().litToBoolean
     println(s"RETRY_CANCEL_RESULT cancel=$cancel free=$free locks=${d.observed.peek().litValue} observed=${if(free)"COMPLETED" else "STUCK"}")
-    assert(free,s"CopyBack cancellation retains request-vPipe locks after PCrdReturn: ${d.observed.peek().litValue}")
+    if(expectBaseIssue) {
+      assert(!free&&d.observed.peek().litValue==24,"known-base boundary lock signature changed")
+      println("RETRY_BASE_KNOWN status=XFAIL issues=locks base 已知问题(见 retry-base-note.md)")
+    } else assert(free,s"CopyBack cancellation retains request-vPipe locks after PCrdReturn: ${d.observed.peek().litValue}")
   }
 }
