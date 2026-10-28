@@ -248,9 +248,11 @@ class TestTopStress(cfg: L2Configuration)(implicit p: Parameters) extends Stress
   val diagnosticWidths=diagnosticSignals.map(_._2.getWidth).toSeq
   val diagnosticPacked=IO(Output(UInt(diagnosticWidths.sum.W)))
   diagnosticPacked:=Cat(diagnosticSignals.reverse.map(_._2).toSeq)
+  val hnPrefetchSource=IO(Output(Vec(cfg.sliceNum,Vec(nMSHR,UInt(L2PfSource.Width.W)))))
   val internal=IO(Output(Vec(cfg.sliceNum,Vec(nMSHR,Bool()))))
   module.slices.zipWithIndex.foreach {case(s,b)=>s.tshrs.zipWithIndex.foreach {case(t,i)=>
     internal(b)(i) := read(t.vPipeREQ.p_rxreq.SrcID)===cfg.pfSrcID.U
+    hnPrefetchSource(b)(i):=Mux(internal(b)(i),L2PrefetchTxnID.decode(read(t.vPipeREQ.p_rxreq.TxnID)),0.U)
   }}
   val stateCounts=IO(Output(Vec(metrics.size,UInt(32.W))))
   metrics.zipWithIndex.foreach {case((_,s,_),i)=>stateCounts(i):=s}
@@ -296,6 +298,7 @@ class StressDemandDriver(dut: StressTopBase, upstream: StressUpstreamModel) exte
   val accepted = mutable.ArrayBuffer.empty[(Int, UpRequestSpec)]
   var latencySum=0L; var latencyMax=0; var latencyCount=0
   var activeLatencySum=0L; var activeLatencyMax=0; var activeLatencyCount=0
+  var validateData:(UpRequestSpec,Int,Int)=>Unit=(_:UpRequestSpec,_:Int,_:Int)=>()
   var stimulusEnd=Int.MaxValue
   private def finish(read: Read,cycle: Int): Unit = {
     val lat=cycle-read.born; latencySum+=lat; latencyMax=latencyMax.max(lat); latencyCount+=1
@@ -358,6 +361,7 @@ class StressDemandDriver(dut: StressTopBase, upstream: StressUpstreamModel) exte
         assert(data.bits.Opcode.peek().litValue == CCHIOpcode.CompData.opcode)
         val beat = data.bits.DataID.peek().litValue.toInt
         assert(Set(0, 1).contains(beat) && !read.beats(beat), s"duplicate/invalid beat: $key beat=$beat")
+        validateData(read.req,beat,cycle)
         val actual = data.bits.Data.peek().litValue
         val expected = StressMemory.beat(read.req.addr, beat)
         assert(actual == expected, s"data mismatch cycle=$cycle $key addr=0x${read.req.addr.toString(16)} beat=$beat actual=0x${actual.toString(16)} expected=0x${expected.toString(16)}")
@@ -451,6 +455,9 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
   val snoopStop=opt("--snoop-stop",minimum.toString).toInt
   val retryPct=opt("--retry-pct","0").toInt
   val retryDelay=opt("--retry-delay","16").toInt
+  val hnExtension=opt("--hn-extension","false").toBoolean
+  val hnDct=opt("--hn-dct","true").toBoolean
+  val hnSplit=opt("--hn-split","true").toBoolean
   val qualityEnabled=opt("--quality","false").toBoolean
   val qualityTrace=opt("--quality-trace","false").toBoolean
   val contentionSets=opt("--contention-sets","8").toInt
@@ -479,6 +486,7 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
     val caseId=opt("--case-id","single")
     val stopAtMs=opt("--stop-at-ms",Long.MaxValue.toString).toLong
     for(seed <- firstSeed to lastSeed if System.currentTimeMillis()<stopAtMs) {
+    var reportHNFailure:()=>Unit=()=>()
     try {
     println(s"STRESS_BEGIN caseId=$caseId item=$item level=$level seed=$seed slices=$slices cycles=$minimum demandPeriod=$demandPeriod recvPct=$recvPct mem=$memMin..$memMax beatGap=$beatGap creditHold=$creditHold tlb=$missPct/$tlbMin..$tlbMax snoopPeriod=$snpPeriod snoopRate=$snoopRate shrink=$shrinkAddresses sets=$contentionSets lines=$contentionLines retryPct=$retryPct pattern=$pattern budget=$budget")
     val seedStart=System.nanoTime()
@@ -532,6 +540,41 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
     val knownPrefetch=mutable.ArrayBuffer.empty[BigInt]
     val offeredSnoops=mutable.Queue.empty[BigInt]
     var replaySnoopOffered=0;var replaySnoopSent=0
+    val overlap=new StressHNCDPOverlap
+    val hnEvents=mutable.ArrayBuffer.empty[(Int,BigInt,String)]
+    val hnTrace=mutable.Queue.empty[String]
+    var hnLastSample = -1
+    val extension=if(hnExtension) Some(new L2HNExtensionModel(
+      HNExtConfig(retryPercent=0,splitPercent=if(hnSplit)50 else 0,dctPercent=if(hnDct)50 else 0,
+        seed=0x484e4558L+seed*100+slices,forwardEnable=hnDct,
+        requestLatencyMin=memMin,requestLatencyMax=memMax,minBeatGap=beatGap),StressMemory.beat _,line=>{
+        hnTrace.enqueue(line);while(hnTrace.size>512)hnTrace.dequeue()
+        if(line.startsWith("HN_EXT_EVENT ")) {
+          val f=line.split(" ").drop(1).map(_.split("=",2)).map(a=>a(0)->a(1)).toMap
+          val event=f("name");val c=f("cycle").toInt;val pa=BigInt(f("pa").drop(2),16)
+          if(Set("dctForwardComplete","requesterDCT","splitRead","normalSnoop","stashSnoop")(event)) hnEvents+=((c,pa,event))
+        } else if(line.startsWith("HN_EXT_DUT_PROTOCOL_ERROR")) println(line)
+      })) else None
+    var extCompletedIndex=0
+    val extPins=extension.map { m=>
+      driver.validateData=(q,b,c)=>m.upstreamData(q.addr,b,c)
+      new StressHNExtensionPins(dut,dn,m,hnRequester,dataPeriod,(q,c)=>{
+        val id=DnTxnID(q.txn);assert(!live(id),s"downstream live TxnID reuse $id")
+        live+=id;dn.noteRequest(id)
+        if(qualityEnabled) qualityModel.downstream(c,q.addr,L2HNExtensionModel.isWrite(q.op))
+        if(!L2HNExtensionModel.isWrite(q.op)) {
+          val tid=id.v.toInt>>log2Ceil(slices);val bank=id.v.toInt & (slices-1)
+          if(dut.internal(bank)(tid).peek().litToBoolean)knownPrefetch+=q.addr
+          if(dut.hnPrefetchSource(bank)(tid).peek().litValue==9)overlap.event(c,q.addr,"cdpIssued")
+        }
+      },(d,c)=>if(qualityEnabled)qualityModel.refill(c,d.addr,d.beat/2))
+    }
+    def hnReport(closed:Boolean):Unit=extension.foreach { m=>
+      println(s"STRESS_HN_EXT caseId=$caseId seed=$seed closed=$closed retryPercent=0 dct=$hnDct split=$hnSplit violations=${m.counts("dutProtocolErrors")} "+m.counts.toSeq.sortBy(_._1).map{case(k,v)=>s"$k=$v"}.mkString(" "))
+      overlap.report(caseId,seed,closed,hnLastSample+1)
+      if(!closed)hnTrace.foreach(println)
+    }
+    reportHNFailure=()=>hnReport(false)
     def cdpSnapshot(closed:Boolean):Unit={
       val raw=dut.cdpCountPacked.peek().litValue
       println(s"STRESS_CDP_SNAPSHOT caseId=$caseId seed=$seed cycle=$cycle closed=$closed " + dut.cdpCounters.indices.map(i=>dut.cdpCounters(i)._1+"="+((raw>>(64*i))&((BigInt(1)<<64)-1))).mkString(" "))
@@ -791,6 +834,10 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
           if(fast && c==0) fastEmits+=1
         }
       }
+      var chosenData:Option[PendingDnComp]=None
+      var chosenResponsePA:Option[BigInt]=None
+      def dataLegal(d:PendingDnComp)=hnOrdering.canData(d.srcId,d.addr)
+      if(!hnExtension) {
       if(flag(dut.io.chi.txreq.flitv)) {
         val f=dut.io.chi.txreq.flit
         val id=DnTxnID(value(f.TxnID.get)); val dst=value(f.SrcID.get)
@@ -825,9 +872,6 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
           for(b <- 0 until 2) data.enqueue(PendingDnComp(id,dst,cycle+delay+b*beatGap,b,resp,addr))
         }
       }
-      var chosenData:Option[PendingDnComp]=None
-      var chosenResponsePA:Option[BigInt]=None
-      def dataLegal(d:PendingDnComp)=hnOrdering.canData(d.srcId,d.addr)
       if(data.exists(d=>d.due<=cycle && !dataLegal(d))) dataOrderStalls+=1
       // Host CHI channels use link credits instead of ready. Measure only
       // a due item waiting for credit, separately from its configured delay.
@@ -854,6 +898,7 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
         if(r.opcode==7) pcrdSent+=1
         else if(r.opcode!=3) { dn.noteResponse(r.dnTxnID,true,cycle); assert(live.remove(r.dnTxnID)) }
       }
+      }
       // Preserve every offer across credit/order stalls, as in pf-v2.
       if(replayPath.nonEmpty && stimulus && tape.snoop>=0) {
         offeredSnoops.enqueue(tape.snoop);replaySnoopOffered+=1;snoopOffers+=1
@@ -867,11 +912,19 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
       }
       if(generateSnoop && (snoopTargets.nonEmpty || shrinkAddresses || pattern=="contention" || knownPrefetch.nonEmpty)) {
         val candidate=if(snoopTargets.nonEmpty) snoopTargets(snoopRandom.nextInt(snoopTargets.size)) else if(shrinkAddresses || pattern=="contention") {
-          data.headOption.map(_.addr).getOrElse(poolAddress(snoopRandom.nextInt(contentionSets*contentionLines)))
+          extension.flatMap(_.activeReadRequests.headOption.map(_.addr)).orElse(data.headOption.map(_.addr)).getOrElse(poolAddress(snoopRandom.nextInt(contentionSets*contentionLines)))
         } else if(knownPrefetch.nonEmpty) knownPrefetch(snoopRandom.nextInt(knownPrefetch.size))
         else BigInt(0x200000)
         offeredSnoops.enqueue(candidate);snoopOffers+=1;tapeSnoop=candidate
       }
+      if(hnExtension) {
+        while(offeredSnoops.nonEmpty)extPins.get.offer(offeredSnoops.dequeue())
+        extPins.get.drive(cycle,_=>false)
+        if(flag(dut.io.chi.rxsnp.flitv)) {
+          snpSent+=1;if(stimulus)stimulusSnoops+=1
+          if(qualityEnabled)qualityModel.snoop(cycle,value(dut.io.chi.rxsnp.flit.Addr.get)<<3)
+        }
+      } else {
       // These are the exact pf-v2 three guards: old scoreboard state,
       // same-edge chosen CompData, and same-edge chosen completion.
       def snoopLegal(addr:BigInt)=hnOrdering.canSnoop(hnRequester,addr)&&
@@ -905,6 +958,7 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
         trace(s"DN_SNP_RESP id=$id")
         assert(snpLive.remove(id),s"unmatched snoop response $id"); snpDone+=1
       }
+      }
       if(!flag(dut.io.t1p.head.UpRSP.valid)) snoops.headOption.foreach { case(id,src)=>
         up.driveUpSnpResp(id,src)
         if(flag(dut.io.t1p.head.UpRSP.ready)) snoops.dequeue()
@@ -923,6 +977,18 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
         }
       }
 
+    if(hnExtension) {
+      extPins.get.sample(cycle)
+      val m=extension.get
+      while(extCompletedIndex<m.completedRequests.size) {
+        val (_,q)=m.completedRequests(extCompletedIndex);extCompletedIndex+=1
+        val id=DnTxnID(q.txn);assert(live.remove(id));dn.noteResponse(id,true,cycle)
+      }
+      snpDone=m.counts("snoopCompleted").toInt
+      hnEvents.foreach{case(c,pa,name)=>overlap.event(c,pa,name)};hnEvents.clear()
+      if(flag(dut.probe.algorithm(1).valid))overlap.event(cycle,value(dut.probe.algorithm(1).bits),"cdpEmitted")
+      overlap.tick(cycle);hnLastSample=cycle
+    } else {
     // Independently sample the actual pins, rather than trusting queue choices.
     // Outgoing messages are checked before incoming responses at this edge:
     // a response observed now only releases an ordering barrier next cycle.
@@ -955,6 +1021,7 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
       hnOrdering.writeData(value(f.SrcID.get),value(f.TxnID.get),value(f.DataID.get).toInt,cycle)
       trace(s"COPYBACK_DATA cycle=$cycle rn=${value(f.SrcID.get)} dbid=${value(f.TxnID.get)} beat=${value(f.DataID.get)}")
     }
+    }
       orderingSamples+=1
       sampleCensus()
       if(stimulus && flag(dut.io.t1p.head.UpREQ.valid)) {
@@ -983,7 +1050,7 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
       if(recordTape) println(s"STRESS_TAPE cycle=$cycle demand=${tapeDemand.toString(16)} recv=${if(recv) 1 else 0} recvAddr=${recvAddr.toString(16)} snoop=${tapeSnoop.toString(16)}")
       if(snapshotCycles(cycle)) {qos();dumpStall()}
       if(driver.pending!=0 && cycle-lastProgress>=20000) {
-        qos();dumpStall()
+        qos();dumpStall();hnReport(false)
         if(qualityEnabled) qualityModel.report(cycle,false)
         println(s"HN_CHI_ORDER_CHECK caseId=$caseId seed=$seed pass=true closed=false violations=0 samples=$orderingSamples dataStallCycles=$dataOrderStalls snoopStallCycles=$snoopOrderStalls responseStallCycles=$responseOrderStalls")
       }
@@ -992,7 +1059,7 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
       val pendingQueues=(0 until slices).flatMap(s=>(0 to 9).map(src=>count(dut.observation.prefetchPendingBySource,s,src))).sum
       val idle= !stimulus && driver.pending==0 && data.isEmpty && rsp.isEmpty && live.isEmpty && snoops.isEmpty && replies.isEmpty && pendingQueues==0 && !active
       val fullyIdle=idle && transactions.isEmpty && terminals.isEmpty && cdpExpected.isEmpty &&
-        allowed(0).values.forall(_==0) && flag(dut.stateEmpty) && snpLive.isEmpty && retryLive.isEmpty && firstBeatSent.isEmpty && offeredSnoops.isEmpty && hnOrdering.empty
+        allowed(0).values.forall(_==0) && flag(dut.stateEmpty) && snpLive.isEmpty && retryLive.isEmpty && firstBeatSent.isEmpty && offeredSnoops.isEmpty && hnOrdering.empty && extension.forall(_.empty)
       quiet=if(fullyIdle) quiet+1 else 0
       withholding=stimulus && ((creditHold>0 && cycle%(creditHold+64)<creditHold) || random.nextInt(100)<creditRandom)
       dn.withholdRequestCredit=withholding
@@ -1041,11 +1108,20 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
       println(s"STRESS_SOURCE caseId=$caseId maxEnterGap=${maxEnterGap(src)} pass=true slices=$slices seed=$seed source=$src produced=${produced.map(_(src)).sum} enqueued=${led(0)} overwritten=${led(1)} entered=${entered.map(_(src)).sum} queueEntered=${led(2)} dedup=${led(3)} pending=${led(4)} useful=$useful redundant=$redundant")
     }
     assert(hnOrdering.empty,"HN ordering closure")
+    extension.foreach(_.finish());hnReport(true)
     qos()
     println(s"HN_CHI_ORDER_CHECK caseId=$caseId seed=$seed pass=true closed=true violations=0 samples=$orderingSamples dataStallCycles=$dataOrderStalls snoopStallCycles=$snoopOrderStalls responseStallCycles=$responseOrderStalls")
     println(s"STRESS_SOAK caseId=$caseId item=$item level=$level pass=true slices=$slices seed=$seed cycles=$cycle activeCycles=$activeCycles demands=$submitted completed=${driver.completed} checkedBeats=${driver.checkedBeats} translations=$translations recvInputs=$recvInputs watchdog=false scoreboard=true sourceClosure=true totalConservation=true recvConservation=true")
     } catch {
       case e:AssertionError=>
+        reportHNFailure()
+        suiteHadFailures=true
+        println(s"STRESS_FAIL caseId=$caseId seed=$seed slices=$slices error=${e.getMessage.replace('\n',' ')}")
+      case e:IllegalStateException if Option(e.getMessage).exists(m=>
+        m.startsWith("HN_CHI_EXTENSION_VIOLATION")||m.startsWith("L2_CHI_PROTOCOL_VIOLATION"))=>
+        // Preserve the original protocol failure even if its partial event
+        // sample cannot be used for an overlap audit.
+        try reportHNFailure() catch {case scala.util.control.NonFatal(d)=>println("STRESS_HN_DIAGNOSTIC_FAILURE "+d.getMessage)}
         suiteHadFailures=true
         println(s"STRESS_FAIL caseId=$caseId seed=$seed slices=$slices error=${e.getMessage.replace('\n',' ')}")
     }

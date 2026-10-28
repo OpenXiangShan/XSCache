@@ -5,9 +5,11 @@ import scala.collection.mutable
 // Host-only CHI model, shared by v2/v3 adapters. No dependency on either
 // conflict harness or RTL hierarchy. IHI0050E.b is the normative issue.
 case class HNExtConfig(retryPercent:Int=30, splitPercent:Int=50, dctPercent:Int=50,
-  seed:Long=1L, maxGrantDelay:Int=2048, maxSplitGap:Int=512, forwardEnable:Boolean=true, directedCopyBackRetry:Boolean=false) {
+  seed:Long=1L, maxGrantDelay:Int=2048, maxSplitGap:Int=512, forwardEnable:Boolean=true, directedCopyBackRetry:Boolean=false,
+  requestLatencyMin:Int=12,requestLatencyMax:Int=44,minBeatGap:Int=1) {
   require(Set(0,10,30,50)(retryPercent))
   require(0<=splitPercent && splitPercent<=100 && 0<=dctPercent && dctPercent<=100)
+  require(requestLatencyMin>=1 && requestLatencyMax>=requestLatencyMin && minBeatGap>=1)
   require(maxGrantDelay>=1 && maxGrantDelay<=2048 && maxSplitGap>=0 && maxSplitGap<=512)
 }
 case class HNExtReq(fields:Map[String,BigInt]) {
@@ -198,7 +200,7 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
   }
   private def accept(req:HNExtReq,c:Int):Unit={
     acceptedRequests+=((c,req));counts("accepted")+=1
-    val due=c+12+rng.nextInt(33)
+    val due=c+config.requestLatencyMin+rng.nextInt(config.requestLatencyMax-config.requestLatencyMin+1)
     if(isWrite(req.op)) {
       writes(req.key)=Write(req)
       responses+=SR(due,HNExtRsp(req.rn,req.txn,if(req.op==13)4 else 5,dbid=req.txn))
@@ -217,11 +219,11 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
         val rspDue=due+(if(responseFirst)0 else gap)
         val datDue=due+(if(responseFirst)gap else 0)
         responses+=SR(rspDue,HNExtRsp(req.rn,req.txn,11,home,dbid,resp))
-        for(beat<-Seq(0,2))data+=SD(datDue+(if(beat==0)0 else 1+rng.nextInt(17)),HNExtDat(req.rn,req.txn,11,src,home,dbid,resp,beat,req.addr))
+        for(beat<-Seq(0,2))data+=SD(datDue+(if(beat==0)0 else config.minBeatGap+rng.nextInt(17)),HNExtDat(req.rn,req.txn,11,src,home,dbid,resp,beat,req.addr))
         counts("splitGapMin")=if(n==0)gap else counts("splitGapMin").min(gap)
         counts("splitGapMax")=counts("splitGapMax").max(gap)
       } else {
-        for(beat<-Seq(0,2))data+=SD(due+(if(beat==0)0 else 1+rng.nextInt(17)),HNExtDat(req.rn,req.txn,4,src,home,dbid,resp,beat,req.addr))
+        for(beat<-Seq(0,2))data+=SD(due+(if(beat==0)0 else config.minBeatGap+rng.nextInt(17)),HNExtDat(req.rn,req.txn,4,src,home,dbid,resp,beat,req.addr))
       }
     }
   }
@@ -251,7 +253,8 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
     val ri=if(rspReady)responses.indexWhere(x=>x.due<=c&&rspLegal(x.r)) else -1
     val rsp=if(ri>=0)Some(responses.remove(ri).r) else None
     if(data.exists(x=>x.due<=c&& !canData(x.d.rn,x.d.addr)))counts("dataOrderStallCycles")+=1
-    val di=if(datReady&&rng.nextInt(5)!=0)data.indexWhere(x=>x.due<=c&& !paused(x.d.addr)&&canData(x.d.rn,x.d.addr)) else -1
+    val di=if(datReady&&rng.nextInt(5)!=0)data.indexWhere(x=>x.due<=c&& !paused(x.d.addr)&&canData(x.d.rn,x.d.addr)&&
+      (x.d.beat==0||reads.get((x.d.rn,x.d.txn)).exists(r=>r.firstData>=0&&c-r.firstData>=config.minBeatGap))) else -1
     val dat=if(di>=0)Some(data.remove(di).d) else None
     val snp=offers.headOption.flatMap{case(rn,pa,requested)=>
       val sameNow=dat.exists(x=>x.rn==rn&&(x.addr>>6)==(pa>>6)) ||
@@ -259,8 +262,10 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
       if(!canSnoop(rn,pa)||sameNow){counts("snoopOrderStallCycles")+=1;None}
       else if(!snpReady)None
       else {
-        check(snpSeq<4000,"snoop TxnID range exhausted")
         val sequence=snpSeq;snpSeq+=1
+        val txn=(1 to 4000).iterator.map(i=>BigInt(1+(sequence+i-1)%4000))
+          .find(id=> !snoops.contains((BigInt(0),id)))
+          .getOrElse(throw new IllegalStateException("HN_CHI_EXTENSION_VIOLATION all snoop TxnIDs live"))
         val selectedOp=requested.getOrElse(if(sequence%10<6)fwdOps((sequence%10+sequence/10)%fwdOps.size)
           else if(sequence%10<8)stashOps((sequence/10+sequence)%stashOps.size)
           else normalOps((sequence/10+sequence)%normalOps.size))
@@ -270,7 +275,7 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
           0x14->4,0x16->0x15,0x17->7).getOrElse(selectedOp,selectedOp)
         val ret=if(Set(1,2,3,4,0x11,0x12,0x14)(op))sequence%2 else 0
         val sd=if(op==0x10)0 else if(Set(1,2,3,4,0x11,0x12,0x13,0x14,0x15,0x16)(op))sequence%2 else 1
-        offers.dequeue();Some(HNExtSnp(rn,0,BigInt(snpSeq),pa,op,ret,sd,
+        offers.dequeue();Some(HNExtSnp(rn,0,txn,pa,op,ret,sd,
           if(isFwd(op))BigInt(0x100+sequence%4) else BigInt(0),if(isFwd(op))BigInt(0x800+sequence%1024) else BigInt(0)))
       }
     }
