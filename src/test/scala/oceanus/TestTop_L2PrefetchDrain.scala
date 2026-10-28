@@ -135,7 +135,8 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
   val fast=args.contains("--fast")
   OvernightMemory.vaMask=if(fast) BigInt(0x1000000) else BigInt(0)
   def physical(va: BigInt)=va ^ OvernightMemory.vaMask
-  require(slices == 1 && Set(1, 6, 11, 16)(firstSeed) && lastSeed == firstSeed)
+  val soak = args.contains("--soak")
+  require(slices == 1 && (if(soak) firstSeed >= 1 && lastSeed >= firstSeed else Set(1, 6, 11, 16)(firstSeed) && lastSeed == firstSeed))
   require(minimum == 5000 && demandPeriod == 32 && !harsh && !fast)
   val stopCycle = minimum + 30000
   val drainLimit = stopCycle + 20000

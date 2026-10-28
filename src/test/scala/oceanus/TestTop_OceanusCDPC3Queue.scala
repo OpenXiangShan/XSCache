@@ -12,6 +12,7 @@ class CDPC3QueueHarness(inputs:Int) extends Module {
   val io=IO(new Bundle {
     val valid=Input(UInt(inputs.W));val data=Input(Vec(inputs,UInt(16.W)));val ready=Input(Bool())
     val accepted=Output(UInt(inputs.W));val out=Output(UInt(17.W));val count=Output(UInt(4.W))
+    val head=Output(UInt(3.W));val tail=Output(UInt(3.W))
     val rawAccepted=Output(UInt(inputs.W));val rawOut=Output(UInt(17.W));val rawCount=Output(UInt(4.W))
   })
   val prod=Module(new OceanusCDPQueue(UInt(16.W),inputs))
@@ -31,27 +32,30 @@ class CDPC3QueueHarness(inputs:Int) extends Module {
   io.count:=prod.io.count
   def read[T<:Data](d:T):T=BoringUtils.bore(d)
   io.rawCount:=read(raw.enq_ptr)-read(raw.deq_ptr)
+  io.head:=read(prod.head);io.tail:=read(prod.tail)
   when(!reset.asBool) {
     assert(prod.io.deq.valid===adapter.io.deq(0).valid)
     when(prod.io.deq.valid){assert(prod.io.deq.bits===adapter.io.deq(0).bits)}
   }
 }
 object TestTop_OceanusCDPC3Queue extends App with ChiselSim {
-  implicit val simulator:HasSimulator=HasSimulator.default
+  implicit val simulator:HasSimulator=CDPAuditSimulator.bounded
   var checks=0L
   for(inputs<-Seq(2,3))simulate(new CDPC3QueueHarness(inputs)){dut=>
+    var pushes=0;var pops=0
     val fifo=mutable.Queue.empty[Int];var rawFires=0;var rawPops=0;var data=1
     def tick(valid:Int,ready:Boolean):Unit={
       dut.io.valid.poke(valid);dut.io.ready.poke(ready)
       for(i<-0 until inputs)dut.io.data(i).poke(data+i)
       val expected=fifo.headOption.map(x=>BigInt(65536+x)).getOrElse(BigInt(0))
       assert(dut.io.out.peek().litValue==expected);assert(dut.io.count.peek().litValue==fifo.size)
+      assert(dut.io.head.peek().litValue==pops%8 && dut.io.tail.peek().litValue==pushes%8,"queue modulo pointer reference")
       val free=8-fifo.size
       val add=(0 until inputs).filter(i=>((valid>>i)&1)!=0).take(free)
       val mask=add.map(1<<_).sum
       assert(dut.io.accepted.peek().litValue==mask)
-      if(ready && fifo.nonEmpty)fifo.dequeue()
-      add.foreach(i=>fifo.enqueue(data+i))
+      if(ready && fifo.nonEmpty){fifo.dequeue();pops+=1}
+      add.foreach(i=>fifo.enqueue(data+i));pushes+=add.size
       rawFires+=dut.io.rawAccepted.peek().litValue.bitCount
       if(ready && dut.io.rawOut.peek().litValue.testBit(16))rawPops+=1
       data+=inputs;dut.clock.step();checks+=1
@@ -83,6 +87,8 @@ object TestTop_OceanusCDPC3Queue extends App with ChiselSim {
     for(_<-0 until 4000)tick(random.nextInt(1<<inputs),random.nextBoolean())
     for(_<-0 until 12)tick(0,true)
     assert(fifo.isEmpty)
+    assert(pushes/8>=50 && pops/8>=50)
+    println(s"CDP_QUEUE_WRAP pass=true inputs=$inputs tailWraps=${pushes/8} headWraps=${pops/8} residual=${fifo.size}")
   }
   println(s"CDP_C3_QUEUE_RESULT pass=true checks=$checks raw_dependency_counterexamples=2")
 }

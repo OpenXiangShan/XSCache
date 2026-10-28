@@ -109,7 +109,7 @@ object TestTop_OceanusCDPC5Replay extends App with ChiselSim {
     case ref.ReferenceCDPKey => ref.CDPParameters()
     case ref.ReferenceCDPBankBitsKey => log2Ceil(header("slices").num.toInt)
   }
-  implicit val simulator: HasSimulator = HasSimulator.default
+  implicit val simulator: HasSimulator = CDPAuditSimulator.bounded
   simulate(new CDPC5ReplayReference()(rp)) { dut =>
     val disposition = dispositionReport.map { _ =>
       Vector("dut", "reference").map(side => new CDPC5Dispositions(side,

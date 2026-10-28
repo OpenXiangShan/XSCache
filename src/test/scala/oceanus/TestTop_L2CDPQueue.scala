@@ -21,6 +21,8 @@ class L2CDPQueueHarness(implicit p: Parameters) extends Module {
     val chosen = Output(UInt(2.W))
     val drops = Output(Vec(4, UInt(64.W)))
     val occupancy = Output(Vec(4, UInt(4.W)))
+    val heads = Output(Vec(4, UInt(3.W)))
+    val tails = Output(Vec(4, UInt(3.W)))
     val source = Input(UInt(4.W))
     val depth = Input(UInt(2.W))
     val sequence = Input(UInt(2.W))
@@ -36,6 +38,8 @@ class L2CDPQueueHarness(implicit p: Parameters) extends Module {
     arb.io.in(bank) <> queue.io.out
     io.drops(bank) := queue.io.dropped
     io.occupancy(bank) := queue.io.occupancy
+    io.heads(bank) := chisel3.util.experimental.BoringUtils.bore(queue.head)
+    io.tails(bank) := chisel3.util.experimental.BoringUtils.bore(queue.tail)
   }
   io.out <> arb.io.out
   io.chosen := arb.io.chosen
@@ -50,12 +54,13 @@ object TestTop_L2CDPQueue extends App with ChiselSim {
     case L2ParamsKey => L2Params()
     case CHIParametersKey => CHIParameters(issue = EnumCHIIssue.E, nodeIdWidth = 11, reqAddrWidth = 48, dataWidth = 256)
   })
-  implicit val simulator: HasSimulator = HasSimulator.default
+  implicit val simulator: HasSimulator = CDPAuditSimulator.bounded
   simulate(new L2CDPQueueHarness()(params)) { dut =>
     case class Half(addr: BigInt, data: BigInt, source: Int, depth: Int, hit: Boolean, high: Boolean)
     val fifos = Seq.fill(4)(mutable.Queue.empty[Half])
     val drops = Array.fill[BigInt](4)(0)
     val served = Array.fill(4)(0)
+    val enqueued = Array.fill(4)(0)
     val waits = Array.fill(4)(0)
     val random = new Random(6882)
     var partial = 0
@@ -95,6 +100,7 @@ object TestTop_L2CDPQueue extends App with ChiselSim {
       for (bank <- 0 until 4) {
         assert(value(dut.io.drops(bank)) == drops(bank))
         assert(value(dut.io.occupancy(bank)) == fifos(bank).size)
+        assert(value(dut.io.heads(bank)) == served(bank)%8 && value(dut.io.tails(bank)) == enqueued(bank)%8, "half queue modulo pointer reference")
       }
       if (ready && backlogged.nonEmpty) {
         val bank = value(dut.io.chosen).toInt
@@ -114,16 +120,21 @@ object TestTop_L2CDPQueue extends App with ChiselSim {
         val accepted = math.min(2, 8 - fifos(bank).size)
         if (accepted == 1) partial += 1
         fifos(bank).enqueueAll(payloads(bank).take(accepted))
+        enqueued(bank) += accepted
         drops(bank) += 2 - accepted
       }
       dut.clock.step(); cycle += 1
     }
     for (_ <- 0 until 6) tick(Set(0, 1, 2, 3), false)
     for (_ <- 0 until 48) tick(Set(0, 1, 2, 3), true)
-    for (_ <- 0 until 1200) tick((0 until 4).filter(_ => random.nextBoolean()).toSet, random.nextInt(4) != 0)
+    for (_ <- 0 until 4000) tick((0 until 4).filter(_ => random.nextBoolean()).toSet, random.nextInt(4) != 0)
     while (fifos.exists(_.nonEmpty)) tick(Set.empty, true)
     tick(Set.empty, true)
     assert(partial > 0 && simultaneous > 0 && drops.forall(_ > 0) && served.forall(_ > 100))
+    for(bank <- 0 until 4) {
+      assert(served(bank)/8>=50 && enqueued(bank)/8>=50)
+      println(s"CDP_HALF_QUEUE_WRAP pass=true bank=$bank headWraps=${served(bank)/8} tailWraps=${enqueued(bank)/8} residual=${fifos(bank).size}")
+    }
     println(s"CDP_QUEUE_RESULT pass=true cycles=$cycle partial=$partial simultaneous=$simultaneous drops=${drops.mkString(",")} served=${served.mkString(",")} rrBound=4")
     println("CDP_TXN_RESULT pass=true encodings=256 sources=16 depths=4 sequences=4 legacyDepthZero=true")
   }

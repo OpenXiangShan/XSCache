@@ -245,10 +245,12 @@ object TestTop_OceanusCDPC2 extends App with ChiselSim {
     case LogUtilsOptionsKey => LogUtilsOptions(enableDebug = false, enablePerf = false, fpgaPlatform = false)
     case PerfCounterOptionsKey => PerfCounterOptions(enablePerfPrint = false, enablePerfDB = false, perfLevel = XSPerfLevel.VERBOSE, 0)
   })
-  implicit val simulator: HasSimulator = HasSimulator.default
+  implicit val simulator: HasSimulator = CDPAuditSimulator.bounded
   def option(name: String, default: Int) = args.find(_.startsWith(name+"=")).map(_.split("=")(1).toInt).getOrElse(default)
   val seeds = option("--seeds", 1000)
   val randomCycles = option("--cycles", 512)
+  val wraps = option("--wraps", 0)
+  require(wraps >= 0)
   val traceRoot = Paths.get(sys.props.getOrElse("oceanus.c2.trace", "/data/zhuy/pf-framework/c2/traces"))
   Files.createDirectories(traceRoot)
   val head = sys.props.getOrElse("oceanus.c2.head", sys.error("HEAD property required"))
@@ -464,6 +466,28 @@ object TestTop_OceanusCDPC2 extends App with ChiselSim {
       for(tag<-0 until 12) separated(event(0,used=false,evict=true,victim=address(tag,5,0)),"same-set-replacement")
       for(i<-0 until 80) tick(event(address(1,5,i%64)),send=64|5,label="same-entry-slot-serialization")
     }
+    if(wraps > 0) {
+      scenario("saturating-boundary-cycles") {
+        val a = address(7, 5, 31)
+        separated(event(a,used=false,evict=true,victim=a), "sat-prime")
+        for(round <- 0 until wraps) {
+          for(i <- 0 until 6) separated(event(a), "sat-down")
+          assert(table(5).flatten.find(_.tag==7).get.sat(31)==0)
+          for(i <- 0 until 6) separated(event(a,used=false,evict=true,victim=a), "sat-up")
+          assert(table(5).flatten.find(_.tag==7).get.sat(31)==3)
+          totals("saturation-roundtrip") += 1
+        }
+      }
+      scenario("plru-return-cycles") {
+        for(tag <- 0 until 4) separated(event(0,used=false,evict=true,victim=address(tag,5,0)), "plru-prime")
+        val origin = lru(5)
+        for(round <- 0 until wraps) {
+          for(tag <- 0 until 4) separated(event(address(tag,5,0)), "plru-cycle")
+          assert(lru(5)==origin, "C2 PLRU return cycle")
+          totals("plru-return") += 1
+        }
+      }
+    }
     scenario("eligibility-disable-drain") {
       for(i<-0 until 32) tick(event(address(1,5,0),used=false,evict=true,victim=address(1,5,0)),label="fill-queue")
       for(i<-0 until 64) tick(event(address(1,5,0),enable=false),label="disabled-drain")
@@ -491,6 +515,7 @@ object TestTop_OceanusCDPC2 extends App with ChiselSim {
       "same-entry-stall","same-entry-different-slot","queue-drop","qualification-excluded","replacement",
       "sat-bank-boundary","response-during-write","write-vs-send","write-vs-train-read","dual-query-contention","full-set-scan"))
     assert(totals(name)>0,s"missing C2 required coverage $name")
+  if(wraps > 0) assert(totals("saturation-roundtrip") >= wraps && totals("plru-return") >= wraps && totals("saturate-zero") >= wraps && totals("saturate-three") >= wraps)
   totals.toSeq.sortBy(_._1).foreach { case(n,c)=>println(s"CDP_C2_CASE name=$n count=$c matched=$c") }
   println(s"CDP_C2_RESULT pass=true cycles=$cycles matched=$cycles seeds=$seeds mismatches=0 host_model=true")
 }

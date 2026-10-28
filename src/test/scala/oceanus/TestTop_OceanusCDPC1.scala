@@ -74,9 +74,11 @@ class CDPC1Harness(period: Int, hash: Boolean)(implicit p: Parameters) extends M
     val directWrite = Input(UInt(20.W))
     val snapshot = Output(UInt(1600.W))
     val activity = Output(UInt(50.W))
+    val plru = Output(UInt(12.W))
   })
   val table = Module(new CDPC1TableProbe()(prodParams))
   val pipe = Module(new CDPC1PipelineProbe()(prodParams))
+  io.plru := pipe.audit(20, 9)
   val referenceTable = Module(new CDPC1ReferenceTableProbe()(refParams))
   val referencePipe = Module(new CDPC1ReferencePipelineProbe()(refParams))
   val queue = Module(new Queue(new OceanusCDPTrain()(prodParams), 8))
@@ -213,10 +215,13 @@ object TestTop_OceanusCDPC1 extends App with ChiselSim {
     case LogUtilsOptionsKey => LogUtilsOptions(enableDebug = false, enablePerf = false, fpgaPlatform = false)
     case PerfCounterOptionsKey => PerfCounterOptions(enablePerfPrint = false, enablePerfDB = false, perfLevel = XSPerfLevel.VERBOSE, 0)
   })
-  implicit val simulator: HasSimulator = HasSimulator.default
+  implicit val simulator: HasSimulator = CDPAuditSimulator.bounded
   def option(name: String, default: Int) = args.find(_.startsWith(name + "=")).map(_.split("=")(1).toInt).getOrElse(default)
   val seeds = option("--seeds", 500)
   val randomCycles = option("--cycles", 512)
+  val wraps = option("--wraps", 1)
+  require(wraps >= 1)
+  val wrapPeriod = math.max(2048, wraps * 256 + 512)
   val traceRoot = Paths.get(sys.props.getOrElse("oceanus.c1.trace", "/data/zhuy/pf-framework/c1/traces"))
   Files.createDirectories(traceRoot)
   val sourceHead = sys.props.getOrElse("oceanus.c1.head", sys.error("run via scripts/run-pf-c1.py diff STAGE to record HEAD"))
@@ -288,7 +293,7 @@ object TestTop_OceanusCDPC1 extends App with ChiselSim {
           allocSub: Boolean = false, cdp: Boolean = false): Int =
     (1 << 19) | (if(allocMain) 1 << 18 else 0) | (if(allocSub) 1 << 17 else 0) |
       (way << 15) | (main << 13) | (sub << 11) | (tag << 1) | (if(cdp) 1 else 0)
-  for((period, hash) <- Seq((128, true), (128, false), (2048, true))) {
+  for((period, hash) <- Seq((128, true), (128, false), (wrapPeriod, true))) {
     simulate(new CDPC1Harness(period, hash)(params)) { dut =>
       var model = new TableModel(period)
       var trace: PrintWriter = null
@@ -400,8 +405,8 @@ object TestTop_OceanusCDPC1 extends App with ChiselSim {
       } else {
         scenario("wrap10") {
           // Real pipeline traffic, no force/deposit of counter state.
-          for(i <- 0 until 300) separated(event(0x201000, hit = true, source = 9), "wrap10")
-          assert(model.entries.flatten.exists(_.refs == 176)) // 300*4 mod 1024
+          for(i <- 0 until (wraps * 256 + 44)) separated(event(0x201000, hit = true, source = 9), "wrap10")
+          assert(model.entries.flatten.exists(_.refs == 176)) // (wraps*256+44)*4 mod 1024
         }
       }
       scenario("conflict-replacement") {
@@ -417,6 +422,26 @@ object TestTop_OceanusCDPC1 extends App with ChiselSim {
           tick(event(va | (BigInt(i%4) << 21), hit = i%2 == 0, source = 9), label = "conflict-replacement")
         }
         for(i <- 0 until 80) tick(event(BigInt(i%4) << 21), label = "same-main-different-sub")
+      }
+      if(wraps > 1) {
+        def sameSetVA(tag: Int): BigInt = {
+          val folded = (0 until 25).filter(b => ((tag >> b)&1) != 0).foldLeft(0)((v,b) => v ^ (1 << (b%2)))
+          (BigInt(tag) << 25) | (if(hash) BigInt(folded) << 23 else BigInt(0))
+        }
+        scenario("plru-return-cycles") {
+          for(tag <- 0 until 4) separated(event(sameSetVA(tag)), "plru-prime")
+          val origin = dut.io.plru.peek().litValue
+          for(round <- 0 until wraps) {
+            for(tag <- 0 until 4) separated(event(sameSetVA(tag)), "plru-cycle")
+            assert(dut.io.plru.peek().litValue == origin, "C1 PLRU return cycle")
+            totals("plru-return") += 1
+          }
+        }
+        if(period == 128) scenario("refresh-cycles") {
+          val before = totals("refresh")
+          for(i <- 0 until (wraps * 129 + 16)) separated(event(0x201000), "refresh-cycles")
+          assert(totals("refresh") - before >= wraps)
+        }
       }
       scenario("address-modes-admission") {
         separated(event((BigInt(1)<<39)-64), "sv39")
@@ -451,6 +476,8 @@ object TestTop_OceanusCDPC1 extends App with ChiselSim {
   for(name <- Seq("plus1", "plus4", "refresh", "refresh-overlap", "wrap", "alloc-main", "alloc-sub", "replacement", "same-main-stall", "queue-drop", "pipeline-refresh-overlap", "hot-true", "hot-false"))
     assert(totals(name) > 0, s"missing required coverage $name")
   assert(totals("random-seeds") >= seeds)
+  assert(totals("wrap") >= wraps)
+  if(wraps > 1) assert(totals("plru-return") >= wraps && totals("refresh") >= wraps)
   totals.toSeq.sortBy(_._1).foreach { case (name, count) => println(s"CDP_C1_CASE name=$name count=$count matched=$count") }
   println(s"CDP_C1_RESULT pass=true cycles=$cycles matched=$cycles seeds=$seeds mismatches=0 host_table_model=true")
   // Shared only within the host driver, reset between every scenario/seed.

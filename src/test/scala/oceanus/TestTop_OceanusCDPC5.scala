@@ -43,6 +43,8 @@ class TestTopCDPC5(cfg: L2Configuration)(implicit p: Parameters) extends TestTop
   def fire(d: ReadyValidIO[_]): Bool = read(d.valid) && read(d.ready)
   val entries = read(s.entries)
   add("enable", module.cdpControlEnable)
+  add("wrap.sequence", module.pfSequence)
+  add("wrap.advance", fire(module.bop.io.req) || read(module.recvReqFire) || fire(module.vbopStub.get.io.req) || fire(c.io.req))
   for ((name, t) <- Seq("vpn" -> c.io.vpnTrain, "filter" -> c.io.filterTrain))
     event(name, t.valid, "pa" -> t.bits.paddr, "victim" -> t.bits.evictPaddr,
       "va" -> t.bits.vaddr, "hit" -> t.bits.hit, "prefetched" -> t.bits.prefetched,
@@ -123,7 +125,7 @@ object TestTop_OceanusCDPC5 extends App with ChiselSim {
     pfRecvEnable = true, pfCtrlEnable = true, pfTrainEnable = true, pfTlbEnable = true,
     vbopStubEnable = true, cdpStubEnable = true,
     vbopParams = OceanusVBOPParameters(badScore = 0, roundMax = 100000))
-  implicit val simulator: HasSimulator = HasSimulator.default
+  implicit val simulator: HasSimulator = CDPAuditSimulator.bounded
   simulate(new TestTopCDPC5(cfg)(CDPC5Params.apply)) { dut =>
     val directory = Paths.get(sys.props("oceanus.c5.trace")); Files.createDirectories(directory)
     val tracePath = directory.resolve(s"system-$slices-$seeds.jsonl.gz")
@@ -145,6 +147,8 @@ object TestTop_OceanusCDPC5 extends App with ChiselSim {
     val seenDownstream = mutable.Set.empty[BigInt]
     var cycle = 0; var txn = 0; var epoch = -1; var beats = 0
     var gate = true; var activePA = BigInt(0); var reset = false
+    var sequenceModel = BigInt(0); var sequenceWraps = 0L
+    val sequenceModulus = BigInt(1) << dut.widths.find(_._1 == "wrap.sequence").get._2
     var allCandidates = 0; var allDrops = 0; var hits = 0; var unused = 0; var contention = 0
     var activeSeed = 0
     def flag(b: Bool) = b.peek().litToBoolean
@@ -216,6 +220,11 @@ object TestTop_OceanusCDPC5 extends App with ChiselSim {
       var rest = packed
       val row = dut.widths.map { case (n, w) => val v = rest & ((BigInt(1) << w) - 1); rest >>= w; n -> v }.toMap
       assert(rest == 0)
+      assert(row("wrap.sequence") == sequenceModel, s"TxnID sequence mismatch cycle=$cycle")
+      if(row("wrap.advance") != 0) {
+        sequenceModel = (sequenceModel + 1) % sequenceModulus
+        if(sequenceModel == 0) sequenceWraps += 1
+      }
       trace.println(ujson.Arr(cycle, epoch, gate, packed.toString(16)).render())
       if(row("candidate") != 0) allCandidates += 1
       allDrops += row("full").toInt + row("duplicate").toInt + row("filterDrop").toInt + (0 until 16).map(i => row(s"translationDrop$i").toInt).sum
@@ -327,6 +336,7 @@ object TestTop_OceanusCDPC5 extends App with ChiselSim {
     assert(emitted.nonEmpty && admitted.nonEmpty && hits > 0)
     assert(beats == txn * 2, "demand data scoreboard did not close")
     trace.close()
+    println(s"CDP_TXN_WRAP pass=true slices=$slices wraps=$sequenceWraps modulus=$sequenceModulus cycles=$cycle")
     println(s"CDP_C5_SYSTEM_RESULT pass=true seeds=$seeds slices=$slices cycles=$cycle demands=$txn checkedBeats=$beats candidates=$allCandidates discarded=$allDrops outputs=${emitted.size} admitted=${admitted.size} useful=$hits unused=$unused tlbContention=$contention csrOff=0 trace=$tracePath")
   }
 }
