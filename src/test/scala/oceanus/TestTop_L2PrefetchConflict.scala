@@ -850,7 +850,7 @@ object TestTop_L2PrefetchConflict extends App with ChiselSim {
         val noDct=Set("no-dct","all-off")(ablation)
         val noRetry=Set("no-retry","all-off")(ablation)
         val noSplit=Set("no-split","all-off")(ablation)
-        r.enableHNExtension(HNExtConfig(retryPercent=if(noRetry)0 else opt("--retry-percent","30").toInt,
+        r.enableHNExtension(HNExtConfig(retryPercent=if(noRetry)0 else opt("--retry-percent","0").toInt,
           splitPercent=if(noSplit)0 else opt("--split-percent","50").toInt,
           dctPercent=if(noDct)0 else opt("--dct-percent","50").toInt,
           seed=0x484e0000L+seed*100+slices,forwardEnable= !noDct && opt("--forward-enable","true").toBoolean))
