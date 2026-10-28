@@ -34,7 +34,7 @@ object CDPAuditProbe {
     o.filterDrop.valid := b(s.filterDrop); o.filterDrop.bits := b(s.idx2)
     o.output.valid := b(c.io.req.valid) && b(c.io.req.ready)
     o.output.bits := b(c.io.req.bits)
-    o.outputIndex := b(s.output.io.deq.bits.index)
+    o.outputIndex := b(s.idx2)
     o.resident := PopCount(b(s.valids)); o.enable := b(c.io.enable)
   }
 }

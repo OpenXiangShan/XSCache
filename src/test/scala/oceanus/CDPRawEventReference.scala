@@ -24,6 +24,7 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt) extends Ch
   private val metas=Array.fill(slices,8)(Meta())
   private val pending=Array.fill[Option[Line]](slices,8)(None)
   private val full=Array.fill(slices,8)(false)
+  private val mergedWait=Array.fill(slices,8)(false)
   private val queues=Seq.fill(slices)(mutable.Queue.empty[Half])
   private val drop=Array.fill[BigInt](slices)(0);private val collision=Array.fill[BigInt](slices)(0)
   private var vpnLast=0;private var filterLast=0;private var halfLast=0
@@ -73,6 +74,17 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt) extends Ch
             if(isHit) old.depth else if(pf) ((num(req+".TxnID")>>2)&3).toInt else 0,isHit))
         }
       }
+      // M5: a data demand accepted into a live CDP prefetch RBE owns a
+      // default-meta refill scan when it executes. Training keeps old meta.
+      // Derive this from allocator acceptance and the host's pending identity.
+      val mergeEnter=bit(p+".enterREQ") && bit(p+".reuseREQ") &&
+        num(p+".incomingSource")!=num(p+".prefetchSourceID") &&
+        Set(CCHIOpcode.ReadShared.opcode,CCHIOpcode.ReadUnique.opcode)(num(p+".incomingOpcode").toInt) &&
+        bit(p+".incomingData") && bit(p+".prefetchActive") &&
+        pending(bank)(i).exists(x=>x.source==9 && !x.hit)
+      val mergeWaiting=mergedWait(bank)(i) || mergeEnter
+      val mergedStart=mergedWait(bank)(i) && start.exists(_.hit)
+      if(mergedStart) { start=start.map(x=>x.copy(source=0,depth=0,hit=false));hit("mergedScans") }
       val expectedTrain=train.lastOption.filter(_._1==bank*8+i).map(_._2)
       assert(bit(p+".train.valid")==expectedTrain.nonEmpty,s"M2 raw train valid bank=$bank tshr=$i cycle=$cycle")
       expectedTrain.foreach { t=>
@@ -92,7 +104,13 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt) extends Ch
         evict+=((bank*8+i,old,addr));hit("evictions")
       }
       val ctx=start.orElse(if(!bit(p+".reqValid")) pending(bank)(i) else None)
-      val expectedLine=ctx.filter(x=> !bit(p+".dealloc") && (bit(p+".last")||bit(p+".ds")||(x.hit && full(bank)(i) && !bit(p+".rx"))))
+      val expectedLine=ctx.filter { x=>
+        val cdpRefill=x.source==9 && !x.hit
+        val complete=bit(p+".last") || bit(p+".ds") ||
+          ((x.hit || cdpRefill || mergedStart) && full(bank)(i) && !bit(p+".rx"))
+        complete && (!bit(p+".dealloc") || (cdpRefill && full(bank)(i) && pending(bank)(i).nonEmpty)) &&
+          (!mergeWaiting || mergedStart) && !(cdpRefill && bit(p+".prefetchActive"))
+      }
       assert(bit(p+".line.valid")==expectedLine.nonEmpty,s"M2 capture lifecycle cycle=$cycle bank=$bank tshr=$i context=$ctx last=${bit(p+".last")} ds=${bit(p+".ds")}")
       expectedLine.foreach { l=>
         val b=p+".line.bits"
@@ -100,7 +118,8 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt) extends Ch
         assert(num(b+".data")==(memory(l.pa,0)|(memory(l.pa,1)<<256)),s"M2 independent capture memory cycle=$cycle PA=${l.pa}")
         lines(bank)+=((i,l));hit("captureLines")
       }
-      if(bit(p+".reqValid")||bit(p+".dealloc")) pending(bank)(i)=None
+      if(bit(p+".reqValid")||bit(p+".dealloc")) { pending(bank)(i)=None;mergedWait(bank)(i)=false }
+      if(mergeEnter) mergedWait(bank)(i)=true
       start.foreach(x=>pending(bank)(i)=Some(x))
       if(expectedLine.nonEmpty) pending(bank)(i)=None
       if(bit(p+".rx")||bit(p+".dealloc")) full(bank)(i)=false

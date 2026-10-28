@@ -110,7 +110,9 @@ class TestTopCDPRawAudit(cfg: L2Configuration)(implicit p: Parameters) extends T
   add("tlbRetry",PopCount(read(a.state).map(_ === 3.U)))
   add("tlbWaiting",PopCount(read(a.state).map(_ === 2.U)))
   add("tlbDone",PopCount(read(a.state).map(_ === 4.U)))
-  add("outputPending",read(s.output.io.count))
+  // Filterfix retires directly from query stage two; there is no output FIFO.
+  // Count the result stage for the overlapping transient census only.
+  add("outputPending",read(s.pftS2).asUInt)
   add("outputValid",c.io.req.valid)
   add("outputReady",c.io.req.ready)
   add("vpnValids",PopCount(read(c.vpnTable.validArray).asUInt))
@@ -153,6 +155,10 @@ class TestTopCDPRawAudit(cfg: L2Configuration)(implicit p: Parameters) extends T
     o.dealloc:=read(CDPAuditReflect.field[Bool](t,"tshr_dealloc"))
     o.last:=read(CDPAuditReflect.field[Bool](t,"tshr_buffer_wen_last"))
     o.ds:=read(CDPAuditReflect.field[Bool](t,"tshr_buffer_wen_DS"))
+    o.prefetchActive:=read(v.io.bopPerf.activePrefetch)
+    o.enterREQ:=read(t.tshr_enter_REQ);o.reuseREQ:=read(t.io.fromAlloc.reuse.REQ)
+    o.incomingSource:=read(t.io.UpRXREQ.SrcID);o.prefetchSourceID:=read(t.io.consts.pfSrcID)
+    o.incomingOpcode:=read(t.io.UpRXREQ.Opcode);o.incomingData:=read(t.io.UpRXREQ.ExpCompData)
     o.rx:=read(CDPAuditReflect.field[Bool](t,"tshr_buffer_wen_RXDAT_0")) || read(CDPAuditReflect.field[Bool](t,"tshr_buffer_wen_RXDAT_2"))
     o.train:=read(t.io.cdpTrain);o.evict:=read(t.io.cdpEvict);o.line:=read(t.io.cdpData)
   }
@@ -201,5 +207,9 @@ class CDPRawLifecycle(implicit val p: Parameters) extends Bundle {
   val dirWrite=Bool();val write=new L2Directory.PathToDirectory
   val metaMask=new L2Directory.MetaWriteMask;val metaValue=new L2Directory.Meta
   val evictState=Bool();val dealloc=Bool();val last=Bool();val ds=Bool();val rx=Bool()
+  // Raw allocator/protocol observations; the host derives merged scan state.
+  val prefetchActive=Bool();val enterREQ=Bool();val reuseREQ=Bool()
+  val incomingSource=UInt(16.W);val prefetchSourceID=UInt(16.W)
+  val incomingOpcode=UInt(8.W);val incomingData=Bool()
   val train=Valid(new L2CDPTrain);val evict=Valid(new L2CDPEvict);val line=Valid(new L2CDPLine)
 }

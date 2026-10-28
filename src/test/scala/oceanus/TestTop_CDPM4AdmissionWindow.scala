@@ -24,6 +24,9 @@ class CDPM4AdmissionWindowHarness(implicit p: Parameters) extends CDPC4Harness {
   add("r.terminalVA",reference.tlb_s3_addr)
   add("d.out",prod.io.out.fire);add("r.out",reference.io.out.fire)
   add("d.drop",prod.filterDrop);add("r.drop",read(reference.pft_s2_valid) && !read(reference.canPft))
+  add("d.outIndex",prod.idx2);add("r.outIndex",reference.pft_s2_chosen_idx)
+  add("d.outPA",prod.io.out.bits.paddr);add("r.outPA",reference.io.out.bits.addr)
+  add("d.outDepth",prod.io.out.bits.pfDepth);add("r.outDepth",reference.io.out.bits.cdpPfDepth.get)
   val debug=IO(Output(UInt(debugFields.map(_._2.getWidth).sum.W)))
   debug:=Cat(debugFields.map(_._2).reverse.toSeq)
   val widths=debugFields.map {case(n,d)=>n->d.getWidth}.toVector
