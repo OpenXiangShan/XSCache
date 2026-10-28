@@ -943,7 +943,7 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     if (enableHintGuidedGrant) {
       // for timing consideration, hint should latch one cycle before sending to L1
       // instead of adding a Pipeline/Queue to latch here, we just set hintQueue in GrantBuf & CustomL1Hint "flow=false"
-      val l1HintArbs = Seq.tabulate(hintChannelCount)(_ => Module(new Arbiter(new L2ToL1HintInsideL2()(l2ECCParams), slices.size)))
+      val l1HintArbs = Seq.tabulate(hintChannelCount)(_ => Module(new RRArbiter(new L2ToL1HintInsideL2()(l2ECCParams), slices.size)))
 
       slices.zipWithIndex.foreach { case (s, i) =>
         val sliceHintChannelOH = if (hintChannelCount == 1) {
