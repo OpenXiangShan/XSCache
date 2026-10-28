@@ -2490,9 +2490,9 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     !refillWritePending && !refillWayCommitPending && !readTxnInFlight &&
     !replLookupInFlight && !io.postGrantReleaseSnoopActive && !io.pairLifetimeHold && !io.sourceBHold && !io.bufferWritePending
   val retirementPending = RegInit(false.B)
-  retirementPending := mayRetire && !io.tasks.preparedLease.held.valid && !mainpipeInvalidate
+  retirementPending := mayRetire && !io.tasks.preparedLease.held.valid && !io.tasks.preparedLease.proposalHeld && !mainpipeInvalidate
   val will_free = retirementPending && mayRetire &&
-    !io.tasks.preparedLease.held.valid && !mainpipeInvalidate
+    !io.tasks.preparedLease.held.valid && !io.tasks.preparedLease.proposalHeld && !mainpipeInvalidate
   io.tasks.preparedLease.canPrepare := req_valid && !mayRetire && !retirementPending
   MainpipeLeaseIO.acknowledge(io.tasks.preparedLease, req_valid, io.alloc.valid, io.tasks.mainpipe.fire)
   io.replaceParentRelease := will_free && req_valid && !cmo_cbo
