@@ -63,6 +63,16 @@ object TestHNExtensionModel extends App {
   assert(fwd.pendingSnoops==1)
   fwd.targetAck(HNExtTargetAck(s.fwd,0,7),7);fwd.finish()
   rejects(fwd.targetAck(HNExtTargetAck(s.fwd,0,7),8))
+  // A completed two-beat transfer counts as actual DCT; an invalid-line
+  // forwarding attempt alone must not create an actualForward overlap.
+  fwd.rxSnp(s.copy(op=7,txn=8,fwd=0,fwdTxn=0),8)
+  fwd.recordOverlaps(8)
+  assert(fwd.overlapWindows("actualForward+normalSnoop")==1)
+  fwd.recordOverlaps(517)
+  assert(fwd.overlapCycles("actualForward+normalSnoop")==2)
+  fwd.recordOverlaps(518) // event at cycle 6 is outside [7,518]
+  assert(fwd.overlapCycles("actualForward+normalSnoop")==2)
+
   val dataBeforeHome=mk();dataBeforeHome.rxSnp(s,0)
   dataBeforeHome.forwardedData(rn,s.fwd,s.fwdTxn,0,7,1,0,OvernightMemory.beat(pa,0),1)
   dataBeforeHome.forwardedData(rn,s.fwd,s.fwdTxn,0,7,1,2,OvernightMemory.beat(pa,1),2)

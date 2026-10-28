@@ -76,7 +76,8 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
   }
   private def category(n:String):Option[String]=n match {
     case "retryAck"|"retryReissue"=>Some("retry")
-    case "fwdSnoop"|"dctForwardComplete"=>Some("forward")
+    case "fwdSnoop"=>Some("forward")
+    case "dctForwardComplete"=>Some("actualForward")
     case "requesterDCT"=>Some("requesterDCT")
     case "splitRead"=>Some("splitRead")
     case "stashSnoop"=>Some("stash")
@@ -87,7 +88,7 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
   def recordOverlaps(c:Int):Unit={
     val now=mutable.Set.empty[(BigInt,String)]
     recent.keys.toSeq.foreach{line=>
-      val q=recent(line);while(q.headOption.exists(_._1<c-512))q.dequeue()
+      val q=recent(line);while(q.headOption.exists(_._1<=c-512))q.dequeue()
       if(q.isEmpty)recent.remove(line)
       else {
         val names=q.flatMap(x=>category(x._2)).toSet.toSeq.sorted
