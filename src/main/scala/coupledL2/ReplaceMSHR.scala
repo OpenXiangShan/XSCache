@@ -57,7 +57,7 @@ class ReplaceMSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   val localReservationHold = Input(Bool())
   val sourceBHold = Input(Bool())
   // The whole nested snoop has completed, including forwarded CompData.
-  val snoopDone = Input(Bool())
+  val snoopDoneCount = Input(UInt(log2Ceil(mshrsAll + 3).W))
   // Keep the snapshot current so a later CMO commit cannot restore stale
   // exclusive ownership after the HN response downgraded the line.
   val snoopMeta = Flipped(ValidIO(new MetaEntry))
@@ -111,8 +111,6 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   val snoopInFlightMax = ((BigInt(1) << snoopInFlightWidth) - 1).U
   // start and done may coincide (one snoop starts while another completes) and
   // then cancel exactly.
-  val snoopStart = io.snoopStarted && !io.snoopDone
-  val snoopFinish = io.snoopDone && !io.snoopStarted
   val snoopInFlightCnt = RegInit(0.U(snoopInFlightWidth.W))
   val snoopInFlight = snoopInFlightCnt =/= 0.U
   val snoopConsumed = RegInit(false.B)
@@ -416,7 +414,7 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   val mainpipeInvalidate = io.alloc.valid || io.sinkC.valid || io.rxrsp.valid ||
     io.releaseDataSeen || io.victimDataCaptured || io.victimDataNeedsWriteback ||
     io.nestedReleaseWritePending ||
-    io.snoopStarted || io.snoopDone || io.snoopMeta.valid || io.snoopToInvalDone ||
+    io.snoopStarted || io.snoopDoneCount.orR || io.snoopMeta.valid || io.snoopToInvalDone ||
     io.copyBackDone || io.parentRelease || io.tasks.source_b.fire ||
     io.tasks.txreq.fire || io.tasks.txdat.fire || io.tasks.txrsp.fire
   val mainpipeIssuedVariant = MainpipeLeaseIO.freeze(io.tasks.preparedLease,
@@ -495,18 +493,15 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   // holds keep the context valid until it drains, so it can never own a flit
   // whose txnID/ReleaseBuf already moved on.
   assert(!io.txreqPending || valid, "TXREQ skid holds a flit without a live ReplaceMSHR")
-  when (snoopStart) {
-    assert(snoopInFlightCnt =/= snoopInFlightMax, "nested snoop reservation tally overflow")
+  // Preserve every source completion and same-cycle start/done net change.
+  val snoopAvailable = snoopInFlightCnt +& io.snoopStarted.asUInt
+  when(io.snoopDoneCount.orR) {
+    assert(valid && io.snoopDoneCount <= snoopAvailable,
+      "nested snoop completions must each own a reserved ReplaceMSHR service")
   }
-  when (io.snoopDone) {
-    assert(valid && snoopInFlight,
-      "nested snoop completion arrived without a reserved ReplaceMSHR")
-  }
-  // Tally as it stands after this cycle's events. Allocation can only happen on
-  // a free context, hence with no reservation outstanding, so it wins outright.
-  val snoopInFlightNext = Mux(io.alloc.valid, 0.U,
-    Mux(snoopStart, snoopInFlightCnt + 1.U,
-      Mux(snoopFinish, Mux(snoopInFlight, snoopInFlightCnt - 1.U, 0.U), snoopInFlightCnt)))
+  val snoopAfterEvents = snoopAvailable - io.snoopDoneCount
+  assert(snoopAfterEvents <= snoopInFlightMax, "nested snoop reservation tally overflow")
+  val snoopInFlightNext = Mux(io.alloc.valid, 0.U, snoopAfterEvents)
   snoopInFlightCnt := snoopInFlightNext
   when (io.snoopToInvalDone) {
     when (!releaseSent) {

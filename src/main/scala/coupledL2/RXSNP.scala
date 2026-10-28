@@ -62,7 +62,7 @@ class RXSNP(
     * 5. Before MSHR completes Probe to L1 for alias replacing, snoop should be **blocked*.
     */
   val reqBlockSnpMask = VecInit(io.refillInfo.map(s =>
-      s.valid && s.bits.set === task.set && s.bits.reqTag === task.tag && !s.bits.willFree && (
+      s.valid && s.bits.set === task.set && s.bits.reqTag === task.tag && (
       // A SourceD Grant has already transferred ownership to L1, while the
       // normal refill commit may still be absent from Directory. Keep the
       // snoop in the queue until that commit is visible; otherwise the snoop
@@ -75,7 +75,7 @@ class RXSNP(
           // A Grant task can leave the MSHR several cycles before its refill
           // reaches DataStorage. During that interval the directory cannot serve
           // a same-line snoop with the newly granted data.
-            (s.bits.s_refill && !s.bits.willFree)))
+            (s.bits.s_refill)))
       ) ||
       // In the post-Grant ReleaseData window the paired-snoop fast path only
       // works if the paired context is allocated before the normal commit can
@@ -111,13 +111,11 @@ class RXSNP(
   val cmoBlockSnpMask = VecInit(io.refillInfo.map(s =>
     s.valid && s.bits.dirHit && isValid(s.bits.meta.state) &&
     !s.bits.s_cmoresp && (!s.bits.s_release || !s.bits.w_rprobeacklast || !s.bits.s_cmometaw) &&
-    !s.bits.willFree &&
     s.bits.set === task.set && s.bits.reqTag === task.tag
   )).asUInt
   val replaceBlockSnpMask = VecInit(io.refillInfo.zipWithIndex.map { case (s, i) =>
     !io.refillVictimDelegated(i) && s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag && !s.bits.dirHit && isValid(s.bits.meta.state) &&
-    s.bits.s_cmoresp && s.bits.w_replResp && (!s.bits.w_rprobeacklast || s.bits.w_releaseack || !RegNext(s.bits.w_replResp)) &&
-    !s.bits.willFree
+    s.bits.s_cmoresp && s.bits.w_replResp && (!s.bits.w_rprobeacklast || s.bits.w_releaseack || !RegNext(s.bits.w_replResp))
   }).asUInt
   val replaceBlockSnp = replaceBlockSnpMask.orR
   // Share the same-line sidecar compare between the nest and block paths.

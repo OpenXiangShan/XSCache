@@ -227,6 +227,67 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     when(allocate) { generation := generation + 1.U }
     generation
   })
+  // Retirement mailboxes capture OLD source and target identities at the
+  // actual retirement edge. Apply never reads a retired/reused source slot.
+  class OwnerRetirement extends Bundle {
+    val sourceId = UInt(mshrBits.W)
+    val sourceGeneration = UInt(8.W)
+    val sourceSet = UInt(setBits.W)
+    val sourceTag = UInt(tagBits.W)
+    val sourceEpoch = Bool()
+    val targets = UInt(mshrsAll.W)
+    val targetGenerations = Vec(mshrsAll, UInt(8.W))
+    val targetSets = Vec(mshrsAll, UInt(setBits.W))
+    val targetTags = Vec(mshrsAll, UInt(tagBits.W))
+    val targetParents = Vec(mshrsAll, UInt(mshrBits.W))
+    val targetParentEpochs = Vec(mshrsAll, Bool())
+    val targetParentAttached = Vec(mshrsAll, Bool())
+  }
+  val snoopRetireEvents = snoopMshrs.zipWithIndex.map { case (source, i) =>
+    val event = RegInit(0.U.asTypeOf(Valid(new OwnerRetirement)))
+    val retiring = source.io.msInfo.valid && source.io.msInfo.bits.willFree
+    event.valid := retiring
+    when(retiring) {
+      event.bits.sourceId := i.U
+      event.bits.sourceGeneration := mshrTaskGenerations(1)(i)
+      event.bits.sourceSet := source.io.msInfo.bits.set
+      event.bits.sourceTag := source.io.msInfo.bits.reqTag
+      event.bits.sourceEpoch := false.B
+      event.bits.targets := VecInit(replaceMshrs.map { target =>
+        target.io.info.valid && target.io.info.bits.set === source.io.msInfo.bits.set &&
+          target.io.info.bits.tag === source.io.msInfo.bits.reqTag
+      }).asUInt
+      event.bits.targetGenerations := VecInit(mshrTaskGenerations(2))
+      event.bits.targetSets := VecInit(replaceMshrs.map(_.io.info.bits.set))
+      event.bits.targetTags := VecInit(replaceMshrs.map(_.io.info.bits.tag))
+      event.bits.targetParents := VecInit(replaceMshrs.map(_.io.info.bits.parentId))
+      event.bits.targetParentEpochs := VecInit(replaceMshrs.map(_.io.info.bits.parentEpoch))
+      event.bits.targetParentAttached := VecInit(replaceMshrs.map(_.io.info.bits.parentAttached))
+    }
+    event
+  }
+  val normalRetireEvents = refillMshrs.zipWithIndex.map { case (source, i) =>
+    val event = RegInit(0.U.asTypeOf(Valid(new OwnerRetirement)))
+    event.valid := source.io.replaceParentRelease
+    when(source.io.replaceParentRelease) {
+      event.bits.sourceId := i.U
+      event.bits.sourceGeneration := mshrTaskGenerations(0)(i)
+      event.bits.sourceSet := source.io.msInfo.bits.set
+      event.bits.sourceTag := source.io.msInfo.bits.reqTag
+      event.bits.sourceEpoch := source.io.allocEpoch
+      event.bits.targets := VecInit(replaceMshrs.map { target =>
+        target.io.info.valid && target.io.info.bits.parentAttached &&
+          target.io.info.bits.parentId === i.U && target.io.info.bits.parentEpoch === source.io.allocEpoch
+      }).asUInt
+      event.bits.targetGenerations := VecInit(mshrTaskGenerations(2))
+      event.bits.targetSets := VecInit(replaceMshrs.map(_.io.info.bits.set))
+      event.bits.targetTags := VecInit(replaceMshrs.map(_.io.info.bits.tag))
+      event.bits.targetParents := VecInit(replaceMshrs.map(_.io.info.bits.parentId))
+      event.bits.targetParentEpochs := VecInit(replaceMshrs.map(_.io.info.bits.parentEpoch))
+      event.bits.targetParentAttached := VecInit(replaceMshrs.map(_.io.info.bits.parentAttached))
+    }
+    event
+  }
   // Full pair context, including a known absence, is registered independently
   // of SourceB and group prepare. A late ReleaseStart is part of this capture,
   // so a previously standalone snoop re-evaluates its payload provenance.
@@ -1418,16 +1479,17 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         Seq(io.txdatDone.bits.meta, io.txrspDone.bits.meta))
       // A forwarding snoop owns both its HN response and requester CompData.
       // Count its context retirement once, after both terminal handshakes.
-      val contextSnoopDone = snoopMshrs.map { snoop =>
-        snoop.io.msInfo.valid && snoop.io.msInfo.bits.willFree &&
-        snoop.io.msInfo.bits.set === replaceMshrs(i).io.info.bits.set &&
-        snoop.io.msInfo.bits.reqTag === replaceMshrs(i).io.info.bits.tag
-      }.reduce(_ || _)
-      val directSnoopDone = Seq(io.txdatDone, io.txrspDone).zip(snoopResponseMatches).map {
-        case (done, matches) => matches && !done.bits.mshrTask
-      }.reduce(_ || _)
-      replaceMshrs(i).io.snoopDone := directSnoopDone ||
-        replaceMshrs(i).io.info.valid && contextSnoopDone
+      val contextSnoopDoneCount = PopCount(VecInit(snoopRetireEvents.map { event =>
+        event.valid && event.bits.targets(i) && replaceMshrs(i).io.info.valid &&
+          event.bits.targetGenerations(i) === mshrTaskGenerations(2)(i) &&
+          event.bits.targetSets(i) === replaceMshrs(i).io.info.bits.set &&
+          event.bits.targetTags(i) === replaceMshrs(i).io.info.bits.tag
+      }))
+      val directSnoopDoneCount = PopCount(VecInit(
+        Seq(io.txdatDone, io.txrspDone).zip(snoopResponseMatches).map {
+          case (done, matches) => matches && !done.bits.mshrTask
+        }))
+      replaceMshrs(i).io.snoopDoneCount := contextSnoopDoneCount +& directSnoopDoneCount
       val snoopToInvalDone = Seq(io.txdatDone, io.txrspDone).map { done =>
         done.valid && done.bits.fromB && done.bits.snpHitRelease &&
         done.bits.chiOpcode.get =/= CompData &&
@@ -1498,12 +1560,17 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // A normal slot can be reused before its detached child finishes writeback.
   // Release only the parent association at the normal MSHR's actual retire
   // edge; the child remains fully visible as an independent victim context.
-  replaceMshrs.foreach { replace =>
-    val parentReleaseMatches = VecInit(refillMshrs.zipWithIndex.map {
-      case (refill, parentId) =>
-        refill.io.replaceParentRelease && replace.io.info.valid && replace.io.info.bits.parentAttached &&
-          replace.io.info.bits.parentId === parentId.U &&
-          replace.io.info.bits.parentEpoch === refill.io.allocEpoch
+  replaceMshrs.zipWithIndex.foreach { case (replace, i) =>
+    val parentReleaseMatches = VecInit(normalRetireEvents.map { event =>
+      event.valid && event.bits.targets(i) && replace.io.info.valid &&
+        event.bits.targetGenerations(i) === mshrTaskGenerations(2)(i) &&
+        event.bits.targetSets(i) === replace.io.info.bits.set &&
+        event.bits.targetTags(i) === replace.io.info.bits.tag &&
+        event.bits.targetParentAttached(i) && replace.io.info.bits.parentAttached &&
+        event.bits.targetParents(i) === replace.io.info.bits.parentId &&
+        event.bits.targetParentEpochs(i) === replace.io.info.bits.parentEpoch &&
+        event.bits.sourceId === replace.io.info.bits.parentId &&
+        event.bits.sourceEpoch === replace.io.info.bits.parentEpoch
     }).asUInt
     replace.io.parentRelease := parentReleaseMatches.orR
     assert(PopCount(parentReleaseMatches) <= 1.U, "a ReplaceMSHR must match at most one retiring normal parent")
@@ -1550,7 +1617,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     replace.io.info.bits.tag === io.fromReqArb.status_s1.aCandidateTag
   }).asUInt.orR
   val aSnoopConflict = VecInit(snoopMshrs.map { snoop =>
-    snoop.io.msInfo.valid && snoop.io.msInfo.bits.blocksSnoop && !snoop.io.msInfo.bits.willFree &&
+    snoop.io.msInfo.valid && snoop.io.msInfo.bits.blocksSnoop &&
       io.fromReqArb.status_s1.aCandidateValid &&
       snoop.io.msInfo.bits.set === io.fromReqArb.status_s1.aCandidateSet &&
       snoop.io.msInfo.bits.reqTag === io.fromReqArb.status_s1.aCandidateTag
