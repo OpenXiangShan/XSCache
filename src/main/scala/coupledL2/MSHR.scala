@@ -201,6 +201,7 @@ class MSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   val probeIssued = Output(Bool())
   val pairLifetimeHold = Input(Bool())
   val sourceBHold = Input(Bool())
+  val bufferWritePending = Input(Bool())
   val replaceDetached = Input(Bool())
   val replaceRefillReady = Input(Bool())
   // Completion of a CMO child ReplaceMSHR.  The normal CMO context retains
@@ -2487,7 +2488,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   val mayRetire = no_schedule && no_wait &&
     (cmo_cbo || normalRefillCommitIssued) &&
     !refillWritePending && !refillWayCommitPending && !readTxnInFlight &&
-    !replLookupInFlight && !io.postGrantReleaseSnoopActive && !io.pairLifetimeHold && !io.sourceBHold
+    !replLookupInFlight && !io.postGrantReleaseSnoopActive && !io.pairLifetimeHold && !io.sourceBHold && !io.bufferWritePending
   val retirementPending = RegInit(false.B)
   retirementPending := mayRetire && !io.tasks.preparedLease.held.valid && !mainpipeInvalidate
   val will_free = retirementPending && mayRetire &&
@@ -2784,7 +2785,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   val leaseNestedEvent = io.nestedwb.c_set_dirty || io.nestedwb.c_set_tip ||
     io.nestedwb.b_inv_dirty || io.nestedwb.b_toN.getOrElse(false.B) ||
     io.nestedwb.b_toB.getOrElse(false.B) || io.nestedwb.b_toClean.getOrElse(false.B)
-  mainpipeInvalidate := io.alloc.valid || io.resps.sinkC.valid || io.resps.rxrsp.valid ||
+  mainpipeInvalidate := io.bufferWritePending || io.alloc.valid || io.resps.sinkC.valid || io.resps.rxrsp.valid ||
     io.resps.rxdat.valid || io.replResp.valid || io.aMergeTask.valid ||
     io.replaceDone || io.refillWriteDone || io.grantSent ||
     io.releaseDataBeforeProbeAck || io.postGrantReleaseData ||

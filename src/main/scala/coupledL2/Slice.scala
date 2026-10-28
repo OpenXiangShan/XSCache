@@ -209,6 +209,8 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
     sinkCWriteReleaseBuf,
     sinkCWriteReleaseBufExtra,
     mpWriteReleaseBuf = Wire(Valid(new MSHRBufWrite()))
+  mshrCtl.io.sinkCProbeAckPayload := sinkC.io.releaseBufWrite.bits.data
+  mshrCtl.io.sinkCRefillWrite := sinkC.io.refillBufWrite
   mshrCtl.io.nestedwbPayload := mainPipe.io.nestedwbData
   nestedWriteReleaseBuf := mshrCtl.io.nestedReleaseWrites(0)
   nestedWriteReleaseBufExtra := mshrCtl.io.nestedReleaseWrites(1)
@@ -220,10 +222,9 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
     x.valid := sinkC.io.releaseBufWrite.valid && !releaseSnapshotIsOlder(x.bits.id)
   }
   sinkCWriteReleaseBufExtra match { case x =>
-    x := sinkC.io.releaseBufWrite
-    x.valid := sinkC.io.releaseBufWrite.valid && mshrCtl.io.releaseBufWriteIdExtra.valid &&
-      !releaseSnapshotIsOlder(mshrCtl.io.releaseBufWriteIdExtra.bits)
-    x.bits.id := mshrCtl.io.releaseBufWriteIdExtra.bits
+    x := mshrCtl.io.releaseBufWriteExtra
+    x.valid := mshrCtl.io.releaseBufWriteExtra.valid &&
+      !releaseSnapshotIsOlder(mshrCtl.io.releaseBufWriteExtra.bits.id)
   }
   mpWriteReleaseBuf := mainPipe.io.releaseBufWrite
   mpWriteReleaseBuf.valid := mainPipe.io.releaseBufWrite.valid &&
@@ -264,7 +265,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   mainPipeWriteRefillBuf.valid := mainPipe.io.refillBufWrite.valid && !mainPipeTargetsReleaseOwnedRefill
   refillBuf.io.w <> VecInit(Seq(
     rxdatWriteRefillBuf,
-    sinkC.io.refillBufWrite,
+    mshrCtl.io.sinkCRefillWriteApplied,
     mainPipeWriteRefillBuf,
     nestedWriteRefillBuf
   ))

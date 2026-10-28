@@ -144,11 +144,17 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     // sidecar cannot copy back stale ProbeAckData before it arrives.
     val sinkCReleaseData = Input(ValidIO(new TaskBundle))
 
+    val sinkCProbeAckPayload = Input(new DSBlock)
+    val sinkCRefillWrite = Input(Valid(new MSHRBufWrite))
+    val sinkCRefillWriteApplied = Output(Valid(new MSHRBufWrite))
     val releaseBufWriteId = Output(UInt(mshrBits.W))
     // A ProbeAckData can belong to a live snoop and a victim sidecar for the
     // same line. Keep the regular writer and expose the sidecar mirror as an
     // independent ReleaseBuf write port.
     val releaseBufWriteIdExtra = Output(ValidIO(UInt(mshrBits.W)))
+    // Registered mirror route carries payload and target generation together.
+    val releaseBufWriteExtra = Output(ValidIO(new MSHRBufWrite))
+    val releaseBufWriteExtraGeneration = Output(UInt(8.W))
     // ProbeAckData for a normal context (Get-on-TRUNK / cache-alias) is
     // captured into the normal slot's RefillBuf; the sidecar and snoop own
     // the ReleaseBuf entries.
@@ -351,6 +357,47 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       Mux1H(normalOH, mshrTaskGenerations(0)) === pair.bits.normal.bits.generation &&
       Mux1H(normalOH, refillMshrs.map(_.io.status.bits.set)) === pair.bits.normal.bits.set &&
       Mux1H(normalOH, refillMshrs.map(_.io.status.bits.reqTag)) === pair.bits.normal.bits.tag
+  }
+  val sinkCRefillRecord = RegInit(0.U.asTypeOf(Valid(new MSHRBufWrite)))
+  val sinkCRefillGeneration = RegInit(0.U(8.W))
+  sinkCRefillRecord.valid := io.sinkCRefillWrite.valid
+  when(io.sinkCRefillWrite.valid) {
+    sinkCRefillRecord.bits := io.sinkCRefillWrite.bits
+    sinkCRefillGeneration := Mux1H(UIntToOH(io.sinkCRefillWrite.bits.id, mshrsAll),
+      mshrTaskGenerations(0))
+  }
+  val sinkCRefillOwnerOH = UIntToOH(sinkCRefillRecord.bits.id, mshrsAll)
+  val sinkCRefillCurrent = Mux1H(sinkCRefillOwnerOH, refillMshrs.map(_.io.status.valid)) &&
+    Mux1H(sinkCRefillOwnerOH, mshrTaskGenerations(0)) === sinkCRefillGeneration
+  io.sinkCRefillWriteApplied := sinkCRefillRecord
+  io.sinkCRefillWriteApplied.valid := sinkCRefillRecord.valid && sinkCRefillCurrent
+  val sinkCRefillPending =
+    Mux(io.sinkCRefillWrite.valid, UIntToOH(io.sinkCRefillWrite.bits.id, mshrsAll), 0.U(mshrsAll.W)) |
+      Mux(sinkCRefillRecord.valid, sinkCRefillOwnerOH, 0.U(mshrsAll.W))
+  // SinkC ReleaseData is accepted before its two-beat payload reaches the
+  // RefillBuf write port.  Pin the matching normal owner across that gap so
+  // retirement cannot invalidate the generation between C acceptance and
+  // refill-record capture.  Direct C-path writes clear the same hold when
+  // MainPipe applies them, while the buffered path clears on sinkCRefillWrite.
+  val sinkCReleaseHold = RegInit(0.U(mshrsAll.W))
+  val sinkCReleaseHoldSet = VecInit(refillMshrs.map { refill =>
+    io.sinkCReleaseData.valid && refill.io.status.valid &&
+      refill.io.status.bits.set === io.sinkCReleaseData.bits.set &&
+      refill.io.status.bits.reqTag === io.sinkCReleaseData.bits.tag &&
+      (refill.io.msInfo.bits.blockRefill ||
+        (refill.io.msInfo.bits.s_refill && refill.io.msInfo.bits.w_grantlast))
+  }).asUInt
+  val sinkCReleaseHoldClear = VecInit(refillMshrs.zipWithIndex.map { case (refill, i) =>
+    (io.sinkCRefillWrite.valid && io.sinkCRefillWrite.bits.id === i.U) ||
+      (io.fromMainPipe.releaseDataDirectWrite.valid && refill.io.status.valid &&
+        refill.io.status.bits.set === io.fromMainPipe.releaseDataDirectWrite.bits.set &&
+        refill.io.status.bits.reqTag === io.fromMainPipe.releaseDataDirectWrite.bits.tag)
+  }).asUInt
+  val sinkCReleaseHoldLive = VecInit(refillMshrs.map(_.io.status.valid)).asUInt
+  sinkCReleaseHold :=
+    (sinkCReleaseHold | sinkCReleaseHoldSet) & ~sinkCReleaseHoldClear & sinkCReleaseHoldLive
+  when(sinkCRefillRecord.valid) {
+    assert(sinkCRefillCurrent, "SinkC refill route lost its reserved normal generation")
   }
   // Index0 is snoop, index1 is replacement. These retain each owner until
   // the entire nested-data transaction has physically written and applied.
@@ -1327,7 +1374,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
           candidate.io.msInfo.bits.way === refill.io.msInfo.bits.way
       }.reduce(_ || _)
       refill.io.deferGrant := snoopMshrs(i).io.status.valid ||
-        pendingSnoopForRefill || nestedBToNForRefill || snoopHoldsRefillWay
+        pendingSnoopForRefill || nestedBToNForRefill || snoopHoldsRefillWay || sinkCRefillPending(i)
       refill.io.releaseDataBeforeProbeAck := releaseDataBeforeProbeAck
       refill.io.postGrantReleaseData := postGrantReleaseData
       refill.io.releaseDataDirectWrite := releaseDataDirectWrite
@@ -1360,6 +1407,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         val sourceToken = new MainpipeLeaseToken
         val outcome = UInt(2.W) // 1: ToN, 2: ToB, 3: clean
       })))
+      refill.io.bufferWritePending := sinkCRefillPending(i) || sinkCReleaseHold(i)
       refill.io.pairLifetimeHold := snoopPairs.zipWithIndex.map { case (pair, s) =>
         snoopPairNormalValid(s) && pair.bits.normal.bits.id === i.U
       }.reduce(_ || _)
@@ -1462,7 +1510,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       val releaseStartsForSnoop = io.sinkCReleaseData.valid && snoop.io.status.valid &&
         io.sinkCReleaseData.bits.set === snoop.io.status.bits.set &&
         io.sinkCReleaseData.bits.tag === snoop.io.status.bits.reqTag
-      snoop.io.pairSearchPending := !snoopPairKnown(i) || releaseStartsForSnoop
+      val pairedRefillWritePending = pairNormalValid &&
+        (UIntToOH(pair.bits.normal.bits.id, mshrsAll) & sinkCRefillPending).orR
+      snoop.io.pairSearchPending := !snoopPairKnown(i) || releaseStartsForSnoop || pairedRefillWritePending
       snoop.io.normalRefillPayloadFromProbeAck :=
         pairedProbeAckDataMirrored || (pairNormalValid && pair.bits.probePayload)
       snoop.io.normalRefillPostGrantReleasePending := pairNormalValid && pair.bits.postGrantPending
@@ -1471,6 +1521,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       snoop.io.pairedNormalId.valid := pairNormalValid && pair.bits.postGrantPending
       snoop.io.pairedNormalId.bits := pair.bits.normal.bits.id
       snoop.io.pairLifetimeHold := false.B
+      snoop.io.bufferWritePending := false.B
       // Capture the allocation address match at the same edge as req/state.
       // Do not feed alloc.valid/slot-selector into an active SourceB gate.
       snoop.io.allocPostGrantReleasePending := postGrantReleaseSnoopTargetOH.orR
@@ -1500,7 +1551,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       val replaceProbeAckDataCapture = io.resps.sinkC.valid && io.resps.sinkC.respInfo.last &&
         io.resps.sinkC.respInfo.opcode === ProbeAckData && replaceProbeSinkCMatch(i)
       val mirroredReplaceProbeAckDataForSlot =
-        mirroredReplaceProbeAckDataCapture && mirroredReplaceProbeAckDataOH(i)
+        mirroredReplaceProbeAckDataDoneOH(i)
       // Client-less victims are captured from DS by the replace capture task;
       // MainPipe pulses replaceCaptureWrite with the replace slot id.
       val replaceCaptureMatch = io.fromMainPipe.replaceCaptureWrite.valid &&
@@ -2325,8 +2376,41 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     resp_sinkC_match_vec(2 * i + 1) || replaceProbeSinkCMatch(i)
   })
   io.releaseBufWriteId := ParallelPriorityMux(releaseBufMatch, (0 until mshrsAll).map(i => i.U))
-  io.releaseBufWriteIdExtra.valid := mirroredReplaceProbeAckDataCapture
-  io.releaseBufWriteIdExtra.bits := OHToUInt(mirroredReplaceProbeAckDataOH)
+  // Independent ProbeAckData mirror route: capture payload, beat mask, target
+  // sidecar id and generation before any later ReleaseBuf write. This route
+  // cannot be substituted by the nested descriptor because it may arrive
+  // after the pair was registered and must retain the newer probe payload.
+  val probeAckMirrorCapture = RegInit(0.U.asTypeOf(Valid(new MSHRBufWrite)))
+  val probeAckMirrorCaptureGeneration = RegInit(0.U(8.W))
+  probeAckMirrorCapture.valid := mirroredReplaceProbeAckDataCapture
+  when(mirroredReplaceProbeAckDataCapture) {
+    probeAckMirrorCapture.bits.id := OHToUInt(mirroredReplaceProbeAckDataOH)
+    probeAckMirrorCapture.bits.data := io.sinkCProbeAckPayload
+    probeAckMirrorCapture.bits.beatMask := Fill(beatSize, true.B)
+    // The raw replacer decision reserves this slot now and allocates it at
+    // next-cycle apply. Retain that next generation even before it is live.
+    probeAckMirrorCaptureGeneration := Mux1H(mirroredReplaceProbeAckDataOH,
+      mshrTaskGenerations(2)) + (!activeReplaceProbeAckDataCapture).asUInt
+  }
+  val probeAckMirrorWrite = RegNext(probeAckMirrorCapture, 0.U.asTypeOf(probeAckMirrorCapture))
+  val probeAckMirrorGeneration = RegEnable(probeAckMirrorCaptureGeneration, probeAckMirrorCapture.valid)
+  val mirrorOwnerOH = UIntToOH(probeAckMirrorWrite.bits.id, mshrsAll)
+  val mirrorOwnerCurrent = Mux1H(mirrorOwnerOH, replaceMshrs.map(_.io.info.valid)) &&
+    Mux1H(mirrorOwnerOH, mshrTaskGenerations(2)) === probeAckMirrorGeneration
+  io.releaseBufWriteExtra := probeAckMirrorWrite
+  io.releaseBufWriteExtra.valid := probeAckMirrorWrite.valid && mirrorOwnerCurrent
+  io.releaseBufWriteExtraGeneration := probeAckMirrorGeneration
+  io.releaseBufWriteIdExtra.valid := io.releaseBufWriteExtra.valid
+  io.releaseBufWriteIdExtra.bits := probeAckMirrorWrite.bits.id
+  mirroredReplaceProbeAckDataDoneOH := Mux(io.releaseBufWriteExtra.valid,
+    mirrorOwnerOH, 0.U(mshrsAll.W))
+  mirroredReplaceProbeAckDataPendingOH :=
+    Mux(mirroredReplaceProbeAckDataCapture, mirroredReplaceProbeAckDataOH, 0.U(mshrsAll.W)) |
+      Mux(probeAckMirrorCapture.valid, UIntToOH(probeAckMirrorCapture.bits.id, mshrsAll), 0.U(mshrsAll.W)) |
+      Mux(probeAckMirrorWrite.valid, mirrorOwnerOH, 0.U(mshrsAll.W))
+  when(probeAckMirrorWrite.valid) {
+    assert(mirrorOwnerCurrent, "ProbeAckData mirror lost its reserved replacement generation")
+  }
   val refillBufMatch = VecInit((0 until mshrsAll).map { i => resp_sinkC_match_vec(2 * i) })
   io.refillBufWriteId.valid := sinkCReleaseBufWrite && Cat(refillBufMatch).orR
   io.refillBufWriteId.bits := ParallelPriorityMux(refillBufMatch, (0 until mshrsAll).map(i => i.U))
@@ -2466,7 +2550,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       if(replacement) nestedReleaseReserved.bits.replace else nestedReleaseReserved.bits.snoop, 0.U(mshrsAll.W))
     val masks = Mux(nestedReleaseMasks.valid,
       if(replacement) nestedReleaseMasks.bits.replace else nestedReleaseMasks.bits.snoop, 0.U(mshrsAll.W))
-    nestedReleasePending(context) := raw | masks | captured |
+    val mirror = if(replacement) mirroredReplaceProbeAckDataPendingOH else 0.U(mshrsAll.W)
+    nestedReleasePending(context) := raw | masks | captured | mirror |
       descriptorMask(nestedReleaseWrite, replacement) | descriptorMask(nestedReleaseValidated, replacement) |
       descriptorMask(nestedReleaseApplied, replacement)
     nestedReleaseDone(context) := descriptorMask(nestedReleaseApplied, replacement)
