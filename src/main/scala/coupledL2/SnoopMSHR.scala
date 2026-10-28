@@ -30,6 +30,7 @@ import xscache.coupledL2.prefetch.DemandRefillBundle
 class SnoopMSHRIO(implicit p: Parameters) extends MSHRIO {
   // dirResult.hit may describe replacement metadata rather than a DS hit.
   val allocDirectoryHit = Input(Bool())
+  val pairSearchPending = Input(Bool())
   // A paired normal MSHR can hold dirty ProbeAckData in RefillBuf. This is
   // distinct from normal RXDAT, which remains with the normal request until
   // the RXSNP refill/Grant interlock has released the snoop.
@@ -250,7 +251,7 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
 
   // A post-Grant ReleaseData proves the client no longer owns this block.
   // Waiting for a new ProbeAck would deadlock against the C release path.
-  io.tasks.source_b.valid := valid && !state.s_pprobe && !normalPostGrantReleasePending
+  io.tasks.source_b.valid := valid && !state.s_pprobe && !normalPostGrantReleasePending && !io.pairSearchPending
   io.tasks.source_b.bits := 0.U.asTypeOf(new SourceBReq)
   io.tasks.source_b.bits.tag := dirResult.tag
   io.tasks.source_b.bits.set := dirResult.set
@@ -267,12 +268,12 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   // still in flight and emits a data-less SnpResp, dropping the only copy of
   // the line's newest dirty data.
   val mpProbeAckValid = valid && !state.s_probeack && !mpCopyValid &&
-    (state.w_pprobeacklast || normalPostGrantReleasePayload) &&
+    (state.w_pprobeacklast || (normalPostGrantReleasePayload && !sourceBProbeIssued)) &&
     (!normalPostGrantReleasePending || normalPostGrantReleasePayload)
   val mpDctValid = valid && !state.s_dct.getOrElse(true.B) && state.s_probeack
   val mainpipeIntent = Wire(Decoupled(new TaskBundle))
   mainpipeIntent.valid := (mpCopyValid || mpProbeAckValid || mpDctValid) &&
-    !io.nestedReleaseWritePending
+    !io.nestedReleaseWritePending && !io.pairSearchPending
 
   // Late copy: RefillBuf[pairedNormalId] -> ReleaseBuf[io.id]. No CHI side effect.
   val copyTask = WireInit(0.U.asTypeOf(new TaskBundle))
@@ -392,7 +393,7 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   val leaseNestedEvent = io.nestedwb.c_set_dirty || io.nestedwb.c_set_tip ||
     io.nestedwb.b_inv_dirty || io.nestedwb.b_toN.getOrElse(false.B) ||
     io.nestedwb.b_toB.getOrElse(false.B) || io.nestedwb.b_toClean.getOrElse(false.B)
-  val mainpipeInvalidate = io.alloc.valid || io.resps.sinkC.valid ||
+  val mainpipeInvalidate = io.pairSearchPending || io.alloc.valid || io.resps.sinkC.valid ||
     io.resps.rxrsp.valid || io.resps.rxdat.valid || io.releaseBufCopyDone ||
     io.snpRespDone || io.dctDone || leaseNestedEvent || leaseOwnerControlsChanged ||
     io.nestedReleaseWritePending || io.nestedReleaseWriteDone ||
@@ -473,11 +474,12 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   }
 
   val mayRetire = state.s_pprobe && state.s_probeack && state.s_dct.getOrElse(true.B) &&
-    snpRespDone && (!doFwd || dctDone) && !io.nestedReleaseWritePending
+    snpRespDone && (!doFwd || dctDone) && !io.nestedReleaseWritePending &&
+    (!sourceBProbeIssued || state.w_pprobeacklast) && !io.pairSearchPending && !io.sourceBHold
   val retirementPending = RegInit(false.B)
-  retirementPending := mayRetire && !io.tasks.preparedLease.held.valid && !mainpipeInvalidate
+  retirementPending := mayRetire && !io.tasks.preparedLease.held.valid && !io.tasks.preparedLease.proposalHeld && !mainpipeInvalidate
   val willFree = retirementPending && mayRetire &&
-    !io.tasks.preparedLease.held.valid && !mainpipeInvalidate
+    !io.tasks.preparedLease.held.valid && !io.tasks.preparedLease.proposalHeld && !mainpipeInvalidate
   io.tasks.preparedLease.canPrepare := valid && !mayRetire && !retirementPending
   MainpipeLeaseIO.acknowledge(io.tasks.preparedLease, valid, io.alloc.valid, io.tasks.mainpipe.fire)
   when (valid && willFree) { valid := false.B }

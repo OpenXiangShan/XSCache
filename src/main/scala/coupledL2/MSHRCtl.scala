@@ -227,6 +227,67 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     when(allocate) { generation := generation + 1.U }
     generation
   })
+  // Full pair context, including a known absence, is registered independently
+  // of SourceB and group prepare. A late ReleaseStart is part of this capture,
+  // so a previously standalone snoop re-evaluates its payload provenance.
+  class SnoopPair extends Bundle {
+    val snoopId = UInt(mshrBits.W)
+    val snoopGeneration = UInt(8.W)
+    val set = UInt(setBits.W)
+    val tag = UInt(tagBits.W)
+    val normal = Valid(new Bundle {
+      val id = UInt(mshrBits.W)
+      val generation = UInt(8.W)
+      val set = UInt(setBits.W)
+      val tag = UInt(tagBits.W)
+    })
+    val postGrantPending = Bool()
+    val payloadReady = Bool()
+    val probePayload = Bool()
+  }
+  val snoopPairs = snoopMshrs.zipWithIndex.map { case (snoop, i) =>
+    val pair = RegInit(0.U.asTypeOf(Valid(new SnoopPair)))
+    val normalMatches = VecInit(refillMshrs.map { normal =>
+      snoop.io.status.valid && normal.io.status.valid &&
+        normal.io.status.bits.set === snoop.io.status.bits.set &&
+        normal.io.status.bits.reqTag === snoop.io.status.bits.reqTag
+    }).asUInt
+    pair.valid := snoop.io.status.valid
+    when(snoop.io.status.valid) {
+      assert(PopCount(normalMatches) <= 1.U, "snoop pair must identify one normal generation")
+      pair.bits.snoopId := i.U
+      pair.bits.snoopGeneration := mshrTaskGenerations(1)(i)
+      pair.bits.set := snoop.io.status.bits.set
+      pair.bits.tag := snoop.io.status.bits.reqTag
+      pair.bits.normal.valid := normalMatches.orR
+      pair.bits.normal.bits.id := OHToUInt(normalMatches)
+      pair.bits.normal.bits.generation := Mux1H(normalMatches, mshrTaskGenerations(0))
+      pair.bits.normal.bits.set := Mux1H(normalMatches, refillMshrs.map(_.io.status.bits.set))
+      pair.bits.normal.bits.tag := Mux1H(normalMatches, refillMshrs.map(_.io.status.bits.reqTag))
+      val releaseStarts = io.sinkCReleaseData.valid &&
+        io.sinkCReleaseData.bits.set === snoop.io.status.bits.set &&
+        io.sinkCReleaseData.bits.tag === snoop.io.status.bits.reqTag
+      pair.bits.postGrantPending := Mux1H(normalMatches, refillMshrs.map(_.io.postGrantReleaseHold)) ||
+        (releaseStarts && Mux1H(normalMatches, refillMshrs.map(_.io.postGrantReleaseWindow)))
+      pair.bits.payloadReady := Mux1H(normalMatches, refillMshrs.map(_.io.postGrantReleasePayloadReady))
+      pair.bits.probePayload := normalMatches(i) && refillMshrs(i).io.refillPayloadFromProbeAck
+    }
+    pair
+  }
+  val snoopPairKnown = snoopPairs.zipWithIndex.map { case (pair, i) =>
+    pair.valid && snoopMshrs(i).io.status.valid &&
+      pair.bits.snoopGeneration === mshrTaskGenerations(1)(i) &&
+      pair.bits.set === snoopMshrs(i).io.status.bits.set &&
+      pair.bits.tag === snoopMshrs(i).io.status.bits.reqTag
+  }
+  val snoopPairNormalValid = snoopPairs.zipWithIndex.map { case (pair, i) =>
+    val normalOH = UIntToOH(pair.bits.normal.bits.id, mshrsAll)
+    snoopPairKnown(i) && pair.bits.normal.valid &&
+      Mux1H(normalOH, refillMshrs.map(_.io.status.valid)) &&
+      Mux1H(normalOH, mshrTaskGenerations(0)) === pair.bits.normal.bits.generation &&
+      Mux1H(normalOH, refillMshrs.map(_.io.status.bits.set)) === pair.bits.normal.bits.set &&
+      Mux1H(normalOH, refillMshrs.map(_.io.status.bits.reqTag)) === pair.bits.normal.bits.tag
+  }
   // Index0 is snoop, index1 is replacement. These retain each owner until
   // the entire nested-data transaction has physically written and applied.
   val nestedReleasePending = Wire(Vec(2, UInt(mshrsAll.W)))
@@ -823,7 +884,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     case ((refill, snoop), i) =>
       Mux(
         allocIsSnoop,
-        snoopServiceSlotOH(i),
+        snoopServiceSlotOH(i) && !snoop.io.status.valid && !replaceMshrs(i).io.info.valid,
         !refill.io.status.valid &&
           (!allocIsCmo || !snoop.io.status.valid)
       )
@@ -1177,6 +1238,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         val sourceToken = new MainpipeLeaseToken
         val outcome = UInt(2.W) // 1: ToN, 2: ToB, 3: clean
       })))
+      refill.io.pairLifetimeHold := snoopPairs.zipWithIndex.map { case (pair, s) =>
+        snoopPairNormalValid(s) && pair.bits.normal.bits.id === i.U
+      }.reduce(_ || _)
       refill.io.postGrantReleaseSnoopActive := refill.io.postGrantReleaseHold &&
         (postGrantReleaseSnoopActive || postGrantReleaseSnoopAllocating || postGrantCompletion.valid)
       val postGrantReleaseSnoopToN = snoopMshrs.zip(postGrantReleaseSnoopLineMatch).map {
@@ -1271,30 +1335,20 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         resp_sinkC_match_vec(2 * i + 1) && refill.io.status.valid &&
         refill.io.status.bits.set === snoop.io.status.bits.set &&
         refill.io.status.bits.reqTag === snoop.io.status.bits.reqTag
+      val pair = snoopPairs(i)
+      val pairNormalValid = snoopPairNormalValid(i)
+      val releaseStartsForSnoop = io.sinkCReleaseData.valid && snoop.io.status.valid &&
+        io.sinkCReleaseData.bits.set === snoop.io.status.bits.set &&
+        io.sinkCReleaseData.bits.tag === snoop.io.status.bits.reqTag
+      snoop.io.pairSearchPending := !snoopPairKnown(i) || releaseStartsForSnoop
       snoop.io.normalRefillPayloadFromProbeAck :=
-        pairedProbeAckDataMirrored ||
-        (refill.io.refillPayloadFromProbeAck && refill.io.status.valid && snoop.io.status.valid &&
-        refill.io.status.bits.set === snoop.io.status.bits.set &&
-        refill.io.status.bits.reqTag === snoop.io.status.bits.reqTag)
-      // Post-Grant pending/payload are address-matched across physical slots.
-      // Affinity is no longer required: ReleaseBuf[S] receives a nestedwb
-      // dual-write or a late RefillBuf[N]->ReleaseBuf[S] copy.
-      val snoopLineSet = snoop.io.status.bits.set
-      val snoopLineTag = snoop.io.status.bits.reqTag
-      val snoopLookingForPair = snoop.io.status.valid
-      val postGrantPairOH = VecInit(refillMshrs.map { candidate =>
-        snoopLookingForPair && candidate.io.status.valid &&
-          candidate.io.postGrantReleaseHold &&
-          candidate.io.status.bits.set === snoopLineSet &&
-          candidate.io.status.bits.reqTag === snoopLineTag
-      }).asUInt
-      snoop.io.normalRefillPostGrantReleasePending := postGrantPairOH.orR
+        pairedProbeAckDataMirrored || (pairNormalValid && pair.bits.probePayload)
+      snoop.io.normalRefillPostGrantReleasePending := pairNormalValid && pair.bits.postGrantPending
       snoop.io.normalRefillPayloadFromPostGrantRelease :=
-        VecInit(refillMshrs.zipWithIndex.map { case (candidate, j) =>
-          postGrantPairOH(j) && candidate.io.postGrantReleasePayloadReady
-        }).asUInt.orR
-      snoop.io.pairedNormalId.valid := postGrantPairOH.orR
-      snoop.io.pairedNormalId.bits := OHToUInt(postGrantPairOH)
+        pairNormalValid && pair.bits.postGrantPending && pair.bits.payloadReady
+      snoop.io.pairedNormalId.valid := pairNormalValid && pair.bits.postGrantPending
+      snoop.io.pairedNormalId.bits := pair.bits.normal.bits.id
+      snoop.io.pairLifetimeHold := false.B
       // Capture the allocation address match at the same edge as req/state.
       // Do not feed alloc.valid/slot-selector into an active SourceB gate.
       snoop.io.allocPostGrantReleasePending := postGrantReleaseSnoopTargetOH.orR
@@ -1737,19 +1791,68 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // still queued, so the arbiter can accept the first Probe and establish the
   // ownership marker without a combinational ready/valid feedback loop.
   val sourceBOutstanding = sourceBProbeOutstanding ++ replaceProbeOutstanding
-  val sourceBTaskCandidates = (sourceBTasks ++ replaceSourceBTasks).map { task =>
-    val sameLineProbeOutstanding = sourceBOutstanding.map {
-      case (valid, set, tag) =>
-        valid && set === task.bits.set && tag === task.bits.tag
-    }.reduce(_ || _)
-    val guardedTask = Wire(Decoupled(new SourceBReq))
-    guardedTask.valid := task.valid && !sameLineProbeOutstanding
-    guardedTask.bits := task.bits
-    task.ready := guardedTask.ready && !sameLineProbeOutstanding
-    guardedTask
+  // Each source publishes a full registered candidate before the 48-way RR.
+  // Capturing a candidate never fires the owner or consumes SourceB capacity.
+  class SourceBCandidate extends Bundle {
+    val request = new SourceBReq
+    val source = UInt(log2Ceil(3 * mshrsAll).W)
+    val context = UInt(2.W)
+    val id = UInt(mshrBits.W)
+    val generation = UInt(8.W)
   }
+  val sourceBInputs = sourceBTasks ++ replaceSourceBTasks
+  val sourceBGenerations = (0 until mshrsAll).flatMap(i =>
+    Seq(mshrTaskGenerations(0)(i), mshrTaskGenerations(1)(i))) ++ mshrTaskGenerations(2)
+  val sourceBCommit = RegInit(0.U.asTypeOf(Valid(new SourceBCandidate)))
+  val sourceBCandidateOut = Wire(Decoupled(new SourceBCandidate))
+  val sourceBHoldPorts = mshrs.map(_.io.sourceBHold) ++ replaceMshrs.map(_.io.sourceBHold)
+  val sourceBTaskCandidates = sourceBInputs.zipWithIndex.map { case (task, i) =>
+    val candidate = RegInit(0.U.asTypeOf(Valid(new SourceBCandidate)))
+    val selected = sourceBCommit.valid && sourceBCommit.bits.source === i.U
+    sourceBHoldPorts(i) := candidate.valid || selected
+    when(!candidate.valid && !selected && task.valid) {
+      candidate.valid := true.B
+      candidate.bits.request := task.bits
+      candidate.bits.source := i.U
+      candidate.bits.context := (if(i < 2 * mshrsAll) i % 2 else 2).U
+      candidate.bits.id := (if(i < 2 * mshrsAll) i / 2 else i - 2 * mshrsAll).U
+      candidate.bits.generation := sourceBGenerations(i)
+    }
+    val out = Wire(Decoupled(new SourceBCandidate))
+    out.valid := candidate.valid
+    out.bits := candidate.bits
+    when(out.fire) { candidate.valid := false.B }
+    task.ready := false.B
+    out
+  }
+  ArbPerf(twoLevelArb(sourceBTaskCandidates, sourceBCandidateOut, Some("source_b_candidate")),
+    "source_b_candidate_arb")
+  sourceBCandidateOut.ready := !sourceBCommit.valid
+  val commitOH = UIntToOH(sourceBCommit.bits.source, sourceBInputs.size)
+  val commitCurrent = Mux1H(commitOH, sourceBInputs.map(_.valid)) &&
+    Mux1H(commitOH, sourceBGenerations) === sourceBCommit.bits.generation &&
+    Mux1H(commitOH, sourceBInputs.map(_.bits)).asUInt === sourceBCommit.bits.request.asUInt
+  // Recheck at the unique commit point: several prepared same-line candidates
+  // may coexist, but only the first can establish the outstanding Probe.
+  val commitLineBusy = sourceBOutstanding.map { case (valid, set, tag) =>
+    valid && set === sourceBCommit.bits.request.set && tag === sourceBCommit.bits.request.tag
+  }.reduce(_ || _)
   val sourceB = Module(new SourceB())
-  ArbPerf(twoLevelArb(sourceBTaskCandidates, sourceB.io.task, Some("source_b")), "source_b_arb")
+  sourceB.io.task.valid := sourceBCommit.valid && commitCurrent && !commitLineBusy
+  sourceB.io.task.bits := sourceBCommit.bits.request
+  sourceBInputs.zipWithIndex.foreach { case (task, i) =>
+    task.ready := sourceB.io.task.fire && commitOH(i)
+  }
+  when(sourceBCandidateOut.fire) {
+    sourceBCommit.valid := true.B
+    sourceBCommit.bits := sourceBCandidateOut.bits
+  }.elsewhen(sourceBCommit.valid && (!commitCurrent || sourceB.io.task.fire)) {
+    sourceBCommit.valid := false.B
+  }
+  when(sourceB.io.task.fire) {
+    assert(PopCount(VecInit(sourceBInputs.map(_.fire))) === 1.U,
+      "only a unique SourceB commit can consume a source")
+  }
   sourceB.io.grantStatus := io.grantStatus
   io.toSourceB.valid := sourceB.io.sourceB.valid
   io.toSourceB.bits := sourceB.io.sourceB.bits
@@ -1843,7 +1946,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   // A source scheduled to retire at this edge cannot grant a fresh lease.
   val mshrTaskSrcValids = VecInit(mshrTaskSources.zip(mshrTaskLeasePorts.flatten).map {
-    case (source, lease) => source.valid && lease.canPrepare
+    case (source, lease) => source.valid
   }).asUInt
 
   // Per-group arbitration: best effective class, then round-robin inside it.

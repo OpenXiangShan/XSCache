@@ -55,6 +55,7 @@ class ReplaceMSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   // Registered local admission phase protects a possible B capture before
   // its exact same-line service reservation is applied on the following edge.
   val localReservationHold = Input(Bool())
+  val sourceBHold = Input(Bool())
   // The whole nested snoop has completed, including forwarded CompData.
   val snoopDone = Input(Bool())
   // Keep the snapshot current so a later CMO commit cannot restore stale
@@ -568,12 +569,12 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     (!needsCopyBack || copyBackComplete || io.copyBackDone) &&
     !snoopInFlight && !io.snoopStarted && !io.txreqPending
   val retireEligible = valid && (consumedRetire || transportRetire) &&
-    !io.nestedReleaseWritePending
+    !io.nestedReleaseWritePending && !io.sourceBHold
   val mayRetire = retireEligible && !io.localReservationHold
   val retirementPending = RegInit(false.B)
-  retirementPending := retireEligible && !io.tasks.preparedLease.held.valid && !mainpipeInvalidate
+  retirementPending := retireEligible && !io.tasks.preparedLease.held.valid && !io.tasks.preparedLease.proposalHeld && !mainpipeInvalidate
   val willFree = retirementPending && mayRetire &&
-    !io.tasks.preparedLease.held.valid && !mainpipeInvalidate
+    !io.tasks.preparedLease.held.valid && !io.tasks.preparedLease.proposalHeld && !mainpipeInvalidate
   io.tasks.preparedLease.canPrepare := valid && !retireEligible && !retirementPending
   MainpipeLeaseIO.acknowledge(io.tasks.preparedLease, valid, io.alloc.valid, io.tasks.mainpipe.fire)
   when (willFree) {

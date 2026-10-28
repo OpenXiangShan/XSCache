@@ -65,24 +65,31 @@ class MainpipeLeaseIO(implicit p: Parameters) extends CoupledL2Bundle {
   val release = Flipped(ValidIO(new MainpipeLeaseToken))
   val released = ValidIO(new MainpipeLeaseToken)
   val canPrepare = Output(Bool())
+  val proposalHeld = Output(Bool())
 }
 object MainpipeLeaseIO {
-  // Freeze the entire operation at the same edge as the controller snapshot.
-  // Owner events continue to apply. Before issue, an event revokes this exact
-  // lease immediately and latches cancellation until its registered return /
-  // acknowledgment drains. Thus cancellation never grants a one-cycle grace
-  // period, and neither source state nor a live task mux chooses fire effects.
+  // Source proposal is a real stage BEFORE group arbitration. It pins this
+  // allocation and freezes payload/variant while all RR inputs read only FFs.
+  // A coincident event may revoke a proposal selected at this edge; the
+  // versioned group lease then cancels and returns without consuming source.
   def freeze(port: MainpipeLeaseIO, intent: DecoupledIO[TaskBundle],
       output: DecoupledIO[TaskBundle], variant: UInt, invalidate: Bool): UInt = {
     val task = Reg(chiselTypeOf(intent.bits))
     val operation = Reg(UInt(4.W))
+    val proposal = RegInit(false.B)
     val token = Reg(chiselTypeOf(port.prepare.bits))
     val issued = RegInit(false.B)
     val canceled = RegInit(false.B)
-    when(port.prepare.valid) {
-      assert(!port.held.valid && intent.valid, "prepare must capture an unleased source intent")
+    port.proposalHeld := proposal
+    when(!proposal && !port.held.valid && intent.valid && port.canPrepare && !invalidate) {
       task := intent.bits
       operation := variant
+      proposal := true.B
+    }
+    when(proposal && invalidate) { proposal := false.B }
+    when(port.prepare.valid) {
+      assert(!port.held.valid && proposal, "prepare must acquire a registered source proposal")
+      proposal := false.B
       token := port.prepare.bits
       issued := false.B
       canceled := invalidate
@@ -94,8 +101,8 @@ object MainpipeLeaseIO {
     }
     port.cancel.valid := port.held.valid && !issued && (canceled || invalidate)
     port.cancel.bits := token
-    output.valid := Mux(port.held.valid, !issued && !port.cancel.valid, intent.valid)
-    output.bits := Mux(port.held.valid, task, intent.bits)
+    output.valid := Mux(port.held.valid, !issued && !port.cancel.valid, proposal)
+    output.bits := task
     intent.ready := false.B
     when(output.fire) {
       assert(port.held.valid && !port.cancel.valid, "issue must own an uncanceled frozen variant")
@@ -192,6 +199,8 @@ class MSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   // SourceB. SinkC must not route a ProbeAck merely by address to a context
   // whose Probe is still queued behind another same-line context.
   val probeIssued = Output(Bool())
+  val pairLifetimeHold = Input(Bool())
+  val sourceBHold = Input(Bool())
   val replaceDetached = Input(Bool())
   val replaceRefillReady = Input(Bool())
   // Completion of a CMO child ReplaceMSHR.  The normal CMO context retains
@@ -2478,7 +2487,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   val mayRetire = no_schedule && no_wait &&
     (cmo_cbo || normalRefillCommitIssued) &&
     !refillWritePending && !refillWayCommitPending && !readTxnInFlight &&
-    !replLookupInFlight && !io.postGrantReleaseSnoopActive
+    !replLookupInFlight && !io.postGrantReleaseSnoopActive && !io.pairLifetimeHold && !io.sourceBHold
   val retirementPending = RegInit(false.B)
   retirementPending := mayRetire && !io.tasks.preparedLease.held.valid && !mainpipeInvalidate
   val will_free = retirementPending && mayRetire &&
