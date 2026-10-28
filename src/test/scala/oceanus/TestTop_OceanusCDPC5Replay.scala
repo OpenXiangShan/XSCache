@@ -80,6 +80,8 @@ object TestTop_OceanusCDPC5Replay extends App with ChiselSim {
   Constantin.init(false)
   val path = Paths.get(args.head)
   val diagnostic = args.contains("--h2-diagnostic")
+  val dispositionReport = args.find(_.startsWith("--disposition-report=")).map(a => Paths.get(a.split("=", 2)(1)))
+  require(!diagnostic || dispositionReport.isEmpty, "ordinary-random disposition audit uses the strict C5 replay")
   val differences = mutable.ArrayBuffer.empty[ujson.Value]
   val lifecycle = mutable.ArrayBuffer.empty[ujson.Value]
   val input = Source.fromInputStream(new GZIPInputStream(Files.newInputStream(path)))
@@ -109,6 +111,10 @@ object TestTop_OceanusCDPC5Replay extends App with ChiselSim {
   }
   implicit val simulator: HasSimulator = HasSimulator.default
   simulate(new CDPC5ReplayReference()(rp)) { dut =>
+    val disposition = dispositionReport.map { _ =>
+      Vector("dut", "reference").map(side => new CDPC5Dispositions(side,
+        (epoch: Int, va: BigInt) => pages((epoch, va >> 12)).pa | (va & 4095)))
+    }
     val expected = mutable.Map.empty[Int, mutable.ArrayBuffer[String]]
     val actual = mutable.Map.empty[Int, mutable.ArrayBuffer[String]]
     val accepted = mutable.Map.empty[Int, mutable.ArrayBuffer[String]]
@@ -193,6 +199,10 @@ object TestTop_OceanusCDPC5Replay extends App with ChiselSim {
         "reference"->ujson.Obj.from(output.map {case(k,v)=>k->ujson.Str(v.toString(16))}))
       if(r("candidate") != 0) for(k <- Seq("candidate.va", "candidate.depth"))
         assert(output(k) == r(k), s"cycle=${row.cycle} epoch=$e $k")
+      disposition.foreach { sides =>
+        sides(0).sample(row.cycle, e, r)
+        sides(1).sample(row.cycle, e, output + ("enable" -> r("enable")))
+      }
       outcomes(output, list(actual, e)); admission(output, list(referenceAccepted, e))
       dut.clock.step()
     }
@@ -204,6 +214,33 @@ object TestTop_OceanusCDPC5Replay extends App with ChiselSim {
         assert(list(accepted, e) == list(referenceAccepted, e), s"epoch=$e accepted identities differ")
       }
       if(d != r) orderDifferences += 1
+    }
+    disposition.foreach { sides =>
+      sides.foreach(_.finish())
+      val seedCount = header("seeds").num.toInt
+      val ordinary = (0 until seedCount).map { epoch =>
+        val row = CDPC5Dispositions.compare(sides(0).outputs(epoch), sides(1).outputs(epoch))
+        row("epoch") = ujson.Num(epoch)
+        row("dutCounters") = sides(0).counters(epoch)
+        row("referenceCounters") = sides(1).counters(epoch)
+        row
+      }
+      def total(key: String): Int = ordinary.map(_(key).num.toInt).sum
+      val union = total("unionOutputs"); val extra = total("dutExtra"); val missing = total("dutMissing")
+      val result = ujson.Obj("status" -> "PASS", "traceHead" -> header("head"),
+        "replayHead" -> ujson.Str(sys.props.getOrElse("oceanus.c5.head", "unknown")), "trace" -> path.toString,
+        "slices" -> header("slices"), "seeds" -> seedCount, "epochStart" -> 0, "epochEndExclusive" -> seedCount,
+        "comparisonKey" -> "candidateCycle:PA:depth; per-epoch multiset then sum",
+        "scope" -> "ordinary C5 random epochs only; natural system training; no added Filter writes or output backpressure; warmup and trailing directed epochs excluded",
+        "dutOutputs" -> total("dutOutputs"), "referenceOutputs" -> total("referenceOutputs"),
+        "unionOutputs" -> union, "dutExtra" -> extra, "dutMissing" -> missing,
+        "changedScenarios" -> ordinary.count(r => r("dutExtra").num + r("dutMissing").num > 0),
+        "differentFractionOfUnion" -> (if(union == 0) 0.0 else (extra + missing).toDouble / union),
+        "random" -> ujson.Arr.from(ordinary))
+      val dest = dispositionReport.get
+      Option(dest.toAbsolutePath.getParent).foreach(p => Files.createDirectories(p))
+      Files.writeString(dest, result.render(2))
+      println(s"CDP_C5_NORMAL_DISPOSITIONS seeds=$seedCount slices=${header("slices").num.toInt} dut=${total("dutOutputs")} reference=${total("referenceOutputs")} union=$union extra=$extra missing=$missing fraction=${result("differentFractionOfUnion").num} report=$dest")
     }
     val outputCount = expected.values.flatten.count(_.startsWith("out:"))
     assert(outputCount > 0 && requestCount > 0)
