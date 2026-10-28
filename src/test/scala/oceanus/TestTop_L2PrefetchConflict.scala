@@ -372,11 +372,12 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
   }
   var sourceMode="all"
   var fullHistory=false
+  var hnFlitsOnly=false
   var tapeWriter:Option[java.io.PrintWriter]=None
   var replayFrames=Map.empty[Int,ConflictFrame]
   val tapeDemands=mutable.ArrayBuffer.empty[(BigInt,Boolean,Boolean)]
   val eventHistory=mutable.Queue.empty[String]
-  def record(s:String):Unit={eventHistory.enqueue(s);if(eventHistory.size>512) eventHistory.dequeue();if(fullHistory) println("CONFLICT_EVENT "+s)}
+  def record(s:String):Unit={eventHistory.enqueue(s);if(eventHistory.size>512) eventHistory.dequeue();if(fullHistory||(hnFlitsOnly&&s.startsWith("HN_EXT"))) println("CONFLICT_EVENT "+s)}
   driver.trace=record _
   driver.dumpTrace=()=>{println(s"CONFLICT_FAILURE seed=$seed slices=$slices cycle=$cycle");eventHistory.foreach(s=>println("CONFLICT_HISTORY "+s));println(s"CONFLICT_FAILURE_STATE live=$live data=$data evicts=${evicts.takeRight(16)}")}
   val data=mutable.Queue.empty[PendingDnComp]
@@ -809,6 +810,14 @@ object TestTop_L2PrefetchConflict extends App with ChiselSim {
   require(Set("all","none","bop","vbop","recv","cdp")(sourceMode))
   val sourceModes=opt("--source-modes",sourceMode).split(",").toSeq
   require(sourceModes.forall(Set("all","none","bop","vbop","recv","cdp")))
+  val ablations=opt("--ablation-modes","baseline").split(",").toSeq
+  require(ablations.forall(Set("baseline","no-dct","no-retry","no-split","all-off")))
+  val seedAblations=opt("--seed-ablation-plan","") match {
+    case "" => selectedSeeds.flatMap(seed=>ablations.map(ablation=>(seed,ablation)))
+    case plan => plan.split(",").toSeq.map{x=>val a=x.split(":",2);(a(0).toInt,a(1))}
+  }
+  require(seedAblations.nonEmpty&&seedAblations.forall{case(seed,a)=>selectedSeeds.contains(seed)&&
+    Set("baseline","no-dct","no-retry","no-split","all-off")(a)})
   val requestedRecordTape=opt("--record-tape","")
   val requestedReplayTape=opt("--replay-tape","")
   val autoIsolation=opt("--auto-isolate-tape","")
@@ -828,19 +837,23 @@ object TestTop_L2PrefetchConflict extends App with ChiselSim {
   implicit val simulator:HasSimulator=HasSimulator.default
   simulate(new TestTopConflict(cfg)(params)){dut=>
     var hostFailures=0
-    for(seed<-selectedSeeds;scenario<-selectedScenarios;phase<-phases) {
+    for((seed,ablation)<-seedAblations;scenario<-selectedScenarios;phase<-phases) {
       val activeMode=if(phase=="record") "all" else phase
       val recordTape=if(autoIsolation.nonEmpty && phase=="record") autoIsolation else requestedRecordTape
       val replayTape=if(autoIsolation.nonEmpty && phase!="record") autoIsolation else requestedReplayTape
-      println(s"CONFLICT_BEGIN seed=$seed slices=$slices mode=$mode case=$scenario level=$level cycles=$cycles")
+      println(s"CONFLICT_BEGIN seed=$seed slices=$slices mode=$mode case=$scenario level=$level cycles=$cycles ablation=$ablation")
       println(s"CONFLICT_ISOLATION_BEGIN seed=$seed slices=$slices level=$level sources=$activeMode phase=$phase")
       val r=new ConflictRun(dut,seed,slices,mode=="random")
-      r.sourceMode=activeMode;r.fullHistory=fullHistory
+      r.sourceMode=activeMode;r.fullHistory=fullHistory;r.hnFlitsOnly=opt("--hn-flits-only","false").toBoolean
       if(opt("--hn-extension","false").toBoolean) {
         require(requestedRecordTape.isEmpty&&requestedReplayTape.isEmpty&&autoIsolation.isEmpty,"HN extension uses event trace instead of legacy-only tape")
-        r.enableHNExtension(HNExtConfig(retryPercent=opt("--retry-percent","30").toInt,
-          splitPercent=opt("--split-percent","50").toInt,dctPercent=opt("--dct-percent","50").toInt,
-          seed=0x484e0000L+seed*100+slices))
+        val noDct=Set("no-dct","all-off")(ablation)
+        val noRetry=Set("no-retry","all-off")(ablation)
+        val noSplit=Set("no-split","all-off")(ablation)
+        r.enableHNExtension(HNExtConfig(retryPercent=if(noRetry)0 else opt("--retry-percent","30").toInt,
+          splitPercent=if(noSplit)0 else opt("--split-percent","50").toInt,
+          dctPercent=if(noDct)0 else opt("--dct-percent","50").toInt,
+          seed=0x484e0000L+seed*100+slices,forwardEnable= !noDct && opt("--forward-enable","true").toBoolean))
       }
       if(recordTape.nonEmpty) {
         val path=java.nio.file.Paths.get(recordTape.replace("{seed}",seed.toString))
@@ -1010,7 +1023,7 @@ object TestTop_L2PrefetchConflict extends App with ChiselSim {
         println(s"CONFLICT_STIMULUS seed=$seed slices=$slices level=$level cycles=$cycles offered=$offered accepted=$accepted validCycles=${r.driver.demandOfferCycles-offerBegin} blockedCycles=${r.driver.demandBlockedCycles-blockedBegin} maxOutstanding=${r.driver.maxOutstanding}")
       }
       r.finish()
-      println(s"CONFLICT_RESULT pass=true seed=$seed slices=$slices mode=$mode case=$scenario level=$level sources=$activeMode")
+      println(s"CONFLICT_RESULT pass=true seed=$seed slices=$slices mode=$mode case=$scenario level=$level sources=$activeMode ablation=$ablation")
       } catch {
         // A host scoreboard failure leaves the simulator alive. Preserve its
         // evidence and reset before the next seed; RTL assertion failures still
@@ -1018,7 +1031,7 @@ object TestTop_L2PrefetchConflict extends App with ChiselSim {
         case e: java.lang.AssertionError if mode=="random" =>
           hostFailures+=1
           r.dumpFailure()
-          println(s"CONFLICT_RESULT pass=false seed=$seed slices=$slices mode=$mode case=$scenario level=$level sources=$activeMode cycle=${r.cycle} error=${e.getMessage}")
+          println(s"CONFLICT_RESULT pass=false seed=$seed slices=$slices mode=$mode case=$scenario level=$level sources=$activeMode ablation=$ablation cycle=${r.cycle} error=${e.getMessage}")
       } finally r.tapeWriter.foreach(_.close())
     }
     assert(hostFailures==0,s"$hostFailures random seeds failed host scoreboards; see pass=false records")

@@ -5,7 +5,7 @@ import scala.collection.mutable
 // Host-only CHI model, shared by v2/v3 adapters. No dependency on either
 // conflict harness or RTL hierarchy. IHI0050E.b is the normative issue.
 case class HNExtConfig(retryPercent:Int=30, splitPercent:Int=50, dctPercent:Int=50,
-  seed:Long=1L, maxGrantDelay:Int=2048, maxSplitGap:Int=512) {
+  seed:Long=1L, maxGrantDelay:Int=2048, maxSplitGap:Int=512, forwardEnable:Boolean=true, directedCopyBackRetry:Boolean=false) {
   require(Set(0,10,30,50)(retryPercent))
   require(0<=splitPercent && splitPercent<=100 && 0<=dctPercent && dctPercent<=100)
   require(maxGrantDelay>=1 && maxGrantDelay<=2048 && maxSplitGap>=0 && maxSplitGap<=512)
@@ -46,10 +46,10 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
     var firstData:Int = -1,var responseCycle:Int = -1)
   private case class Write(req:HNExtReq,var grant:Boolean=false,var comp:Boolean=false,
     var beats:Set[Int]=Set.empty)
-  private case class Retry(req:HNExtReq,credit:Int,var ack:Boolean=false)
+  private case class Retry(req:HNExtReq,credit:Int,var ack:Boolean=false,var invalidated:Boolean=false)
   private case class Snoop(s:HNExtSnp,var home:Boolean=false,var forwarded:Boolean=false,
     var fwdState:Int = -1,var homeBeats:Set[Int]=Set.empty,var beats:Set[Int]=Set.empty,
-    var ack:Boolean=false,var ackDue:Int=Int.MaxValue)
+    var ack:Boolean=false,var ackDue:Int=Int.MaxValue,var fallback:Boolean=false)
   private case class SR(due:Int,r:HNExtRsp)
   private case class SD(due:Int,d:HNExtDat)
   private val reads=mutable.Map.empty[(BigInt,BigInt),Read]
@@ -142,28 +142,41 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
     if(req.op==5) { // PCrdReturn; cancelled CopyBack retry (§2.6.6, §2.11.1)
       val t=req("PCrdType").toInt;val key=(req("TgtID"),req.rn,t)
       check(req("AllowRetry")==0&&credits(key)>0,s"credit return without credit cycle=$c req=$req")
-      val pending=retries.get(req.key).orElse(retries.values.find(r=>r.req.rn==req.rn&&r.credit==t&&r.ack))
-      check(pending.nonEmpty,s"unmatched PCrdReturn $req")
+      if(req.txn!=0) {
+        counts("dutProtocolErrors")+=1
+        trace(s"HN_EXT_DUT_PROTOCOL_ERROR cycle=$c channel=TXREQ rule=2.6.6 PCrdReturnTxnID=${req.txn} expected=0")
+      }
+      // PCrdReturn carries no transaction identity. Credits are fungible within
+      // (Completer, Requester, PCrdType); never associate it by TxnID zero.
+      val pending=retries.values.find(r=>r.req.rn==req.rn&&r.credit==t&&r.ack&&
+        r.req("TgtID")==req("TgtID")&&isWrite(r.req.op)&&r.invalidated)
+      check(pending.nonEmpty,s"unmatched/non-invalidated CopyBack PCrdReturn $req (§2.11)")
       credits(key)-=1;retries.remove(pending.get.req.key)
       event("creditReturn",pending.get.req.addr,c);completedRequests+=((c,pending.get.req));return
     }
     check(!reads.contains(req.key)&& !writes.contains(req.key),s"request identity reused cycle=$c req=$req")
     if(req("AllowRetry")==0) {
-      val retry=retries.getOrElse(req.key,throw new IllegalStateException(s"HN_CHI_EXTENSION_VIOLATION reissue without RetryAck cycle=$c req=$req"))
+      val variableFields=Seq("QoS","TgtID","TxnID",
+        "SLCRepHint","AllowRetry","PCrdType","TraceTag","RSVDC")
+      def invariant(q:HNExtReq)=q.fields -- variableFields
+      val retry=retries.get(req.key).filter(r=>r.credit==req("PCrdType")&&invariant(r.req)==invariant(req))
+        .orElse(retries.values.find(r=>r.req.rn==req.rn&&r.credit==req("PCrdType")&&invariant(r.req)==invariant(req)))
+        .getOrElse(throw new IllegalStateException(s"HN_CHI_EXTENSION_VIOLATION reissue without matching RetryAck cycle=$c req=$req"))
       val ck=(BigInt(0),req.rn,retry.credit)
       check(retry.ack&&req("PCrdType")==retry.credit&&credits(ck)>0,s"reissue credit mismatch cycle=$c req=$req")
-      val a=retry.req.fields -- Seq("AllowRetry","PCrdType")
-      val b=req.fields -- Seq("AllowRetry","PCrdType")
+      val a=invariant(retry.req)
+      val b=invariant(req)
       check(a==b,s"reissue changed fields cycle=$c changed=${(a.keySet++b.keySet).filter(k=>a.get(k)!=b.get(k))}")
-      credits(ck)-=1;retries.remove(req.key);event("retryReissue",req.addr,c)
+      credits(ck)-=1;retries.remove(retry.req.key);event("retryReissue",req.addr,c)
       accept(req,c)
     } else {
       check(req("PCrdType")==0,s"initial PCrdType nonzero cycle=$c")
       check(!retries.contains(req.key),s"retry identity reused cycle=$c")
-      if(rng.nextInt(100)<config.retryPercent) {
-        val t=retrySeq%16;retrySeq+=1
-        val grantDelay=if(retrySeq%4==1) 1 else if(retrySeq%4==2) config.maxGrantDelay else 1+rng.nextInt(config.maxGrantDelay)
-        val early=retrySeq%2==1
+      if(rng.nextInt(100)<config.retryPercent||(config.directedCopyBackRetry&&isWrite(req.op))) {
+        val directed=config.directedCopyBackRetry&&isWrite(req.op)
+        val t=if(directed)1 else retrySeq%16;retrySeq+=1
+        val grantDelay=if(directed)config.maxGrantDelay else if(retrySeq%4==1) 1 else if(retrySeq%4==2) config.maxGrantDelay else 1+rng.nextInt(config.maxGrantDelay)
+        val early= !directed&&retrySeq%2==1
         val ackDelay=if(early) grantDelay+1+rng.nextInt(32) else 1
         val actualGrant=if(early)grantDelay else math.max(2,grantDelay)
         retries(req.key)=Retry(req,t)
@@ -187,7 +200,7 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
     } else {
       val split=rng.nextInt(100)<config.splitPercent
       val dct= !split&&rng.nextInt(100)<config.dctPercent
-      val home=if(dct)BigInt(0x20) else BigInt(0)
+      val home=BigInt(0) // One fixed Home; only the DCT data source differs.
       val src=if(dct)BigInt(0x31) else home
       val resp=if(Set(7,0x4c)(req.op))2 else 1
       val dbid=allocateDBID(home,req.rn)
@@ -211,7 +224,18 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
   def drive(c:Int,rspReady:Boolean,datReady:Boolean,snpReady:Boolean,
     paused:BigInt=>Boolean=(_:BigInt)=>false):HNExtDrive={
     check(c>lastDriveCycle,s"drive repeated cycle=$c");lastDriveCycle=c
-    val acks=snoops.values.filter(x=>x.forwarded&&x.beats.size==2&& !x.ack&&x.ackDue<=c)
+    // A failed forwarding attempt still belongs to an original virtual Read.
+    // Complete that Read from memory instead of discarding its requester.
+    snoops.values.filter(x=>isFwd(x.s.op)&&x.home&& !x.forwarded&& !x.fallback).foreach{x=>
+      x.fallback=true;x.beats=Set(0);x.ackDue=c+2
+      trace(s"HN_EXT_VIRTUAL_FALLBACK cycle=$c SrcID=${x.s.hn} TgtID=${x.s.fwd} TxnID=${x.s.fwdTxn} HomeNID=${x.s.hn} DBID=${x.s.txn} DataID=0 Resp=${expectedFwd(x.s.op)} pa=0x${x.s.addr.toString(16)}")
+    }
+    snoops.values.filter(x=>x.fallback&&x.beats==Set(0)&&x.ackDue<=c+1).foreach{x=>
+      x.beats+=2
+      trace(s"HN_EXT_VIRTUAL_FALLBACK cycle=$c SrcID=${x.s.hn} TgtID=${x.s.fwd} TxnID=${x.s.fwdTxn} HomeNID=${x.s.hn} DBID=${x.s.txn} DataID=2 Resp=${expectedFwd(x.s.op)} pa=0x${x.s.addr.toString(16)}")
+      counts("fallbackReadCompleted")+=1
+    }
+    val acks=snoops.values.filter(x=>(x.forwarded||x.fallback)&&x.beats.size==2&& !x.ack&&x.ackDue<=c)
       .map(x=>HNExtTargetAck(x.s.fwd,x.s.hn,x.s.txn)).toSeq
     acks.foreach(a=>targetAck(a,c))
     def rspLegal(r:HNExtRsp)=r.op==3||r.op==7||{
@@ -232,9 +256,13 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
       else {
         check(snpSeq<4000,"snoop TxnID range exhausted")
         val sequence=snpSeq;snpSeq+=1
-        val op=requested.getOrElse(if(sequence%10<6)fwdOps((sequence%10+sequence/10)%fwdOps.size)
+        val selectedOp=requested.getOrElse(if(sequence%10<6)fwdOps((sequence%10+sequence/10)%fwdOps.size)
           else if(sequence%10<8)stashOps((sequence/10+sequence)%stashOps.size)
           else normalOps((sequence/10+sequence)%normalOps.size))
+        // Disabling DCT also replaces forwarding snoops with their non-forwarding
+        // equivalents. Preserve the sequence and address selection for ablation.
+        val op=if(config.forwardEnable)selectedOp else Map(0x11->1,0x12->2,0x13->3,
+          0x14->4,0x16->0x15,0x17->7).getOrElse(selectedOp,selectedOp)
         val ret=if(Set(1,2,3,4,0x11,0x12,0x14)(op))sequence%2 else 0
         val sd=if(op==0x10)0 else if(Set(1,2,3,4,0x11,0x12,0x13,0x14,0x15,0x16)(op))sequence%2 else 1
         offers.dequeue();Some(HNExtSnp(rn,0,BigInt(snpSeq),pa,op,ret,sd,
@@ -296,6 +324,19 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
   def rxSnp(s:HNExtSnp,c:Int):Unit={
     check(canSnoop(s.rn,s.addr),"SNP during completion/targetAck/CopyBack window (§4.11.2)")
     check(!snoops.contains((s.hn,s.txn)),"snoop TxnID reused")
+    check((fwdOps++stashOps++normalOps).contains(s.op),"unsupported SNP opcode")
+    check(Set(0,1)(s.ret)&&Set(0,1)(s.dnSD),"SNP modifier encoding")
+    check(!Set(5,6,8,9,10,11,12,0x10,0x13,0x17)(s.op)||s.ret==0,
+      "RetToSrc must be zero (§4.9)")
+    check(!Set(5,6,7,8,9,10,11,12,0x17)(s.op)||s.dnSD==1,
+      "DoNotGoToSD must be one (§13.10.34)")
+    check(s.op!=0x10||s.dnSD==0,"SnpQuery DoNotGoToSD must be zero (§13.10.34)")
+    check(isFwd(s.op)||(s.fwd==0&&s.fwdTxn==0),"non-Fwd SNP forwarding fields must be zero (§2.5.7–8)")
+    if(isFwd(s.op)) {
+      check(!snoops.values.exists(x=>isFwd(x.s.op)&&x.s.fwd==s.fwd&&x.s.fwdTxn==s.fwdTxn),
+        "virtual requester TxnID reused (§2.5.2)")
+      trace(s"HN_EXT_VIRTUAL_REQUEST cycle=$c SrcID=${s.fwd} TgtID=${s.hn} TxnID=${s.fwdTxn} Opcode=${Map(0x11->1,0x12->2,0x13->3,0x14->0x26,0x16->0x4c,0x17->7)(s.op)} ExpCompAck=1 pa=0x${s.addr.toString(16)}")
+    }
     snoops((s.hn,s.txn))=Snoop(s);issuedSnoops+=s
     counts("snoopTotal")+=1;counts("snpOpcode:"+s.op)+=1
     if(retries.values.exists(x=>x.req.rn==s.rn&&(x.req.addr>>6)==(s.addr>>6)))counts("snoopDuringRetrySameLine")+=1
@@ -324,7 +365,10 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
         x.homeBeats+=b;x.home=x.homeBeats.size==2
       case None=>x.home=true
     }
-    if(x.home){counts(if(forwarded)"homeFwdResponse" else "homeSnoopResponse")+=1;retireSnoop(key,c)}
+    if(x.home){
+      if((resp&3)==0)retries.values.filter(r=>r.req.rn==rn&&(r.req.addr>>6)==(x.s.addr>>6)&&isWrite(r.req.op)).foreach(_.invalidated=true)
+      counts(if(forwarded)"homeFwdResponse" else "homeSnoopResponse")+=1;retireSnoop(key,c)
+    }
   }
   def forwardedData(rn:BigInt,target:BigInt,txn:BigInt,home:BigInt,dbid:BigInt,
     resp:Int,beat:Int,payload:BigInt,c:Int):Unit={
@@ -342,13 +386,13 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
   }
   def targetAck(a:HNExtTargetAck,c:Int):Unit={
     val key=(a.tgt,a.txn);val x=snoops.getOrElse(key,throw new IllegalStateException("HN_CHI_EXTENSION_VIOLATION unmatched target CompAck"))
-    check(x.s.fwd==a.src&&x.forwarded&&x.beats.size==2&& !x.ack,"target CompAck before all DCT data/duplicate (§2.8.3)")
-    x.ack=true;counts("targetCompAck")+=1;trace(s"HN_EXT_TARGET_COMP_ACK cycle=$c SrcID=${a.src} TgtID=${a.tgt} TxnID=${a.txn}")
+    check(x.s.fwd==a.src&&(x.forwarded||x.fallback)&&x.beats.size==2&& !x.ack,"target CompAck before all DCT data/duplicate (§2.8.3)")
+    x.ack=true;counts(if(x.forwarded)"targetCompAck" else "fallbackCompAck")+=1;trace(s"HN_EXT_TARGET_COMP_ACK cycle=$c SrcID=${a.src} TgtID=${a.tgt} TxnID=${a.txn}")
     retireSnoop(key,c)
   }
   private def retireSnoop(key:(BigInt,BigInt),c:Int):Unit={
     val x=snoops(key)
-    if(x.home&&(!x.forwarded||(x.beats.size==2&&x.ack))) {
+    if(x.home&&(!isFwd(x.s.op)||(x.beats.size==2&&x.ack))) {
       snoops.remove(key);counts("snoopCompleted")+=1
       if(x.forwarded)counts("forwardTransactionCompleted")+=1
     } else if(x.home&&x.forwarded)counts("homeResponseAwaitTargetAck")+=1
@@ -367,6 +411,9 @@ class L2HNExtensionModel(val config:HNExtConfig, val memory:(BigInt,Int)=>BigInt
     check(counts("accepted")==completedRequests.size-counts("creditReturn"),"accepted request closure")
     check(counts("snoopTotal")==counts("snoopCompleted"),"snoop closure")
     check(counts("targetCompAck")==counts("forwardTransactionCompleted"),"forward completion/target CompAck closure")
+    check(counts("fallbackReadCompleted")==counts("fallbackCompAck"),"fallback Read/CompAck closure")
+    if(counts("dutProtocolErrors")!=0)throw new IllegalStateException(
+      "L2_CHI_PROTOCOL_VIOLATION DUT protocol field violation; see HN_EXT_DUT_PROTOCOL_ERROR")
   }
 }
 object L2HNExtensionModel {

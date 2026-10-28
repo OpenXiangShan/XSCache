@@ -99,7 +99,8 @@ object TestHNExtensionModel extends App {
       d.dat.foreach{x=>m.rxDat(x,c)
         if(x.op==4&&x.beat==0)ackQueue.enqueue((c+1,x.rn,x.home,x.dbid))}
       retryAck.toSeq.foreach{case(key,t)=>if(credit(t)>0){
-        val original=originals(key);val re=original.copy(fields=original.fields++Map("AllowRetry"->BigInt(0),"PCrdType"->BigInt(t)))
+        val original=originals(key);val re=original.copy(fields=original.fields++Map("AllowRetry"->BigInt(0),"PCrdType"->BigInt(t),
+          "TxnID"->(original.txn+1000),"QoS"->BigInt(5)))
         rejects(m.request(re.copy(fields=re.fields.updated("MemAttr",BigInt(0))),c))
         m.request(re,c);credit(t)-=1;retryAck.remove(key)
       }}
@@ -110,5 +111,32 @@ object TestHNExtensionModel extends App {
     if(rate==50)assert((0 until 16).forall(t=>m.counts("retryPCrdType:"+t)>0))
     println(s"HN_EXT_UNIT_CREDIT rate=$rate retries=${m.counts("retrySelected")} grantFirst=${m.counts("grantBeforeRetryAck")} pass=true")
   }
+  // Snoop modifier rules and a failed-forwarding Read must be checked beyond
+  // the original data-forwarding happy path (§4.9, §13.10.34, §2.3.1 Alt 5c).
+  rejects(mk().rxSnp(s.copy(op=0x13,ret=1),0))
+  rejects(mk().rxSnp(s.copy(op=0x17,dnSD=0),0))
+  rejects(mk().rxSnp(s.copy(op=7,fwdTxn=0),0))
+  val fallback=mk();fallback.rxSnp(s,0)
+  fallback.snoopResponse(rn,0,7,1,0,0,None,None,1)
+  assert(!fallback.empty,"failed forwarding must not discard its original Read")
+  for(c<-2 to 5)fallback.drive(c,true,true,true)
+  fallback.finish();assert(fallback.counts("fallbackReadCompleted")==1&&fallback.counts("fallbackCompAck")==1)
+  // Directed CopyBack cancellation uses a fungible P-Credit, never TxnID of
+  // PCrdReturn. Its protocol-required zero cannot identify request TxnID 7.
+  val cancelModel=new L2HNExtensionModel(HNExtConfig(0,0,0,seed=37,maxGrantDelay=64,
+    forwardEnable=false,directedCopyBackRetry=true),OvernightMemory.beat _)
+  val copy=q(7).copy(fields=q(7).fields.updated("Opcode",BigInt(0x42)))
+  cancelModel.request(copy,0);var invalidated=false;var returned=false
+  for(c<-1 to 100){val d=cancelModel.drive(c,true,true,true)
+    d.rsp.foreach{r=>cancelModel.rxRsp(r,c)
+      if(r.op==3){cancelModel.rxSnp(s.copy(op=7,fwd=0,fwdTxn=0),c)
+        cancelModel.snoopResponse(rn,0,7,1,0,0,None,None,c+1);invalidated=true}
+      if(r.op==7){assert(invalidated)
+        val ret=HNExtReq(Map("SrcID"->rn,"TgtID"->BigInt(0),"TxnID"->BigInt(0),
+          "Opcode"->BigInt(5),"AllowRetry"->BigInt(0),"PCrdType"->BigInt(r.credit)))
+        cancelModel.request(ret,c+1);returned=true}
+    }
+  }
+  assert(returned);cancelModel.finish()
   println(s"HN_EXT_UNIT pass=true negatives=$negatives forwardTarget=true requesterDCT=true splitRead=true retry=true")
 }
