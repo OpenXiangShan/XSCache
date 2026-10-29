@@ -44,6 +44,7 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt, tshrs: Int
   def sample(dut: TestTopCDPRawAudit,row: Map[String,BigInt],cycle: Int): Unit = {
     def num(path:String):BigInt=row(path)
     def bit(path:String):Boolean=row(path)!=0
+    val observePrefetch=dut.module.config.cdpObserveEnable
     val enabled=row("enable")!=0
     val train=mutable.ArrayBuffer.empty[(Int,Train)]
     val evict=mutable.ArrayBuffer.empty[(Int,Meta,BigInt)]
@@ -61,14 +62,14 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt, tshrs: Int
           val k=(num(req+".SrcID"),num(req+".TxnID"))
           val q=requests.getOrElse(k,throw new AssertionError(s"M2 execution without upstream $k cycle=$cycle"))
           assert(q.nonEmpty);val (pa,va,rs,en)=q.dequeue();if(q.isEmpty) requests.remove(k)
-          assert(pa==addr && (va>>6)==num(p+".context.vpn")*64+(addr>>6&63) && rs==num(p+".context.reqSource") && en==bit(p+".context.trainEnable"),s"M2 upstream context cycle=$cycle key=$k")
+          assert(pa==addr && (!observePrefetch || ((va>>6)==num(p+".context.vpn")*64+(addr>>6&63) && rs==num(p+".context.reqSource") && en==bit(p+".context.trainEnable"))),s"M2 upstream context cycle=$cycle key=$k")
           if(opcode==CCHIOpcode.ReadOnce.opcode) hit("ReadOnce")
         }
-        if(demand && read) train+=((bank*tshrs+i,Train(addr,(num(p+".context.vpn")<<6)|(addr>>6&63),if(old.hit) old.source else 0,if(old.hit) old.depth else 0,old.hit,num(p+".context.reqSource").toInt,bit(p+".context.trainEnable"))))
+        if(observePrefetch && demand && read) train+=((bank*tshrs+i,Train(addr,(num(p+".context.vpn")<<6)|(addr>>6&63),if(old.hit) old.source else 0,if(old.hit) old.depth else 0,old.hit,num(p+".context.reqSource").toInt,bit(p+".context.trainEnable"))))
         val isHit=demand && old.hit && Set(9,L2PfSource.SMS,2,3)(old.source) &&
           Set(CCHIOpcode.ReadShared.opcode,CCHIOpcode.ReadUnique.opcode)(opcode) && bit(req+".ExpCompData")
         val refill= !old.hit && Set(CCHIOpcode.ReadShared.opcode,CCHIOpcode.ReadUnique.opcode,CCHIOpcode.StashShared.opcode,CCHIOpcode.StashUnique.opcode)(opcode)
-        if(isHit || refill) {
+        if(observePrefetch && (isHit || refill)) {
           val pf= !demand && (num(req+".TxnID")>>4)!=0
           start=Some(Line(addr,if(isHit) old.source else if(pf) (num(req+".TxnID")>>4).toInt else 0,
             if(isHit) old.depth else if(pf) ((num(req+".TxnID")>>2)&3).toInt else 0,isHit))
@@ -94,9 +95,9 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt, tshrs: Int
         if(!t.en) hit("trainEnable0")
       }
       val e=bit(p+".evictState") && bit(p+".metaMask.state") && num(p+".metaValue.state")==0 && old.hit && old.state!=0
-      assert(bit(p+".evict.valid")==e,s"M2 eviction lifecycle cycle=$cycle bank=$bank tshr=$i old=$old")
+      assert(bit(p+".evict.valid")== (observePrefetch && e),s"M2 eviction lifecycle cycle=$cycle bank=$bank tshr=$i old=$old")
       if(e) {
-        assert(num(p+".evict.bits.paddr")==addr && num(p+".evict.bits.pfSource")==old.source && num(p+".evict.bits.pfDepth")==old.depth)
+        if (observePrefetch) assert(num(p+".evict.bits.paddr")==addr && num(p+".evict.bits.pfSource")==old.source && num(p+".evict.bits.pfDepth")==old.depth)
         val resident=residentLines.get(addr)
         assert(resident.exists(m=>m.state!=0 && m.source==old.source && m.depth==old.depth),
           s"M2 victim lifecycle PA=$addr old=$old resident=$resident history=${residentHistory.mkString(";")}")
@@ -144,7 +145,8 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt, tshrs: Int
         else residentLines.remove(line)
       }
     }
-    checkAdapters(row,cycle,train.toSeq,evict.toSeq,lines.map(_.toSeq),dut.selectedVpn,dut.selectedFilter,dut.halfOut,dut.halfBank)
+    if (observePrefetch) checkAdapters(row,cycle,train.toSeq,evict.toSeq,lines.map(_.toSeq),dut.selectedVpn,dut.selectedFilter,dut.halfOut,dut.halfBank)
+    else assert(train.isEmpty && lines.forall(_.isEmpty), "structural-off predicted prefetch events")
   }
   // The same M2 RR/admission/capture oracle is also exercised at the adapter
   // interface. Those directed witnesses are reported separately from system

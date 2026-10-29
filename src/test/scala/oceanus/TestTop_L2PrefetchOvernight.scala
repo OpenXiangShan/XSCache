@@ -40,8 +40,12 @@ class TestTopOvernight(cfg: L2Configuration)(implicit p: Parameters) extends Tes
   def read[T <: Data](x: T): T = BoringUtils.bore(x)
   val probe = IO(Output(new OvernightProbe(cfg.sliceNum)))
   val cdpAudit = IO(Output(new CDPAuditProbe))
+  // Structural-off uses the same demand driver, with absent learner probes idle.
+  // This is test observation only; production configuration proves absence.
+  // Kept as a public member for existing conflict-observation subclasses.
+  val adapter = module.pfTlbAdapter.orNull
+  if (cfg.stubMode) {
   CDPAuditProbe.connect(cdpAudit, module.cdp.get, read _)
-  val adapter=module.pfTlbAdapter.get
   probe.tlbOwner := read(adapter.owner)(read(adapter.issue))
   probe.tlbRetry := read(adapter.retried)(read(adapter.issue))
   for(c <- 0 until 2) {
@@ -77,6 +81,14 @@ class TestTopOvernight(cfg: L2Configuration)(implicit p: Parameters) extends Tes
     val req=module.slices(s).io.UpRXREQ
     probe.entered(s).valid := read(req.valid) && read(req.ready) && read(req.bits.SrcID)===cfg.pfSrcID.U
     probe.entered(s).bits := read(req.bits.TxnID)(7,4)
+  }
+  } else {
+    require(!cfg.bopEnable && !cfg.prefetchIssueEnable && !cfg.pfRecvEnable &&
+      !cfg.pfCtrlEnable && !cfg.pfTrainEnable && !cfg.pfTlbEnable)
+    require(module.cdp.isEmpty && module.vbopStub.isEmpty && module.pfTlbAdapter.isEmpty)
+    require(module.pfQueues.isEmpty && module.pfRecvReqs.isEmpty && module.recvFallback.isEmpty)
+    probe := 0.U.asTypeOf(probe)
+    cdpAudit := 0.U.asTypeOf(cdpAudit)
   }
 }
 

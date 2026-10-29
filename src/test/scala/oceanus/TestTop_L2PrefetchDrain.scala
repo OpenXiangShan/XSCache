@@ -55,19 +55,28 @@ class TestTopDrain(cfg: L2Configuration)(implicit p: Parameters) extends TestTop
   val sourceQueues = children(module).collect {
     case q: OverwriteQueue[_] => q.asInstanceOf[OverwriteQueue[FlitREQ]]
   }
-  require(sourceQueues.size == cfg.sliceNum * (module.pfSourceSlots.size + 1))
+  require(sourceQueues.size == (if (cfg.stubMode) cfg.sliceNum * (module.pfSourceSlots.size + 1) else 0))
   val mergedFire = IO(Output(Vec(cfg.sliceNum, Bool())))
   val mergedSource = IO(Output(Vec(cfg.sliceNum, UInt(4.W))))
+  val starved = if (cfg.stubMode) {
+    (0 until cfg.sliceNum).flatMap(bank => Seq(L2PfSource.PBOP, L2PfSource.CDP).map(
+      src => sourceQueues(bank * module.pfSourceSlots.size + module.pfSourceSlots.indexOf(src))))
+  } else Seq.empty[OverwriteQueue[FlitREQ]]
+  val starvedEnq = IO(Output(Vec(cfg.sliceNum*2, Valid(UInt(48.W)))))
+  val starvedDeq = IO(Output(Vec(cfg.sliceNum*2, Valid(UInt(48.W)))))
+  val starvedOverwrite = IO(Output(Vec(cfg.sliceNum*2, Bool())))
+  mergedFire := 0.U.asTypeOf(mergedFire)
+  mergedSource := 0.U.asTypeOf(mergedSource)
+  starvedEnq := 0.U.asTypeOf(starvedEnq)
+  starvedDeq := 0.U.asTypeOf(starvedDeq)
+  starvedOverwrite := 0.U.asTypeOf(starvedOverwrite)
+  if (cfg.stubMode) {
   for (bank <- 0 until cfg.sliceNum) {
     val q = module.pfQueues(bank)
     mergedFire(bank) := read(q.valid) && read(q.ready)
     mergedSource(bank) := read(q.bits.TxnID)(7,4)
   }
-  val starved = (0 until cfg.sliceNum).flatMap(bank => Seq(L2PfSource.PBOP,L2PfSource.CDP).map(
-    src => sourceQueues(bank * module.pfSourceSlots.size + module.pfSourceSlots.indexOf(src))))
-  val starvedEnq = IO(Output(Vec(cfg.sliceNum*2, Valid(UInt(48.W)))))
-  val starvedDeq = IO(Output(Vec(cfg.sliceNum*2, Valid(UInt(48.W)))))
-  val starvedOverwrite = IO(Output(Vec(cfg.sliceNum*2, Bool())))
+  }
   starved.zipWithIndex.foreach { case(q,i) =>
     starvedEnq(i).valid := read(q.io.enq.valid) && read(q.io.enq.ready)
     starvedEnq(i).bits := read(q.io.enq.bits.Addr)
@@ -75,6 +84,7 @@ class TestTopDrain(cfg: L2Configuration)(implicit p: Parameters) extends TestTop
     starvedDeq(i).bits := read(q.io.deq.bits.Addr)
     starvedOverwrite(i) := read(q.io.overwrite)
   }
+  if (cfg.stubMode) {
   val a = module.pfTlbAdapter.get
   for (i <- 0 until a.entries) add(s"tlb.slot$i", a.state(i))
   add("tlb.retry", PopCount(read(a.state).map(_ === 3.U)))
@@ -106,10 +116,14 @@ class TestTopDrain(cfg: L2Configuration)(implicit p: Parameters) extends TestTop
   for ((lane, i) <- cdp.detectFrontend.lanes.zipWithIndex)
     for (stage <- Seq(lane.s1_req, lane.s2_req, lane.s3_req).zipWithIndex)
       add(s"cdp.detect$i.${stage._2}", stage._1.valid)
+  } else {
+    add("pbop.delay", PopCount(read(field[Vec[Bool]](field[AnyRef](module.bop, "delayQueue"), "valid"))))
+    add("pbop.output", module.bop.io.req.valid)
+  }
   module.slices.zipWithIndex.foreach { case (slice, s) =>
     field[Seq[L2TSHR]](slice, "tshrs").zipWithIndex.foreach { case (t, i) =>
       add(s"slice$s.tshr$i.valid", t.tshr_valid)
-      add(s"slice$s.tshr$i.cdpPending", t.cdpPending)
+      if (cfg.cdpObserveEnable) add(s"slice$s.tshr$i.cdpPending", t.cdpPending)
     }
   }
   val drainCounts = IO(Output(Vec(metrics.size, UInt(32.W))))
@@ -131,13 +145,19 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
   val fast=args.contains("--fast")
   OvernightMemory.vaMask=if(fast) BigInt(0x1000000) else BigInt(0)
   def physical(va: BigInt)=va ^ OvernightMemory.vaMask
+  val off = sys.props.get("oceanus.validation.prefetchOff").contains("true")
   val soak = args.contains("--soak")
   require(Set(1,2,4)(slices) && (if(soak) firstSeed >= 1 && lastSeed >= firstSeed else Set(1, 6, 11, 16)(firstSeed) && lastSeed == firstSeed))
   require(minimum == 5000 && demandPeriod == 32 && !harsh && !fast)
-  val stopCycle = minimum + 30000
+  // Optional target-geometry stress: keep the same producer stimulus active
+  // until both starved source queues contain real items. Never waive a zero
+  // resident inventory; the original fixed cut remains the default.
+  val residentCut = args.contains("--resident-cut")
+  require(!residentCut || !off)
+  var stopCycle = minimum + 30000
   val drainLimit = stopCycle + 20000
-  val cfg=new L2Configuration(8,true,0 until slices,bopEnable=true,pfRecvEnable=true,
-    pfCtrlEnable=true,pfTrainEnable=true,pfTlbEnable=true,vbopStubEnable=true,cdpStubEnable=true,
+  val cfg=new L2Configuration(8,true,0 until slices,bopEnable = !off,pfRecvEnable = !off,
+    prefetchIssueEnable = !off, pfCtrlEnable = !off,pfTrainEnable = !off,pfTlbEnable = !off,vbopStubEnable = !off,cdpStubEnable = !off,
     bopParams=OceanusBOPParameters(badScore=0,roundMax=100000),
     vbopParams=OceanusVBOPParameters(badScore=0,roundMax=100000,samePagePA=fast))
   val params=new Config((_,_,_)=>{
@@ -201,6 +221,7 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
       }
     }
     up.initInputs(); dn.initInputs(); dut.log.dump.poke(false.B); dut.log.clean.poke(false.B)
+    if (!off) {
     dut.holdIssue.get.poke(false.B)
     dut.io.pfRecv.get.poke(0.U.asTypeOf(dut.io.pfRecv.get))
     dut.io.pfRecv.get.pf_en.poke(true.B); dut.io.pfRecv.get.pf_source.poke(10.U)
@@ -212,6 +233,7 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
     dut.io.pfTlb.get.resp.bits.poke(0.U.asTypeOf(dut.io.pfTlb.get.resp.bits))
     dut.io.pfTlb.get.pmp_resp.poke(0.U.asTypeOf(dut.io.pfTlb.get.pmp_resp))
     dut.io.pfTrain.get.foreach(t=>t.poke(0.U.asTypeOf(t)))
+    }
     dut.reset.poke(true.B); dut.clock.step(8); dut.reset.poke(false.B); dn.activateRxLink()
     for(c <- -300 until 0) dn.stepWithCredits(c)
     var quiet=0; var stimulus=true; var activeCycles=0
@@ -234,6 +256,11 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
     }
     while(quiet<40 && cycle<drainLimit) {
       up.clearResponses(); dn.clearResponses()
+      if (residentCut && cycle >= minimum && cycle < stopCycle &&
+        (0 until 2).forall(src => (0 until slices).exists(bank => residents(2*bank+src).nonEmpty))) {
+        stopCycle=cycle
+        println(s"DRAIN_RESIDENT_CUT seed=$seed cycle=$cycle minimum=$minimum queueItems=${residents.map(_.size).mkString(",")}")
+      }
       if(cycle == stopCycle) {
         check(); snapshot("original-stop")
         // A held valid is still external, unaccepted traffic. Withdraw it
@@ -256,7 +283,7 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
         // C5 changes CDP occupancy/TLB traffic; the historical stub's exact
         // seed16 transaction at this cut is no longer an expected invariant.
       }
-      stimulus=cycle<stopCycle && (cycle<minimum || !sources.forall(src=>entered.map(_(src)).sum>0))
+      stimulus=cycle<stopCycle && (residentCut || cycle<minimum || (!off && !sources.forall(src=>entered.map(_(src)).sum>0)))
       if(stimulus) activeCycles+=1
       if(stimulus && cycle%demandPeriod==0 && driver.pending<20 && random.nextInt(3)!=0) {
         // Repeated working set plus fresh lines exercises hits and refills.
@@ -265,12 +292,14 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
         submitted+=1
       }
       driver.drive(cycle)
+      var recv = false
+      if (!off) {
       val train=dut.io.pfTrain.get.head
       train.vaddrBlock.poke(((value(dut.io.t1p.head.UpREQ.bits.Addr)^OvernightMemory.vaMask)>>6).U)
       train.trainEnable.poke(true.B); train.reqSource.poke((cycle%32).U)
       // Burst Recv, with occasional issue pauses to build source queues.
       dut.holdIssue.get.poke((stimulus && cycle%311<75).B)
-      val recv=stimulus && (cycle%257<48 || random.nextInt(29)==0)
+      recv=stimulus && (cycle%257<48 || random.nextInt(29)==0)
       dut.io.pfRecv.get.addr_valid.poke(recv.B)
       dut.io.pfRecv.get.addr.poke((BigInt(0x210000)+random.nextInt(512)*64).U)
       val tlb=dut.io.pfTlb.get
@@ -337,6 +366,7 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
         if(cycle >= stopCycle || (seed == 16 && key == (0,BigInt(2161024))))
           println(s"DRAIN_TLB event=external-request seed=$seed cycle=$cycle client=$c va=$va attempt=$attempt due=${replies.last.due}")
         translations+=1
+      }
       }
       cdpLedger.sample(dut.cdpAudit, cycle)
       for(c <- 0 until 2) {
@@ -443,7 +473,13 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
         s"starved source ${Seq(3,9)(i%2)} item ledger did not close")
       println(s"DRAIN_DISPOSITION seed=$seed source=${Seq(3,9)(i%2)} pendingAtStop=${stopped(i).size} entered=${resolved(i).values.count(_=="entered")} dedup=${resolved(i).values.count(_=="dedup")} overwritten=${resolved(i).values.count(_=="overwrite")} pending=0")
     }
-    for(src <- 0 until 2) assert((0 until slices).exists(bank => stopped(2*bank+src).nonEmpty), s"starved source ${Seq(3,9)(src)} not exercised")
+    if (!off) {
+      for(src <- 0 until 2) assert((0 until slices).exists(bank => stopped(2*bank+src).nonEmpty), s"starved source ${Seq(3,9)(src)} not exercised")
+    } else {
+      assert(produced.flatten.forall(_ == 0) && entered.flatten.forall(_ == 0), "structural-off generated a prefetch")
+      assert(translations == 0 && recvInputs == 0 && stopped.forall(_.isEmpty), "structural-off owns prefetch work")
+      println(s"DRAIN_OFF_COVERAGE sourceGeneration=inapplicable pendingAtStop=inapplicable demandScoreboard=true drain=true seed=$seed")
+    }
     println(s"DRAIN_ACCEPTANCE seed=$seed drain=true ledger=true itemClosure=true")
     }
   }

@@ -21,9 +21,6 @@ import java.util.zip.GZIPOutputStream
 
 class TestTopCDPRawAudit(cfg: L2Configuration)(implicit p: Parameters) extends TestTop_L2Top(cfg) {
   def read[T <: Data](x: T): T = BoringUtils.bore(x)
-  val c = module.cdp.get
-  val s = c.sentUnit.get
-  val a = module.pfTlbAdapter.get
   val fields = mutable.ArrayBuffer.empty[(String, UInt)]
   def add(name: String, value: Data): Unit = fields += name -> read(value).asUInt
   def event(name: String, valid: Bool, fields: (String, Data)*): Unit = {
@@ -31,6 +28,18 @@ class TestTopCDPRawAudit(cfg: L2Configuration)(implicit p: Parameters) extends T
     fields.foreach { case (n, b) => add(name + "." + n, Mux(read(valid), read(b).asUInt, 0.U(b.getWidth.W))) }
   }
   def fire(d: ReadyValidIO[_]): Bool = read(d.valid) && read(d.ready)
+  val raw=IO(Output(Vec(cfg.sliceNum,Vec(nMSHR,new CDPRawLifecycle))))
+  val selectedVpn=IO(Output(Valid(new OceanusCDPTrain)))
+  val selectedFilter=IO(Output(Valid(new OceanusCDPTrain)))
+  val halfOut=IO(Output(Valid(new L2CDPHalf)))
+  val halfBank=IO(Output(UInt(2.W)))
+  val filterReady=IO(Output(Bool()))
+  val vpnReady=IO(Output(Bool()))
+  val audit=IO(Output(new CDPAuditProbe))
+  if (cfg.cdpObserveEnable) {
+  val c = module.cdp.get
+  val s = c.sentUnit.get
+  val a = module.pfTlbAdapter.get
   val entries = read(s.entries)
   add("enable", module.cdpControlEnable)
   for ((name, t) <- Seq("vpn" -> c.io.vpnTrain, "filter" -> c.io.filterTrain))
@@ -143,10 +152,48 @@ class TestTopCDPRawAudit(cfg: L2Configuration)(implicit p: Parameters) extends T
     event(s"source9deq$b",fire(q.io.deq),"pa"->q.io.deq.bits.Addr,"txn"->q.io.deq.bits.TxnID)
     add(s"source9overwrite$b",q.io.overwrite)
   }
-  val raw=IO(Output(Vec(cfg.sliceNum,Vec(nMSHR,new CDPRawLifecycle))))
+  selectedVpn:=read(c.io.vpnTrain);selectedFilter:=read(c.io.filterTrain)
+  halfOut:=read(module.cdpData);halfBank:=read(module.cdpDataSlice)
+  filterReady:=read(c.filterTraining.get.queue.io.enq.ready)
+  vpnReady:=read(c.vpnTrainReqBuf.io.enq.ready)
+  CDPAuditProbe.connect(audit,c,read _)
+  add("out.source",c.io.req.bits.pfSource);add("out.reqSource",c.io.req.bits.reqSource);add("out.needT",c.io.req.bits.needT)
+  add("filterQueueCount",c.filterTraining.get.queue.io.count)
+  add("filterDequeue",fire(c.filterTraining.get.queue.io.deq))
+  add("vpnQueueCount",c.vpnTrainReqBuf.io.count)
+  add("vpnDequeue",fire(c.vpnTrainReqBuf.io.deq))
+  } else {
+    require(!cfg.bopEnable && !cfg.prefetchIssueEnable && !cfg.pfRecvEnable &&
+      !cfg.pfCtrlEnable && !cfg.pfTrainEnable && !cfg.pfTlbEnable && !cfg.stubMode)
+    require(module.cdp.isEmpty && module.vbopStub.isEmpty && module.pfTlbAdapter.isEmpty)
+    require(module.pfQueues.isEmpty && module.pfRecvReqs.isEmpty && module.recvFallback.isEmpty)
+    selectedVpn:=0.U.asTypeOf(selectedVpn);selectedFilter:=0.U.asTypeOf(selectedFilter)
+    halfOut:=0.U.asTypeOf(halfOut);halfBank:=0.U
+    filterReady:=false.B;vpnReady:=false.B;audit:=0.U.asTypeOf(audit)
+    // These names describe absent learner events, not synthetic DUT probes.
+    for (name <- Seq("enable","tlbRequest","half","halfAccepted","halfRejected",
+      "candidate","full","duplicate","filterDrop","vbopBlockedCDP","out",
+      "filter","resident","candidatePending")) fields += name -> 0.U(1.W)
+    for (name <- Seq("allocated","vpn","terminal","vpnAccepted","vpnDropped","filterAccepted",
+      "filterDropped","filterQueueCount","filterPLRU","filterTrainWrite","filterTrainWrite.bits"))
+      fields += name -> 0.U(1.W)
+    for (kind <- Seq("vpn","filter"); leaf <- Seq("pa","victim","va","hit","prefetched",
+      "source","reqSource","trainEnable","vpnValid","used","evict"))
+      fields += s"$kind.$leaf" -> 0.U(48.W)
+    for (leaf <- Seq("data","source","depth","hit")) fields += s"half.$leaf" -> 0.U(256.W)
+    for (i <- 0 until 16) fields += s"translationDrop$i" -> 0.U(1.W)
+    for ((slice,bank) <- module.slices.zipWithIndex) {
+      event(s"enter$bank", fire(slice.io.UpRXREQ) && read(slice.io.UpRXREQ.bits.SrcID) === cfg.pfSrcID.U,
+        "pa" -> slice.io.UpRXREQ.bits.Addr, "txn" -> slice.io.UpRXREQ.bits.TxnID)
+      for (i <- 0 until nMSHR) {
+        fields += s"evict$bank.$i" -> 0.U(1.W)
+        fields += s"evict$bank.$i.source" -> 0.U(4.W)
+      }
+    }
+  }
   for ((slice,bank)<-module.slices.zipWithIndex; (t,i)<-CDPAuditReflect.field[Seq[L2TSHR]](slice,"tshrs").zipWithIndex) {
     val o=raw(bank)(i);val v=CDPAuditReflect.field[oceanus.l2.tshr.L2VPipeREQ](t,"vPipeREQ")
-    o.exec:=read(CDPAuditReflect.field[Bool](v,"rxreq_fire"));o.req:=read(v.io.UpRXREQ.bits);o.context:=read(v.io.UpRXREQTrain.get)
+    o.exec:=read(CDPAuditReflect.field[Bool](v,"rxreq_fire"));o.req:=read(v.io.UpRXREQ.bits);v.io.UpRXREQTrain match { case Some(ctx) => o.context:=read(ctx); case None => o.context:=0.U.asTypeOf(o.context) }
     o.reqValid:=read(v.io.UpRXREQ.valid);o.addr:=read(t.io.toAlloc.paddr)
     o.dirRead:=read(t.io.fromDir.DirRdResp);o.dirMeta:=read(t.io.fromDir.META)
     o.dirWrite:=read(t.io.fromDir.DirWbArbComp);o.write:=read(t.io.toDir)
@@ -162,19 +209,6 @@ class TestTopCDPRawAudit(cfg: L2Configuration)(implicit p: Parameters) extends T
     o.rx:=read(CDPAuditReflect.field[Bool](t,"tshr_buffer_wen_RXDAT_0")) || read(CDPAuditReflect.field[Bool](t,"tshr_buffer_wen_RXDAT_2"))
     o.train:=read(t.io.cdpTrain);o.evict:=read(t.io.cdpEvict);o.line:=read(t.io.cdpData)
   }
-  val selectedVpn=IO(Output(Valid(new OceanusCDPTrain)));selectedVpn:=read(c.io.vpnTrain)
-  val selectedFilter=IO(Output(Valid(new OceanusCDPTrain)));selectedFilter:=read(c.io.filterTrain)
-  val halfOut=IO(Output(Valid(new L2CDPHalf)));halfOut:=read(module.cdpData)
-  val halfBank=IO(Output(UInt(2.W)));halfBank:=read(module.cdpDataSlice)
-  val filterReady=IO(Output(Bool()));filterReady:=read(c.filterTraining.get.queue.io.enq.ready)
-  val vpnReady=IO(Output(Bool()));vpnReady:=read(c.vpnTrainReqBuf.io.enq.ready)
-  val audit=IO(Output(new CDPAuditProbe))
-  CDPAuditProbe.connect(audit,c,read _)
-  add("out.source",c.io.req.bits.pfSource);add("out.reqSource",c.io.req.bits.reqSource);add("out.needT",c.io.req.bits.needT)
-  add("filterQueueCount",c.filterTraining.get.queue.io.count)
-  add("filterDequeue",fire(c.filterTraining.get.queue.io.deq))
-  add("vpnQueueCount",c.vpnTrainReqBuf.io.count)
-  add("vpnDequeue",fire(c.vpnTrainReqBuf.io.deq))
   // One host peek per cycle for all raw lifecycle leaves. Avoid hundreds of
   // simulator RPCs while keeping named, independently decoded observations.
   def flattenRaw(prefix:String,d:Data):Unit=d match {

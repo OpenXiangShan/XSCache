@@ -17,12 +17,13 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
   val seeds = opt("--seeds", 3); val slices = opt("--slices", 1)
   val conflictMode=args.contains("--conflicts")
   val csrMode=args.contains("--csr")
+  val off = sys.props.get("oceanus.validation.prefetchOff").contains("true")
   val traceCHI = sys.props.get("oceanus.m3.traceCHI").contains("true")
   val upstream=if(conflictMode) new L2UpstreamTable(Seq(0,2,6,7).map(n=>L2UpstreamTableEntry(L2UpstreamPortType.Type1,n)) ++
     Seq(4,5).map(n=>L2UpstreamTableEntry(L2UpstreamPortType.Type4,n))) else L2UpstreamTable.defaults
-  val cfg = new L2Configuration(8, true, 0 until slices, upstream=upstream,bopEnable = false,
-    pfRecvEnable = true, pfCtrlEnable = true, pfTrainEnable = true, pfTlbEnable = true,
-    vbopStubEnable = true, cdpStubEnable = true,
+  val cfg = new L2Configuration(8, true, 0 until slices, upstream=upstream,bopEnable = false, prefetchIssueEnable = !off,
+    pfRecvEnable = !off, pfCtrlEnable = !off, pfTrainEnable = !off, pfTlbEnable = !off,
+    vbopStubEnable = !off, cdpStubEnable = !off,
     vbopParams = OceanusVBOPParameters(badScore = 0, roundMax = 100000))
   implicit val simulator: HasSimulator = CDPAuditSimulator.bounded
   simulate(new TestTopCDPRawAudit(cfg)(CDPC5Params.apply)) { dut =>
@@ -30,7 +31,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
     val tracePath = directory.resolve(s"system-$slices-$seeds.jsonl.gz")
     val trace = new PrintWriter(new GZIPOutputStream(new FileOutputStream(tracePath.toFile), 8192, traceCHI))
     trace.println(ujson.Obj("head" -> sys.props.getOrElse("oceanus.c5.head","402504254fe4fffbd4e6b80785e52b973c6d4c9e"), "slices" -> slices,
-      "seeds" -> seeds, "widths" -> ujson.Arr.from(dut.widths.map { case (n, w) => ujson.Arr(n, w) })).render())
+      "seeds" -> seeds, "structuralPrefetchOff" -> off, "widths" -> ujson.Arr.from(dut.widths.map { case (n, w) => ujson.Arr(n, w) })).render())
     val dummy = UpRequestSpec(MasterId.t1p0, 0, 0, 0, CCHIOpcode.ReadShared.opcode, BigInt(0), expCompData = true)
     val spec = CaseSpec("cdp-c5", UpConfig(Seq(MasterId.t1p0), ExplicitRequestStream(Seq(dummy), Seq(BigInt(CHIFieldResp.CompData_SC))), SnoopPolicy.SnpRespI),
       DnConfig(FixedLatency(80), FixedOutstanding(64), ImmediateCreditPolicy()), 2000000, (0, 2000000), Seq.empty)
@@ -44,7 +45,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
     val admitted = mutable.ArrayBuffer.empty[(BigInt, Int)]
     val useful = mutable.Map.empty[BigInt, Int].withDefaultValue(0)
     val seenDownstream = mutable.Set.empty[BigInt]
-    var cycle = 0; var txn = 0; var epoch = -1; var beats = 0
+    var cycle = 0; var txn = 0; var epoch = -1; var beats = 0; var checkedDemandRequests = 0
     var gate = true; var activePA = BigInt(0); var reset = false
     var allCandidates = 0; var allDrops = 0; var hits = 0; var unused = 0; var contention = 0
     var activeSeed = 0
@@ -98,9 +99,10 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
     var residualSourceRetired=0L
     var newOwnershipDuringResidual=0L
     def controls(c: Boolean = true, v: Boolean = false): Unit = {
-      val ctrl = dut.io.pfCtrl.get
+      dut.io.pfCtrl.foreach { ctrl =>
       ctrl.l2_pf_master_en.poke(true); ctrl.l2_pf_recv_en.poke(true)
       ctrl.l2_cdp_en.poke(c); ctrl.l2_vbop_en.poke(v); ctrl.l2_pbop_en.poke(false)
+      }
     }
     def observe():Map[String,BigInt]={
       var bits=value(dut.boundary)
@@ -141,12 +143,12 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
           q.valid.poke(true);q.bits.poke(0.U.asTypeOf(q.bits));q.bits.SrcID.poke(cfg.upstream.type1(index).nid)
           q.bits.TxnID.poke(txn%256);q.bits.Opcode.poke(CCHIOpcode.ReadShared.opcode);q.bits.Size.poke(6)
           q.bits.MemAttr.poke(5);q.bits.ExpCompData.poke(true);q.bits.Addr.poke(addr)
-          dut.io.pfTrain.get(index).trainEnable.poke(true);dut.io.pfTrain.get(index).reqSource.poke(0)
-          dut.io.pfTrain.get(index).vaddrBlock.poke(BigInt(0x200040)>>6)
+          dut.io.pfTrain.foreach { t => t(index).trainEnable.poke(true);t(index).reqSource.poke(0)
+            t(index).vaddrBlock.poke(BigInt(0x200040)>>6) }
           txn+=1;competingDemand=None;evictionRaceIssued+=1
         }
       }
-      val tlb = dut.io.pfTlb.get
+      dut.io.pfTlb.foreach { tlb =>
       tlb.req.ready.poke(gate); tlb.resp.valid.poke(false)
       tlb.resp.bits.poke(0.U.asTypeOf(tlb.resp.bits)); tlb.pmp_resp.poke(0.U.asTypeOf(tlb.pmp_resp))
       replies.headOption.filter(_ => !holdExternalTLB).filter(_._1 <= cycle).foreach { case (_, va, miss, fault) =>
@@ -159,6 +161,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
         val miss = kind == 1 && attempts(va >> 12) % 2 == 1 || kind == 2
         val fault = kind == 3
         replies.enqueue((cycle + 1 + activeSeed % 7 + responseDelay, va, miss, fault))
+      }
       }
       if(flag(dut.io.chi.txreq.flitv)) {
         val f = dut.io.chi.txreq.flit
@@ -191,13 +194,14 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
           evictCompletions+=1
         }
         if(flag(port.UpREQ.valid) && flag(port.UpREQ.ready)) {
-          acceptedPorts+=index
-          val p=port.UpREQ;val ctx=dut.io.pfTrain.get(index);val key=index->value(p.bits.TxnID)
+          acceptedPorts+=index;checkedDemandRequests+=1
+          val p=port.UpREQ;val ctx=dut.io.pfTrain.map(_(index));val key=index->value(p.bits.TxnID)
           if (traceCHI && cycle >= 23180) println(s"M3_UPREQ cycle=$cycle portType=Type1 port=$index Opcode=${value(p.bits.Opcode)} SrcID=${value(p.bits.SrcID)} TxnID=${value(p.bits.TxnID)} Addr=0x${value(p.bits.Addr).toString(16)} ExpCompData=${flag(p.bits.ExpCompData)} ExpCompAck=absent-in-CCHI")
           assert(!demandAddresses.contains(key));demandAddresses(key)=value(p.bits.Addr)
           assert(!demandOpcodes.contains(key));demandOpcodes(key)=value(p.bits.Opcode)
           reference.upstream(value(p.bits.SrcID),value(p.bits.TxnID),value(p.bits.Addr),
-            (value(ctx.vaddrBlock)>>6<<12)|(value(p.bits.Addr)&0xfc0),value(ctx.reqSource).toInt,flag(ctx.trainEnable))
+            ctx.map(c => (value(c.vaddrBlock)>>6<<12)|(value(p.bits.Addr)&0xfc0)).getOrElse(value(p.bits.Addr)&0xfc0),
+            ctx.map(c => value(c.reqSource).toInt).getOrElse(0),ctx.exists(c => flag(c.trainEnable)))
         }
       }
       for(port<-dut.io.t4p.map(_.UpREQ)) if(flag(port.valid) && flag(port.ready))
@@ -214,7 +218,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
         if(row("half")!=0) {assert(row("halfAccepted")==0 && row("halfRejected")>0,"M4 captured half not rejected");disabledHalves+=1}
       }
       reference.sample(dut,row,cycle)
-      tlbOwnership.sample(row,cycle,currentGeneration)
+      if (!off) tlbOwnership.sample(row,cycle,currentGeneration)
       val outputGeneration=if(row("out")!=0)Some(identities.retirementGeneration(value(dut.audit.outputIndex).toInt)) else None
       identities.sample(dut.audit,cycle)
       trace.println(ujson.Arr(cycle, epoch, gate, packed.toString(16)).render())
@@ -227,7 +231,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
         emitted += ((row("out.pa"), row("out.depth").toInt))
 
       }
-      if(csrMode) for(b<-0 until slices) {
+      if(csrMode && !off) for(b<-0 until slices) {
         val q=sourceOwnership(b)
         assert(q.size==value(dut.observation.prefetchPendingBySource(b)(9)),s"M4 source9 occupancy bank=$b")
         if(row(s"source9deq$b")!=0 || row(s"source9overwrite$b")!=0) {
@@ -247,6 +251,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
         }
       }
       for(bank <- 0 until slices) {
+        if (off) assert(row(s"enter$bank")==0,s"structural-off PF REQ entered slice $bank")
         if(row(s"enter$bank") != 0 && (row(s"enter$bank.txn") >> 4) == 9) {
           val addr = row(s"enter$bank.pa"); val depth = ((row(s"enter$bank.txn") >> 2) & 3).toInt
           assert(emitted.contains((addr, depth)), "source9/depth TxnID without CDP producer")
@@ -286,8 +291,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
     def request(addr: BigInt, va: BigInt, enable: Boolean = true, opcode: Int = CCHIOpcode.ReadShared.opcode): Unit = {
       activePA = addr
       up.driveRead(dummy.copy(txnId = txn % 256, addr = addr, opcode = opcode,memAttr=5))
-      dut.io.pfTrain.get.head.vaddrBlock.poke(va >> 6)
-      dut.io.pfTrain.get.head.trainEnable.poke(enable)
+      dut.io.pfTrain.foreach { t => t.head.vaddrBlock.poke(va >> 6);t.head.trainEnable.poke(enable) }
       while(!flag(dut.io.t1p.head.UpREQ.ready)) tick()
       tick(); up.clearUpReq(); txn += 1
     }
@@ -299,13 +303,14 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
       port.UpRSP.valid.poke(false);port.UpRSP.bits.poke(0.U.asTypeOf(port.UpRSP.bits))
       port.DnDAT.ready.poke(true);port.DnRSP.ready.poke(true);port.DnSNP.ready.poke(true)
     }
-    dut.holdIssue.get.poke(false)
-    dut.io.pfRecv.get.poke(0.U.asTypeOf(dut.io.pfRecv.get))
-    dut.io.pfCtrl.get.poke(0.U.asTypeOf(dut.io.pfCtrl.get)); controls()
-    dut.io.pfTrain.get.foreach(_.poke(0.U.asTypeOf(dut.io.pfTrain.get.head)))
-    dut.io.pfTlb.get.req.ready.poke(true); dut.io.pfTlb.get.resp.valid.poke(false)
-    dut.io.pfTlb.get.resp.bits.poke(0.U.asTypeOf(dut.io.pfTlb.get.resp.bits))
-    dut.io.pfTlb.get.pmp_resp.poke(0.U.asTypeOf(dut.io.pfTlb.get.pmp_resp))
+    dut.holdIssue.foreach(_.poke(false))
+    dut.io.pfRecv.foreach(x => x.poke(0.U.asTypeOf(x)))
+    dut.io.pfCtrl.foreach(x => x.poke(0.U.asTypeOf(x))); controls()
+    dut.io.pfTrain.foreach(_.foreach(x => x.poke(0.U.asTypeOf(x))))
+    dut.io.pfTlb.foreach { tlb =>
+      tlb.req.ready.poke(true);tlb.resp.valid.poke(false)
+      tlb.resp.bits.poke(0.U.asTypeOf(tlb.resp.bits));tlb.pmp_resp.poke(0.U.asTypeOf(tlb.pmp_resp))
+    }
     dut.reset.poke(true); dut.clock.step(8); dut.reset.poke(false); dn.activateRxLink()
     for(w <- -300 until 0) dn.stepWithCredits(w)
     for(_ <- 0 until 130) { request(0x3e040, 0x200040); drain() }
@@ -316,7 +321,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
       request(BigInt(0x40000 + seed * 64), BigInt(0x200000 + seed * 64))
       // Both real refill halves must arrive before releasing translation.
       run(155); gate = true; drain()
-      assert(allCandidates > before, s"seed $seed detection was empty")
+      if (!off) assert(allCandidates > before, s"seed $seed detection was empty")
       if(seed < 2 && emitted.size > outBefore) {
         val (addr, _) = emitted(outBefore)
         assert(admitted.exists(_._1 == addr) && seenDownstream(addr))
@@ -330,7 +335,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
     // Preserve an unused genuine CDP line, then evict it with actual same-set
     // demand replacements. The victim PA must come from the old host Meta.
     epoch = seeds; activeSeed = 0; attempts.clear()
-    val unusedTarget = emitted.map(_._1).find(a => useful(a) == 0).get
+    val unusedTarget = if (off) BigInt(0x40000) else emitted.map(_._1).find(a => useful(a) == 0).get
     def bank(addr: BigInt): Int = if(slices == 1) 0 else if(slices == 2) (addr >> 6).bitCount % 2 else {
       val low = (6 until 48 by 2).count(addr.testBit) % 2
       val high = (7 until 48 by 2).count(addr.testBit) % 2
@@ -339,7 +344,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
     val victimsBefore = unused
     val conflicts = (1 to 128).map(i => unusedTarget + i * dut.p(L2ParamsKey).sets * 64).filter(a => bank(a) == bank(unusedTarget)).take(10)
     for(addr <- conflicts) { request(addr, 0x200040); drain() }
-    assert(unused > victimsBefore, "no unused genuine CDP victim feedback")
+    if (!off) assert(unused > victimsBefore, "no unused genuine CDP victim feedback")
     // Occupy all shared translation slots with real VBOP trains. A subsequent
     // pointer line waits alongside VBOP; production assertion checks priority.
     epoch = seeds + 1; gate = false; controls(v = true)
@@ -350,14 +355,14 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
     for(i <- 0 until 12) { request(BigInt(0xb0000 + i * 64), BigInt(0x280040 + i * 4096)); run(120) }
     request(BigInt(0x40000 + seeds * 64), BigInt(0x200000 + seeds * 64)); run(155)
     gate = true; drain(); controls()
-    assert(contention > 0, "shared TLB slot contention was empty")
+    if (!off) assert(contention > 0, "shared TLB slot contention was empty")
     epoch = seeds + 2
     val disabled = emitted.size; controls(c = false)
     request(0x90000, 0x200040); drain()
     assert(emitted.size == disabled, "CSR off emitted a request")
-    assert(emitted.nonEmpty && admitted.nonEmpty && hits > 0)
+    if (!off) assert(emitted.nonEmpty && admitted.nonEmpty && hits > 0)
     assert(beats == txn * 2, "demand data scoreboard did not close")
-    if(csrMode) {
+    if(csrMode && !off) {
       controls();drain()
       def transient(row:Map[String,BigInt]):BigInt=row("resident")+row("candidatePending")+row("tlbSlots")+row("outputPending")+
         row("filterQueueCount")+row("vpnQueueCount")+(0 until slices).map(b=>row(s"halfCount$b")).sum+rowSourcePending
@@ -433,6 +438,17 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
       assert(disabledHalves>0,"M4 no captured-half rejection observed")
       println(s"CDP_CSR_RESULT exercised=${cases.size} disabledHalfRejected=$disabledHalves residualAllowed=true freshWithResidual=$newOwnershipDuringResidual candidateOwnership=${identities.ownershipCounters} tlbOwnership=${tlbOwnership.counters} residualSourceRetired=$residualSourceRetired accounting=true")
     }
+    if (csrMode && off) {
+      // No CSR/TLB/candidate storage exists. Keep each original pointer-demand
+      // address and disabled/reopen timing, with protocol/data/drain checks.
+      for ((name,index) <- Seq("retry","slots8","waitingResult","outputBackpressure","halfQueue","source9Queue").zipWithIndex) {
+        epoch=1000+index;activeSeed=if(name=="retry")1 else 0;attempts.clear()
+        request(BigInt(0x48000+index*64),0x200040);run(1200)
+        controls(c=false);run(if(Set("retry","slots8","waitingResult")(name))3 else 350)
+        controls();request(BigInt(0x48000+(index+8)*64),0x200040);run(130);drain()
+        println(s"CDP_CSR_OFF_CASE state=$name retainedOwnership=inapplicable demandScoreboard=true drain=true")
+      }
+    }
     if(conflictMode) {
       // Actual upstream ports create independent buffered request lifecycles.
       // Concurrent repeated hits build capture pressure without forcing any DUT event.
@@ -444,8 +460,8 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
           port.bits.SrcID.poke(cfg.upstream.type1(i).nid);port.bits.TxnID.poke(txn%256)
           port.bits.Opcode.poke(if(negative==0) CCHIOpcode.ReadOnce.opcode else CCHIOpcode.ReadShared.opcode)
           port.bits.Size.poke(6);port.bits.MemAttr.poke(5);port.bits.ExpCompData.poke(true);port.bits.Addr.poke(addr)
-          val ctx=dut.io.pfTrain.get(i);ctx.vaddrBlock.poke((BigInt(0x200000)|(addr&0xfc0))>>6)
-          ctx.reqSource.poke(if(negative==1) MemReqSource.L1DataPrefetch.id else 0);ctx.trainEnable.poke(negative!=2)
+          dut.io.pfTrain.foreach { t => val ctx=t(i);ctx.vaddrBlock.poke((BigInt(0x200000)|(addr&0xfc0))>>6)
+            ctx.reqSource.poke(if(negative==1) MemReqSource.L1DataPrefetch.id else 0);ctx.trainEnable.poke(negative!=2) }
           txn+=1
         }
         while(pending.nonEmpty) {
@@ -458,8 +474,8 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
         q.valid.poke(true);q.bits.poke(0.U.asTypeOf(q.bits));q.bits.SrcID.poke(cfg.upstream.type1(index).nid)
         q.bits.TxnID.poke(txn%256);q.bits.Opcode.poke(CCHIOpcode.ReadShared.opcode);q.bits.Size.poke(6)
         q.bits.MemAttr.poke(5);q.bits.ExpCompData.poke(true);q.bits.Addr.poke(addr)
-        dut.io.pfTrain.get(index).trainEnable.poke(true);dut.io.pfTrain.get(index).reqSource.poke(0)
-        dut.io.pfTrain.get(index).vaddrBlock.poke(BigInt(0x200040)>>6);txn+=1
+        dut.io.pfTrain.foreach { t => t(index).trainEnable.poke(true);t(index).reqSource.poke(0)
+          t(index).vaddrBlock.poke(BigInt(0x200040)>>6) };txn+=1
         do tick() while(!acceptedPorts(index))
         q.valid.poke(false)
       }
@@ -508,10 +524,10 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
       // Build genuine prefetched resident lines first. Fresh first-use hits
       // carry capture provenance; repeatedly hitting ordinary source0 rows
       // cannot exercise the half queue because first use clears the mark.
-      val recv=dut.io.pfRecv.get
+      dut.io.pfRecv.foreach { recv =>
       recv.pf_en.poke(true);recv.pf_source.poke(MemReqSource.Prefetch2L2SMS.id)
       for(i<-0 until 64){recv.addr.poke(BigInt(0x70000+i*64));recv.addr_valid.poke(true);tick()}
-      recv.addr_valid.poke(false);drain()
+      recv.addr_valid.poke(false) };drain()
       for(r<-0 until 16)burst(r,base=BigInt(0x70000))
       drain()
       println("CDP_M3_FIRST_USE_PRESSURE "+reference.coverage.toSeq.sortBy(_._1).map{case(k,v)=>s"$k=$v"}.mkString(" "))
@@ -531,18 +547,23 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
       println(s"CDP_READONCE_RESULT legalClientI=true L2Hit=true eligibilityChecked=1 returnedBeats=${beats-roBeats} outstanding=${demandAddresses.size} upstreamCompAck=false hitResponse=PASS countedFailure=true")
       trace.close()
       println("CDP_M3_COVERAGE "+reference.coverage.toSeq.sortBy(_._1).map {case(k,v)=>s"$k=$v"}.mkString(" "))
-      reference.requireCoverage(Seq("crossSliceTrain","vpnFilterDifferent","captureSimultaneous","ReadOnce","L1DataPrefetch","trainEnable0") ++
+      if (!off) reference.requireCoverage(Seq("crossSliceTrain","vpnFilterDifferent","captureSimultaneous","ReadOnce","L1DataPrefetch","trainEnable0") ++
         (if(slices>1) Seq("captureOneSlot","captureFull") else Seq.empty))
       // Keep all requested witnesses explicit: zero is a failing coverage gap.
-      reference.requireCoverage(Seq("crossTSHRTrain","trainEvictSameCycle","usedEvictConflict"))
+      if (!off) reference.requireCoverage(Seq("crossTSHRTrain","trainEvictSameCycle","usedEvictConflict"))
       assert(reference.coverage("multiEvict")==0,"structural assumption changed: inspect eviction implementation")
       println("CDP_M3_STRUCTURAL multiEvict=unreachable configWriteEvictOrEvict=true singletonExternalRXRSP=true evictValidRequiresCompDBID=true")
+    }
+    if (off) {
+      assert(allCandidates==0 && allDrops==0 && emitted.isEmpty && admitted.isEmpty && replies.isEmpty)
+      assert(beats==checkedDemandRequests*2 && demandAddresses.isEmpty && demandOpcodes.isEmpty && evictTransactions.isEmpty)
+      println(s"CDP_STRUCTURAL_OFF_RESULT pass=true rawDemandExecutions=${reference.coverage("executed")} checkedBeats=$beats pfGenerated=0 pfIssued=0 learnerCoverage=inapplicable retainedOwnership=inapplicable")
     }
     reference.finish();identities.finish(s"audit=raw slices=$slices")
     trace.close()
     println(s"CDP_RAW_SYSTEM_RESULT pass=true seeds=$seeds slices=$slices cycles=$cycle demands=$txn checkedBeats=$beats candidates=$allCandidates discarded=$allDrops outputs=${emitted.size} admitted=${admitted.size} useful=$hits unused=$unused tlbContention=$contention csrOff=0 trace=$tracePath")
     // CSR reopening keeps old ownership; all generations must eventually close.
-    if(csrMode) {
+    if(csrMode && !off) {
       assert(newOwnershipDuringResidual>0,"M4 no residual/new-generation overlap")
       assert(identities.ownershipCounters("retainedRetired")>0,"M4 no old candidate retirement")
       assert(residualSourceRetired>0,"M4 no old source9 identity completed after reopen")
