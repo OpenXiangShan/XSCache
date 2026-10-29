@@ -17,6 +17,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
   val seeds = opt("--seeds", 3); val slices = opt("--slices", 1)
   val conflictMode=args.contains("--conflicts")
   val csrMode=args.contains("--csr")
+  val traceCHI = sys.props.get("oceanus.m3.traceCHI").contains("true")
   val upstream=if(conflictMode) new L2UpstreamTable(Seq(0,2,6,7).map(n=>L2UpstreamTableEntry(L2UpstreamPortType.Type1,n)) ++
     Seq(4,5).map(n=>L2UpstreamTableEntry(L2UpstreamPortType.Type4,n))) else L2UpstreamTable.defaults
   val cfg = new L2Configuration(8, true, 0 until slices, upstream=upstream,bopEnable = false,
@@ -27,7 +28,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
   simulate(new TestTopCDPRawAudit(cfg)(CDPC5Params.apply)) { dut =>
     val directory = Paths.get(sys.props.getOrElse("oceanus.c5.trace","/data/zhuy/pf-audit-tests/traces")); Files.createDirectories(directory)
     val tracePath = directory.resolve(s"system-$slices-$seeds.jsonl.gz")
-    val trace = new PrintWriter(new GZIPOutputStream(new FileOutputStream(tracePath.toFile)))
+    val trace = new PrintWriter(new GZIPOutputStream(new FileOutputStream(tracePath.toFile), 8192, traceCHI))
     trace.println(ujson.Obj("head" -> sys.props.getOrElse("oceanus.c5.head","402504254fe4fffbd4e6b80785e52b973c6d4c9e"), "slices" -> slices,
       "seeds" -> seeds, "widths" -> ujson.Arr.from(dut.widths.map { case (n, w) => ujson.Arr(n, w) })).render())
     val dummy = UpRequestSpec(MasterId.t1p0, 0, 0, 0, CCHIOpcode.ReadShared.opcode, BigInt(0), expCompData = true)
@@ -62,6 +63,8 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
     var filterMemoryWrites=0L
     val acceptedPorts=mutable.Set.empty[Int]
     val demandAddresses=mutable.Map.empty[(Int,BigInt),BigInt]
+    // ReadOnce returns data without an upstream CompAck (including Type-1 audit traffic).
+    val demandOpcodes=mutable.Map.empty[(Int,BigInt),BigInt]
     val demandBeats=mutable.Map.empty[(Int,BigInt),Set[Int]].withDefaultValue(Set.empty)
     val portAcks=Seq.fill(cfg.upstream.type1.size)(mutable.Queue.empty[(BigInt,BigInt)])
     def flag(b: Bool) = b.peek().litToBoolean
@@ -109,6 +112,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
       dut.io.t1p.foreach(_.UpRSP.valid.poke(false))
       dut.io.t1p.foreach(_.DnRSP.ready.poke(!holdEvictComp))
       for((queue,index)<-portAcks.zipWithIndex) queue.headOption.filter(_=> !holdAcks).foreach {case(dbid,target)=>
+        if (traceCHI && cycle >= 23180) println(s"M3_UPACK cycle=$cycle portType=Type1 port=$index SrcID=${cfg.upstream.type1(index).nid} TxnID=$dbid TgtID=$target")
         val p=dut.io.t1p(index).UpRSP
         p.valid.poke(true);p.bits.poke(0.U.asTypeOf(p.bits));p.bits.TxnID.poke(dbid);p.bits.SrcID.poke(cfg.upstream.type1(index).nid)
         p.bits.TgtID.poke(target);p.bits.Opcode.poke(CCHIOpcode.CompAck.opcode)
@@ -170,10 +174,15 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
       for((port,index)<-dut.io.t1p.zipWithIndex) {
         if(flag(port.DnDAT.valid) && flag(port.DnDAT.ready)) {
           val f=port.DnDAT.bits;val beat=value(f.DataID).toInt;val key=index->value(f.TxnID)
+          if (traceCHI && cycle >= 23180) println(s"M3_UPDATA cycle=$cycle portType=Type1 port=$index TxnID=${value(f.TxnID)} DBID=${value(f.DBID)} SrcID=${value(f.SrcID)} DataID=$beat Resp=${value(f.Resp)}")
           val addr=demandAddresses.getOrElse(key,throw new AssertionError(s"unknown demand response $key"))
           assert(value(f.Data)==memory(addr,beat),s"cache data mismatch key=$key PA=$addr beat=$beat")
           assert(!demandBeats(key)(beat));demandBeats(key)+=beat;beats+=1
-          if(demandBeats(key).size==2) {portAcks(index).enqueue(value(f.DBID)->value(f.SrcID));demandBeats.remove(key);demandAddresses.remove(key)}
+          if(demandBeats(key).size==2) {
+            val opcode = demandOpcodes.remove(key).getOrElse(throw new AssertionError(s"missing request opcode $key"))
+            if (opcode != CCHIOpcode.ReadOnce.opcode) portAcks(index).enqueue(value(f.DBID)->value(f.SrcID))
+            demandBeats.remove(key);demandAddresses.remove(key)
+          }
         }
         if(flag(port.DnSNP.valid)) snoop.enqueue(PendingSnpRsp(SnpTxnID(value(port.DnSNP.bits.TxnID)),value(port.DnSNP.bits.SrcID),cycle+1))
         if(flag(port.DnRSP.valid) && flag(port.DnRSP.ready)) {
@@ -184,7 +193,9 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
         if(flag(port.UpREQ.valid) && flag(port.UpREQ.ready)) {
           acceptedPorts+=index
           val p=port.UpREQ;val ctx=dut.io.pfTrain.get(index);val key=index->value(p.bits.TxnID)
+          if (traceCHI && cycle >= 23180) println(s"M3_UPREQ cycle=$cycle portType=Type1 port=$index Opcode=${value(p.bits.Opcode)} SrcID=${value(p.bits.SrcID)} TxnID=${value(p.bits.TxnID)} Addr=0x${value(p.bits.Addr).toString(16)} ExpCompData=${flag(p.bits.ExpCompData)} ExpCompAck=absent-in-CCHI")
           assert(!demandAddresses.contains(key));demandAddresses(key)=value(p.bits.Addr)
+          assert(!demandOpcodes.contains(key));demandOpcodes(key)=value(p.bits.Opcode)
           reference.upstream(value(p.bits.SrcID),value(p.bits.TxnID),value(p.bits.Addr),
             (value(ctx.vaddrBlock)>>6<<12)|(value(p.bits.Addr)&0xfc0),value(ctx.reqSource).toInt,flag(ctx.trainEnable))
         }
@@ -207,6 +218,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
       val outputGeneration=if(row("out")!=0)Some(identities.retirementGeneration(value(dut.audit.outputIndex).toInt)) else None
       identities.sample(dut.audit,cycle)
       trace.println(ujson.Arr(cycle, epoch, gate, packed.toString(16)).render())
+      if (traceCHI && cycle >= 23180) trace.flush()
       if(row("candidate") != 0) allCandidates += 1
       allDrops += row("full").toInt + row("duplicate").toInt + row("filterDrop").toInt + (0 until 16).map(i => row(s"translationDrop$i").toInt).sum
       contention += row("vbopBlockedCDP").toInt
@@ -512,8 +524,11 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
       request(roPA,0x200000,opcode=CCHIOpcode.ReadOnce.opcode);run(200)
       assert(reference.coverage("ReadOnce")-roBefore==1,"M3 legal ReadOnce execution absent")
       val legalHit=reference.directory.values.exists(x=>x._1==roPA && x._2.state!=0)
-      assert(legalHit,"M3 ReadOnce must be L2 hit; miss is base known limitation")
-      println(s"CDP_READONCE_RESULT legalClientI=true L2Hit=true eligibilityChecked=1 returnedBeats=${beats-roBeats} outstanding=${demandAddresses.size} miss=KNOWN_ISSUE hitResponse=KNOWN_ISSUE countedFailure=false label=base 已知问题(见 readonce-base-note.md)")
+      assert(legalHit,"M3 ReadOnce stimulus must be an L2 hit")
+      assert(beats-roBeats==2,s"M3 ReadOnce must return both data beats, got ${beats-roBeats}")
+      assert(demandAddresses.isEmpty && demandOpcodes.isEmpty,"M3 ReadOnce left an outstanding demand")
+      assert(portAcks.forall(_.isEmpty),"M3 ReadOnce must not enqueue an upstream CompAck")
+      println(s"CDP_READONCE_RESULT legalClientI=true L2Hit=true eligibilityChecked=1 returnedBeats=${beats-roBeats} outstanding=${demandAddresses.size} upstreamCompAck=false hitResponse=PASS countedFailure=true")
       trace.close()
       println("CDP_M3_COVERAGE "+reference.coverage.toSeq.sortBy(_._1).map {case(k,v)=>s"$k=$v"}.mkString(" "))
       reference.requireCoverage(Seq("crossSliceTrain","vpnFilterDifferent","captureSimultaneous","ReadOnce","L1DataPrefetch","trainEnable0") ++
