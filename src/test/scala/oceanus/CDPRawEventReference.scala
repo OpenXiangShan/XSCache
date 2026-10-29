@@ -10,7 +10,7 @@ import utility.MemReqSource
 // M2: upstream identities + directory responses/updates + independent immutable
 // memory establish raw events. No DUT train/evict/capture output feeds prediction.
 // Losing pulses disappear at the two separate RR arbiters, before admission.
-class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt) extends ChiselSim {
+class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt, tshrs: Int = 8, sets: Int = 128) extends ChiselSim {
   case class Meta(hit: Boolean=false,state: Int=0,source: Int=0,depth: Int=0)
   case class Train(pa: BigInt,va: BigInt,source: Int,depth: Int,hit: Boolean,req: Int,en: Boolean)
   case class Line(pa: BigInt,source: Int,depth: Int,hit: Boolean)
@@ -21,10 +21,10 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt) extends Ch
   def hit(name: String,n: Long=1): Unit=coverage(name)+=n
   def f(x: Bool)=x.litOption.getOrElse(x.peek().litValue)!=0
   def v(x: UInt)=x.litOption.getOrElse(x.peek().litValue)
-  private val metas=Array.fill(slices,8)(Meta())
-  private val pending=Array.fill[Option[Line]](slices,8)(None)
-  private val full=Array.fill(slices,8)(false)
-  private val mergedWait=Array.fill(slices,8)(false)
+  private val metas=Array.fill(slices,tshrs)(Meta())
+  private val pending=Array.fill[Option[Line]](slices,tshrs)(None)
+  private val full=Array.fill(slices,tshrs)(false)
+  private val mergedWait=Array.fill(slices,tshrs)(false)
   private val queues=Seq.fill(slices)(mutable.Queue.empty[Half])
   private val drop=Array.fill[BigInt](slices)(0);private val collision=Array.fill[BigInt](slices)(0)
   private var vpnLast=0;private var filterLast=0;private var halfLast=0
@@ -48,7 +48,7 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt) extends Ch
     val train=mutable.ArrayBuffer.empty[(Int,Train)]
     val evict=mutable.ArrayBuffer.empty[(Int,Meta,BigInt)]
     val lines=Seq.fill(slices)(mutable.ArrayBuffer.empty[(Int,Line)])
-    for(bank<-0 until slices;i<-0 until 8) {
+    for(bank<-0 until slices;i<-0 until tshrs) {
       val p=s"raw$bank.$i";val addr=num(p+".addr");val old=metas(bank)(i)
       val exec=bit(p+".exec");val req=p+".req"
       val demand=num(req+".SrcID")!=dut.module.config.pfSrcID
@@ -64,7 +64,7 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt) extends Ch
           assert(pa==addr && (va>>6)==num(p+".context.vpn")*64+(addr>>6&63) && rs==num(p+".context.reqSource") && en==bit(p+".context.trainEnable"),s"M2 upstream context cycle=$cycle key=$k")
           if(opcode==CCHIOpcode.ReadOnce.opcode) hit("ReadOnce")
         }
-        if(demand && read) train+=((bank*8+i,Train(addr,(num(p+".context.vpn")<<6)|(addr>>6&63),if(old.hit) old.source else 0,if(old.hit) old.depth else 0,old.hit,num(p+".context.reqSource").toInt,bit(p+".context.trainEnable"))))
+        if(demand && read) train+=((bank*tshrs+i,Train(addr,(num(p+".context.vpn")<<6)|(addr>>6&63),if(old.hit) old.source else 0,if(old.hit) old.depth else 0,old.hit,num(p+".context.reqSource").toInt,bit(p+".context.trainEnable"))))
         val isHit=demand && old.hit && Set(9,L2PfSource.SMS,2,3)(old.source) &&
           Set(CCHIOpcode.ReadShared.opcode,CCHIOpcode.ReadUnique.opcode)(opcode) && bit(req+".ExpCompData")
         val refill= !old.hit && Set(CCHIOpcode.ReadShared.opcode,CCHIOpcode.ReadUnique.opcode,CCHIOpcode.StashShared.opcode,CCHIOpcode.StashUnique.opcode)(opcode)
@@ -85,7 +85,7 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt) extends Ch
       val mergeWaiting=mergedWait(bank)(i) || mergeEnter
       val mergedStart=mergedWait(bank)(i) && start.exists(_.hit)
       if(mergedStart) { start=start.map(x=>x.copy(source=0,depth=0,hit=false));hit("mergedScans") }
-      val expectedTrain=train.lastOption.filter(_._1==bank*8+i).map(_._2)
+      val expectedTrain=train.lastOption.filter(_._1==bank*tshrs+i).map(_._2)
       assert(bit(p+".train.valid")==expectedTrain.nonEmpty,s"M2 raw train valid bank=$bank tshr=$i cycle=$cycle")
       expectedTrain.foreach { t=>
         val b=p+".train.bits"
@@ -101,7 +101,7 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt) extends Ch
         assert(resident.exists(m=>m.state!=0 && m.source==old.source && m.depth==old.depth),
           s"M2 victim lifecycle PA=$addr old=$old resident=$resident history=${residentHistory.mkString(";")}")
         history(s"evict cycle=$cycle bank=$bank tshr=$i addr=$addr old=$old");residentLines.remove(addr)
-        evict+=((bank*8+i,old,addr));hit("evictions")
+        evict+=((bank*tshrs+i,old,addr));hit("evictions")
       }
       val ctx=start.orElse(if(!bit(p+".reqValid")) pending(bank)(i) else None)
       val expectedLine=ctx.filter { x=>
@@ -132,7 +132,7 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt) extends Ch
       if(bit(p+".metaMask.pfSource")) m=m.copy(source=num(p+".metaValue.pfSource").toInt,depth=num(p+".metaValue.cdpPfDepth").toInt)
       metas(bank)(i)=m
       if(bit(p+".dirWrite")) {
-        val w=p+".write";val key=(bank,((num(w+".PADDR")>>6)&127).toInt,num(w+".WAY").toInt)
+        val w=p+".write";val key=(bank,((num(w+".PADDR")>>6)&(sets-1)).toInt,num(w+".WAY").toInt)
         val previous=directory.getOrElse(key,(num(w+".PADDR"),Meta()))
         var dm=previous._2
         if(bit(w+".META_WEN.state")) dm=dm.copy(state=num(w+".META.state").toInt,hit=num(w+".META.state")!=0)
@@ -153,14 +153,14 @@ class CDPRawEventReference(slices: Int, memory: (BigInt,Int)=>BigInt) extends Ch
       lines:Seq[Seq[(Int,Line)]],selectedVpn:chisel3.util.Valid[OceanusCDPTrain],
       selectedFilter:chisel3.util.Valid[OceanusCDPTrain],halfOut:chisel3.util.Valid[L2CDPHalf],halfBank:UInt):Unit={
     val enabled=row("enable")!=0
-    if(train.size>1) {hit("multiTrain");if(train.map(_._1/8).distinct.size>1) hit("crossSliceTrain");if(train.groupBy(_._1/8).values.exists(_.size>1)) hit("crossTSHRTrain")}
-    if(evict.size>1) {hit("multiEvict");if(evict.map(_._1/8).distinct.size>1) hit("crossSliceEvict");if(evict.groupBy(_._1/8).values.exists(_.size>1)) hit("crossTSHREvict")}
+    if(train.size>1) {hit("multiTrain");if(train.map(_._1/tshrs).distinct.size>1) hit("crossSliceTrain");if(train.groupBy(_._1/tshrs).values.exists(_.size>1)) hit("crossTSHRTrain")}
+    if(evict.size>1) {hit("multiEvict");if(evict.map(_._1/tshrs).distinct.size>1) hit("crossSliceEvict");if(evict.groupBy(_._1/tshrs).values.exists(_.size>1)) hit("crossTSHREvict")}
     if(train.nonEmpty && evict.nonEmpty) hit("trainEvictSameCycle")
     val eligible=train.filter(t=>enabled && t._2.en && t._2.req!=MemReqSource.L1DataPrefetch.id)
     def mapped(t: Train)=Selected(t.pa,t.va,source=t.source,hit=t.hit,prefetched=t.source!=0,req=t.req,en=t.en,vpn=true,used=t.hit)
     val vs=eligible.map(t=>t._1->mapped(t._2)).toMap
     val fs=(eligible.filter(_._2.hit).map(t=>t._1->mapped(t._2))++evict.filter(e=>enabled && e._2.source==9).map { e=>
-      (e._1+slices*8)->Selected(victim=e._3,source=9,prefetched=true,req=MemReqSource.Prefetch2L2CDP.id,en=true,evict=true)
+      (e._1+slices*tshrs)->Selected(victim=e._3,source=9,prefetched=true,req=MemReqSource.Prefetch2L2CDP.id,en=true,evict=true)
     }).toMap
     val vi=rr(vs.keys.toSeq.sorted,vpnLast);val fi=rr(fs.keys.toSeq.sorted,filterLast)
     def compare(p: chisel3.util.Valid[OceanusCDPTrain],e: Option[Selected]): Unit = {

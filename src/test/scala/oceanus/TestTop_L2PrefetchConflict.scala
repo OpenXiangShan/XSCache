@@ -77,7 +77,7 @@ class ConflictQueueProbe extends Bundle {
 }
 class TestTopConflict(cfg: L2Configuration)(implicit p: Parameters) extends TestTopOvernight(cfg) {
   val hnNodeID=cfg.nodeId
-  val ct=IO(Output(Vec(cfg.sliceNum,Vec(8,new ConflictTshrProbe))))
+  val ct=IO(Output(Vec(cfg.sliceNum,Vec(nMSHR,new ConflictTshrProbe))))
   val cq=IO(Output(Vec(cfg.sliceNum*10,new ConflictQueueProbe)))
   val enterPA=IO(Output(Vec(cfg.sliceNum,UInt(48.W))))
   val storage=IO(Output(Vec(cfg.sliceNum,new ConflictStorageProbe)))
@@ -89,7 +89,7 @@ class TestTopConflict(cfg: L2Configuration)(implicit p: Parameters) extends Test
     o.data:=read(ds.issueReq.wdata);o.response:=read(ds.sram.io.rdata.data)
   }
   for(s<-0 until cfg.sliceNum) enterPA(s):=read(module.slices(s).io.UpRXREQ.bits.Addr)
-  val tf=IO(Output(UInt((cfg.sliceNum*8*12).W)))
+  val tf=IO(Output(UInt((cfg.sliceNum*nMSHR*12).W)))
   val qf=IO(Output(UInt((cfg.sliceNum*10*4).W)))
   // Final CDP replaces the legacy single-request stub. Drain every accepted
   // training/detection/candidate stage, including Filter re-query pipelines.
@@ -164,11 +164,13 @@ class ConflictDemandDriver(dut: TestTop_L2Top, upstream: L2TopUpstreamModel) ext
   val masters = Seq(MasterId.t1p0, MasterId.t4p0, MasterId.t4p1)
   private def reqPort(master: MasterId) = master match {
     case MasterId.T1P0 => dut.io.t1p(0).UpREQ
+    case MasterId.T1P1 => dut.io.t1p(1).UpREQ
     case MasterId.T4P0 => dut.io.t4p(0).UpREQ
     case MasterId.T4P1 => dut.io.t4p(1).UpREQ
   }
   private def dataPort(master: MasterId) = master match {
     case MasterId.T1P0 => dut.io.t1p(0).DnDAT
+    case MasterId.T1P1 => dut.io.t1p(1).DnDAT
     case MasterId.T4P0 => dut.io.t4p(0).DnDAT
     case MasterId.T4P1 => dut.io.t4p(1).DnDAT
   }
@@ -202,7 +204,8 @@ class ConflictDemandDriver(dut: TestTop_L2Top, upstream: L2TopUpstreamModel) ext
         (0 until count).map(i => (nextID(master) + i) % count)
           .find(id => !active.contains((master, BigInt(id)))).foreach { id =>
             val src = master match {
-              case MasterId.T1P0 => 0
+              case MasterId.T1P0 => dut.l2cfg.upstream.type1.head.nid
+              case MasterId.T1P1 => dut.l2cfg.upstream.type1(1).nid
               case MasterId.T4P0 => 4
               case MasterId.T4P1 => 5
             }
@@ -478,15 +481,15 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
     val flags=value(dut.tf);lastFlags=flags
     var trainSlices=Set.empty[Int];var disabled=false
     val hitThisCycle=mutable.Map.empty[BigInt,Int]
-    for(s<-0 until slices;t<-0 until 8) {
-      val f=((flags>>((s*8+t)*12))&4095).toInt
+    for(s<-0 until slices;t<-0 until dut.nMSHR) {
+      val f=((flags>>((s*dut.nMSHR+t)*12))&4095).toInt
       val p=dut.ct(s)(t)
       if(bit(f,0)) {
         val inPA=value(p.inputPA);val src=value(p.inputSource)
-        if(src!=1 && value(p.inputOpcode)!=CCHIOpcode.StashShared.opcode && inFlightPrefetch(inPA)) {lateDemands+=inPA;hit("C01_enter",s"slice=$s tshr=$t pa=0x${inPA.toString(16)} liveDownstream=true src=$src")}
-        if(src!=1 && value(p.inputOpcode)==CCHIOpcode.StashShared.opcode && inFlightPrefetch(inPA)) hit("C05",s"slice=$s tshr=$t pa=0x${inPA.toString(16)} externalStash=true")
+        if(src!=dut.l2cfg.pfSrcID && value(p.inputOpcode)!=CCHIOpcode.StashShared.opcode && inFlightPrefetch(inPA)) {lateDemands+=inPA;hit("C01_enter",s"slice=$s tshr=$t pa=0x${inPA.toString(16)} liveDownstream=true src=$src")}
+        if(src!=dut.l2cfg.pfSrcID && value(p.inputOpcode)==CCHIOpcode.StashShared.opcode && inFlightPrefetch(inPA)) hit("C05",s"slice=$s tshr=$t pa=0x${inPA.toString(16)} externalStash=true")
       }
-      if(bit(f,1) && !bit(f,2) && value(p.queuedSource)!=1 && inFlightPrefetch(value(p.pa))) hit("C01_wait",s"slice=$s tshr=$t pa=0x${value(p.pa).toString(16)} rbeValid=true rbeOut=false")
+      if(bit(f,1) && !bit(f,2) && value(p.queuedSource)!=dut.l2cfg.pfSrcID && inFlightPrefetch(value(p.pa))) hit("C01_wait",s"slice=$s tshr=$t pa=0x${value(p.pa).toString(16)} rbeValid=true rbeOut=false")
       if(bit(f,3)) {
         val tr=p.train;val addr=value(tr.paddr);val src=value(tr.pfSource).toInt;val depth=value(tr.pfDepth).toInt;val ishit=flag(tr.hit)
         trains+=((cycle,addr,src,depth,ishit))
@@ -507,7 +510,7 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
         writes.get(addr).foreach{case(a,b)=>assert(a==src && b==d,s"victim history pa=$addr expected=$a/$b actual=$src/$d")}
         if(!randomMode) println(s"CONFLICT_EVICT cycle=$cycle victim=0x${addr.toString(16)} source=$src depth=$d peers=${dut.observation.dirProbeBySlice(s).map(x=>s"${flag(x.reqActive)}:${flag(x.pRxReqIsPrefetch)}:${value(x.tshrPaddr).toString(16)}").mkString(",")}")
         replacements.remove((s,addr)).foreach{case(refiller,selectedAt)=>
-          assert(refiller!=addr&&((refiller>>6)&127)==((addr>>6)&127),"replacement set/tag mismatch")
+          assert(refiller!=addr&&((refiller>>6)&(dut.p(L2ParamsKey).sets-1))==((addr>>6)&(dut.p(L2ParamsKey).sets-1)),"replacement set/tag mismatch")
           hit("C04",s"slice=$s victim=0x${addr.toString(16)} refiller=0x${refiller.toString(16)} source=$src depth=$d replSelectedAt=$selectedAt actualInvalidation=true")
         }
         writes.remove(addr)
@@ -716,7 +719,7 @@ class ConflictRun(val dut: TestTopConflict,val seed: Int,val slices: Int,val ran
       e.model.counts.toSeq.sortBy(_._1).foreach{case(k,n)=>println(s"HN_EXT_FAILURE_COVER seed=$seed slices=$slices cycle=$cycle name=$k count=$n")}
       e.model.overlapWindows.toSeq.sortBy(_._1).foreach{case(k,n)=>println(s"HN_EXT_FAILURE_OVERLAP seed=$seed slices=$slices name=$k windows=$n cycles=${e.model.overlapCycles(k)} windowLength=512")}
     }
-    for(s<-0 until slices;t<-0 until 8){val p=dut.ct(s)(t)
+    for(s<-0 until slices;t<-0 until dut.nMSHR){val p=dut.ct(s)(t)
       println(s"CONFLICT_FAILURE_TSHR slice=$s tshr=$t flags=${value(p.flags)} requestWaits=${value(p.requestWaits)} pa=${value(p.pa).toString(16)} metaFlags=${value(p.metaFlags)} localState=${value(p.localState)} directoryState=${value(p.directoryState)} requestState=${value(p.requestState)} snoopState=${value(p.snoopState)}")
     }
     eventHistory.foreach(x=>println("CONFLICT_HISTORY "+x))
@@ -931,11 +934,11 @@ object TestTop_L2PrefetchConflict extends App with ChiselSim {
             // Same actual set: sets=128, line=64 => stride 8192.
             r.controls(b=false,v=false,c=false)
             for(i<-0 until 12) {
-              val pa=BigInt(0x80000+i*8192);r.recv(pa);r.drain()
+              val pa=BigInt(0x80000+i*dut.p(L2ParamsKey).sets*64);r.recv(pa);r.drain()
               println(s"CONFLICT_REPL_PHASE i=$i pa=0x${pa.toString(16)} entered=${r.entries.size} reads=${r.readRequests.size} writes=${r.writes.toSeq.sortBy(_._1).map{case(a,(s,d))=>s"${a.toString(16)}:$s:$d"}.mkString(",")} evictions=${r.evicts.size} rtlEvictions=${r.value(dut.moduleEvictions)}")
             }
             assert(r.evicts.size>=8 && r.evidence("C04")>0,s"actual replacement overlap missing evictions=${r.evicts.size} overlap=${r.evidence("C04")}")
-            for(i<-0 until 12) {r.enqueue(BigInt(0x80000+i*8192),enabled=false);r.drain()}
+            for(i<-0 until 12) {r.enqueue(BigInt(0x80000+i*dut.p(L2ParamsKey).sets*64),enabled=false);r.drain()}
           case other=>sys.error("unknown case "+other)
         }
       } else {

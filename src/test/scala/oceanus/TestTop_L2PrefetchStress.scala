@@ -280,11 +280,13 @@ class StressDemandDriver(dut: StressTopBase, upstream: StressUpstreamModel) exte
   val masters = Seq(MasterId.t1p0) // Type-4 is never stimulated
   private def reqPort(master: MasterId) = master match {
     case MasterId.T1P0 => dut.io.t1p(0).UpREQ
+    case MasterId.T1P1 => dut.io.t1p(1).UpREQ
     case MasterId.T4P0 => dut.io.t4p(0).UpREQ
     case MasterId.T4P1 => dut.io.t4p(1).UpREQ
   }
   private def dataPort(master: MasterId) = master match {
     case MasterId.T1P0 => dut.io.t1p(0).DnDAT
+    case MasterId.T1P1 => dut.io.t1p(1).DnDAT
     case MasterId.T4P0 => dut.io.t4p(0).DnDAT
     case MasterId.T4P1 => dut.io.t4p(1).DnDAT
   }
@@ -320,7 +322,8 @@ class StressDemandDriver(dut: StressTopBase, upstream: StressUpstreamModel) exte
         (0 until count).map(i => (nextID(master) + i) % count)
           .find(id => !active.contains((master, BigInt(id)))).foreach { id =>
             val src = master match {
-              case MasterId.T1P0 => 0
+              case MasterId.T1P0 => dut.l2cfg.upstream.type1.head.nid
+              case MasterId.T1P1 => dut.l2cfg.upstream.type1(1).nid
               case MasterId.T4P0 => 4
               case MasterId.T4P1 => 5
             }
@@ -656,7 +659,7 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
       if(cycle%64==0) for(s<-0 until slices; src<-0 to 9)
         assert(value(dut.observation.bopPerfCountBySliceSource(s)(src)(L2BOPPerf.UselessSnoop))==uselessSnoop(s)(src),s"useless_snoop mismatch slice=$s source=$src")
       var snps=value(dut.snpPacked)
-      for(s<-0 until slices; t<-0 until 8) {
+      for(s<-0 until slices; t<-0 until dut.nMSHR) {
         val source=(snps & 15).toInt; val valid=snps.testBit(4); snps=snps>>5
         if(valid) uselessSnoop(s)(source)+=1
       }

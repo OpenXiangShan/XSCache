@@ -84,11 +84,13 @@ class OvernightDemandDriver(dut: TestTop_L2Top, upstream: L2TopUpstreamModel) ex
   val masters = Seq(MasterId.t1p0, MasterId.t4p0, MasterId.t4p1)
   private def reqPort(master: MasterId) = master match {
     case MasterId.T1P0 => dut.io.t1p(0).UpREQ
+    case MasterId.T1P1 => dut.io.t1p(1).UpREQ
     case MasterId.T4P0 => dut.io.t4p(0).UpREQ
     case MasterId.T4P1 => dut.io.t4p(1).UpREQ
   }
   private def dataPort(master: MasterId) = master match {
     case MasterId.T1P0 => dut.io.t1p(0).DnDAT
+    case MasterId.T1P1 => dut.io.t1p(1).DnDAT
     case MasterId.T4P0 => dut.io.t4p(0).DnDAT
     case MasterId.T4P1 => dut.io.t4p(1).DnDAT
   }
@@ -115,7 +117,8 @@ class OvernightDemandDriver(dut: TestTop_L2Top, upstream: L2TopUpstreamModel) ex
         (0 until count).map(i => (nextID(master) + i) % count)
           .find(id => !active.contains((master, BigInt(id)))).foreach { id =>
             val src = master match {
-              case MasterId.T1P0 => 0
+              case MasterId.T1P0 => dut.l2cfg.upstream.type1.head.nid
+              case MasterId.T1P1 => dut.l2cfg.upstream.type1(1).nid
               case MasterId.T4P0 => 4
               case MasterId.T4P1 => 5
             }

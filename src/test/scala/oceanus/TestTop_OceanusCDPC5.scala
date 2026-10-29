@@ -90,7 +90,7 @@ class TestTopCDPC5(cfg: L2Configuration)(implicit p: Parameters) extends TestTop
       "pa" -> slice.io.UpRXREQ.bits.Addr, "txn" -> slice.io.UpRXREQ.bits.TxnID)
     add(s"captureDrops$bank", slice.io.cdpHalfDrops)
     add(s"collisionDrops$bank", slice.io.cdpCollisionDrops)
-    for (i <- 0 until 8) {
+    for (i <- 0 until nMSHR) {
       val t = slice.io.cdpTrain(i); val e = slice.io.cdpEvict(i)
       event(s"train$bank.$i", t.valid, "bits" -> t.bits)
       event(s"evict$bank.$i", e.valid, "pa" -> e.bits.paddr, "source" -> e.bits.pfSource, "depth" -> e.bits.pfDepth)
@@ -239,7 +239,7 @@ object TestTop_OceanusCDPC5 extends App with ChiselSim {
           assert(emitted.contains((addr, depth)), "source9/depth TxnID without CDP producer")
           admitted += ((addr, depth))
         }
-        for(i <- 0 until 8) {
+        for(i <- 0 until dut.nMSHR) {
           if(row(s"evict$bank.$i") != 0 && row(s"evict$bank.$i.source") == 9) {
             assert(emitted.exists(_._1 == row(s"evict$bank.$i.pa")), "unused victim was never issued by CDP")
             assert(useful(row(s"evict$bank.$i.pa")) == 0, "used CDP line reported unused")
@@ -312,7 +312,7 @@ object TestTop_OceanusCDPC5 extends App with ChiselSim {
       low + 2 * high
     }
     val victimsBefore = unused
-    val conflicts = (1 to 128).map(i => unusedTarget + i * 8192).filter(a => bank(a) == bank(unusedTarget)).take(10)
+    val conflicts = (1 to 128).map(i => unusedTarget + i * dut.p(L2ParamsKey).sets * 64).filter(a => bank(a) == bank(unusedTarget)).take(10)
     for(addr <- conflicts) { request(addr, 0x200040); drain() }
     assert(unused > victimsBefore, "no unused genuine CDP victim feedback")
     // Occupy all shared translation slots with real VBOP trains. A subsequent

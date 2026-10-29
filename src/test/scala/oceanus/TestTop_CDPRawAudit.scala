@@ -88,7 +88,7 @@ class TestTopCDPRawAudit(cfg: L2Configuration)(implicit p: Parameters) extends T
       "pa" -> slice.io.UpRXREQ.bits.Addr, "txn" -> slice.io.UpRXREQ.bits.TxnID)
     add(s"captureDrops$bank", slice.io.cdpHalfDrops)
     add(s"collisionDrops$bank", slice.io.cdpCollisionDrops)
-    for (i <- 0 until 8) {
+    for (i <- 0 until nMSHR) {
       val t = slice.io.cdpTrain(i); val e = slice.io.cdpEvict(i)
       event(s"train$bank.$i", t.valid, "bits" -> t.bits)
       event(s"evict$bank.$i", e.valid, "pa" -> e.bits.paddr, "source" -> e.bits.pfSource, "depth" -> e.bits.pfDepth)
@@ -143,7 +143,7 @@ class TestTopCDPRawAudit(cfg: L2Configuration)(implicit p: Parameters) extends T
     event(s"source9deq$b",fire(q.io.deq),"pa"->q.io.deq.bits.Addr,"txn"->q.io.deq.bits.TxnID)
     add(s"source9overwrite$b",q.io.overwrite)
   }
-  val raw=IO(Output(Vec(cfg.sliceNum,Vec(8,new CDPRawLifecycle))))
+  val raw=IO(Output(Vec(cfg.sliceNum,Vec(nMSHR,new CDPRawLifecycle))))
   for ((slice,bank)<-module.slices.zipWithIndex; (t,i)<-CDPAuditReflect.field[Seq[L2TSHR]](slice,"tshrs").zipWithIndex) {
     val o=raw(bank)(i);val v=CDPAuditReflect.field[oceanus.l2.tshr.L2VPipeREQ](t,"vPipeREQ")
     o.exec:=read(CDPAuditReflect.field[Bool](v,"rxreq_fire"));o.req:=read(v.io.UpRXREQ.bits);o.context:=read(v.io.UpRXREQTrain.get)
@@ -182,7 +182,7 @@ class TestTopCDPRawAudit(cfg: L2Configuration)(implicit p: Parameters) extends T
     case v:Vec[_]=>v.zipWithIndex.foreach {case(x,i)=>flattenRaw(prefix+"."+i,x)}
     case x=>fields+=prefix->x.asUInt
   }
-  for(bank<-0 until cfg.sliceNum;i<-0 until 8)flattenRaw(s"raw$bank.$i",raw(bank)(i))
+  for(bank<-0 until cfg.sliceNum;i<-0 until nMSHR)flattenRaw(s"raw$bank.$i",raw(bank)(i))
   val boundary = IO(Output(UInt(fields.map(_._2.getWidth).sum.W)))
   boundary := Cat(fields.map(_._2).reverse.toSeq)
   val widths = fields.map { case (n, v) => (n, v.getWidth) }.toVector

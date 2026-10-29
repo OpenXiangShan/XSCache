@@ -55,24 +55,20 @@ class TestTopDrain(cfg: L2Configuration)(implicit p: Parameters) extends TestTop
   val sourceQueues = children(module).collect {
     case q: OverwriteQueue[_] => q.asInstanceOf[OverwriteQueue[FlitREQ]]
   }
-  require(cfg.sliceNum == 1 && sourceQueues.size == module.pfSourceSlots.size + 1)
-  val pbopQueue = sourceQueues(module.pfSourceSlots.indexOf(L2PfSource.PBOP))
-  val merged = module.pfQueues.head
-  val pbopRetire = IO(Output(Bool()))
-  val pbopAddr = IO(Output(UInt(48.W)))
-  val mergedFire = IO(Output(Bool()))
-  val mergedAddr = IO(Output(UInt(48.W)))
-  val mergedSource = IO(Output(UInt(4.W)))
-  pbopRetire := read(pbopQueue.io.deq.valid) && read(pbopQueue.io.deq.ready)
-  pbopAddr := read(pbopQueue.io.deq.bits.Addr)
-  mergedFire := read(merged.valid) && read(merged.ready)
-  mergedAddr := read(merged.bits.Addr)
-  mergedSource := read(merged.bits.TxnID)(7,4)
-  val starved = Seq(L2PfSource.PBOP, L2PfSource.CDP).map(src => sourceQueues(module.pfSourceSlots.indexOf(src)))
-  val starvedEnq = IO(Output(Vec(2, Valid(UInt(48.W)))))
-  val starvedDeq = IO(Output(Vec(2, Valid(UInt(48.W)))))
-  val starvedOverwrite = IO(Output(Vec(2, Bool())))
-  starved.zipWithIndex.foreach { case (q, i) =>
+  require(sourceQueues.size == cfg.sliceNum * (module.pfSourceSlots.size + 1))
+  val mergedFire = IO(Output(Vec(cfg.sliceNum, Bool())))
+  val mergedSource = IO(Output(Vec(cfg.sliceNum, UInt(4.W))))
+  for (bank <- 0 until cfg.sliceNum) {
+    val q = module.pfQueues(bank)
+    mergedFire(bank) := read(q.valid) && read(q.ready)
+    mergedSource(bank) := read(q.bits.TxnID)(7,4)
+  }
+  val starved = (0 until cfg.sliceNum).flatMap(bank => Seq(L2PfSource.PBOP,L2PfSource.CDP).map(
+    src => sourceQueues(bank * module.pfSourceSlots.size + module.pfSourceSlots.indexOf(src))))
+  val starvedEnq = IO(Output(Vec(cfg.sliceNum*2, Valid(UInt(48.W)))))
+  val starvedDeq = IO(Output(Vec(cfg.sliceNum*2, Valid(UInt(48.W)))))
+  val starvedOverwrite = IO(Output(Vec(cfg.sliceNum*2, Bool())))
+  starved.zipWithIndex.foreach { case(q,i) =>
     starvedEnq(i).valid := read(q.io.enq.valid) && read(q.io.enq.ready)
     starvedEnq(i).bits := read(q.io.enq.bits.Addr)
     starvedDeq(i).valid := read(q.io.deq.valid) && read(q.io.deq.ready)
@@ -136,7 +132,7 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
   OvernightMemory.vaMask=if(fast) BigInt(0x1000000) else BigInt(0)
   def physical(va: BigInt)=va ^ OvernightMemory.vaMask
   val soak = args.contains("--soak")
-  require(slices == 1 && (if(soak) firstSeed >= 1 && lastSeed >= firstSeed else Set(1, 6, 11, 16)(firstSeed) && lastSeed == firstSeed))
+  require(Set(1,2,4)(slices) && (if(soak) firstSeed >= 1 && lastSeed >= firstSeed else Set(1, 6, 11, 16)(firstSeed) && lastSeed == firstSeed))
   require(minimum == 5000 && demandPeriod == 32 && !harsh && !fast)
   val stopCycle = minimum + 30000
   val drainLimit = stopCycle + 20000
@@ -226,9 +222,9 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
     // generation from a historical-address filter (which this merge lacks).
     val stopEntered = Array.fill(slices, 10)(BigInt(0))
     case class Item(id: Int, addr: BigInt)
-    val residents = Seq.fill(2)(mutable.Queue.empty[Item])
-    val stopped = Seq.fill(2)(mutable.Set.empty[Int])
-    val resolved = Seq.fill(2)(mutable.Map.empty[Int,String])
+    val residents = Seq.fill(2*slices)(mutable.Queue.empty[Item])
+    val stopped = Seq.fill(2*slices)(mutable.Set.empty[Int])
+    val resolved = Seq.fill(2*slices)(mutable.Map.empty[Int,String])
     var nextItem = 0
     val birth = mutable.Map.empty[(Int, BigInt), Int]
     def snapshot(tag: String): Unit = {
@@ -249,10 +245,10 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
         assert(driver.queued == 0 && driver.accepted.size == submitted-withdrawn)
         println(s"DRAIN_DEMAND_CUT seed=$seed cycle=$cycle planned=$submitted withdrawn=$withdrawn accepted=${driver.accepted.size}")
         for(s <- 0 until slices; src <- 0 to 9) stopEntered(s)(src) = entered(s)(src)
-        for(i <- 0 until 2) {
-          assert(residents(i).size == ledger(0,Seq(3,9)(i))(4).toInt)
+        for(i <- 0 until 2*slices) {
+          assert(residents(i).size == ledger(i/2,Seq(3,9)(i%2))(4).toInt)
           stopped(i) ++= residents(i).map(_.id)
-          println(s"DRAIN_RESIDENT seed=$seed source=${Seq(3,9)(i)} items=${residents(i).mkString(",")} uniqueAddresses=${residents(i).map(_.addr).distinct.size}")
+          println(s"DRAIN_RESIDENT seed=$seed source=${Seq(3,9)(i%2)} items=${residents(i).mkString(",")} uniqueAddresses=${residents(i).map(_.addr).distinct.size}")
         }
         // Reproduce the original end-of-loop assertion ordering before draining.
         val reason = if(transactions.nonEmpty || terminals.nonEmpty) "TLB-ledger" else "absolute-watchdog"
@@ -393,21 +389,20 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
           entered(s)(src)+=1
         }
       }
-      for(i <- 0 until 2) {
+      for(i <- 0 until 2*slices) {
         def retire(reason: String): Unit = {
           val item = residents(i).dequeue()
           if(reason != "overwrite") assert(item.addr == value(dut.starvedDeq(i).bits))
           if(stopped(i)(item.id)) {
             assert(!resolved(i).contains(item.id)); resolved(i)(item.id)=reason
-            println(s"DRAIN_ITEM seed=$seed cycle=$cycle source=${Seq(3,9)(i)} id=${item.id} addr=${item.addr} reason=$reason")
+            println(s"DRAIN_ITEM seed=$seed cycle=$cycle source=${Seq(3,9)(i%2)} id=${item.id} addr=${item.addr} reason=$reason")
           }
         }
-        if(flag(dut.starvedDeq(i).valid)) retire(if(flag(dut.mergedFire) && value(dut.mergedSource)==Seq(3,9)(i)) "entered" else "dedup")
+        if(flag(dut.starvedDeq(i).valid)) retire(if(flag(dut.mergedFire(i/2)) && value(dut.mergedSource(i/2))==Seq(3,9)(i%2)) "entered" else "dedup")
         if(flag(dut.starvedOverwrite(i))) retire("overwrite")
         if(flag(dut.starvedEnq(i).valid)) { residents(i).enqueue(Item(nextItem,value(dut.starvedEnq(i).bits))); nextItem+=1 }
       }
-      if(cycle >= stopCycle && flag(dut.pbopRetire))
-        println(s"DRAIN_PBOP_RETIRE seed=$seed cycle=$cycle addr=${value(dut.pbopAddr)} mergedFire=${flag(dut.mergedFire)} mergedSource=${value(dut.mergedSource)} mergedAddr=${value(dut.mergedAddr)}")
+
       driver.sample(cycle)
       if(driver.completed!=lastCompleted) { lastProgress=cycle; lastCompleted=driver.completed }
       assert(cycle>=stopCycle || cycle-lastProgress<4000,s"progress watchdog seed=$seed slices=$slices cycle=$cycle pending=${driver.pending}")
@@ -441,11 +436,12 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
       println(s"OVERNIGHT_SOURCE pass=true slices=$slices seed=$seed source=$src produced=${produced.map(_(src)).sum} enqueued=${led(0)} overwritten=${led(1)} entered=${entered.map(_(src)).sum} queueEntered=${led(2)} dedup=${led(3)} pending=${led(4)} useful=$useful redundant=$redundant")
     }
     println(s"OVERNIGHT_SOAK pass=true slices=$slices seed=$seed cycles=$cycle activeCycles=$activeCycles demands=${submitted-withdrawn} planned=$submitted withdrawn=$withdrawn completed=${driver.completed} checkedBeats=${driver.checkedBeats} translations=$translations recvInputs=$recvInputs watchdog=false scoreboard=true sourceClosure=true totalConservation=true recvConservation=true")
-    for(i <- 0 until 2) {
-      assert(stopped(i).nonEmpty && resolved(i).keySet == stopped(i) && residents(i).isEmpty,
-        s"starved source ${Seq(3,9)(i)} item ledger did not close")
-      println(s"DRAIN_DISPOSITION seed=$seed source=${Seq(3,9)(i)} pendingAtStop=${stopped(i).size} entered=${resolved(i).values.count(_=="entered")} dedup=${resolved(i).values.count(_=="dedup")} overwritten=${resolved(i).values.count(_=="overwrite")} pending=0")
+    for(i <- 0 until 2*slices) {
+      assert(resolved(i).keySet == stopped(i) && residents(i).isEmpty,
+        s"starved source ${Seq(3,9)(i%2)} item ledger did not close")
+      println(s"DRAIN_DISPOSITION seed=$seed source=${Seq(3,9)(i%2)} pendingAtStop=${stopped(i).size} entered=${resolved(i).values.count(_=="entered")} dedup=${resolved(i).values.count(_=="dedup")} overwritten=${resolved(i).values.count(_=="overwrite")} pending=0")
     }
+    for(src <- 0 until 2) assert((0 until slices).exists(bank => stopped(2*bank+src).nonEmpty), s"starved source ${Seq(3,9)(src)} not exercised")
     println(s"DRAIN_ACCEPTANCE seed=$seed drain=true ledger=true itemClosure=true")
     }
   }

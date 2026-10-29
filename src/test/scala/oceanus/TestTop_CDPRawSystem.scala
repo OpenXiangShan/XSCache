@@ -90,7 +90,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
         words.slice(beat * 4, beat * 4 + 4).zipWithIndex.map { case (v, i) => v << (i * 64) }.sum
       } else BigInt(0)
     }
-    val reference=new CDPRawEventReference(slices,memory _)
+    val reference=new CDPRawEventReference(slices,memory _,dut.nMSHR,dut.p(L2ParamsKey).sets)
     val identities=new CDPCandidateLedger(allowRetainedDisabledOutput=csrMode)
     val tlbOwnership=new CDPTlbOwnershipLedger
     val sourceOwnership=Seq.fill(slices)(mutable.Queue.empty[(BigInt,Int,Long)])
@@ -253,7 +253,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
           admitted += ((addr, depth))
 
         }
-        for(i <- 0 until 8) {
+        for(i <- 0 until dut.nMSHR) {
           if(row(s"evict$bank.$i") != 0 && row(s"evict$bank.$i.source") == 9) {
             assert(emitted.exists(_._1 == row(s"evict$bank.$i.pa")), "unused victim was never issued by CDP")
             assert(useful(row(s"evict$bank.$i.pa")) == 0, "used CDP line reported unused")
@@ -337,7 +337,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
       low + 2 * high
     }
     val victimsBefore = unused
-    val conflicts = (1 to 128).map(i => unusedTarget + i * 8192).filter(a => bank(a) == bank(unusedTarget)).take(10)
+    val conflicts = (1 to 128).map(i => unusedTarget + i * dut.p(L2ParamsKey).sets * 64).filter(a => bank(a) == bank(unusedTarget)).take(10)
     for(addr <- conflicts) { request(addr, 0x200040); drain() }
     assert(unused > victimsBefore, "no unused genuine CDP victim feedback")
     // Occupy all shared translation slots with real VBOP trains. A subsequent
@@ -488,7 +488,7 @@ object TestTop_CDPRawAudit extends App with ChiselSim {
         val target=emitted.map(_._1).find(a=>useful(a)==0 && reference.directory.values.exists(x=>x._1==a && x._2.source==9))
         target.foreach { victim =>
           val old=reference.coverage("evictions")
-          val candidates=(1 to 256).map(j=>victim+j*8192).filter(a=>bank(a)==bank(victim)).take(12)
+          val candidates=(1 to 256).map(j=>victim+j*dut.p(L2ParamsKey).sets*64).filter(a=>bank(a)==bank(victim)).take(12)
           competingDemand=Some(first)
           for(a<-candidates if reference.coverage("evictions")==old) {request(a,0x200040);drain()}
           competingDemand=None
