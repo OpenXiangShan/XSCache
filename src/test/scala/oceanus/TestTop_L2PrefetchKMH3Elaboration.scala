@@ -11,7 +11,7 @@ import utility._
 // This checks construction and initialized DFT inputs; it does not claim MBIST scan coverage.
 object TestTop_L2PrefetchKMH3Elaboration extends App {
   Constantin.init(false)
-  require(args.length == 3, "usage: <bop|vbop|cdp> <mbist:true|false> <output.sv>")
+  require(args.length == 3 || args.length == 4, "usage: <bop|vbop|cdp> <mbist:true|false> <output.sv>")
   val source = args(0)
   require(Set("bop", "vbop", "cdp").contains(source))
   val mbist = args(1).toBoolean
@@ -20,7 +20,8 @@ object TestTop_L2PrefetchKMH3Elaboration extends App {
       ways = 8, sets = 1024, blockBytes = 64, dataSRAMSplit = 8,
       enableDataECC = true, dataECC = Some("secded"), hasMbist = mbist,
       hasSramCtl = false, replacement = "drrip",
-      enableDRRIPReleaseUpdate = true, enableDRRIPEntranceReleaseUpdate = true)
+      enableDRRIPReleaseUpdate = true, enableDRRIPEntranceReleaseUpdate = true,
+      prefetchMaxSharedTSHRs = args.lift(3).map(_.toInt))
     case CHIParametersKey => CHIParameters(issue = EnumCHIIssue.E, nodeIdWidth = 11,
       reqAddrWidth = 48, reqRsvdcWidth = 4, datRsvdcWidth = 4, dataWidth = 256,
       dataCheckPresent = true, poisonPresent = true, mpamPresent = true)
