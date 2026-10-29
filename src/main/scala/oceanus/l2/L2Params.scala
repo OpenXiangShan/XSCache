@@ -25,6 +25,9 @@ case class L2Params(
     enableDRRIPReleaseUpdate: Boolean = true,
     // Entrance path: WayValid EVT entrances train immediately at allocation entrance.
     enableDRRIPEntranceReleaseUpdate: Boolean = true,
+    // R01: per-slice cap on shared TSHRs that admitted internal prefetch work.
+    // None preserves the existing unlimited policy and adds no tracking state.
+    prefetchMaxSharedTSHRs: Option[Int] = None,
 )
 
 // Standalone observation modules remain enabled; L2Top explicitly scopes this key.

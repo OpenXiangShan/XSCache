@@ -192,6 +192,7 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   tshrAlloc.io.fromTSHRCtrl.RXSNP <> io.DnRXSNP
   tshrAlloc.io.fromTSHRCtrl.RXEVB <> EVB
   tshrAlloc.io.fromTSHRCtrl.RXREQ <> io.UpRXREQ
+  tshrAlloc.io.pfSrcID.foreach(_ := io.consts.pfSrcID)
 
   tshrs.foreach { case t => 
     tshrAlloc.io.fromTSHR(t.tshrId).bits := t.io.toAlloc

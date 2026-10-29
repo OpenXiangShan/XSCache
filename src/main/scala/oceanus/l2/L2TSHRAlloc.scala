@@ -123,6 +123,7 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
     val toTSHR = Output(Vec(paramL2.mshrSize, new L2TSHRAlloc.PathToTSHR))
 
     val fromTSHRCtrl = new L2TSHRAlloc.PathFromTSHRCtrl
+    val pfSrcID = paramL2.prefetchMaxSharedTSHRs.map(_ => Input(UInt(p(xscache.oceanus.compactchi.CCHIParametersKey).UpstreamNodeID_Width.W)))
   })
 
   // -- The unified cluster bundle type to connect different channels into the same target Arbiter
@@ -155,12 +156,36 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
   preclusterRXEVB.bits.target := L2TSHRTarget.asEVB
   io.fromTSHRCtrl.RXEVB.ready := preclusterRXEVB.ready
 
+  // R01: conservative slot ownership. Any accepted PF REQ, including reuse
+  // of a demand-origin slot, marks that shared TSHR until the whole slot is
+  // deallocated. Demand/SNP/EVT/EVB reuse never clears an outstanding owner.
+  // An already-owned same-PA slot costs no additional quota. The check is
+  // combinational (one REQ admission per cycle), so there is no overshoot.
+  val prefetchQuotaAllows = paramL2.prefetchMaxSharedTSHRs.map { limit =>
+    val shared = (0 until nMSHR).filterNot(i => config.resv.exists(_._1 == i))
+    require(limit >= 0 && limit <= shared.size, "prefetchMaxSharedTSHRs must fit shared TSHRs")
+    val owners = RegInit(VecInit(Seq.fill(nMSHR)(false.B)))
+    val occupied = VecInit((0 until nMSHR).map(i => owners(i) && io.fromTSHR(i).valid))
+    val used = PopCount(shared.map(i => occupied(i)))
+    val alreadyOwned = shared.map(i => occupied(i) &&
+      (io.fromTSHR(i).bits.paddr >> 6) === (io.fromTSHRCtrl.RXREQ.bits.Addr >> 6)).reduceOption(_ || _).getOrElse(false.B)
+    val isPrefetch = io.fromTSHRCtrl.RXREQ.bits.SrcID === io.pfSrcID.get
+    for(i <- 0 until nMSHR) {
+      when(!io.fromTSHR(i).valid || io.toTSHR(i).alloc.asUInt.orR) { owners(i) := false.B }
+      when(io.fromTSHRCtrl.RXREQ.fire && isPrefetch &&
+        (io.toTSHR(i).alloc.REQ || io.toTSHR(i).reuse.REQ)) { owners(i) := true.B }
+    }
+    assert(used <= limit.U, "R01 prefetch shared TSHR quota exceeded")
+    dontTouch(used)
+    !isPrefetch || alreadyOwned || used < limit.U
+  }.getOrElse(true.B)
+
   val preclusterRXREQ = Wire(Decoupled(new ClusterBundle))
-  preclusterRXREQ.valid := io.fromTSHRCtrl.RXREQ.valid
+  preclusterRXREQ.valid := io.fromTSHRCtrl.RXREQ.valid && prefetchQuotaAllows
   preclusterRXREQ.bits.paddr := io.fromTSHRCtrl.RXREQ.bits.Addr
   preclusterRXREQ.bits.opcode := io.fromTSHRCtrl.RXREQ.bits.Opcode
   preclusterRXREQ.bits.target := L2TSHRTarget.asREQ
-  io.fromTSHRCtrl.RXREQ.ready := preclusterRXREQ.ready
+  io.fromTSHRCtrl.RXREQ.ready := preclusterRXREQ.ready && prefetchQuotaAllows
   // ----------------------------------------------------------------
 
   val postcluster = Wire(Vec(clusterCount, Decoupled(new ClusterBundle)))
