@@ -1,0 +1,440 @@
+id	priority	category	point	owner	oracle
+A.recv.s1.train	P0	A	recv/source=1/1-slice：训练入口/资格	L1-life-recv-s1（拟新增，复用 LIFE）	Recv 自身不产生算法训练；其他来源核对真实训练事件/数据事件及 enable
+A.recv.s1.issue	P0	A	recv/source=1/1-slice：实际发射	L1-life-recv-s1（拟新增，复用 LIFE）	真实生产者到 slice REQ fire，来源和地址匹配；不以 generated 代替
+A.recv.s1.refill	P0	A	recv/source=1/1-slice：下游回填	L1-life-recv-s1（拟新增，复用 LIFE）	实际完整行回填，两个数据 beat 与独立内存模型一致
+A.recv.s1.meta	P0	A	recv/source=1/1-slice：Meta 写入	L1-life-recv-s1（拟新增，复用 LIFE）	真实目录写回、TSHR 去分配后 fresh SRAM read，source/depth 与历史一致
+A.recv.s1.useful	P0	A	recv/source=1/1-slice：首次 demand useful	L1-life-recv-s1（拟新增，复用 LIFE）	首次合格 demand 消费旧来源，useful 对应来源恰加一
+A.recv.s1.clear	P0	A	recv/source=1/1-slice：清预取标记	L1-life-recv-s1（拟新增，复用 LIFE）	首次消费后 fresh read source/depth=0；再次命中不重复 useful
+A.recv.s1.useless_evict	P0	A	recv/source=1/1-slice：未消费容量逐出	L1-life-recv-s1（拟新增，复用 LIFE）	victim 实际 valid→I 时恰计一次，PA/旧来源正确
+A.recv.s1.useless_snoop	P0	A	recv/source=1/1-slice：未消费 snoop 失效	L1-life-recv-s1（拟新增，复用 LIFE）	真实 snoop 失效恰计一次；不混入容量逐出
+A.recv.s1.redundant_resident	P0	A	recv/source=1/1-slice：redundant_resident	L1-life-recv-s1（拟新增，复用 LIFE）	未消费预取行上再次执行内部预取，不发下游、原标记保留
+A.recv.s1.redundant_after_demand	P0	A	recv/source=1/1-slice：redundant_after_demand	L1-life-recv-s1（拟新增，复用 LIFE）	已被 demand 消费行上再次执行内部预取，分类与来源归因正确
+A.recv.s1.late	P0	A	recv/source=1/1-slice：late	L1-life-recv-s1（拟新增，复用 LIFE）	demand 在相同 PA 内部预取活动期间到达，经过 RBE，late/useful/数据及自己的 context 闭合
+A.recv.s2.train	P1	A	recv/source=1/2-slice：训练入口/资格	L1-life-recv-s2（拟新增，复用 LIFE）	Recv 自身不产生算法训练；其他来源核对真实训练事件/数据事件及 enable
+A.recv.s2.issue	P1	A	recv/source=1/2-slice：实际发射	L1-life-recv-s2（拟新增，复用 LIFE）	真实生产者到 slice REQ fire，来源和地址匹配；不以 generated 代替
+A.recv.s2.refill	P1	A	recv/source=1/2-slice：下游回填	L1-life-recv-s2（拟新增，复用 LIFE）	实际完整行回填，两个数据 beat 与独立内存模型一致
+A.recv.s2.meta	P1	A	recv/source=1/2-slice：Meta 写入	L1-life-recv-s2（拟新增，复用 LIFE）	真实目录写回、TSHR 去分配后 fresh SRAM read，source/depth 与历史一致
+A.recv.s2.useful	P1	A	recv/source=1/2-slice：首次 demand useful	L1-life-recv-s2（拟新增，复用 LIFE）	首次合格 demand 消费旧来源，useful 对应来源恰加一
+A.recv.s2.clear	P1	A	recv/source=1/2-slice：清预取标记	L1-life-recv-s2（拟新增，复用 LIFE）	首次消费后 fresh read source/depth=0；再次命中不重复 useful
+A.recv.s2.useless_evict	P1	A	recv/source=1/2-slice：未消费容量逐出	L1-life-recv-s2（拟新增，复用 LIFE）	victim 实际 valid→I 时恰计一次，PA/旧来源正确
+A.recv.s2.useless_snoop	P1	A	recv/source=1/2-slice：未消费 snoop 失效	L1-life-recv-s2（拟新增，复用 LIFE）	真实 snoop 失效恰计一次；不混入容量逐出
+A.recv.s2.redundant_resident	P1	A	recv/source=1/2-slice：redundant_resident	L1-life-recv-s2（拟新增，复用 LIFE）	未消费预取行上再次执行内部预取，不发下游、原标记保留
+A.recv.s2.redundant_after_demand	P1	A	recv/source=1/2-slice：redundant_after_demand	L1-life-recv-s2（拟新增，复用 LIFE）	已被 demand 消费行上再次执行内部预取，分类与来源归因正确
+A.recv.s2.late	P1	A	recv/source=1/2-slice：late	L1-life-recv-s2（拟新增，复用 LIFE）	demand 在相同 PA 内部预取活动期间到达，经过 RBE，late/useful/数据及自己的 context 闭合
+A.recv.s4.train	P1	A	recv/source=1/4-slice：训练入口/资格	L1-life-recv-s4（拟新增，复用 LIFE）	Recv 自身不产生算法训练；其他来源核对真实训练事件/数据事件及 enable
+A.recv.s4.issue	P1	A	recv/source=1/4-slice：实际发射	L1-life-recv-s4（拟新增，复用 LIFE）	真实生产者到 slice REQ fire，来源和地址匹配；不以 generated 代替
+A.recv.s4.refill	P1	A	recv/source=1/4-slice：下游回填	L1-life-recv-s4（拟新增，复用 LIFE）	实际完整行回填，两个数据 beat 与独立内存模型一致
+A.recv.s4.meta	P1	A	recv/source=1/4-slice：Meta 写入	L1-life-recv-s4（拟新增，复用 LIFE）	真实目录写回、TSHR 去分配后 fresh SRAM read，source/depth 与历史一致
+A.recv.s4.useful	P1	A	recv/source=1/4-slice：首次 demand useful	L1-life-recv-s4（拟新增，复用 LIFE）	首次合格 demand 消费旧来源，useful 对应来源恰加一
+A.recv.s4.clear	P1	A	recv/source=1/4-slice：清预取标记	L1-life-recv-s4（拟新增，复用 LIFE）	首次消费后 fresh read source/depth=0；再次命中不重复 useful
+A.recv.s4.useless_evict	P1	A	recv/source=1/4-slice：未消费容量逐出	L1-life-recv-s4（拟新增，复用 LIFE）	victim 实际 valid→I 时恰计一次，PA/旧来源正确
+A.recv.s4.useless_snoop	P1	A	recv/source=1/4-slice：未消费 snoop 失效	L1-life-recv-s4（拟新增，复用 LIFE）	真实 snoop 失效恰计一次；不混入容量逐出
+A.recv.s4.redundant_resident	P1	A	recv/source=1/4-slice：redundant_resident	L1-life-recv-s4（拟新增，复用 LIFE）	未消费预取行上再次执行内部预取，不发下游、原标记保留
+A.recv.s4.redundant_after_demand	P1	A	recv/source=1/4-slice：redundant_after_demand	L1-life-recv-s4（拟新增，复用 LIFE）	已被 demand 消费行上再次执行内部预取，分类与来源归因正确
+A.recv.s4.late	P1	A	recv/source=1/4-slice：late	L1-life-recv-s4（拟新增，复用 LIFE）	demand 在相同 PA 内部预取活动期间到达，经过 RBE，late/useful/数据及自己的 context 闭合
+A.vbop.s1.train	P0	A	vbop/source=2/1-slice：训练入口/资格	L1-life-vbop-s1（拟新增，复用 LIFE）	Recv 自身不产生算法训练；其他来源核对真实训练事件/数据事件及 enable
+A.vbop.s1.issue	P0	A	vbop/source=2/1-slice：实际发射	L1-life-vbop-s1（拟新增，复用 LIFE）	真实生产者到 slice REQ fire，来源和地址匹配；不以 generated 代替
+A.vbop.s1.refill	P0	A	vbop/source=2/1-slice：下游回填	L1-life-vbop-s1（拟新增，复用 LIFE）	实际完整行回填，两个数据 beat 与独立内存模型一致
+A.vbop.s1.meta	P0	A	vbop/source=2/1-slice：Meta 写入	L1-life-vbop-s1（拟新增，复用 LIFE）	真实目录写回、TSHR 去分配后 fresh SRAM read，source/depth 与历史一致
+A.vbop.s1.useful	P0	A	vbop/source=2/1-slice：首次 demand useful	L1-life-vbop-s1（拟新增，复用 LIFE）	首次合格 demand 消费旧来源，useful 对应来源恰加一
+A.vbop.s1.clear	P0	A	vbop/source=2/1-slice：清预取标记	L1-life-vbop-s1（拟新增，复用 LIFE）	首次消费后 fresh read source/depth=0；再次命中不重复 useful
+A.vbop.s1.useless_evict	P0	A	vbop/source=2/1-slice：未消费容量逐出	L1-life-vbop-s1（拟新增，复用 LIFE）	victim 实际 valid→I 时恰计一次，PA/旧来源正确
+A.vbop.s1.useless_snoop	P0	A	vbop/source=2/1-slice：未消费 snoop 失效	L1-life-vbop-s1（拟新增，复用 LIFE）	真实 snoop 失效恰计一次；不混入容量逐出
+A.vbop.s1.redundant_resident	P0	A	vbop/source=2/1-slice：redundant_resident	L1-life-vbop-s1（拟新增，复用 LIFE）	未消费预取行上再次执行内部预取，不发下游、原标记保留
+A.vbop.s1.redundant_after_demand	P0	A	vbop/source=2/1-slice：redundant_after_demand	L1-life-vbop-s1（拟新增，复用 LIFE）	已被 demand 消费行上再次执行内部预取，分类与来源归因正确
+A.vbop.s1.late	P0	A	vbop/source=2/1-slice：late	L1-life-vbop-s1（拟新增，复用 LIFE）	demand 在相同 PA 内部预取活动期间到达，经过 RBE，late/useful/数据及自己的 context 闭合
+A.vbop.s2.train	P1	A	vbop/source=2/2-slice：训练入口/资格	L1-life-vbop-s2（拟新增，复用 LIFE）	Recv 自身不产生算法训练；其他来源核对真实训练事件/数据事件及 enable
+A.vbop.s2.issue	P1	A	vbop/source=2/2-slice：实际发射	L1-life-vbop-s2（拟新增，复用 LIFE）	真实生产者到 slice REQ fire，来源和地址匹配；不以 generated 代替
+A.vbop.s2.refill	P1	A	vbop/source=2/2-slice：下游回填	L1-life-vbop-s2（拟新增，复用 LIFE）	实际完整行回填，两个数据 beat 与独立内存模型一致
+A.vbop.s2.meta	P1	A	vbop/source=2/2-slice：Meta 写入	L1-life-vbop-s2（拟新增，复用 LIFE）	真实目录写回、TSHR 去分配后 fresh SRAM read，source/depth 与历史一致
+A.vbop.s2.useful	P1	A	vbop/source=2/2-slice：首次 demand useful	L1-life-vbop-s2（拟新增，复用 LIFE）	首次合格 demand 消费旧来源，useful 对应来源恰加一
+A.vbop.s2.clear	P1	A	vbop/source=2/2-slice：清预取标记	L1-life-vbop-s2（拟新增，复用 LIFE）	首次消费后 fresh read source/depth=0；再次命中不重复 useful
+A.vbop.s2.useless_evict	P1	A	vbop/source=2/2-slice：未消费容量逐出	L1-life-vbop-s2（拟新增，复用 LIFE）	victim 实际 valid→I 时恰计一次，PA/旧来源正确
+A.vbop.s2.useless_snoop	P1	A	vbop/source=2/2-slice：未消费 snoop 失效	L1-life-vbop-s2（拟新增，复用 LIFE）	真实 snoop 失效恰计一次；不混入容量逐出
+A.vbop.s2.redundant_resident	P1	A	vbop/source=2/2-slice：redundant_resident	L1-life-vbop-s2（拟新增，复用 LIFE）	未消费预取行上再次执行内部预取，不发下游、原标记保留
+A.vbop.s2.redundant_after_demand	P1	A	vbop/source=2/2-slice：redundant_after_demand	L1-life-vbop-s2（拟新增，复用 LIFE）	已被 demand 消费行上再次执行内部预取，分类与来源归因正确
+A.vbop.s2.late	P1	A	vbop/source=2/2-slice：late	L1-life-vbop-s2（拟新增，复用 LIFE）	demand 在相同 PA 内部预取活动期间到达，经过 RBE，late/useful/数据及自己的 context 闭合
+A.vbop.s4.train	P1	A	vbop/source=2/4-slice：训练入口/资格	L1-life-vbop-s4（拟新增，复用 LIFE）	Recv 自身不产生算法训练；其他来源核对真实训练事件/数据事件及 enable
+A.vbop.s4.issue	P1	A	vbop/source=2/4-slice：实际发射	L1-life-vbop-s4（拟新增，复用 LIFE）	真实生产者到 slice REQ fire，来源和地址匹配；不以 generated 代替
+A.vbop.s4.refill	P1	A	vbop/source=2/4-slice：下游回填	L1-life-vbop-s4（拟新增，复用 LIFE）	实际完整行回填，两个数据 beat 与独立内存模型一致
+A.vbop.s4.meta	P1	A	vbop/source=2/4-slice：Meta 写入	L1-life-vbop-s4（拟新增，复用 LIFE）	真实目录写回、TSHR 去分配后 fresh SRAM read，source/depth 与历史一致
+A.vbop.s4.useful	P1	A	vbop/source=2/4-slice：首次 demand useful	L1-life-vbop-s4（拟新增，复用 LIFE）	首次合格 demand 消费旧来源，useful 对应来源恰加一
+A.vbop.s4.clear	P1	A	vbop/source=2/4-slice：清预取标记	L1-life-vbop-s4（拟新增，复用 LIFE）	首次消费后 fresh read source/depth=0；再次命中不重复 useful
+A.vbop.s4.useless_evict	P1	A	vbop/source=2/4-slice：未消费容量逐出	L1-life-vbop-s4（拟新增，复用 LIFE）	victim 实际 valid→I 时恰计一次，PA/旧来源正确
+A.vbop.s4.useless_snoop	P1	A	vbop/source=2/4-slice：未消费 snoop 失效	L1-life-vbop-s4（拟新增，复用 LIFE）	真实 snoop 失效恰计一次；不混入容量逐出
+A.vbop.s4.redundant_resident	P1	A	vbop/source=2/4-slice：redundant_resident	L1-life-vbop-s4（拟新增，复用 LIFE）	未消费预取行上再次执行内部预取，不发下游、原标记保留
+A.vbop.s4.redundant_after_demand	P1	A	vbop/source=2/4-slice：redundant_after_demand	L1-life-vbop-s4（拟新增，复用 LIFE）	已被 demand 消费行上再次执行内部预取，分类与来源归因正确
+A.vbop.s4.late	P1	A	vbop/source=2/4-slice：late	L1-life-vbop-s4（拟新增，复用 LIFE）	demand 在相同 PA 内部预取活动期间到达，经过 RBE，late/useful/数据及自己的 context 闭合
+A.pbop.s1.train	P0	A	pbop/source=3/1-slice：训练入口/资格	L1-life-pbop-s1（拟新增，复用 LIFE）	Recv 自身不产生算法训练；其他来源核对真实训练事件/数据事件及 enable
+A.pbop.s1.issue	P0	A	pbop/source=3/1-slice：实际发射	L1-life-pbop-s1（拟新增，复用 LIFE）	真实生产者到 slice REQ fire，来源和地址匹配；不以 generated 代替
+A.pbop.s1.refill	P0	A	pbop/source=3/1-slice：下游回填	L1-life-pbop-s1（拟新增，复用 LIFE）	实际完整行回填，两个数据 beat 与独立内存模型一致
+A.pbop.s1.meta	P0	A	pbop/source=3/1-slice：Meta 写入	L1-life-pbop-s1（拟新增，复用 LIFE）	真实目录写回、TSHR 去分配后 fresh SRAM read，source/depth 与历史一致
+A.pbop.s1.useful	P0	A	pbop/source=3/1-slice：首次 demand useful	L1-life-pbop-s1（拟新增，复用 LIFE）	首次合格 demand 消费旧来源，useful 对应来源恰加一
+A.pbop.s1.clear	P0	A	pbop/source=3/1-slice：清预取标记	L1-life-pbop-s1（拟新增，复用 LIFE）	首次消费后 fresh read source/depth=0；再次命中不重复 useful
+A.pbop.s1.useless_evict	P0	A	pbop/source=3/1-slice：未消费容量逐出	L1-life-pbop-s1（拟新增，复用 LIFE）	victim 实际 valid→I 时恰计一次，PA/旧来源正确
+A.pbop.s1.useless_snoop	P0	A	pbop/source=3/1-slice：未消费 snoop 失效	L1-life-pbop-s1（拟新增，复用 LIFE）	真实 snoop 失效恰计一次；不混入容量逐出
+A.pbop.s1.redundant_resident	P0	A	pbop/source=3/1-slice：redundant_resident	L1-life-pbop-s1（拟新增，复用 LIFE）	未消费预取行上再次执行内部预取，不发下游、原标记保留
+A.pbop.s1.redundant_after_demand	P0	A	pbop/source=3/1-slice：redundant_after_demand	L1-life-pbop-s1（拟新增，复用 LIFE）	已被 demand 消费行上再次执行内部预取，分类与来源归因正确
+A.pbop.s1.late	P0	A	pbop/source=3/1-slice：late	L1-life-pbop-s1（拟新增，复用 LIFE）	demand 在相同 PA 内部预取活动期间到达，经过 RBE，late/useful/数据及自己的 context 闭合
+A.pbop.s2.train	P1	A	pbop/source=3/2-slice：训练入口/资格	L1-life-pbop-s2（拟新增，复用 LIFE）	Recv 自身不产生算法训练；其他来源核对真实训练事件/数据事件及 enable
+A.pbop.s2.issue	P1	A	pbop/source=3/2-slice：实际发射	L1-life-pbop-s2（拟新增，复用 LIFE）	真实生产者到 slice REQ fire，来源和地址匹配；不以 generated 代替
+A.pbop.s2.refill	P1	A	pbop/source=3/2-slice：下游回填	L1-life-pbop-s2（拟新增，复用 LIFE）	实际完整行回填，两个数据 beat 与独立内存模型一致
+A.pbop.s2.meta	P1	A	pbop/source=3/2-slice：Meta 写入	L1-life-pbop-s2（拟新增，复用 LIFE）	真实目录写回、TSHR 去分配后 fresh SRAM read，source/depth 与历史一致
+A.pbop.s2.useful	P1	A	pbop/source=3/2-slice：首次 demand useful	L1-life-pbop-s2（拟新增，复用 LIFE）	首次合格 demand 消费旧来源，useful 对应来源恰加一
+A.pbop.s2.clear	P1	A	pbop/source=3/2-slice：清预取标记	L1-life-pbop-s2（拟新增，复用 LIFE）	首次消费后 fresh read source/depth=0；再次命中不重复 useful
+A.pbop.s2.useless_evict	P1	A	pbop/source=3/2-slice：未消费容量逐出	L1-life-pbop-s2（拟新增，复用 LIFE）	victim 实际 valid→I 时恰计一次，PA/旧来源正确
+A.pbop.s2.useless_snoop	P1	A	pbop/source=3/2-slice：未消费 snoop 失效	L1-life-pbop-s2（拟新增，复用 LIFE）	真实 snoop 失效恰计一次；不混入容量逐出
+A.pbop.s2.redundant_resident	P1	A	pbop/source=3/2-slice：redundant_resident	L1-life-pbop-s2（拟新增，复用 LIFE）	未消费预取行上再次执行内部预取，不发下游、原标记保留
+A.pbop.s2.redundant_after_demand	P1	A	pbop/source=3/2-slice：redundant_after_demand	L1-life-pbop-s2（拟新增，复用 LIFE）	已被 demand 消费行上再次执行内部预取，分类与来源归因正确
+A.pbop.s2.late	P1	A	pbop/source=3/2-slice：late	L1-life-pbop-s2（拟新增，复用 LIFE）	demand 在相同 PA 内部预取活动期间到达，经过 RBE，late/useful/数据及自己的 context 闭合
+A.pbop.s4.train	P1	A	pbop/source=3/4-slice：训练入口/资格	L1-life-pbop-s4（拟新增，复用 LIFE）	Recv 自身不产生算法训练；其他来源核对真实训练事件/数据事件及 enable
+A.pbop.s4.issue	P1	A	pbop/source=3/4-slice：实际发射	L1-life-pbop-s4（拟新增，复用 LIFE）	真实生产者到 slice REQ fire，来源和地址匹配；不以 generated 代替
+A.pbop.s4.refill	P1	A	pbop/source=3/4-slice：下游回填	L1-life-pbop-s4（拟新增，复用 LIFE）	实际完整行回填，两个数据 beat 与独立内存模型一致
+A.pbop.s4.meta	P1	A	pbop/source=3/4-slice：Meta 写入	L1-life-pbop-s4（拟新增，复用 LIFE）	真实目录写回、TSHR 去分配后 fresh SRAM read，source/depth 与历史一致
+A.pbop.s4.useful	P1	A	pbop/source=3/4-slice：首次 demand useful	L1-life-pbop-s4（拟新增，复用 LIFE）	首次合格 demand 消费旧来源，useful 对应来源恰加一
+A.pbop.s4.clear	P1	A	pbop/source=3/4-slice：清预取标记	L1-life-pbop-s4（拟新增，复用 LIFE）	首次消费后 fresh read source/depth=0；再次命中不重复 useful
+A.pbop.s4.useless_evict	P1	A	pbop/source=3/4-slice：未消费容量逐出	L1-life-pbop-s4（拟新增，复用 LIFE）	victim 实际 valid→I 时恰计一次，PA/旧来源正确
+A.pbop.s4.useless_snoop	P1	A	pbop/source=3/4-slice：未消费 snoop 失效	L1-life-pbop-s4（拟新增，复用 LIFE）	真实 snoop 失效恰计一次；不混入容量逐出
+A.pbop.s4.redundant_resident	P1	A	pbop/source=3/4-slice：redundant_resident	L1-life-pbop-s4（拟新增，复用 LIFE）	未消费预取行上再次执行内部预取，不发下游、原标记保留
+A.pbop.s4.redundant_after_demand	P1	A	pbop/source=3/4-slice：redundant_after_demand	L1-life-pbop-s4（拟新增，复用 LIFE）	已被 demand 消费行上再次执行内部预取，分类与来源归因正确
+A.pbop.s4.late	P1	A	pbop/source=3/4-slice：late	L1-life-pbop-s4（拟新增，复用 LIFE）	demand 在相同 PA 内部预取活动期间到达，经过 RBE，late/useful/数据及自己的 context 闭合
+A.cdp.s1.train	P0	A	cdp/source=9/1-slice：训练入口/资格	L1-life-cdp-s1（拟新增，复用 LIFE）	Recv 自身不产生算法训练；其他来源核对真实训练事件/数据事件及 enable
+A.cdp.s1.issue	P0	A	cdp/source=9/1-slice：实际发射	L1-life-cdp-s1（拟新增，复用 LIFE）	真实生产者到 slice REQ fire，来源和地址匹配；不以 generated 代替
+A.cdp.s1.refill	P0	A	cdp/source=9/1-slice：下游回填	L1-life-cdp-s1（拟新增，复用 LIFE）	实际完整行回填，两个数据 beat 与独立内存模型一致
+A.cdp.s1.meta	P0	A	cdp/source=9/1-slice：Meta 写入	L1-life-cdp-s1（拟新增，复用 LIFE）	真实目录写回、TSHR 去分配后 fresh SRAM read，source/depth 与历史一致
+A.cdp.s1.useful	P0	A	cdp/source=9/1-slice：首次 demand useful	L1-life-cdp-s1（拟新增，复用 LIFE）	首次合格 demand 消费旧来源，useful 对应来源恰加一
+A.cdp.s1.clear	P0	A	cdp/source=9/1-slice：清预取标记	L1-life-cdp-s1（拟新增，复用 LIFE）	首次消费后 fresh read source/depth=0；再次命中不重复 useful
+A.cdp.s1.useless_evict	P0	A	cdp/source=9/1-slice：未消费容量逐出	L1-life-cdp-s1（拟新增，复用 LIFE）	victim 实际 valid→I 时恰计一次，PA/旧来源正确
+A.cdp.s1.useless_snoop	P0	A	cdp/source=9/1-slice：未消费 snoop 失效	L1-life-cdp-s1（拟新增，复用 LIFE）	真实 snoop 失效恰计一次；不混入容量逐出
+A.cdp.s1.redundant_resident	P0	A	cdp/source=9/1-slice：redundant_resident	L1-life-cdp-s1（拟新增，复用 LIFE）	未消费预取行上再次执行内部预取，不发下游、原标记保留
+A.cdp.s1.redundant_after_demand	P0	A	cdp/source=9/1-slice：redundant_after_demand	L1-life-cdp-s1（拟新增，复用 LIFE）	已被 demand 消费行上再次执行内部预取，分类与来源归因正确
+A.cdp.s1.late	P0	A	cdp/source=9/1-slice：late	L1-life-cdp-s1（拟新增，复用 LIFE）	demand 在相同 PA 内部预取活动期间到达，经过 RBE，late/useful/数据及自己的 context 闭合
+A.cdp.s2.train	P1	A	cdp/source=9/2-slice：训练入口/资格	L1-life-cdp-s2（拟新增，复用 LIFE）	Recv 自身不产生算法训练；其他来源核对真实训练事件/数据事件及 enable
+A.cdp.s2.issue	P1	A	cdp/source=9/2-slice：实际发射	L1-life-cdp-s2（拟新增，复用 LIFE）	真实生产者到 slice REQ fire，来源和地址匹配；不以 generated 代替
+A.cdp.s2.refill	P1	A	cdp/source=9/2-slice：下游回填	L1-life-cdp-s2（拟新增，复用 LIFE）	实际完整行回填，两个数据 beat 与独立内存模型一致
+A.cdp.s2.meta	P1	A	cdp/source=9/2-slice：Meta 写入	L1-life-cdp-s2（拟新增，复用 LIFE）	真实目录写回、TSHR 去分配后 fresh SRAM read，source/depth 与历史一致
+A.cdp.s2.useful	P1	A	cdp/source=9/2-slice：首次 demand useful	L1-life-cdp-s2（拟新增，复用 LIFE）	首次合格 demand 消费旧来源，useful 对应来源恰加一
+A.cdp.s2.clear	P1	A	cdp/source=9/2-slice：清预取标记	L1-life-cdp-s2（拟新增，复用 LIFE）	首次消费后 fresh read source/depth=0；再次命中不重复 useful
+A.cdp.s2.useless_evict	P1	A	cdp/source=9/2-slice：未消费容量逐出	L1-life-cdp-s2（拟新增，复用 LIFE）	victim 实际 valid→I 时恰计一次，PA/旧来源正确
+A.cdp.s2.useless_snoop	P1	A	cdp/source=9/2-slice：未消费 snoop 失效	L1-life-cdp-s2（拟新增，复用 LIFE）	真实 snoop 失效恰计一次；不混入容量逐出
+A.cdp.s2.redundant_resident	P1	A	cdp/source=9/2-slice：redundant_resident	L1-life-cdp-s2（拟新增，复用 LIFE）	未消费预取行上再次执行内部预取，不发下游、原标记保留
+A.cdp.s2.redundant_after_demand	P1	A	cdp/source=9/2-slice：redundant_after_demand	L1-life-cdp-s2（拟新增，复用 LIFE）	已被 demand 消费行上再次执行内部预取，分类与来源归因正确
+A.cdp.s2.late	P1	A	cdp/source=9/2-slice：late	L1-life-cdp-s2（拟新增，复用 LIFE）	demand 在相同 PA 内部预取活动期间到达，经过 RBE，late/useful/数据及自己的 context 闭合
+A.cdp.s4.train	P1	A	cdp/source=9/4-slice：训练入口/资格	L1-life-cdp-s4（拟新增，复用 LIFE）	Recv 自身不产生算法训练；其他来源核对真实训练事件/数据事件及 enable
+A.cdp.s4.issue	P1	A	cdp/source=9/4-slice：实际发射	L1-life-cdp-s4（拟新增，复用 LIFE）	真实生产者到 slice REQ fire，来源和地址匹配；不以 generated 代替
+A.cdp.s4.refill	P1	A	cdp/source=9/4-slice：下游回填	L1-life-cdp-s4（拟新增，复用 LIFE）	实际完整行回填，两个数据 beat 与独立内存模型一致
+A.cdp.s4.meta	P1	A	cdp/source=9/4-slice：Meta 写入	L1-life-cdp-s4（拟新增，复用 LIFE）	真实目录写回、TSHR 去分配后 fresh SRAM read，source/depth 与历史一致
+A.cdp.s4.useful	P1	A	cdp/source=9/4-slice：首次 demand useful	L1-life-cdp-s4（拟新增，复用 LIFE）	首次合格 demand 消费旧来源，useful 对应来源恰加一
+A.cdp.s4.clear	P1	A	cdp/source=9/4-slice：清预取标记	L1-life-cdp-s4（拟新增，复用 LIFE）	首次消费后 fresh read source/depth=0；再次命中不重复 useful
+A.cdp.s4.useless_evict	P1	A	cdp/source=9/4-slice：未消费容量逐出	L1-life-cdp-s4（拟新增，复用 LIFE）	victim 实际 valid→I 时恰计一次，PA/旧来源正确
+A.cdp.s4.useless_snoop	P1	A	cdp/source=9/4-slice：未消费 snoop 失效	L1-life-cdp-s4（拟新增，复用 LIFE）	真实 snoop 失效恰计一次；不混入容量逐出
+A.cdp.s4.redundant_resident	P1	A	cdp/source=9/4-slice：redundant_resident	L1-life-cdp-s4（拟新增，复用 LIFE）	未消费预取行上再次执行内部预取，不发下游、原标记保留
+A.cdp.s4.redundant_after_demand	P1	A	cdp/source=9/4-slice：redundant_after_demand	L1-life-cdp-s4（拟新增，复用 LIFE）	已被 demand 消费行上再次执行内部预取，分类与来源归因正确
+A.cdp.s4.late	P1	A	cdp/source=9/4-slice：late	L1-life-cdp-s4（拟新增，复用 LIFE）	demand 在相同 PA 内部预取活动期间到达，经过 RBE，late/useful/数据及自己的 context 闭合
+B.ctrl.00	P0	B	pfCtrl M/R/P/V/TP/C=0/0/0/0/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.01	P0	B	pfCtrl M/R/P/V/TP/C=0/0/0/0/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.02	P0	B	pfCtrl M/R/P/V/TP/C=0/0/0/0/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.03	P0	B	pfCtrl M/R/P/V/TP/C=0/0/0/0/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.04	P0	B	pfCtrl M/R/P/V/TP/C=0/0/0/1/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.05	P0	B	pfCtrl M/R/P/V/TP/C=0/0/0/1/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.06	P0	B	pfCtrl M/R/P/V/TP/C=0/0/0/1/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.07	P0	B	pfCtrl M/R/P/V/TP/C=0/0/0/1/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.08	P0	B	pfCtrl M/R/P/V/TP/C=0/0/1/0/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.09	P0	B	pfCtrl M/R/P/V/TP/C=0/0/1/0/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.10	P0	B	pfCtrl M/R/P/V/TP/C=0/0/1/0/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.11	P0	B	pfCtrl M/R/P/V/TP/C=0/0/1/0/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.12	P0	B	pfCtrl M/R/P/V/TP/C=0/0/1/1/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.13	P0	B	pfCtrl M/R/P/V/TP/C=0/0/1/1/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.14	P0	B	pfCtrl M/R/P/V/TP/C=0/0/1/1/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.15	P0	B	pfCtrl M/R/P/V/TP/C=0/0/1/1/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.16	P0	B	pfCtrl M/R/P/V/TP/C=0/1/0/0/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.17	P0	B	pfCtrl M/R/P/V/TP/C=0/1/0/0/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.18	P0	B	pfCtrl M/R/P/V/TP/C=0/1/0/0/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.19	P0	B	pfCtrl M/R/P/V/TP/C=0/1/0/0/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.20	P0	B	pfCtrl M/R/P/V/TP/C=0/1/0/1/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.21	P0	B	pfCtrl M/R/P/V/TP/C=0/1/0/1/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.22	P0	B	pfCtrl M/R/P/V/TP/C=0/1/0/1/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.23	P0	B	pfCtrl M/R/P/V/TP/C=0/1/0/1/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.24	P0	B	pfCtrl M/R/P/V/TP/C=0/1/1/0/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.25	P0	B	pfCtrl M/R/P/V/TP/C=0/1/1/0/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.26	P0	B	pfCtrl M/R/P/V/TP/C=0/1/1/0/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.27	P0	B	pfCtrl M/R/P/V/TP/C=0/1/1/0/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.28	P0	B	pfCtrl M/R/P/V/TP/C=0/1/1/1/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.29	P0	B	pfCtrl M/R/P/V/TP/C=0/1/1/1/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.30	P0	B	pfCtrl M/R/P/V/TP/C=0/1/1/1/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.31	P0	B	pfCtrl M/R/P/V/TP/C=0/1/1/1/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.32	P0	B	pfCtrl M/R/P/V/TP/C=1/0/0/0/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.33	P0	B	pfCtrl M/R/P/V/TP/C=1/0/0/0/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.34	P0	B	pfCtrl M/R/P/V/TP/C=1/0/0/0/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.35	P0	B	pfCtrl M/R/P/V/TP/C=1/0/0/0/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.36	P0	B	pfCtrl M/R/P/V/TP/C=1/0/0/1/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.37	P0	B	pfCtrl M/R/P/V/TP/C=1/0/0/1/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.38	P0	B	pfCtrl M/R/P/V/TP/C=1/0/0/1/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.39	P0	B	pfCtrl M/R/P/V/TP/C=1/0/0/1/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.40	P0	B	pfCtrl M/R/P/V/TP/C=1/0/1/0/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.41	P0	B	pfCtrl M/R/P/V/TP/C=1/0/1/0/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.42	P0	B	pfCtrl M/R/P/V/TP/C=1/0/1/0/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.43	P0	B	pfCtrl M/R/P/V/TP/C=1/0/1/0/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.44	P0	B	pfCtrl M/R/P/V/TP/C=1/0/1/1/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.45	P0	B	pfCtrl M/R/P/V/TP/C=1/0/1/1/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.46	P0	B	pfCtrl M/R/P/V/TP/C=1/0/1/1/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.47	P0	B	pfCtrl M/R/P/V/TP/C=1/0/1/1/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.48	P0	B	pfCtrl M/R/P/V/TP/C=1/1/0/0/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.49	P0	B	pfCtrl M/R/P/V/TP/C=1/1/0/0/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.50	P0	B	pfCtrl M/R/P/V/TP/C=1/1/0/0/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.51	P0	B	pfCtrl M/R/P/V/TP/C=1/1/0/0/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.52	P0	B	pfCtrl M/R/P/V/TP/C=1/1/0/1/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.53	P0	B	pfCtrl M/R/P/V/TP/C=1/1/0/1/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.54	P0	B	pfCtrl M/R/P/V/TP/C=1/1/0/1/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.55	P0	B	pfCtrl M/R/P/V/TP/C=1/1/0/1/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.56	P0	B	pfCtrl M/R/P/V/TP/C=1/1/1/0/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.57	P0	B	pfCtrl M/R/P/V/TP/C=1/1/1/0/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.58	P0	B	pfCtrl M/R/P/V/TP/C=1/1/1/0/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.59	P0	B	pfCtrl M/R/P/V/TP/C=1/1/1/0/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.60	P0	B	pfCtrl M/R/P/V/TP/C=1/1/1/1/0/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.61	P0	B	pfCtrl M/R/P/V/TP/C=1/1/1/1/0/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.62	P0	B	pfCtrl M/R/P/V/TP/C=1/1/1/1/1/0	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.ctrl.63	P0	B	pfCtrl M/R/P/V/TP/C=1/1/1/1/1/1	L1-controls（拟新增，复用 CTRL）	真实四源存货下核对master&&source门控；配对翻转TP位，逐周期所有可观察有效事件/Meta/效果/队列轨迹相同；TP未实例化
+B.delay.0	P0	B	l2_pf_delay_latency=0：OceanusVBOP与ReferenceVBOP同值差分	TestTop_OceanusVBOP --delay-check --samples=20	两侧使用相同delay；页内stride/跨页stride/随机各20条，逐项比较学习事件及发出VA/PA/source；0回退默认300，0/300完整轨迹一致。额外300及固定随机值在矩阵中单列，不增加稳定ID。
+B.delay.1	P0	B	l2_pf_delay_latency=1：OceanusVBOP与ReferenceVBOP同值差分	TestTop_OceanusVBOP --delay-check --samples=20	两侧使用相同delay；页内stride/跨页stride/随机各20条，逐项比较学习事件及发出VA/PA/source；0回退默认300，0/300完整轨迹一致。额外300及固定随机值在矩阵中单列，不增加稳定ID。
+B.delay.511	P0	B	l2_pf_delay_latency=511：OceanusVBOP与ReferenceVBOP同值差分	TestTop_OceanusVBOP --delay-check --samples=20	两侧使用相同delay；页内stride/跨页stride/随机各20条，逐项比较学习事件及发出VA/PA/source；0回退默认300，0/300完整轨迹一致。额外300及固定随机值在矩阵中单列，不增加稳定ID。
+B.delay.512	P0	B	l2_pf_delay_latency=512：OceanusVBOP与ReferenceVBOP同值差分	TestTop_OceanusVBOP --delay-check --samples=20	两侧使用相同delay；页内stride/跨页stride/随机各20条，逐项比较学习事件及发出VA/PA/source；0回退默认300，0/300完整轨迹一致。额外300及固定随机值在矩阵中单列，不增加稳定ID。
+B.delay.1023	P0	B	l2_pf_delay_latency=1023：OceanusVBOP与ReferenceVBOP同值差分	TestTop_OceanusVBOP --delay-check --samples=20	两侧使用相同delay；页内stride/跨页stride/随机各20条，逐项比较学习事件及发出VA/PA/source；0回退默认300，0/300完整轨迹一致。额外300及固定随机值在矩阵中单列，不增加稳定ID。
+B.disable_inflight	P0	B	关闭控制时已有 TLB 在途	L1-controls / TRAIN / ARB / PARAM / SUITE	终态仍消费、关闭期间不下发；恢复后无重复或泄漏
+B.hold_resume	P0	B	关闭/恢复时来源队列有存货	L1-controls / TRAIN / ARB / PARAM / SUITE	保留/覆盖/恢复逐项核对，禁止丢失账目
+B.recv_input	P0	B	Recv pf_en/addr_valid 四组合	L1-controls / TRAIN / ARB / PARAM / SUITE	只有两者都真且 CSR 许可才接收
+B.train0	P0	B	trainEnable=0	L1-controls / TRAIN / ARB / PARAM / SUITE	raw 观察非空、算法训练未接纳、cache 请求正常完成
+B.train1	P0	B	trainEnable=1	L1-controls / TRAIN / ARB / PARAM / SUITE	真实训练被算法接纳且完整 PA/VA/needT/identity 相同
+B.local_mixed	P0	B	同 slice disabled 低位/enabled 高位	L1-controls / TRAIN / ARB / PARAM / SUITE	过滤发生在 local selector 前，enabled 不被挤掉
+B.global_mixed	P0	B	跨 slice disabled 低位/enabled 高位	L1-controls / TRAIN / ARB / PARAM / SUITE	过滤发生在 global selector 前，enabled 不被挤掉
+B.patterns256	P0	B	训练 valid/enable 的 256 种模式	L1-controls / TRAIN / ARB / PARAM / SUITE	全部模式逐字段核对 selector，输出单拍无残留；记录模式位图
+B.ordinary_hit0	P0	B	普通已消费命中 trainEnable=0	L1-controls / TRAIN / ARB / PARAM / SUITE	CDP 合格训练禁用计数不遗漏普通 hit
+B.ports_off	P0	B	sideband 关闭	L1-controls / TRAIN / ARB / PARAM / SUITE	端口缺省训练许可为 true，VA/source 缺省口径与旧回归相同
+B.ports_on_idle	P0	B	sideband 开启静默	L1-controls / TRAIN / ARB / PARAM / SUITE	VA/source=0、trainEnable=1，结果行与 off 基线逐项比较
+B.ports_on_live	P0	B	sideband 开启有刺激	L1-controls / TRAIN / ARB / PARAM / SUITE	buffered VA/reqSource/trainEnable/needT/identity 跨排队保持
+B.parameters	P0	B	参数 off/train-only/tlb-only/none/vbop/cdp/both	L1-controls / TRAIN / ARB / PARAM / SUITE	每种生成配置检查正负结构，关闭观察逻辑时硬件不存在
+B.static_issue_off	P0	B	静态 issue-off	L1-controls / TRAIN / ARB / PARAM / SUITE	训练仍进展，队列按既有契约排空且无下游预取
+C.owner0.hit	P0	C	owner=0（VBOP/CDP）：命中成功	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner0.retry_hit	P0	C	owner=0（VBOP/CDP）：首次 miss→重发成功	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner0.retry_miss	P0	C	owner=0（VBOP/CDP）：再次 miss→终态丢弃	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner0.pf	P0	C	owner=0（VBOP/CDP）：page fault	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner0.gpf	P0	C	owner=0（VBOP/CDP）：guest page fault	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner0.af	P0	C	owner=0（VBOP/CDP）：access fault	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner0.pmp	P0	C	owner=0（VBOP/CDP）：PMP load 拒绝	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner0.mmio	P0	C	owner=0（VBOP/CDP）：PMP mmio	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner0.pbmt0	P0	C	owner=0（VBOP/CDP）：PBMT=00 允许	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner0.pbmt1	P0	C	owner=0（VBOP/CDP）：PBMT=01 丢弃	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner0.pbmt2	P0	C	owner=0（VBOP/CDP）：PBMT=10 丢弃	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner0.pbmt3	P0	C	owner=0（VBOP/CDP）：PBMT=11 沿既有契约允许	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner0.latency1	P0	C	owner=0：TLB 延迟 1 拍	TLB（补 latency sweep）	req.fire 后精确延迟响应，PMP 晚响应一拍；检查 PA/归属和实际发射
+C.owner0.latency2	P0	C	owner=0：TLB 延迟 2 拍	TLB（补 latency sweep）	req.fire 后精确延迟响应，PMP 晚响应一拍；检查 PA/归属和实际发射
+C.owner0.latency3	P0	C	owner=0：TLB 延迟 3 拍	TLB（补 latency sweep）	req.fire 后精确延迟响应，PMP 晚响应一拍；检查 PA/归属和实际发射
+C.owner0.latency4	P0	C	owner=0：TLB 延迟 4 拍	TLB（补 latency sweep）	req.fire 后精确延迟响应，PMP 晚响应一拍；检查 PA/归属和实际发射
+C.owner0.latency5	P0	C	owner=0：TLB 延迟 5 拍	TLB（补 latency sweep）	req.fire 后精确延迟响应，PMP 晚响应一拍；检查 PA/归属和实际发射
+C.owner0.latency6	P0	C	owner=0：TLB 延迟 6 拍	TLB（补 latency sweep）	req.fire 后精确延迟响应，PMP 晚响应一拍；检查 PA/归属和实际发射
+C.owner0.latency7	P0	C	owner=0：TLB 延迟 7 拍	TLB（补 latency sweep）	req.fire 后精确延迟响应，PMP 晚响应一拍；检查 PA/归属和实际发射
+C.owner1.hit	P0	C	owner=1（VBOP/CDP）：命中成功	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner1.retry_hit	P0	C	owner=1（VBOP/CDP）：首次 miss→重发成功	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner1.retry_miss	P0	C	owner=1（VBOP/CDP）：再次 miss→终态丢弃	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner1.pf	P0	C	owner=1（VBOP/CDP）：page fault	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner1.gpf	P0	C	owner=1（VBOP/CDP）：guest page fault	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner1.af	P0	C	owner=1（VBOP/CDP）：access fault	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner1.pmp	P0	C	owner=1（VBOP/CDP）：PMP load 拒绝	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner1.mmio	P0	C	owner=1（VBOP/CDP）：PMP mmio	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner1.pbmt0	P0	C	owner=1（VBOP/CDP）：PBMT=00 允许	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner1.pbmt1	P0	C	owner=1（VBOP/CDP）：PBMT=01 丢弃	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner1.pbmt2	P0	C	owner=1（VBOP/CDP）：PBMT=10 丢弃	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner1.pbmt3	P0	C	owner=1（VBOP/CDP）：PBMT=11 沿既有契约允许	TLB（补参数矩阵）	独立逐事务模型核对 attempt/PA/retried/所有原因位/终态归属；drop 不提供算法发射许可
+C.owner1.latency1	P0	C	owner=1：TLB 延迟 1 拍	TLB（补 latency sweep）	req.fire 后精确延迟响应，PMP 晚响应一拍；检查 PA/归属和实际发射
+C.owner1.latency2	P0	C	owner=1：TLB 延迟 2 拍	TLB（补 latency sweep）	req.fire 后精确延迟响应，PMP 晚响应一拍；检查 PA/归属和实际发射
+C.owner1.latency3	P0	C	owner=1：TLB 延迟 3 拍	TLB（补 latency sweep）	req.fire 后精确延迟响应，PMP 晚响应一拍；检查 PA/归属和实际发射
+C.owner1.latency4	P0	C	owner=1：TLB 延迟 4 拍	TLB（补 latency sweep）	req.fire 后精确延迟响应，PMP 晚响应一拍；检查 PA/归属和实际发射
+C.owner1.latency5	P0	C	owner=1：TLB 延迟 5 拍	TLB（补 latency sweep）	req.fire 后精确延迟响应，PMP 晚响应一拍；检查 PA/归属和实际发射
+C.owner1.latency6	P0	C	owner=1：TLB 延迟 6 拍	TLB（补 latency sweep）	req.fire 后精确延迟响应，PMP 晚响应一拍；检查 PA/归属和实际发射
+C.owner1.latency7	P0	C	owner=1：TLB 延迟 7 拍	TLB（补 latency sweep）	req.fire 后精确延迟响应，PMP 晚响应一拍；检查 PA/归属和实际发射
+C.full8	P0	C	默认 8 槽满槽背压	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	客户持续 valid，第9项不接纳；直到旧终态 resp.fire 才释放并恢复
+C.full_retry	P0	C	满8槽首次 miss/重发/二次miss	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	客户阻塞仍保留终态容量，所有 accepted 恰退休一次
+C.client_stall	P0	C	客户终态反压稳定	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	valid/bits 持续稳定；一个客户阻塞不串到另一个客户
+C.request_stall	P0	C	TLB 外部 req 反压稳定	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	后来高优先请求不替换已提供 payload/owner
+C.consecutive	P0	C	连续响应与 PMP 配对	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	前笔 PMP/后笔 TLB/再后笔 req 重叠逐事务不串扰
+C.owner_priority	P0	C	双客户同拍接纳优先	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	按真实 ready/fire 验证 VBOP 接纳优先；发射单独按 RR
+C.same_va	P0	C	两个 owner 同 VA	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	同 VA 翻译串行，终态无歧义、每请求仅一次
+C.miss_attributes	P0	C	首次 miss 带 fault/PMP/PBMT	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	首次 miss 忽略无意义属性，仍按一次重试契约
+C.secondmiss_attributes	P0	C	第二次 miss 带异常属性	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	miss/drop 及屏蔽原因位符合独立预期
+C.retry_timing0	P0	C	VBOP 重发计时	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	从 PMP 配对点加载倒计时，不早发；受竞争按服务拍计
+C.retry_timing1	P0	C	CDP 重发计时	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	从 TLB 响应点加载倒计时，不早发；受竞争按服务拍计
+C.fair_single	P0	C	8 槽单 owner 持续补流	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	0..7 每槽均服务，所有 eligible 请求满足配置服务拍上限
+C.fair_mixed	P0	C	8 槽 mixed owner 持续补流	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	两个 owner 的已接纳槽均满足服务拍上限
+C.fair_retry	P0	C	8 槽重试与新请求竞争	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	重试 eligible 后也满足服务拍上限
+C.fair_stall	P0	C	服务拍计数与墙钟分离	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	ready 关闭或 inflight 满不累计服务拍；恢复后按服务界退休
+C.bound_config	P1	C	serviceBound 默认0与显式8/更大合法值	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	默认0解析为entries；按参数分别检查上界
+C.nonidentity	P0	C	VA/PA 非恒等映射	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	页内偏移不变、页号不同，实际请求必须使用翻译后的 PA
+C.fast_off	P0	C	samePagePA=false	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	同页也走翻译，不能用 fast 结果代替
+C.fast_on	P0	C	samePagePA=true	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	仅同页跳过 TLB/PMP，跨页仍翻译，登记 D3
+C.drop_no_issue	P0	C	翻译所有丢弃原因不发射	TLB / FAIR / PHASE2 / SOAK（按缺口扩展）	逐原因等待足够窗口和排空，无多余算法 req.fire
+D.recv.overflow	P0	D	recv/source=1：源队列满溢出	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	暂停 issue，真实生产者生成超过深度；旧队首覆盖及payload FIFO正确
+D.recv.wrap	P0	D	recv/source=1：head/tail 回绕	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	超过两圈，独立host FIFO逐字段/顺序一致
+D.recv.simultaneous	P0	D	recv/source=1：同拍入队/出队	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	独立推演本拍是否覆盖和下拍残留
+D.recv.last	P0	D	recv/source=1：边界 lastIssuedAddr 去重	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	重复地址被丢弃、dedup归因正确且没有第二次入slice
+D.recv.chosen	P0	D	recv/source=1：边界同拍chosen地址去重（结构上不可达，豁免）	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	WAIVED：L2Top.scala:359 source1排首位，:432-450候选与!isChosen条件矛盾；stale归D.recv.last；:473-482/:538-545 stub Recv走独立fallback仲裁。
+D.recv.drain	P0	D	recv/source=1：停输入后逐项排空	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	每个resident唯一 entered/dedup/overwritten，pending=0
+D.vbop.overflow	P0	D	vbop/source=2：源队列满溢出	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	暂停 issue，真实生产者生成超过深度；旧队首覆盖及payload FIFO正确
+D.vbop.wrap	P0	D	vbop/source=2：head/tail 回绕	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	超过两圈，独立host FIFO逐字段/顺序一致
+D.vbop.simultaneous	P0	D	vbop/source=2：同拍入队/出队	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	独立推演本拍是否覆盖和下拍残留
+D.vbop.last	P0	D	vbop/source=2：边界 lastIssuedAddr 去重	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	重复地址被丢弃、dedup归因正确且没有第二次入slice
+D.vbop.chosen	P0	D	vbop/source=2：边界同拍 chosen 地址去重	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	其他非chosen源同地址项被移除、source账目闭合
+D.vbop.drain	P0	D	vbop/source=2：停输入后逐项排空	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	每个resident唯一 entered/dedup/overwritten，pending=0
+D.pbop.overflow	P0	D	pbop/source=3：源队列满溢出	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	暂停 issue，真实生产者生成超过深度；旧队首覆盖及payload FIFO正确
+D.pbop.wrap	P0	D	pbop/source=3：head/tail 回绕	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	超过两圈，独立host FIFO逐字段/顺序一致
+D.pbop.simultaneous	P0	D	pbop/source=3：同拍入队/出队	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	独立推演本拍是否覆盖和下拍残留
+D.pbop.last	P0	D	pbop/source=3：边界 lastIssuedAddr 去重	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	重复地址被丢弃、dedup归因正确且没有第二次入slice
+D.pbop.chosen	P0	D	pbop/source=3：边界同拍 chosen 地址去重	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	其他非chosen源同地址项被移除、source账目闭合
+D.pbop.drain	P0	D	pbop/source=3：停输入后逐项排空	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	每个resident唯一 entered/dedup/overwritten，pending=0
+D.cdp.overflow	P0	D	cdp/source=9：源队列满溢出	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	暂停 issue，真实生产者生成超过深度；旧队首覆盖及payload FIFO正确
+D.cdp.wrap	P0	D	cdp/source=9：head/tail 回绕	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	超过两圈，独立host FIFO逐字段/顺序一致
+D.cdp.simultaneous	P0	D	cdp/source=9：同拍入队/出队	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	独立推演本拍是否覆盖和下拍残留
+D.cdp.last	P0	D	cdp/source=9：边界 lastIssuedAddr 去重	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	重复地址被丢弃、dedup归因正确且没有第二次入slice
+D.cdp.chosen	P0	D	cdp/source=9：边界同拍 chosen 地址去重	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	其他非chosen源同地址项被移除、source账目闭合
+D.cdp.drain	P0	D	cdp/source=9：停输入后逐项排空	L1-queues（拟新增，复用 PHASE2 / DRAIN / RECV）	每个resident唯一 entered/dedup/overwritten，pending=0
+D.order	P0	D	四源同时有货	L1-queues / SOAK / CDPQ / DRAIN	真实入slice顺序 Recv>VBOP>PBOP>CDP
+D.recv_labels	P0	D	Recv 携 source2/3/9 标签	L1-queues / SOAK / CDPQ / DRAIN	仍保持 Recv 生产者优先级，不能按标签降低优先级
+D.recv_direct	P0	D	Recv direct 与 fallback 互斥	L1-queues / SOAK / CDPQ / DRAIN	一个输入恰 direct 或入fallback，不重复计算
+D.history_limited	P1	D	A/B/A 超出 lastIssued 单项历史	L1-queues / SOAK / CDPQ / DRAIN	不要求历史CAM过滤，实际 REQ redundant/数据正确
+D.starvation	P0	D	持续 Recv 压力及停止后恢复	L1-queues / SOAK / CDPQ / DRAIN	区分固定优先级饥饿和无进展；按逐项账目排空
+D.vbop_trainq	P0	D	VBOP 4项训练队列满	L1-queues / SOAK / CDPQ / DRAIN	满丢新，不反压cache；逐项记录 accepted/drop
+D.vbop_buffer	P0	D	VBOP 16项buffer满与去重	L1-queues / SOAK / CDPQ / DRAIN	按 VA/needT/sourceId 独立模型核对
+D.pbop_delay	P0	D	PBOP delay queue 满	L1-queues / SOAK / CDPQ / DRAIN	满丢计数、后续进展和跨页丢弃口径正确
+D.cdp_input	P0	D	CDP 桩16项输入队列满	L1-queues / SOAK / CDPQ / DRAIN	覆盖旧项不反压数据事件，逐项核对归宿
+D.halfqueue	P0	D	CDP 每slice8项双入半行队列	L1-queues / SOAK / CDPQ / DRAIN	部分接受/满丢/同拍回收逐字段独立host FIFO核对
+D.rr	P0	D	CDP 半行跨slice RR	L1-queues / SOAK / CDPQ / DRAIN	同拍多slice backlog，每slice持续被服务且等待有界
+D.collision	P1	D	同slice多个TSHR数据事件碰撞	L1-queues / SOAK / CDPQ / DRAIN	保留实际优先项、其余collisionDrops按半行计，不能反压cache
+D.accounting	P0	D	每source与总账守恒	L1-queues / SOAK / CDPQ / DRAIN	direct和queueEntered分开，每64拍与排空末检查；8种效果总和等于各source之和
+E.recv_raw.00	P0	E	Recv pf_source 原始值=0	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.01	P0	E	Recv pf_source 原始值=1	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.02	P0	E	Recv pf_source 原始值=2	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.03	P0	E	Recv pf_source 原始值=3	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.04	P0	E	Recv pf_source 原始值=4	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.05	P0	E	Recv pf_source 原始值=5	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.06	P0	E	Recv pf_source 原始值=6	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.07	P0	E	Recv pf_source 原始值=7	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.08	P0	E	Recv pf_source 原始值=8	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.09	P0	E	Recv pf_source 原始值=9	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.10	P0	E	Recv pf_source 原始值=10	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.11	P0	E	Recv pf_source 原始值=11	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.12	P0	E	Recv pf_source 原始值=12	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.13	P0	E	Recv pf_source 原始值=13	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.14	P0	E	Recv pf_source 原始值=14	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.15	P0	E	Recv pf_source 原始值=15	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.16	P0	E	Recv pf_source 原始值=16	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.17	P0	E	Recv pf_source 原始值=17	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.18	P0	E	Recv pf_source 原始值=18	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.19	P0	E	Recv pf_source 原始值=19	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.20	P0	E	Recv pf_source 原始值=20	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.21	P0	E	Recv pf_source 原始值=21	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.22	P0	E	Recv pf_source 原始值=22	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.23	P0	E	Recv pf_source 原始值=23	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.24	P0	E	Recv pf_source 原始值=24	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.25	P0	E	Recv pf_source 原始值=25	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.26	P0	E	Recv pf_source 原始值=26	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.27	P0	E	Recv pf_source 原始值=27	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.28	P0	E	Recv pf_source 原始值=28	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.29	P0	E	Recv pf_source 原始值=29	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.30	P0	E	Recv pf_source 原始值=30	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.recv_raw.31	P0	E	Recv pf_source 原始值=31	RECV（补全 raw0..31）	独立字面映射到source0..9，核对实际TxnID和fresh Meta；未识别值映射0，负向效果不误计
+E.txn_source.00	P0	E	TxnID pfSource=0	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.01	P0	E	TxnID pfSource=1	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.02	P0	E	TxnID pfSource=2	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.03	P0	E	TxnID pfSource=3	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.04	P0	E	TxnID pfSource=4	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.05	P0	E	TxnID pfSource=5	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.06	P0	E	TxnID pfSource=6	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.07	P0	E	TxnID pfSource=7	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.08	P0	E	TxnID pfSource=8	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.09	P0	E	TxnID pfSource=9	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.10	P0	E	TxnID pfSource=10	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.11	P0	E	TxnID pfSource=11	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.12	P0	E	TxnID pfSource=12	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.13	P0	E	TxnID pfSource=13	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.14	P0	E	TxnID pfSource=14	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.txn_source.15	P0	E	TxnID pfSource=15	CDPQ / L1-txn-meta	字面位移构造期望值；与encoder/decoder独立比较；保留10..15仅编码覆盖，不冒充生产可达
+E.depth0.encode	P0	E	depth=0：编码/解码	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth0.sram	P0	E	depth=0：真实回填→fresh SRAM读回	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth0.consume	P0	E	depth=0：demand读旧值→清0→再次fresh read	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth0.late	P1	E	depth=0：late RBE保留旧depth及demand context	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth1.encode	P0	E	depth=1：编码/解码	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth1.sram	P0	E	depth=1：真实回填→fresh SRAM读回	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth1.consume	P0	E	depth=1：demand读旧值→清0→再次fresh read	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth1.late	P1	E	depth=1：late RBE保留旧depth及demand context	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth2.encode	P0	E	depth=2：编码/解码	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth2.sram	P0	E	depth=2：真实回填→fresh SRAM读回	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth2.consume	P0	E	depth=2：demand读旧值→清0→再次fresh read	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth2.late	P1	E	depth=2：late RBE保留旧depth及demand context	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth3.encode	P0	E	depth=3：编码/解码	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth3.sram	P0	E	depth=3：真实回填→fresh SRAM读回	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth3.consume	P0	E	depth=3：demand读旧值→清0→再次fresh read	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.depth3.late	P0	E	depth=3：late RBE保留旧depth及demand context	DEPTH（按缺口扩展）	通过现有测试子类内部请求注入depth，不force Meta；真实目录路径保留观测
+E.meta.s1.d0	P1	E	Meta source=1 × depth=0	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s1.d1	P1	E	Meta source=1 × depth=1	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s1.d2	P1	E	Meta source=1 × depth=2	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s1.d3	P1	E	Meta source=1 × depth=3	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s2.d0	P1	E	Meta source=2 × depth=0	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s2.d1	P1	E	Meta source=2 × depth=1	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s2.d2	P1	E	Meta source=2 × depth=2	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s2.d3	P1	E	Meta source=2 × depth=3	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s3.d0	P1	E	Meta source=3 × depth=0	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s3.d1	P1	E	Meta source=3 × depth=1	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s3.d2	P1	E	Meta source=3 × depth=2	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s3.d3	P1	E	Meta source=3 × depth=3	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s9.d0	P0	E	Meta source=9 × depth=0	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s9.d1	P0	E	Meta source=9 × depth=1	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s9.d2	P0	E	Meta source=9 × depth=2	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.meta.s9.d3	P0	E	Meta source=9 × depth=3	L1-txn-meta（拟新增，复用 DEPTH）	测试请求载荷注入→实际回填/SRAM→消费；明确该组合是否生产自然可达
+E.txn256	P0	E	8位TxnID全部256个[source4&#124;depth2&#124;seq2]	CDPQ / DEPTH / PHASE2 / L1-txn-meta	全部组合字面编码比较，不复用被测decoder生成期望
+E.legacy	P0	E	legacy三参数encode的16来源	CDPQ / DEPTH / PHASE2 / L1-txn-meta	depth恒0、seq截位正确
+E.seqwrap	P0	E	seq=0..3及回绕	CDPQ / DEPTH / PHASE2 / L1-txn-meta	来源/depth不被seq进位污染；按真实事务历史识别
+E.mask	P0	E	source/depth共mask原子写	CDPQ / DEPTH / PHASE2 / L1-txn-meta	无关mask写保留depth，新tag覆盖，首demand同步清source/depth
+E.source0	P0	E	source0普通/未知来源	CDPQ / DEPTH / PHASE2 / L1-txn-meta	不建立有效预取标记，不误报useful/useless
+E.reserved	P1	E	source10..15可达性边界	CDPQ / DEPTH / PHASE2 / L1-txn-meta	生产映射不可达；仅编码测试覆盖，不把不可达动态桶删分母
+E.cdp_depthstop	P0	E	CDP桩自然链0→1→2停止	CDPQ / DEPTH / PHASE2 / L1-txn-meta	depth2回填即使含合法指针也无下一次翻译/发射，depth3自然生成缺口单列
+F.recv.shared_hit	P1	F	recv/source=1：外部 StashShared 命中	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.recv.unique_hit	P1	F	recv/source=1：外部 StashUnique 命中	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.recv.unique_dirty	P1	F	recv/source=1：外部 StashUnique dirty路径	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.recv.miss	P1	F	recv/source=1：外部 Stash miss	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.recv.snoop_preserve	P1	F	recv/source=1：不失效snoop/release无关Meta写	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.vbop.shared_hit	P1	F	vbop/source=2：外部 StashShared 命中	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.vbop.unique_hit	P1	F	vbop/source=2：外部 StashUnique 命中	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.vbop.unique_dirty	P1	F	vbop/source=2：外部 StashUnique dirty路径	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.vbop.miss	P1	F	vbop/source=2：外部 Stash miss	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.vbop.snoop_preserve	P1	F	vbop/source=2：不失效snoop/release无关Meta写	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.pbop.shared_hit	P0	F	pbop/source=3：外部 StashShared 命中	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.pbop.unique_hit	P0	F	pbop/source=3：外部 StashUnique 命中	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.pbop.unique_dirty	P0	F	pbop/source=3：外部 StashUnique dirty路径	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.pbop.miss	P0	F	pbop/source=3：外部 Stash miss	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.pbop.snoop_preserve	P0	F	pbop/source=3：不失效snoop/release无关Meta写	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.cdp.shared_hit	P1	F	cdp/source=9：外部 StashShared 命中	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.cdp.unique_hit	P1	F	cdp/source=9：外部 StashUnique 命中	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.cdp.unique_dirty	P1	F	cdp/source=9：外部 StashUnique dirty路径	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.cdp.miss	P1	F	cdp/source=9：外部 Stash miss	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+F.cdp.snoop_preserve	P1	F	cdp/source=9：不失效snoop/release无关Meta写	L1-stash（拟新增，复用 PREFETCHED）	外部SrcID不是内部pfSrcID；检查旧标记保留/新行source0、响应/数据、useful/redundant/useless不误计
+G.s1.route	P0	G	1-slice：每个物理slice均收到目标地址	SOAK / L1-life / RECV / TRAIN	逐slice非空计数；停止输入后host/RTL pending均为0，无watchdog；不把配置生成当动态覆盖
+G.s1.data	P0	G	1-slice：真实demand/预取回填数据逐beat正确	SOAK / L1-life / RECV / TRAIN	逐slice非空计数；停止输入后host/RTL pending均为0，无watchdog；不把配置生成当动态覆盖
+G.s1.ledger	P0	G	1-slice：每slice和全局source/效果账目闭合	SOAK / L1-life / RECV / TRAIN	逐slice非空计数；停止输入后host/RTL pending均为0，无watchdog；不把配置生成当动态覆盖
+G.s1.tlb	P0	G	1-slice：多slice共享TLB归属和进展	SOAK / L1-life / RECV / TRAIN	逐slice非空计数；停止输入后host/RTL pending均为0，无watchdog；不把配置生成当动态覆盖
+G.s2.route	P0	G	2-slice：每个物理slice均收到目标地址	SOAK / L1-life / RECV / TRAIN	逐slice非空计数；停止输入后host/RTL pending均为0，无watchdog；不把配置生成当动态覆盖
+G.s2.data	P0	G	2-slice：真实demand/预取回填数据逐beat正确	SOAK / L1-life / RECV / TRAIN	逐slice非空计数；停止输入后host/RTL pending均为0，无watchdog；不把配置生成当动态覆盖
+G.s2.ledger	P0	G	2-slice：每slice和全局source/效果账目闭合	SOAK / L1-life / RECV / TRAIN	逐slice非空计数；停止输入后host/RTL pending均为0，无watchdog；不把配置生成当动态覆盖
+G.s2.tlb	P0	G	2-slice：多slice共享TLB归属和进展	SOAK / L1-life / RECV / TRAIN	逐slice非空计数；停止输入后host/RTL pending均为0，无watchdog；不把配置生成当动态覆盖
+G.s4.route	P0	G	4-slice：每个物理slice均收到目标地址	SOAK / L1-life / RECV / TRAIN	逐slice非空计数；停止输入后host/RTL pending均为0，无watchdog；不把配置生成当动态覆盖
+G.s4.data	P0	G	4-slice：真实demand/预取回填数据逐beat正确	SOAK / L1-life / RECV / TRAIN	逐slice非空计数；停止输入后host/RTL pending均为0，无watchdog；不把配置生成当动态覆盖
+G.s4.ledger	P0	G	4-slice：每slice和全局source/效果账目闭合	SOAK / L1-life / RECV / TRAIN	逐slice非空计数；停止输入后host/RTL pending均为0，无watchdog；不把配置生成当动态覆盖
+G.s4.tlb	P0	G	4-slice：多slice共享TLB归属和进展	SOAK / L1-life / RECV / TRAIN	逐slice非空计数；停止输入后host/RTL pending均为0，无watchdog；不把配置生成当动态覆盖
+H.vbop5	P0	H	VBOP五类序列	VBOP / VBOP-OVERNIGHT	每类实际发生learning/commit/req；参考事件顺序/地址/source/needT逐条相等
+H.vbopdefault	P0	H	VBOP生产默认参数	VBOP --defaults	真实默认offset/RR/轮次，非仅短轮次
+H.vbopshort	P0	H	VBOP短轮次参数	VBOP	scoreBits3/roundMax5等参数登记，事件与参考一致
+H.needt	P0	H	needT=0/1	PHASE2 / VBOP	原始needT逐条相等；实际Shared及D2降级计数单列
+H.stall	P0	H	VBOP TLB/output双反压	VBOP	实际输出序列稳定、无丢重，参考事件相等
+H.pbop	P1	H	PBOP学习和正负offset	SUITE / L1-life-pbop	真实训练学习到偏移，地址/跨页drop与独立期望一致
+H.cdpword	P0	H	CDP桩合法word0指针	PHASE2	真实完整回填→word0→VA对齐→TLB→source9/depth，非真实CDP算法
+H.cdpinvalid	P0	H	CDP桩零/非canonical指针	L1-life-cdp	分别注入两种非法word0；不翻译/不发射
+H.lineforward	P0	H	CDP完整行和当前完成beat前递	TRAIN / DEPTH	第二beat当拍512位与独立内存期望一致，只发一次
+H.lineclass	P0	H	CDP事件资格	L1-stash / TRAIN	RS/RU/Stash miss、合格hit扫描；MU/独立release不建立无数据扫描

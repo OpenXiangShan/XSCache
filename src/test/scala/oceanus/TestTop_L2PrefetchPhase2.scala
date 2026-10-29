@@ -43,30 +43,40 @@ class Phase2WriteProbe extends Bundle {
   val source = UInt(4.W)
   val depth = UInt(2.W)
 }
-class Phase2Observation(implicit val p: Parameters) extends Bundle {
+class Phase2Observation(val slices: Int = 1, val tshrs: Int = 8, val bopEntries: Int = 16, val recvEntries: Int = 32, val queuesPerBank: Int = 10)(implicit val p: Parameters) extends Bundle {
   // Intent (3a): prove the downgrade counter from an actual ReadUnique event
   // and inspect the resulting CCHI opcode at the real slice admission.
   val needTDowngraded = UInt(64.W)
-  val queues = Vec(10, new Phase2QueueProbe)
-  val enter = Valid(new FlitREQ)
-  val issue = Valid(new FlitREQ)
-  val write = Vec(8, new Phase2WriteProbe)
+  val queues = Vec(slices * queuesPerBank, new Phase2QueueProbe)
+  val enter = Vec(slices, Valid(new FlitREQ))
+  val issue = Vec(slices, Valid(new FlitREQ))
+  val write = Vec(slices * tshrs, new Phase2WriteProbe)
   val evictions = UInt(64.W)
-  val evictPulses = UInt(4.W)
+  val evictPulses = UInt(log2Ceil(slices * tshrs + 1).W)
   val vbopOverflow = UInt(64.W)
   val cdpOverflow = UInt(64.W)
-  val enterPacked = UInt((new FlitREQ).getWidth.W)
-  val issuePacked = UInt((new FlitREQ).getWidth.W)
-  val generated = Vec(10, Bool())
+  val enterPacked = Vec(slices, UInt((new FlitREQ).getWidth.W))
+  val issuePacked = Vec(slices, UInt((new FlitREQ).getWidth.W))
+  val generated = Vec(10, UInt(log2Ceil(slices + 1).W))
+  def capacity(i: Int): Int = if (Set(1, 2)(i % queuesPerBank)) bopEntries else recvEntries
 }
 object Phase2Observation {
   def attach(top: L2Top)(implicit p: Parameters): Phase2Observation = {
     def read[T <: Data](x: T): T = BoringUtils.bore(x)
-    val obs = IO(Output(new Phase2Observation))
+    val obs = IO(Output(new Phase2Observation(top.config.sliceNum, top.nMSHR,
+      top.config.pfBopQueueEntries, top.config.pfRecvQueueEntries,
+      top.pfSourceSlots.size + (if(top.recvFallback.nonEmpty) 1 else 0))))
     val ids = top.getClass.getMethods.find(_.getName == "getIds").get.invoke(top)
       .asInstanceOf[scala.collection.Seq[AnyRef]]
-    val queues = ids.collect { case q: OverwriteQueue[_] => q.asInstanceOf[OverwriteQueue[FlitREQ]] }
-    require(queues.size == 10)
+    val allQueues = ids.collect { case q: OverwriteQueue[_] => q.asInstanceOf[OverwriteQueue[FlitREQ]] }
+    val sourceCount = top.pfSourceSlots.size
+    require(sourceCount == 9 && (top.recvFallback.isEmpty || top.recvFallback.size == top.config.sliceNum))
+    require(allQueues.size == top.config.sliceNum * sourceCount + top.recvFallback.size)
+    val sourceQueues = allQueues.filterNot(q => top.recvFallback.exists(_ eq q))
+    require(sourceQueues.size == top.config.sliceNum * sourceCount)
+    // Each bank exposes all source queues followed by its own Recv fallback.
+    val queues = (0 until top.config.sliceNum).flatMap(bank =>
+      sourceQueues.slice(bank * sourceCount, (bank + 1) * sourceCount) ++ top.recvFallback.lift(bank))
     queues.zip(obs.queues).foreach { case (q, out) =>
       out.enq.valid := read(q.io.enq.valid)
       out.enq.bits := read(q.io.enq.bits)
@@ -77,29 +87,32 @@ object Phase2Observation {
       out.head := read(q.head); out.tail := read(q.tail); out.full := read(q.full)
       out.enqPacked := out.enq.bits.asUInt; out.deqPacked := out.deq.bits.asUInt
     }
-    val slice = top.slices.head
-    obs.enter.valid := read(slice.io.UpRXREQ.valid) && read(slice.io.UpRXREQ.ready)
-    obs.enter.bits := read(slice.io.UpRXREQ.bits)
-    obs.issue.valid := read(top.pfQueues.head.valid) && read(top.pfQueues.head.ready)
-    obs.issue.bits := read(top.pfQueues.head.bits)
-    obs.enterPacked := obs.enter.bits.asUInt; obs.issuePacked := obs.issue.bits.asUInt
-    slice.tshrs.zip(obs.write).foreach { case (t, out) =>
-      val req = t.vPipeREQ
-      out.valid := read(req.io.tshr_meta_write_en.pfSource)
-      out.addr := read(req.io.tshr_paddr)
-      out.source := read(req.io.tshr_meta_write_meta.pfSource)
-      out.depth := read(req.io.tshr_meta_write_meta.cdpPfDepth)
+    for ((slice, bank) <- top.slices.zipWithIndex) {
+      obs.enter(bank).valid := read(slice.io.UpRXREQ.valid) && read(slice.io.UpRXREQ.ready)
+      obs.enter(bank).bits := read(slice.io.UpRXREQ.bits)
+      obs.issue(bank).valid := read(top.pfQueues(bank).valid) && read(top.pfQueues(bank).ready)
+      obs.issue(bank).bits := read(top.pfQueues(bank).bits)
+      obs.enterPacked(bank) := obs.enter(bank).bits.asUInt
+      obs.issuePacked(bank) := obs.issue(bank).bits.asUInt
+      slice.tshrs.zipWithIndex.foreach { case (t, i) =>
+        val out = obs.write(bank * top.nMSHR + i)
+        val req = t.vPipeREQ
+        out.valid := read(req.io.tshr_meta_write_en.pfSource)
+        out.addr := read(req.io.tshr_paddr)
+        out.source := read(req.io.tshr_meta_write_meta.pfSource)
+        out.depth := read(req.io.tshr_meta_write_meta.cdpPfDepth)
+      }
     }
-    obs.evictions := read(top.cdpEvents.get.evictions)
+    obs.evictions := top.cdpEvents.map(e => read(e.evictions)).getOrElse(0.U)
     obs.evictPulses := PopCount(top.slices.flatMap(_.io.cdpEvict.map(e => read(e.valid))))
-    obs.vbopOverflow := read(top.vbopStub.get.overwritten)
-    obs.needTDowngraded := read(top.vbopStub.get.needTDowngraded)
-    obs.cdpOverflow := read(top.cdpEvents.get.vpnCollisions) + read(top.cdpEvents.get.filterCollisions)
-    obs.generated.foreach(_ := false.B)
-    obs.generated(1) := read(top.pfRecvReqs.head.valid)
-    obs.generated(2) := read(top.vbopStub.get.io.req.valid) && read(top.vbopStub.get.io.req.ready)
+    obs.vbopOverflow := top.vbopStub.map(v => read(v.overwritten)).getOrElse(0.U)
+    obs.needTDowngraded := top.vbopStub.map(v => read(v.needTDowngraded)).getOrElse(0.U)
+    obs.cdpOverflow := top.cdpEvents.map(e => read(e.vpnCollisions) + read(e.filterCollisions)).getOrElse(0.U)
+    obs.generated.foreach(_ := 0.U)
+    obs.generated(1) := PopCount(top.pfRecvReqs.map(r => read(r.valid)))
+    obs.generated(2) := top.vbopStub.map(v => read(v.io.req.valid) && read(v.io.req.ready)).getOrElse(false.B)
     obs.generated(3) := read(top.bop.io.req.valid) && read(top.bopControlEnable)
-    obs.generated(9) := read(top.cdp.get.io.req.valid) && read(top.cdp.get.io.req.ready)
+    obs.generated(9) := top.cdp.map(c => read(c.io.req.valid) && read(c.io.req.ready)).getOrElse(false.B)
     obs
   }
 }
@@ -142,6 +155,7 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
     val downstream = mutable.ArrayBuffer.empty[BigInt]
     val entered = mutable.ArrayBuffer.empty[(BigInt, Int, Int)]
     val writes = mutable.ArrayBuffer.empty[(BigInt, Int, Int)]
+    val enteredByBank = Seq.fill(cfg.sliceNum)(mutable.ArrayBuffer.empty[Int])
     val pointers = mutable.Map.empty[BigInt, BigInt]
     // Literal fixed page table; no PA is derived from a DUT decoder.
     val pages = Seq(0x110 -> 0x51, 0x120 -> 0x52, 0x130 -> 0x53,
@@ -153,9 +167,9 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
     val attempts = mutable.Map.empty[BigInt, Int].withDefaultValue(0)
     case class Translation(va: BigInt, due: Int, miss: Boolean, fault: Boolean)
     val replies = mutable.Queue.empty[Translation]
-    val queueModels = Seq.fill(10)(mutable.Queue.empty[BigInt])
-    val enqueues = Array.fill(10)(0); val takes = Array.fill(10)(0); val overwrites = Array.fill(10)(0)
-    val drops = Array.fill(10)(0); val issued = Array.fill(10)(0)
+    val queueModels = Seq.fill(dut.phase2.queues.size)(mutable.Queue.empty[BigInt])
+    val enqueues = Array.fill(dut.phase2.queues.size)(0); val takes = Array.fill(dut.phase2.queues.size)(0); val overwrites = Array.fill(dut.phase2.queues.size)(0)
+    val drops = Array.fill(dut.phase2.queues.size)(0); val issued = Array.fill(dut.phase2.queues.size)(0)
     val generated = Array.fill(10)(0); val enteredBySource = Array.fill(10)(0)
     var evictions = BigInt(0)
     var cycle = 0; var txn = 0; var activeAddr = BigInt(0); var beats = 0
@@ -164,7 +178,7 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
     def source(f: FlitREQ): Int = (value(f.TxnID) >> 4).toInt
     def depth(f: FlitREQ): Int = ((value(f.TxnID) >> 2) & 3).toInt
     def memory(addr: BigInt, beat: Int): BigInt = if (beat == 0) pointers.getOrElse(addr, BigInt(0)) else BigInt(0)
-    def useful(src: Int): BigInt = value(dut.observation.bopPerfCountBySliceSource(0)(src)(L2BOPPerf.Useful))
+    def useful(src: Int): BigInt = (0 until cfg.sliceNum).map(b => value(dut.observation.bopPerfCountBySliceSource(b)(src)(L2BOPPerf.Useful))).sum
     def controls(v: Boolean = false, c: Boolean = false, b: Boolean = false, master: Boolean = true): Unit = {
       val ctrl = dut.io.pfCtrl.get
       ctrl.l2_pf_master_en.poke(master.B); ctrl.l2_pf_recv_en.poke(true.B)
@@ -217,26 +231,27 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
       if (flag(port.DnSNP.valid)) snpQ.enqueue(PendingSnpRsp(SnpTxnID(value(port.DnSNP.bits.TxnID)), value(port.DnSNP.bits.SrcID), cycle + 1))
       assert(!flag(port.DnRSP.valid))
       val obs = dut.phase2
-      for ((s, q) <- Seq(1 -> 9, 2 -> 1, 3 -> 2, 9 -> 8)) {
+      for (bank <- 0 until cfg.sliceNum; (s, local) <- Seq(1 -> 9, 2 -> 1, 3 -> 2, 9 -> 8)) {
+        val q = bank * 10 + local
         val o = dut.observation
-        assert(value(o.prefetchEnqueueBySource(0)(s)) == enqueues(q))
-        assert(value(o.prefetchEnterBySource(0)(s)) == issued(q))
-        assert(value(o.prefetchQueueOverwriteBySource(0)(s)) == overwrites(q))
-        assert(value(o.prefetchDedupBySource(0)(s)) == drops(q))
-        assert(value(o.prefetchPendingBySource(0)(s)) == queueModels(q).size)
+        assert(value(o.prefetchEnqueueBySource(bank)(s)) == enqueues(q))
+        assert(value(o.prefetchEnterBySource(bank)(s)) == issued(q))
+        assert(value(o.prefetchQueueOverwriteBySource(bank)(s)) == overwrites(q))
+        assert(value(o.prefetchDedupBySource(bank)(s)) == drops(q))
+        assert(value(o.prefetchPendingBySource(bank)(s)) == queueModels(q).size)
       }
-      if (flag(obs.enter.valid) && value(obs.enter.bits.SrcID) == 1) {
-        if(source(obs.enter.bits) == 2)
-          assert(value(obs.enter.bits.Opcode) == CCHIOpcode.StashShared.opcode)
-        entered += ((value(obs.enter.bits.Addr), source(obs.enter.bits), depth(obs.enter.bits)))
-        enteredBySource(source(obs.enter.bits)) += 1
-      }
-      obs.generated.zipWithIndex.foreach { case (pulse, s) => if (flag(pulse)) generated(s) += 1 }
+      obs.enter.zipWithIndex.foreach { case (e, bank) => if (flag(e.valid) && value(e.bits.SrcID) == cfg.pfSrcID) {
+        if(source(e.bits) == 2) assert(value(e.bits.Opcode) == CCHIOpcode.StashShared.opcode)
+        entered += ((value(e.bits.Addr), source(e.bits), depth(e.bits)))
+        enteredBySource(source(e.bits)) += 1
+        enteredByBank(bank) += source(e.bits)
+      }}
+      obs.generated.zipWithIndex.foreach { case (pulse, s) => generated(s) += value(pulse).toInt }
       obs.write.foreach(w => if (flag(w.valid)) writes += ((value(w.addr), value(w.source).toInt, value(w.depth).toInt)))
       assert(value(obs.evictions) == evictions); evictions += value(obs.evictPulses)
       assert(value(obs.vbopOverflow) == 0 && value(obs.cdpOverflow) == 0)
       obs.queues.zipWithIndex.foreach { case (q, i) =>
-        val model = queueModels(i); val capacity = if (i == 1 || i == 2) 16 else 32
+        val model = queueModels(i); val capacity = obs.capacity(i); val bank = i / 10
         val occupancy = if (flag(q.full)) capacity else (value(q.tail).toInt - value(q.head).toInt + capacity) % capacity
         assert(occupancy == model.size && flag(q.deq.valid) == model.nonEmpty, s"queue occupancy $i")
         if (model.nonEmpty) assert(value(q.deqPacked) == model.head, s"queue payload/order $i")
@@ -245,22 +260,24 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
         assert(flag(q.overwrite) == overwrite)
         if (take) {
           val bits = model.dequeue(); takes(i) += 1
-          val wasIssued = if (i == 9) flag(obs.enter.valid) && value(obs.enterPacked) == bits
-            else flag(obs.issue.valid) && value(obs.issuePacked) == bits
+          val wasIssued = if (i % 10 == 9) flag(obs.enter(bank).valid) && value(obs.enterPacked(bank)) == bits
+            else flag(obs.issue(bank).valid) && value(obs.issuePacked(bank)) == bits
           if (wasIssued) issued(i) += 1 else drops(i) += 1
         }
         if (overwrite) { model.dequeue(); overwrites(i) += 1 }
         if (put) { model.enqueue(value(q.enqPacked)); enqueues(i) += 1 }
         assert(enqueues(i) == overwrites(i) + issued(i) + drops(i) + model.size)
       }
-      for (metric <- L2BOPPerf.names.indices) {
-        val total = value(dut.observation.bopPerfCountBySlice(0)(metric))
-        val sum = (0 to 9).map(s => value(dut.observation.bopPerfCountBySliceSource(0)(s)(metric))).sum
+      for (bank <- 0 until cfg.sliceNum; metric <- L2BOPPerf.names.indices) {
+        val total = value(dut.observation.bopPerfCountBySlice(bank)(metric))
+        val sum = (0 to 9).map(s => value(dut.observation.bopPerfCountBySliceSource(bank)(s)(metric))).sum
         assert(total == sum, s"effect accounting metric=$metric total=$total sum=$sum")
       }
-      for ((s, q) <- Seq(1 -> 9, 2 -> 1, 3 -> 2, 9 -> 8))
-        assert(generated(s) == enteredBySource(s) + overwrites(q) + drops(q) + queueModels(q).size,
+      for ((s, q) <- Seq(1 -> 9, 2 -> 1, 3 -> 2, 9 -> 8)) {
+        val inventories = (0 until cfg.sliceNum).map(b => b * 10 + q)
+        assert(generated(s) == enteredBySource(s) + inventories.map(i => overwrites(i) + drops(i) + queueModels(i).size).sum,
           s"producer/slice conservation source=$s generated=${generated(s)} entered=${enteredBySource(s)}")
+      }
       dn.stepWithCredits(cycle); cycle += 1
     }
     def drain(queued: Boolean = true): Unit = {
@@ -352,11 +369,11 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
     // target is seeded separately to avoid the fixed-offset VBOP duplicate.
     dut.holdIssue.get.poke(true.B)
     controls(b = true); request(0x70040, 0x500040)
-    assert(queueModels(2).nonEmpty)
+    assert((0 until cfg.sliceNum).exists(b => queueModels(b*10+2).nonEmpty))
     controls(v = true, c = true)
     pointers(BigInt(0x74040)) = BigInt(0x310080)
     request(0x74040, 0x600040)
-    assert(queueModels(1).nonEmpty && queueModels(8).nonEmpty)
+    assert(Seq(1,8).forall(q => (0 until cfg.sliceNum).exists(b => queueModels(b*10+q).nonEmpty)))
     controls(v = true, c = true, b = true)
     // A real demand wins this cycle, forcing the simultaneous receiver into
     // its fallback FIFO. Release all four nonempty producer queues together.
@@ -366,11 +383,14 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
     while (!flag(dut.io.t1p.head.UpREQ.ready)) tick()
     recv(0x78040); up.clearUpReq(); txn += 1
     drain(queued = false)
-    assert(queueModels(9).nonEmpty)
+    assert((0 until cfg.sliceNum).exists(b => queueModels(b*10+9).nonEmpty))
     val arbStart = entered.size
+    val bankStarts = enteredByBank.map(_.size)
+    val bankExpected = (0 until cfg.sliceNum).map(b => Seq(1 -> 9, 2 -> 1, 3 -> 2, 9 -> 8).flatMap { case (src, q) => Seq.fill(queueModels(b*10+q).size)(src) })
     dut.holdIssue.get.poke(false.B); drain()
     val order = entered.drop(arbStart).map(_._2).toSeq
-    assert(order == Seq(1, 2, 3, 9, 9, 9), s"four source priority $order")
+    assert(order.sorted == Seq(1, 2, 3, 9, 9, 9).sorted, s"four source completion inventory $order")
+    for (bank <- 0 until cfg.sliceNum) assert(enteredByBank(bank).drop(bankStarts(bank)).toSeq == bankExpected(bank), s"four source priority bank=$bank actual=${enteredByBank(bank).drop(bankStarts(bank))} expected=${bankExpected(bank)}")
     println("PHASE2_ARBITRATION pass=true order=Recv,VBOP,PBOP,CDP sources=1,2,3,9,9,9")
     assert(queueModels.forall(_.isEmpty))
     controls(v = true)
@@ -379,12 +399,16 @@ object TestTop_L2PrefetchPhase2 extends App with ChiselSim {
     assert(entered.contains((BigInt(0x900c0), 2, 0)))
     assert(value(dut.phase2.needTDowngraded) == beforeDowngrade + 1)
     println("PHASE3A_NEEDT pass=true training=ReadUnique emitted=StashShared downgraded=1 deviation=D2")
-    for (i <- Seq(9, 1, 2, 8)) {
-      assert(enqueues(i) > 0 && issued(i) > 0)
-      println(s"PHASE2_SOURCE_ACCOUNT pass=true source=${if (i == 9) 1 else Seq(1,2,3,4,5,6,7,8,9)(i)} enqueued=${enqueues(i)} overwritten=${overwrites(i)} issued=${issued(i)} dedup=${drops(i)} pending=${queueModels(i).size}")
+    for (local <- Seq(9, 1, 2, 8)) {
+      val indices = (0 until cfg.sliceNum).map(b => b*10+local)
+      assert(indices.map(enqueues(_)).sum > 0 && indices.map(issued(_)).sum > 0)
+      println(s"PHASE2_SOURCE_ACCOUNT pass=true source=${if(local==9) 1 else local+1} enqueued=${indices.map(enqueues(_)).sum} overwritten=${indices.map(overwrites(_)).sum} issued=${indices.map(issued(_)).sum} dedup=${indices.map(drops(_)).sum} pending=${indices.map(i=>queueModels(i).size).sum}")
     }
     controls()
-    for (i <- 0 until 10) { recv(BigInt(0x80000 + i * 0x2000)); drain() }
+    val evictionBase = BigInt(0x80000)
+    val evictionBank = L2TopBOPExpectations.slice(evictionBase, cfg.sliceNum)
+    val evictionAddresses = Iterator.from(0).map(i => evictionBase + BigInt(i) * dut.p(L2ParamsKey).sets * 64).filter(a => L2TopBOPExpectations.slice(a,cfg.sliceNum) == evictionBank).take(dut.p(L2ParamsKey).ways + 6).toSeq
+    evictionAddresses.foreach { a => recv(a); drain() }
     assert(value(dut.phase2.evictions) == evictions)
     assert(evictions >= 6)
     println(s"PHASE2_EVICT_COUNT pass=true events=$evictions requests=0")
