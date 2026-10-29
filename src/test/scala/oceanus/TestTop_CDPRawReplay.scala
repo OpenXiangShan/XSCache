@@ -95,6 +95,7 @@ object TestTop_CDPRawReplay extends App with ChiselSim {
   Constantin.init(false)
   val diagnose = args.contains("--diagnose")
   val d7Boundary = args.contains("--d7-boundary")
+  val structuralOff = sys.props.get("oceanus.validation.prefetchOff").contains("true")
   require(!d7Boundary || diagnose, "D7 boundary uses a separately labelled diagnostic; strict replay remains unchanged")
   val path = Paths.get(args.head)
   val input = Source.fromInputStream(new GZIPInputStream(Files.newInputStream(path)))
@@ -179,7 +180,23 @@ object TestTop_CDPRawReplay extends App with ChiselSim {
     var admissionDifferences = 0
     // Preserve allocation identity until actual output, so a timestamp shift
     // cannot move an older output into the next admission window's count.
-    val d7Windows = Seq(("precloseHalf", 11874, 11898), ("newRequestHalf", 11979, 12003))
+    val d7Windows = if (d7Boundary) {
+      // Anchor only to recorded input halves and CSR transitions. The detector
+      // takes four cycles to emit its first of 24 candidates for two halves;
+      // never use DUT admission/output to choose a diagnostic window.
+      val retryRows = rows.filter(_.epoch == 1000)
+      val close = retryRows.find(_.values("enable") == 0).get.cycle
+      val reopen = retryRows.find(r => r.cycle > close && r.values("enable") != 0).get.cycle
+      def window(name: String, inputRows: Vector[Row]) = {
+        val halves = inputRows.filter(r => r.values("half") != 0 && r.values("enable") != 0).take(2)
+        require(halves.size == 2 && halves(1).cycle == halves(0).cycle + 1, s"D7 $name needs two adjacent captured input halves")
+        val first = halves.head.cycle + 4
+        println(s"CDP_D7_INPUT_WINDOW name=$name halves=${halves.map(_.cycle).mkString(",")} first=$first end=${first+24}")
+        (name, first, first + 24)
+      }
+      Seq(window("precloseHalf", retryRows.filter(_.cycle < close)),
+        window("newRequestHalf", retryRows.filter(_.cycle >= reopen)))
+    } else Seq.empty[(String, Int, Int)]
     val d7Candidates = Array.fill(d7Windows.size)(0)
     val d7Outputs = Array.fill(d7Windows.size, 2)(0)
     val d7Pending = Vector.fill(2)(mutable.Map.empty[(BigInt, BigInt), mutable.Queue[Int]])
@@ -238,7 +255,7 @@ object TestTop_CDPRawReplay extends App with ChiselSim {
       }
       // The detection/training boundaries retain exact cycle identity. D1 is
       // limited to translated outputs/drops, compared as complete epoch bags.
-      if(diagnose && row.cycle >= 11860 && row.cycle <= 11960) {
+      if(diagnose && row.epoch == 1000) {
         diagnostic += ujson.Obj("cycle"->row.cycle,"epoch"->e,
           "dut"->ujson.Obj.from(r.map { case(k,v)=>k->ujson.Str(v.toString(16)) }),
           "reference"->ujson.Obj.from(output.map { case(k,v)=>k->ujson.Str(v.toString(16)) }))
@@ -283,7 +300,12 @@ object TestTop_CDPRawReplay extends App with ChiselSim {
       if(d != r) orderDifferences += 1
     }
     val outputCount = expected.values.flatten.count(_.startsWith("out:"))
-    assert(outputCount > 0 && requestCount > 0)
+    if (structuralOff) {
+      assert(outputCount == 0 && requestCount == 0 && expected.values.forall(_.isEmpty))
+      assert(rows.forall(r => Seq("half", "vpn", "filter", "candidate", "resident").forall(k => r.values(k) == 0)),
+        "structural-off trace contains learner activity")
+      println(s"CDP_STRUCTURAL_OFF_REPLAY pass=true cycles=${rows.size} outputs=0 translations=0 learnerActivity=0 demandScoreboard=onlineRawEventReference")
+    } else assert(outputCount > 0 && requestCount > 0)
     if(diagnose) println(s"CDP_RAW_REPLAY_DIAGNOSTIC_COMPLETE acceptance=false cycles=${rows.size} admissionFieldDifferences=$admissionDifferences referenceBody=unmodified trace=$path")
     else println(s"CDP_RAW_REPLAY_RESULT pass=true seeds=${header("seeds").num.toInt} slices=${header("slices").num.toInt} cycles=${rows.size} outputs=$outputCount outcomes=${expected.values.map(_.size).sum} epochs=${expected.size} d1OrderDifferences=$orderDifferences missing=0 extra=0 referenceBody=unmodified trace=$path")
   }
