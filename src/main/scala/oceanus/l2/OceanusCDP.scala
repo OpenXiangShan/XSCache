@@ -496,6 +496,8 @@ class OceanusCDPIO(capturedHalves: Boolean = false)(implicit p: Parameters) exte
   val capturedHalf = if (capturedHalves) Some(Flipped(Valid(new OceanusCDPCapturedHalf))) else None
   val vpnTrain = Flipped(Valid(new OceanusCDPTrain))
   val filterTrain = Flipped(Valid(new OceanusCDPTrain))
+  val vpnTrainAccepted = Output(Bool()) // R10 learner FIFO admission.
+  val filterTrainAccepted = Output(Bool())
   val pfStat = Input(new OceanusCDPStat)
   val tlb = Flipped(new L2PrefetchTranslationClientIO)
   val req = Decoupled(new OceanusCDPRequest)
@@ -1056,6 +1058,7 @@ class OceanusCDPFtTrainPipeline(implicit p: Parameters) extends OceanusCDPModule
 class OceanusCDPFilterTraining(implicit p: Parameters) extends OceanusCDPModule {
   val io = IO(new Bundle {
     val enable = Input(Bool())
+    val trainAccepted = Output(Bool())
     val train = Flipped(Valid(new OceanusCDPTrain))
     val sendQuery = Flipped(Decoupled(new OceanusCDPFtQueryReq))
     val sendRsp = Valid(new OceanusCDPFtQueryRsp)
@@ -1067,6 +1070,7 @@ class OceanusCDPFilterTraining(implicit p: Parameters) extends OceanusCDPModule 
     (io.train.bits.isUsed || io.train.bits.isEvict) &&
     io.train.bits.reqSource =/= MemReqSource.L1DataPrefetch.id.U
   queue.io.enq.bits := io.train.bits
+  io.trainAccepted := queue.io.enq.fire
   pipe.io.trainTrigger <> queue.io.deq
   val arb = Module(new RRArbiter(new OceanusCDPFtQueryReq, 2))
   arb.io.in(0) <> pipe.io.queryReq
@@ -1392,6 +1396,7 @@ class OceanusCDP(config: OceanusCDPParameters = OceanusCDPParameters(), bankCoun
     io.vpnTrain.bits.vpnValid && io.vpnTrain.bits.trainEnable &&
     io.vpnTrain.bits.reqSource =/= MemReqSource.L1DataPrefetch.id.U
   vpnTrainReqBuf.io.enq.bits := io.vpnTrain.bits
+  io.vpnTrainAccepted := vpnTrainReqBuf.io.enq.fire
   vtTrainPipe.io.trainTrigger <> vpnTrainReqBuf.io.deq
   vpnTable.io.queryReq(detectPipeNum) := vtTrainPipe.io.queryReq
   vtTrainPipe.io.queryRsp := vpnTable.io.queryRsp(detectPipeNum)
@@ -1413,6 +1418,7 @@ class OceanusCDP(config: OceanusCDPParameters = OceanusCDPParameters(), bankCoun
   XSPerfAccumulate("vpn_train_accept", vpnTrainReqBuf.io.enq.fire)
   // C2: exercise Filter training behind the standalone interface only.
   val filterTraining = if (useFilterTable) Some(Module(new OceanusCDPFilterTraining()(instanceParams))) else None
+  io.filterTrainAccepted := filterTraining.map(_.io.trainAccepted).getOrElse(false.B)
   filterTraining.foreach { ft =>
     ft.io.enable := io.enable
     ft.io.train := io.filterTrain

@@ -20,6 +20,8 @@ class L2CDPCacheEvents(ports: Int)(implicit p: Parameters) extends Module {
     val evict = Input(Vec(ports, Valid(new L2CDPEvict)))
     val vpn = Valid(new OceanusCDPTrain)
     val filter = Valid(new OceanusCDPTrain)
+    val vpnChoice = Output(UInt(log2Ceil(ports).max(1).W))
+    val filterChoice = Output(UInt(log2Ceil(2*ports).max(1).W))
   })
   val vpnArb = Module(new RRArbiter(new OceanusCDPTrain, ports))
   val filterArb = Module(new RRArbiter(new OceanusCDPTrain, 2 * ports))
@@ -47,6 +49,8 @@ class L2CDPCacheEvents(ports: Int)(implicit p: Parameters) extends Module {
   }
   vpnArb.io.out.ready := true.B
   filterArb.io.out.ready := true.B
+  io.vpnChoice := vpnArb.io.chosen
+  io.filterChoice := filterArb.io.chosen
   io.vpn.valid := vpnArb.io.out.valid
   io.vpn.bits := vpnArb.io.out.bits
   io.filter.valid := filterArb.io.out.valid

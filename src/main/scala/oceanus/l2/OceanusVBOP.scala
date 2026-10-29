@@ -541,12 +541,14 @@ class OceanusVBOP(val params: OceanusVBOPParameters = OceanusVBOPParameters())(i
     val requestVA = Output(UInt(50.W))
     val originalNeedT = Output(Bool())
     val issuedNeedT = Output(Bool())
+    val trainAccepted = Output(Bool()) // R10: input FIFO admission, independent of issue enable.
   })
   // Reference Prefetcher.scala:332-340: 4 entries, never backpressure cache,
   // full drops the NEW training event. CSR enable gates issue, not this queue.
   val input = Module(new Queue(new L2PrefetchTrain(true)(p), 4))
   input.io.enq.valid := io.train.valid && io.train.bits.trainEnable.get
   input.io.enq.bits := io.train.bits
+  io.trainAccepted := input.io.enq.fire
   val overwritten = RegInit(0.U(64.W)) // legacy observation name: counts drop-new
   when(input.io.enq.valid && !input.io.enq.ready) { overwritten := overwritten + 1.U }
   val delayQueue = Module(new OceanusVDelayQueue("oceanus_vbop")(p))

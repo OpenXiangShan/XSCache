@@ -78,6 +78,9 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
     val fromClientTableEVT = Input(Vec(paramL2.mshrSize, Vec(1, Bool()))) // TODO: parameterize with coherent l2 client count
 
     val bopTrain = Valid(new L2PrefetchTrain(pfTrainEnable))
+    // R10: raw pulses and physical source identities before local selection.
+    val bopTrainRaw = if (pfTrainEnable) Some(Output(Vec(nMSHR, Bool()))) else None
+    val trainSourceNID = if (pfTrainEnable) Some(Output(Vec(nMSHR, UInt(paramCCHI.UpstreamNodeID_Width.W)))) else None
     val cdpData = Decoupled(new L2CDPHalf)
     val cdpTrain = Output(Vec(paramL2.mshrSize, Valid(new L2CDPTrain)))
     val cdpEvict = Output(Vec(paramL2.mshrSize, Valid(new L2CDPEvict)))
@@ -126,6 +129,12 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   assert(!io.DnRXRSP.valid || (PopCount(tshrs.map(_.io.DnRXRSP.valid)) =/= 0.U), "DnRXRSP valid but no TSHR selected, flit lost")
   assert(!io.DnRXDAT.valid || (PopCount(tshrs.map(_.io.DnRXDAT.valid)) =/= 0.U), "DnRXDAT valid but no TSHR selected, flit lost")
   io.bopTrain := L2PrefetchTrainSelect.local(tshrs.map(_.io.bopTrain))
+  if (pfTrainEnable) {
+    tshrs.zipWithIndex.foreach { case (t,i) =>
+      io.bopTrainRaw.get(i) := t.io.bopTrain.valid
+      io.trainSourceNID.get(i) := t.io.bopTrain.bits.sourceId.get >> paramCCHI.TxnID_Width
+    }
+  }
   if (p(L2CDPObserveEnableKey)) {
     val cdpQueue = Module(new L2CDPHalfQueue)
     val cdpValids = tshrs.map(_.io.cdpData.valid)

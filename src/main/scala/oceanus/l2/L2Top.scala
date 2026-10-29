@@ -383,6 +383,45 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     stub.io.train.bits := bopTrainArb.io.out.bits
   }
 
+  // R10 observation: the origin is the physical upstream SrcID, not reqSource
+  // or the provenance source of an old prefetched line. Evictions have their
+  // own bucket because their origin request no longer belongs to this event.
+  val trainAccounting = if (config.pfTrainEnable) Some(Module(new L2PrefetchTrainCounters(
+    config.upstream.entries.size + 1, 2 * config.sliceNum * nMSHR))) else None
+  trainAccounting.foreach { counts =>
+    val origins = VecInit(slices.flatMap(_.io.trainSourceNID.get.toSeq))
+    val bopRaw = slices.flatMap(_.io.bopTrainRaw.get.toSeq)
+    val cdpRaw = slices.flatMap(_.io.cdpTrain.toSeq)
+    val evictRaw = slices.flatMap(_.io.cdpEvict.toSeq)
+    counts.io.total := 0.U.asTypeOf(counts.io.total)
+    counts.io.accepted := 0.U.asTypeOf(counts.io.accepted)
+    val selectedOrigin = bopTrainArb.io.out.bits.sourceId.get >> p(xscache.oceanus.compactchi.CCHIParametersKey).TxnID_Width
+    config.upstream.entries.zipWithIndex.foreach { case (entry,source) =>
+      val rawBop = PopCount(bopRaw.zipWithIndex.map { case (v,i) => v && origins(i) === entry.nid.U })
+      val rawCDP = PopCount(cdpRaw.zipWithIndex.map { case (t,i) => t.valid && origins(i) === entry.nid.U })
+      counts.io.total(0)(source) := rawBop
+      counts.io.total(1)(source) := rawBop
+      counts.io.total(2)(source) := rawCDP
+      counts.io.total(3)(source) := rawCDP
+      counts.io.accepted(0)(source) := bop.io.train.fire && selectedOrigin === entry.nid.U
+      vbopStub.foreach { learner =>
+        counts.io.accepted(1)(source) := learner.io.trainAccepted && selectedOrigin === entry.nid.U
+      }
+      cdp.foreach { learner =>
+        val events = cdpEvents.get
+        counts.io.accepted(2)(source) := learner.io.vpnTrainAccepted && origins(events.io.vpnChoice) === entry.nid.U
+        counts.io.accepted(3)(source) := learner.io.filterTrainAccepted &&
+          events.io.filterChoice < cdpRaw.size.U && origins(events.io.filterChoice) === entry.nid.U
+      }
+    }
+    val victimBucket = config.upstream.entries.size
+    counts.io.total(3)(victimBucket) := PopCount(evictRaw.map(_.valid))
+    cdp.foreach { learner =>
+      counts.io.accepted(3)(victimBucket) := learner.io.filterTrainAccepted &&
+        cdpEvents.get.io.filterChoice >= cdpRaw.size.U
+    }
+  }
+
   // Internal Stash has no upstream completion; downstream IDs remain TSHR/slice IDs.
   // Source order is the policy boundary: receiver encodings precede PBOP/BOP,
   // and remaining slots leave room for VBOP/CDP. A later aging policy can
