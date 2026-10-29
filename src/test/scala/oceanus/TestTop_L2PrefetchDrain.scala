@@ -404,7 +404,9 @@ object TestTop_L2PrefetchDrain extends App with ChiselSim {
       }
 
       driver.sample(cycle)
-      if(driver.completed!=lastCompleted) { lastProgress=cycle; lastCompleted=driver.completed }
+      // No demand completion is expected while the driver has no outstanding work.
+      // Start the progress window from the idle cycle preceding new work.
+      if(driver.pending==0 || driver.completed!=lastCompleted) { lastProgress=cycle; lastCompleted=driver.completed }
       assert(cycle>=stopCycle || cycle-lastProgress<4000,s"progress watchdog seed=$seed slices=$slices cycle=$cycle pending=${driver.pending}")
       val active=dut.observation.dirProbeBySlice.flatten.exists(p=>flag(p.valid)||flag(p.reqActive))
       val pendingQueues=(0 until slices).flatMap(s=>(0 to 9).map(src=>count(dut.observation.prefetchPendingBySource,s,src))).sum
