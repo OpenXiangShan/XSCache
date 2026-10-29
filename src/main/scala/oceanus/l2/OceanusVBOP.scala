@@ -65,7 +65,7 @@ import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.{Parameters, Field}
 import utility.{ChiselDB, Constantin, MemReqSource, ParallelPriorityMux, XSPerfAccumulate, TwoLevelRRArbiter, ArbPerf}
-import utility.sram.SRAMTemplate
+import utility.sram.{SRAMTemplate, SramBroadcastBundle}
 import freechips.rocketchip.util.SeqToAugmentedSeq
 import oceanus.l2._
 import xscache.oceanus.compactchi.CCHIParametersKey
@@ -203,6 +203,13 @@ class OceanusVRecentRequestTable(name: String)(implicit p: Parameters) extends O
       hasSramCtl = cacheParams.hasSramCtl
     )
   )
+
+  // [Implementation detail R06] Define the optional SRAM-template DFT inputs.
+  // Original: utility exposes broadcast inputs when the RR SRAM has MBIST.
+  // This implementation: use Directory's inactive local broadcast defaults.
+  // Reason: standalone/target construction otherwise leaves those inputs uninitialized.
+  // Status: verification results are recorded in the migration ledger.
+  rrTable.io.broadcast.foreach(_ := 0.U.asTypeOf(new SramBroadcastBundle))
 
   val wAddr = io.w.bits
   rrTable.io.w.req.valid := io.w.valid && !io.r.req.valid

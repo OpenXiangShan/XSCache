@@ -178,7 +178,7 @@ import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import utility.{ChiselDB, XSPerfAccumulate}
-import utility.sram.SRAMTemplate
+import utility.sram.{SRAMTemplate, SramBroadcastBundle}
 
 case class OceanusBOPParameters(
   rrTableEntries: Int = 256,
@@ -263,6 +263,13 @@ private class OceanusBOPRecentRequestTable(name: String, params: OceanusBOPParam
     hasMbist = paramL2.hasMbist,
     hasSramCtl = paramL2.hasSramCtl
   ))
+
+  // [Implementation detail R06] Define the optional SRAM-template DFT inputs.
+  // Original: utility exposes broadcast inputs when the RR SRAM has MBIST.
+  // This implementation: use Directory's inactive local broadcast defaults.
+  // Reason: standalone/target construction otherwise leaves those inputs uninitialized.
+  // Status: verification results are recorded in the migration ledger.
+  rrTable.io.broadcast.foreach(_ := 0.U.asTypeOf(new SramBroadcastBundle))
 
   private val writeAddress = io.w.bits
   rrTable.io.w.req.valid := io.w.valid && !io.r.req.valid
