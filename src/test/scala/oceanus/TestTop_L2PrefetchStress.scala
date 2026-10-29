@@ -466,7 +466,7 @@ object TestTop_L2PrefetchStress extends App with ChiselSim {
   val contentionSets=opt("--contention-sets","8").toInt
   val contentionLines=opt("--contention-lines","8").toInt
   val snoopLead=opt("--snoop-lead","0").toInt
-  def poolAddress(index:Int):BigInt=BigInt(0x200000)+((index%contentionSets)+(index/contentionSets%contentionLines)*128)*64
+  def poolAddress(index:Int):BigInt=BigInt(0x200000)+((index%contentionSets)+(index/contentionSets%contentionLines)*params(L2ParamsKey).sets)*64
   val traceWindow=opt("--trace-window","0").toInt
   val prefetchMode=opt("--prefetch-mode","all")
   require(Set("all","none","bop","vbop","recv","cdp")(prefetchMode))

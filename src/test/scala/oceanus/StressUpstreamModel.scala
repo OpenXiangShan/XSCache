@@ -20,17 +20,13 @@ class StressUpstreamModel(dut: StressTopBase, spec: CaseSpec) extends ChiselSim 
       train.poke(0.U.asTypeOf(train))
       train.trainEnable.poke(true.B)
     })
-    dut.io.t1p(0).UpEVT.valid.poke(false.B)
-    dut.io.t1p(0).UpEVT.bits.poke(0.U.asTypeOf(dut.io.t1p(0).UpEVT.bits))
-    dut.io.t1p(0).UpREQ.valid.poke(false.B)
-    dut.io.t1p(0).UpREQ.bits.poke(0.U.asTypeOf(dut.io.t1p(0).UpREQ.bits))
-    dut.io.t1p(0).UpRSP.valid.poke(false.B)
-    dut.io.t1p(0).UpRSP.bits.poke(0.U.asTypeOf(dut.io.t1p(0).UpRSP.bits))
-    dut.io.t1p(0).UpDAT.valid.poke(false.B)
-    dut.io.t1p(0).UpDAT.bits.poke(0.U.asTypeOf(dut.io.t1p(0).UpDAT.bits))
-    dut.io.t1p(0).DnSNP.ready.poke(true.B)
-    dut.io.t1p(0).DnRSP.ready.poke(true.B)
-    dut.io.t1p(0).DnDAT.ready.poke(true.B)
+    dut.io.t1p.foreach { port =>
+      port.UpEVT.valid.poke(false.B); port.UpEVT.bits.poke(0.U.asTypeOf(port.UpEVT.bits))
+      port.UpREQ.valid.poke(false.B); port.UpREQ.bits.poke(0.U.asTypeOf(port.UpREQ.bits))
+      port.UpRSP.valid.poke(false.B); port.UpRSP.bits.poke(0.U.asTypeOf(port.UpRSP.bits))
+      port.UpDAT.valid.poke(false.B); port.UpDAT.bits.poke(0.U.asTypeOf(port.UpDAT.bits))
+      port.DnSNP.ready.poke(true.B);port.DnRSP.ready.poke(true.B);port.DnDAT.ready.poke(true.B)
+    }
 
     dut.io.t4p.zipWithIndex.foreach { case (port, _) =>
       port.UpREQ.valid.poke(false.B)
@@ -40,13 +36,12 @@ class StressUpstreamModel(dut: StressTopBase, spec: CaseSpec) extends ChiselSim 
   }
 
   def clearUpReq(): Unit = {
-    dut.io.t1p(0).UpREQ.valid.poke(false.B)
+    dut.io.t1p.foreach(_.UpREQ.valid.poke(false.B))
     dut.io.t4p.foreach(_.UpREQ.valid.poke(false.B))
   }
 
   def clearResponses(): Unit = {
-    dut.io.t1p(0).UpRSP.valid.poke(false.B)
-    dut.io.t1p(0).UpDAT.valid.poke(false.B)
+    dut.io.t1p.foreach { port => port.UpRSP.valid.poke(false.B);port.UpDAT.valid.poke(false.B) }
   }
 
   def requestAddr(index: Int): BigInt = spec.up.stream.request(index).addr
@@ -60,6 +55,7 @@ class StressUpstreamModel(dut: StressTopBase, spec: CaseSpec) extends ChiselSim 
   def driveRead(req: UpRequestSpec): Unit = {
     val port = req.master match {
       case MasterId.T1P0 => dut.io.t1p(0).UpREQ
+      case MasterId.T1P1 => dut.io.t1p(1).UpREQ
       case MasterId.T4P0 => dut.io.t4p(0).UpREQ
       case MasterId.T4P1 => dut.io.t4p(1).UpREQ
     }
