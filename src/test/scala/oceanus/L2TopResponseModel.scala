@@ -53,7 +53,7 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
     val dnCreditDelayArgPrefix = "--dn-credit-return-delay="
     val probeRequestsArgPrefix = "--probe-requests="
     val probeCyclesArgPrefix = "--probe-cycles="
-    val testMshrSize = args.collectFirst {
+    val requestedMshrSize = args.collectFirst {
       case s if s.startsWith(mshrSizeArgPrefix) => s.stripPrefix(mshrSizeArgPrefix).toInt
     }.getOrElse(8)
     val selectedCase = args.collectFirst {
@@ -115,76 +115,12 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
     varArgs -= "--no-bop"
     varArgs.trimToSize()
 
-    val validCases = L2TopCases.names.toSet
-    require(validCases.contains(selectedCase),
-      s"unknown --case=$selectedCase, expected one of ${validCases.toSeq.sorted.mkString(",")}")
-    val baseCaseSpec = L2TopCases(selectedCase)
-    require(selectedCase != "prefetched-clear" && selectedCase != "prefetched-clear-readunique",
-      "prefetched-clear cases are not supported on bop-on-base")
-    val caseSpec = if (policyProbe) {
-      val baseStream = baseCaseSpec.up.stream
-      val stream = baseStream match {
-        case fixed: FixedReadStream => fixed.copy(requestCount = probeRequests, opcode = CCHIOpcode.ReadShared.opcode, dirtyDataResp = false)
-        case other => throw new IllegalArgumentException(s"policy probe requires FixedReadStream, got ${other.getClass.getSimpleName}")
-      }
-      baseCaseSpec.copy(
-        up = baseCaseSpec.up.copy(stream = stream),
-        dn = baseCaseSpec.dn.copy(
-          latency = FixedLatency(dnLatency),
-          maxOutstanding = FixedOutstanding(dnOutstanding),
-          creditPolicy = ImmediateCreditPolicy(txCreditReturnDelay = dnCreditDelay),
-          holdTxReqCreditUntilResponse = true
-        ),
-        cycles = probeCycles,
-        checks = Seq.empty
-      )
-    } else if (selectedCase == "dirty-victim" && numSlices > 1) {
-      // Multi-slice routing, derived from the hash before this run. The test
-      // config assigns slice i the node ID i (L2TopResponseModel.scala:145), so
-      // the mapped index is the slice index. Both hashes are byte-identical to
-      // tag prefetch-bop-freeze-20260929 (its L2Top.scala:70-72 map2 and :82-88
-      // map4, versus the current L2Top.scala:91-93 and :103-108). Its
-      // prefetchTarget (freeze L2Top.scala:177-187) calls the same mapN, so the
-      // prefetch demux and the demand SAM cannot disagree.
-      //
-      // map2 (2 slices) is the parity of addr>>6. map4 (4 slices) xors the even
-      // and the odd bits of the raw byte address; shifting by 6 does not change
-      // the parity class of a bit, so a line-aligned address gives the same
-      // result either way (the map4 entry in CLAUDE.md).
-      //
-      //   addr      line    map2   map4
-      //   0x8000    0x200   1      2
-      //   0x1c000   0x700   1      2
-      //   0x4c000   0x1300  1      2
-      //   0x58000   0x1600  1      2
-      //   0x10c000  0x4300  1      2
-      //
-      // All five land on one slice: slice 1 for 2 slices, slice 2 for 4 slices.
-      // The set index is addr[12:6] (offsetBits=6, setBits=7, 128 sets), and
-      // every address has those seven bits clear, so all five share set 0 of
-      // that one slice. The first four fill empty ways and hit
-      // evict_victim_invalid; only the fifth replaces a dirty line. Expected:
-      // created/completed/pending/active = 1/1/0/0, with the single fire on that
-      // slice and 0 on the others. The replacement phase counts only the fifth
-      // request, so dnTxReq/upTxDat/dnTxDat = 2/2/2, the downstream opcode is
-      // WriteBackFull 0x1B, and both beats match the preload with nonzero BE.
-      // Same derivation as the 1-slice comment above passLoadMiss, since the
-      // set occupancy is identical.
-      val addresses = Seq("8000", "1c000", "4c000", "58000", "10c000").map(BigInt(_, 16))
-      val stream = ExplicitRequestStream(
-        addresses.zipWithIndex.map { case (addr, index) =>
-          UpRequestSpec(MasterId.t1p0, BigInt(index), 0, 0, CCHIOpcode.ReadUnique.opcode, addr)
-        },
-        Seq.fill(addresses.size)(BigInt(CHIFieldResp.CompData_UD_PD))
-      )
-      baseCaseSpec.copy(up = baseCaseSpec.up.copy(stream = stream))
-    } else baseCaseSpec
     require(numSlices >= 1 && numSlices <= 4, s"Unsupported slice count $numSlices under eSAM")
     require(!bopOverwriteQueue || numSlices == 1, "bop-overwrite-queue requires --slices 1")
     require(!bopCollision || numSlices == 1, "bop-collision requires --slices 1")
     require(!bopPrefetchSmoke || (!noPrefetchIssue && !noBop && Set(1, 2, 4).contains(numSlices)),
       "prefetch smoke requires issue enabled and 1/2/4 slices")
-    require(testMshrSize >= 2, s"--mshr-size=$testMshrSize is too small for this test")
+    require(requestedMshrSize >= 2, s"--mshr-size=$requestedMshrSize is too small for this test")
 
     // Phase 1a: run the same oracle with optional ports absent or present and idle.
     val l2cfg = new L2Configuration(
@@ -202,7 +138,7 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
     val config = new Config((_, _, _) => {
       case L2ParamsKey => L2Params (
         physicalAddrWidth = 48,
-        mshrSize = testMshrSize,
+        mshrSize = requestedMshrSize,
         ways = 4,
         sets = 128,
         blockBytes = 64,
@@ -231,6 +167,70 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
         0
       )
     })
+
+    val testMshrSize = config(L2ParamsKey).mshrSize
+    val dirtyWays = config(L2ParamsKey).ways
+    var dirtyAddresses = Seq.empty[BigInt]
+    val validCases = L2TopCases.names.toSet
+    require(validCases.contains(selectedCase),
+      s"unknown --case=$selectedCase, expected one of ${validCases.toSeq.sorted.mkString(",")}")
+    val baseCaseSpec = L2TopCases(selectedCase)
+    require(selectedCase != "prefetched-clear" && selectedCase != "prefetched-clear-readunique",
+      "prefetched-clear cases are not supported on bop-on-base")
+    val caseSpec = if (policyProbe) {
+      val baseStream = baseCaseSpec.up.stream
+      val stream = baseStream match {
+        case fixed: FixedReadStream => fixed.copy(requestCount = probeRequests, opcode = CCHIOpcode.ReadShared.opcode, dirtyDataResp = false)
+        case other => throw new IllegalArgumentException(s"policy probe requires FixedReadStream, got ${other.getClass.getSimpleName}")
+      }
+      baseCaseSpec.copy(
+        up = baseCaseSpec.up.copy(stream = stream),
+        dn = baseCaseSpec.dn.copy(
+          latency = FixedLatency(dnLatency),
+          maxOutstanding = FixedOutstanding(dnOutstanding),
+          creditPolicy = ImmediateCreditPolicy(txCreditReturnDelay = dnCreditDelay),
+          holdTxReqCreditUntilResponse = true
+        ),
+        cycles = probeCycles,
+        checks = Seq.empty
+      )
+    } else if (selectedCase == "dirty-victim") {
+      // Fill every way of one physical set before the replacement request.
+      // Choose addresses from the configured set stride and the documented
+      // eSAM hash; replacement policy does not choose the expected data.
+      val oldAddresses = if (numSlices == 1)
+        (0 until 5).map(i => BigInt("8000", 16) + (BigInt(i) << 13))
+      else Seq("8000", "1c000", "4c000", "58000", "10c000").map(BigInt(_, 16))
+      def sliceOf(addr: BigInt): Int = numSlices match {
+        case 1 => 0
+        case 2 => (addr >> 6).bitCount & 1
+        case 3 => Seq((0,3),(3,3),(6,3),(9,2),(11,3),(14,3),(17,3),(20,2)).map { case (shift,width) =>
+          ((addr >> (6+shift)) & ((BigInt(1)<<width)-1)).toInt
+        }.sum % 3
+        case 4 =>
+          val even = (0 until config(L2ParamsKey).physicalAddrWidth by 2).count(addr.testBit) & 1
+          val odd = (1 until config(L2ParamsKey).physicalAddrWidth by 2).count(addr.testBit) & 1
+          (odd << 1) | even
+      }
+      val addresses = if (dirtyWays == 4 && config(L2ParamsKey).sets == 128 && numSlices != 3)
+        oldAddresses
+      else {
+        val stride = BigInt(config(L2ParamsKey).sets * config(L2ParamsKey).blockBytes)
+        val targetSlice = sliceOf(stride)
+        Iterator.from(1).map(i => stride * i).filter(a => sliceOf(a) == targetSlice).take(dirtyWays + 1).toVector
+      }
+      require(addresses.distinct.size == dirtyWays + 1 && addresses.map(sliceOf).distinct.size == 1)
+      require(addresses.forall(a => (a / config(L2ParamsKey).blockBytes) % config(L2ParamsKey).sets == 0))
+      dirtyAddresses = addresses
+      println(s"DIRTY_VICTIM_GEOMETRY ways=$dirtyWays sets=${config(L2ParamsKey).sets} slices=$numSlices targetSlice=${sliceOf(addresses.head)} addresses=${addresses.map(_.toString(16)).mkString(",")}")
+      val stream = ExplicitRequestStream(
+        addresses.zipWithIndex.map { case (addr, index) =>
+          UpRequestSpec(MasterId.t1p0, BigInt(index), 0, 0, CCHIOpcode.ReadUnique.opcode, addr)
+        },
+        Seq.fill(addresses.size)(BigInt(CHIFieldResp.CompData_UD_PD))
+      )
+      baseCaseSpec.copy(up = baseCaseSpec.up.copy(stream = stream))
+    } else baseCaseSpec
 
     val fullChiCompDataOpcode = 0x04
     val fullChiCompOpcode = 0x04
@@ -274,7 +274,7 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
 
       val requestCount = caseSpec.up.stream.requestCount
       val responseDelay = caseSpec.dn.latency.delay(0, L2TopLatencyOp.CompData, 0)
-      val directoryInitWaitCycles = 300
+      val directoryInitWaitCycles = if (selectedCase == "dirty-victim") math.max(300, config(L2ParamsKey).sets + 8) else 300
       val watchdogCycles = caseSpec.cycles
       val fixedAddr = BigInt("8000", 16)
       val dirtyVictimKnownFailReport = "/nfs/home/zhuy/handover/be-zero-dirty-evict-defect-20260902.md"
@@ -476,19 +476,19 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
         // EvictBack: created/completed/pending/active = 0/0/0/0. The demand itself
         // is unchanged, so dnTxReqDelta=1, upTxDatDelta=2, completed=1 stay.
         //
-        // dirty-victim: five ReadUnique with dirtyDataResp (L2TopCases.scala:176)
-        // into a 4-way set (L2TopResponseModel.scala:155). The first four allocate
+        // dirty-victim: ways+1 ReadUnique with dirtyDataResp (L2TopCases.scala:176)
+        // into one configured set (L2TopResponseModel.scala:155). The first ways requests allocate
         // empty ways and hit evict_victim_invalid, producing no EvictBack; only
-        // the fifth replaces a dirty, non-Invalid line, so exactly one EvictBack
+        // the last request replaces a dirty, non-Invalid line, so exactly one EvictBack
         // is created and its target TSHR deallocates: 1/1/0/0. Deltas are taken
-        // against the snapshot at issued == completed == 4 (below), so they count
-        // only the fifth request: its own ReadUnique miss is one downstream read
+        // against the snapshot at issued == completed == ways (below), so they count
+        // only the replacement request: its own ReadUnique miss is one downstream read
         // and the EvictBack's WriteBackFull is the second, dnTxReqDelta=2; the
         // miss returns two CompData beats, upTxDatDelta=2; the writeback sends two
         // CopyBackWrData beats, dnTxDatDelta=2. That victim's dirResult.dirty
         // selects CHI_WriteBackFull = 0x1B (L2VPipeREQ.scala:603-609,
         // CHIRNFOpcodesREQ.scala:32), and the two beats (DataID 0 and 2) carry the
-        // preload CompData of upTxnID < 4 (L2TopResponseModel.scala:1247-1248)
+        // preload CompData of upTxnID < ways (L2TopResponseModel.scala:1247-1248)
         // with nonzero BE because the victim state is not I (L2VPipeREQ.scala:1009).
         def passLoadMiss(baseHost: HostSnapshot, baseGrant: GrantSnapshot, dnTxReqCount: Int, upTxDatCount: Int, completed: Int): Boolean = {
           (dnTxReqCount - baseHost.dnTxReq) == 1 &&
@@ -796,9 +796,17 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
         def passSnoopDataPassDirty: Boolean =
           sawReqDirtyWrite && sawSnoopDataPassDirtyBeat0 && sawSnoopDataPassDirtyBeat2
 
+        // Match the actual writeback address to an independently preloaded
+        // request. DRRIP can select a different way from PLRU; data remains exact.
+        var victimWritebackAddress = Option.empty[BigInt]
+        def expectedVictimData(beat: Int): Option[BigInt] = victimWritebackAddress.flatMap { addr =>
+          val index = dirtyAddresses.indexOf(addr)
+          if (index >= 0 && index < dirtyWays) preloadData.get((index, beat)) else None
+        }
+
         def victimDataSummary: String = {
-          val expected0 = preloadData.get((0, 0))
-          val expected2 = preloadData.get((0, 2))
+          val expected0 = expectedVictimData(0)
+          val expected2 = expectedVictimData(2)
           val match0 = expected0.contains(victimBeat0Data)
           val match2 = expected2.contains(victimBeat2Data)
           s" beat0Data=${hex(victimBeat0Data)} beat0Expected=${expected0.map(hex).getOrElse("<unknown>")} beat0DataMatch=${if (match0) 1 else 0}" +
@@ -992,7 +1000,7 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
             printTshr0Probe("SIM_PROGRESS", cycle, upTxReqCount)
           }
 
-          if (selectedCase == "dirty-victim" && !victimBaseSet && issued == 4 && completed == 4) {
+          if (selectedCase == "dirty-victim" && !victimBaseSet && issued == dirtyWays && completed == dirtyWays) {
             victimBaseHost = host(dnTxReqCount, upTxDatCount, completed, dnTxDatCount)
             victimBaseGrant = grants()
             victimBaseSet = true
@@ -1063,7 +1071,7 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
             case "prefetched-clear" | "prefetched-clear-readunique" => false
             case "load-miss" if policyProbe => false
             case "load-miss" => firstCasePrinted
-            case "dirty-victim" => victimBaseSet && completed >= 5 && victimDnTxDatBeat0 && victimDnTxDatBeat2 && victimBeat0BE != 0 && victimBeat2BE != 0
+            case "dirty-victim" => victimBaseSet && completed >= dirtyWays + 1 && victimDnTxDatBeat0 && victimDnTxDatBeat2 && victimBeat0BE != 0 && victimBeat2BE != 0
             case "snoop-data-passdirty" => passSnoopDataPassDirty
           }
 
@@ -1404,7 +1412,13 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
               closedLoopPrefetchIssueCycles.getOrElseUpdate(dut.io.chi.txreq.flit.Addr.get.peek().litValue, cycle)
             }
             if (isEvictReq(opcode)) {
-              if (selectedCase == "dirty-victim" && victimBaseSet) victimDnOpcodes += opcode
+              if (selectedCase == "dirty-victim" && victimBaseSet) {
+                victimDnOpcodes += opcode
+                val address = dut.io.chi.txreq.flit.Addr.get.peek().litValue
+                assert(dirtyAddresses.take(dirtyWays).contains(address), s"writeback of an unpreloaded line: $address")
+                assert(victimWritebackAddress.isEmpty, "dirty-victim must write back exactly one line")
+                victimWritebackAddress = Some(address)
+              }
               val handle = nextHandle
               nextHandle += 1
               val parent = tshrHandles(globalTshr)
@@ -1434,7 +1448,7 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
                 tshrHandles(globalTshr) = Some(handle)
                 rootTshr = Some(globalTshr)
                 origin match {
-                  case L1Origin(_, upTxnID, _, _) if selectedCase == "dirty-victim" && upTxnID.v == 4 =>
+                  case L1Origin(_, upTxnID, _, _) if selectedCase == "dirty-victim" && upTxnID.v == dirtyWays =>
                     victimATshr = globalTshr
                   case _ => ()
                 }
@@ -1475,7 +1489,7 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
               throw new AssertionError(s"DnRXDAT for unknown transaction: cycle=$cycle dnTxn=${p.dnTxnID.v} table=$dnTxnTable"))
             trace(info.handle, info.parentHandle, cycle, "DnRXDAT", "In", fullChiCompDataOpcode.toString, s"TxnID:${p.dnTxnID.v}", s"beat${p.beat}")
             info.origin match {
-              case L1Origin(_, upTxnID, _, _) if selectedCase == "dirty-victim" && upTxnID.v < 4 =>
+              case L1Origin(_, upTxnID, _, _) if selectedCase == "dirty-victim" && upTxnID.v < dirtyWays =>
                 preloadData((upTxnID.v.toInt, dataId)) = data
               case _ => ()
             }
@@ -1634,7 +1648,7 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
               val dataId = dut.io.chi.txdat.flit.DataID.get.peek().litValue
               victimBE = dut.io.chi.txdat.flit.BE.get.peek().litValue
               val data = dut.io.chi.txdat.flit.Data.get.peek().litValue
-              val expectedDataOpt = if (dataId == 0 || dataId == 2) preloadData.get((0, dataId.toInt)) else None
+              val expectedDataOpt = if (dataId == 0 || dataId == 2) expectedVictimData(dataId.toInt) else None
               val dataMatches = expectedDataOpt.contains(data)
               val expectedData = expectedDataOpt.map(hex).getOrElse("<unknown>")
               if (dataId == 0) {
@@ -1726,7 +1740,7 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
               loadMissBTshr = loadMissBTshr.orElse(Some(targetTshr))
               if (selectedCase == "dirty-victim" && dnTxnTable.values.exists(info =>
                   info.handle == parentHandle && (info.origin match {
-                    case L1Origin(_, upTxnID, _, _) => upTxnID.v == 4
+                    case L1Origin(_, upTxnID, _, _) => upTxnID.v == dirtyWays
                     case _ => false
                   }))) victimBTshr = targetTshr
               val allocationKind = if (((allocMask >> (targetTshr % testMshrSize)) & 1) == 1) "alloc" else "reuse"
@@ -1796,7 +1810,7 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
           val dirtyVictimBadBE = selectedCase == "dirty-victim" && victimBaseSet &&
             victimDnTxDatBeat0 && victimDnTxDatBeat2 && (victimBeat0BE == 0 || victimBeat2BE == 0)
           val dirtyVictimDataMatches =
-            preloadData.get((0, 0)).contains(victimBeat0Data) && preloadData.get((0, 2)).contains(victimBeat2Data)
+            expectedVictimData(0).contains(victimBeat0Data) && expectedVictimData(2).contains(victimBeat2Data)
           val dirtyVictimDSReadSeen = grants().dsRd - victimBaseGrant.dsRd > 0
           val dirtyVictimKnownBEFailure = dirtyVictimBadBE && dirtyVictimDataMatches && dirtyVictimDSReadSeen
           val evictBacksComplete = pendingEvictHandleBySource.isEmpty && activeEvictHandleByTshr.isEmpty &&
@@ -1812,7 +1826,7 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
             case "bop-overwrite-queue" => cycle >= 5000 && overwriteExpectedQueue.isEmpty
             case "prefetched-clear" | "prefetched-clear-readunique" => false
             case "load-miss" => firstCasePrinted
-            case "dirty-victim" => victimBaseSet && completed >= 5 && victimDnTxDatBeat0 && victimDnTxDatBeat2 &&
+            case "dirty-victim" => victimBaseSet && completed >= dirtyWays + 1 && victimDnTxDatBeat0 && victimDnTxDatBeat2 &&
               victimBeat0BE != 0 && victimBeat2BE != 0 && evictBacksComplete
             case "snoop-data-passdirty" => passSnoopDataPassDirty
           }
@@ -1847,8 +1861,8 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
             finished = true
             cycle += 1
             if (selectedCase == "dirty-victim") {
-              // 1/1/0/0, not the frozen 5/5/0/0: only the fifth ReadUnique replaces a
-              // dirty line; the first four hit evict_victim_invalid. completed counts
+              // 1/1/0/0, not the frozen 5/5/0/0: only the final ReadUnique replaces a
+              // dirty line; the first ways requests hit evict_victim_invalid. completed counts
               // the target TSHR's dealloc (below), and the downstream request must be
               // WriteBackFull with both CopyBackWrData beats matching the preload.
               assert(evictBackHandles.size == 1 && completedEvictBackHandles.size == 1 &&
@@ -2138,15 +2152,15 @@ object L2TopBuiltInResponseModel extends L2TopResponseModel with ChiselSim {
             // Step 10, derived before running: issue-off drains the queues, so
             // only demands enter REQ. load-miss has one cold read: 1/2/0,
             // completed=1, TRAIN_FIRE=1, EvictBack=0/0/0/0. dirty-victim has
-            // five cold ReadUnique lines in one 4-way set: TRAIN_FIRE=5;
-            // the fifth replaces once (EvictBack=1/1/0/0), with replacement
+            // ways+1 cold ReadUnique lines in one set: TRAIN_FIRE=ways+1;
+            // the final request replaces once (EvictBack=1/1/0/0), with replacement
             // deltas 2/2/2, WriteBackFull 0x1B and both full-BE matching beats.
             // Routing changes which slice owns the set, not these counts.
             if ((noPrefetchIssue || noBop) && !policyProbe &&
                 (selectedCase == "load-miss" || selectedCase == "dirty-victim")) {
               val dirty = selectedCase == "dirty-victim"
-              assert(dut.observation.bopTrainFireCount.peek().litValue == (if (dirty) 5 else 1))
-              assert(completed == (if (dirty) 5 else 1))
+              assert(dut.observation.bopTrainFireCount.peek().litValue == (if (dirty) dirtyWays + 1 else 1))
+              assert(completed == (if (dirty) dirtyWays + 1 else 1))
               assert(evictBackHandles.size == (if (dirty) 1 else 0) &&
                 completedEvictBackHandles.size == (if (dirty) 1 else 0) &&
                 pendingEvictHandleBySource.isEmpty && activeEvictHandleByTshr.isEmpty)

@@ -157,7 +157,25 @@ object TestTop_L2CDPDepth extends App with ChiselSim {
     assert(cdp.trains.contains((lateAddr, BigInt(9), BigInt(3), true)))
     readback(lateAddr, 0, 0)
     val beforeEvict = cdp.evictions.size
-    for (index <- 0 until 10) prefetch(BigInt(0x80000 + index * 0x2000), index % 3 + 1)
+    // Keep the original six real evictions after filling one physical set.
+    // The default 4-way/128-set/one-slice addresses remain unchanged.
+    val geometry = params(L2ParamsKey)
+    val base = BigInt(0x80000)
+    def bank(addr: BigInt): Int = cfg.sliceNum match {
+      case 1 => 0
+      case 2 => (addr >> 6).bitCount & 1
+      case 4 =>
+        val even = (0 until geometry.physicalAddrWidth by 2).count(addr.testBit) & 1
+        val odd = (1 until geometry.physicalAddrWidth by 2).count(addr.testBit) & 1
+        (odd << 1) | even
+    }
+    val stride = BigInt(geometry.sets * geometry.blockBytes)
+    val evictionAddresses = Iterator.from(0).map(i => base + stride * i)
+      .filter(a => bank(a) == bank(base)).take(geometry.ways + 6).toVector
+    require(evictionAddresses.distinct.size == geometry.ways + 6)
+    require(evictionAddresses.forall(a => (a / geometry.blockBytes) % geometry.sets == (base / geometry.blockBytes) % geometry.sets))
+    println(s"CDP_DEPTH_EVICTION_GEOMETRY ways=${geometry.ways} sets=${geometry.sets} slice=${bank(base)} addresses=${evictionAddresses.map(_.toString(16)).mkString(",")}")
+    evictionAddresses.zipWithIndex.foreach { case (addr,index) => prefetch(addr, index % 3 + 1) }
     val victims = cdp.evictions.drop(beforeEvict)
     assert(victims.size >= 6)
     victims.foreach { case (addr, source, depth) =>
