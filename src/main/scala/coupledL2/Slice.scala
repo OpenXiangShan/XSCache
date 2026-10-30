@@ -55,15 +55,17 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   /* Data path and control path */
   val directory = Module(new Directory())
   val dataStorage = Module(new DataStorage())
-  val refillBuf = Module(new MSHRBuffer(wPorts = 2))
-  val releaseBuf = Module(new MSHRBuffer(wPorts = 3))
+  val refillBuf = Module(new MSHRBuffer(wPorts = 4))
+  val releaseBuf = Module(new MSHRBuffer(wPorts = 5))
 
   val reqArb = Module(new RequestArb())
   val mainPipe = Module(new MainPipe())
   val reqBuf = Module(new RequestBuffer())
   val mshrCtl = Module(new MSHRCtl())
   private val mbistPl = MbistPipeline.PlaceMbistPipeline(2, "L2Slice", p(L2ParamKey).hasMbist)
-  sinkC.io.msInfo := mshrCtl.io.msInfo
+  sinkC.io.msInfo := mshrCtl.io.refillInfo
+  sinkC.io.refillBufWriteId := mshrCtl.io.refillBufWriteId
+  sinkC.io.snoopRefillBufWriteId := mshrCtl.io.snoopRefillBufWriteId
 
   grantBuf.io.d_task <> mainPipe.io.toSourceD
   grantBuf.io.fromReqArb.status_s1 := reqArb.io.status_s1
@@ -72,22 +74,31 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   val status_vec_toTX = reqArb.io.status_vec_toTX ++ mainPipe.io.status_vec_toTX
   txreq.io.pipeReq <> mainPipe.io.toTXREQ
   txreq.io.mshrReq <> mshrCtl.io.toTXREQ
+  txreq.io.replacePendingCnt := mshrCtl.io.replaceTxreqPendingCnt
   txreq.io.pipeStatusVec := status_vec_toTX
   txreq.io.sliceId := io.sliceId
 
   txdat.io.in <> mainPipe.io.toTXDAT
+  txdat.io.mshrIn <> mshrCtl.io.toTXDAT
+  mshrCtl.io.txdatDirectSpace := txdat.io.directSpace
   txdat.io.pipeStatusVec := status_vec_toTX
 
   txrsp.io.pipeRsp <> mainPipe.io.toTXRSP
   txrsp.io.mshrRsp <> mshrCtl.io.toTXRSP
   txrsp.io.pipeStatusVec := status_vec_toTX
 
-  rxsnp.io.msInfo := mshrCtl.io.msInfo
+  rxsnp.io.refillInfo := mshrCtl.io.refillInfo
+  rxsnp.io.snoopInfo := mshrCtl.io.snoopInfo
+  rxsnp.io.replaceInfo := mshrCtl.io.replaceInfoForSnoop
+  rxsnp.io.refillVictimDelegated := mshrCtl.io.refillVictimDelegated
+  rxsnp.io.replaceAlloc := mshrCtl.io.replaceAllocForSnoop
 
   directory.io.read <> reqArb.io.dirRead_s1
   directory.io.metaWReq := mainPipe.io.metaWReq
   directory.io.tagWReq := mainPipe.io.tagWReq
-  directory.io.msInfo := mshrCtl.io.msInfo
+  directory.io.refillInfo := mshrCtl.io.refillInfo
+  directory.io.snoopInfo := mshrCtl.io.snoopInfo
+  directory.io.replaceInfo := mshrCtl.io.replaceInfo
 
   dataStorage.io.en := mainPipe.io.toDS.en_s3
   dataStorage.io.req := mainPipe.io.toDS.req_s3
@@ -99,41 +110,72 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   reqArb.io.sinkB <> rxsnp.io.task
   reqArb.io.sinkC <> sinkC.io.task
   reqArb.io.mshrTask <> mshrCtl.io.mshrTask
+  reqArb.io.mshrLeaseToken := mshrCtl.io.mshrTaskLeaseToken
+  mshrCtl.io.bServiceStart := reqArb.io.bServiceStart
+  mshrCtl.io.sidecarReservationHold := reqArb.io.sidecarReservationHold
+  mshrCtl.io.contextReservation := reqArb.io.contextReservation
+  txdat.io.reservedB := reqArb.io.reservedB
+  txrsp.io.reservedB := reqArb.io.reservedB
   reqArb.io.fromMSHRCtl := mshrCtl.io.toReqArb
   reqArb.io.fromMainPipe := mainPipe.io.toReqArb
+  reqArb.io.blockRefillOnlyCommit := mainPipe.io.blockRefillOnlyCommit
   reqArb.io.fromGrantBuffer := grantBuf.io.toReqArb
   reqArb.io.fromTXDAT := txdat.io.toReqArb
   reqArb.io.fromTXRSP := txrsp.io.toReqArb
   reqArb.io.fromTXREQ := txreq.io.toReqArb
-  reqArb.io.msInfo := mshrCtl.io.msInfo
+  reqArb.io.msInfo := mshrCtl.io.refillInfo
 
   reqBuf.io.in <> sinkA.io.task
-  reqBuf.io.mshrInfo := mshrCtl.io.msInfo
+  reqBuf.io.mshrInfo := mshrCtl.io.refillInfo
+  reqBuf.io.snoopInfo := mshrCtl.io.snoopInfo
   reqBuf.io.mainPipeBlock := mainPipe.io.toReqBuf
   reqBuf.io.pipeStatusVec(0) := reqArb.io.status_vec(1) // s2 status
-  reqBuf.io.pipeStatusVec(1) := mainPipe.io.status_vec_toD(0) // s3 status
+  reqBuf.io.pipeStatusVec(1) := mainPipe.io.status_vec_toD(3) // result capture
+  reqBuf.io.pipeStatusVec(2) := mainPipe.io.status_vec_toD(0) // S3 apply
   reqBuf.io.s1Entrance := reqArb.io.s1Entrance
   reqBuf.io.taskFromArb_s2 := reqArb.io.taskToPipe_s2
 
   mainPipe.io.taskFromArb_s2 := reqArb.io.taskToPipe_s2
+  mainPipe.io.taskLeaseToken_s2 := reqArb.io.taskLeaseToken_s2
   mainPipe.io.mshrHintQInfo := reqArb.io.mshrHintQInfo
   mainPipe.io.sinkCHintQInfo := reqArb.io.sinkCHintQInfo
   reqArb.io.hint_s1QueueFull := mainPipe.io.hint_s1QueueFull
   mainPipe.io.fromReqArb.status_s1 := reqArb.io.status_s1
-  mainPipe.io.bufResp := sinkC.io.bufResp
-  mainPipe.io.dirResp_s3 := directory.io.resp.bits
-  mainPipe.io.replResp := directory.io.replResp
-  mainPipe.io.metaOnHit_s3 := directory.io.metaOnHit
-  mainPipe.io.errOnSnp_s3 := directory.io.errOnSnp
-  mainPipe.io.dirWayOH_s3 := directory.io.wayOH
-  mainPipe.io.dirReplWayOH_s3 := directory.io.replWayOH
-  mainPipe.io.cmoHitInvalid := directory.io.cmoHitInvalid
+  // Complete S3 event: Directory, task (in MainPipe), C payload and both
+  // MSHR-buffer returns advance together. No individual hit/retry bypass
+  // reaches the owner/allocation logic ahead of the registered transaction.
+  val directoryEvent = Wire(new Bundle {
+    val result = Valid(new DirResult)
+    val replacement = Valid(new ReplacerResult)
+    val metaOnHit = new MetaEntry
+    val errOnSnp = Bool()
+    val wayOH = UInt(cacheParams.ways.W)
+    val replWayOH = UInt(cacheParams.ways.W)
+    val cmoHitInvalid = Bool()
+  })
+  directoryEvent.result := directory.io.resp
+  directoryEvent.replacement := directory.io.replResp
+  directoryEvent.metaOnHit := directory.io.metaOnHit
+  directoryEvent.errOnSnp := directory.io.errOnSnp
+  directoryEvent.wayOH := directory.io.wayOH
+  directoryEvent.replWayOH := directory.io.replWayOH
+  directoryEvent.cmoHitInvalid := directory.io.cmoHitInvalid
+  val directoryEventReg = RegNext(directoryEvent, 0.U.asTypeOf(directoryEvent))
+  mainPipe.io.bufResp := RegNext(sinkC.io.bufResp)
+  mainPipe.io.dirResp_s3 := directoryEventReg.result.bits
+  mainPipe.io.replResp := directoryEventReg.replacement
+  mainPipe.io.metaOnHit_s3 := directoryEventReg.metaOnHit
+  mainPipe.io.errOnSnp_s3 := directoryEventReg.errOnSnp
+  mainPipe.io.dirWayOH_s3 := directoryEventReg.wayOH
+  mainPipe.io.dirReplWayOH_s3 := directoryEventReg.replWayOH
+  mainPipe.io.cmoHitInvalid := directoryEventReg.cmoHitInvalid
   mainPipe.io.retryFastFwd_s2 := directory.io.retryFastFwd
   mainPipe.io.fromMSHRCtl <> mshrCtl.io.toMainPipe
-  mainPipe.io.refillBufResp_s3.valid := RegNext(refillBuf.io.r.valid, false.B)
-  mainPipe.io.refillBufResp_s3.bits := refillBuf.io.resp.data
-  mainPipe.io.releaseBufResp_s3.valid := RegNext(releaseBuf.io.r.valid, false.B)
-  mainPipe.io.releaseBufResp_s3.bits := releaseBuf.io.resp.data
+  mainPipe.io.refillBufResp_s3.valid := RegNext(RegNext(refillBuf.io.r.valid, false.B), false.B)
+  mainPipe.io.refillBufResp_s3.bits.id := RegNext(refillBuf.io.resp.id)
+  mainPipe.io.refillBufResp_s3.bits.data := RegNext(refillBuf.io.resp.data)
+  mainPipe.io.releaseBufResp_s3.valid := RegNext(RegNext(releaseBuf.io.r.valid, false.B), false.B)
+  mainPipe.io.releaseBufResp_s3.bits := RegNext(releaseBuf.io.resp.data)
   mainPipe.io.toDS.rdata_s5 := dataStorage.io.rdata
   mainPipe.io.toDS.error_s5 := dataStorage.io.error
   // mainPipe.io.grantBufferHint := grantBuf.io.l1Hint
@@ -142,40 +184,91 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   mshrCtl.io.fromReqArb.status_s1 := reqArb.io.status_s1
   mshrCtl.io.fromMainPipe <> mainPipe.io.toMSHRCtl
   mshrCtl.io.fromMainPipe.mshr_alloc_s3 := mainPipe.io.toMSHRCtl.mshr_alloc_s3
+  mshrCtl.io.txdatDone := txdat.io.done
+  mshrCtl.io.txrspDone := txrsp.io.done
   mshrCtl.io.grantStatus := grantBuf.io.grantStatus
   mshrCtl.io.resps.sinkC := sinkC.io.resp
+  mshrCtl.io.sinkCReleaseData := sinkC.io.releaseData
   mshrCtl.io.resps.rxrsp := rxrsp.io.in
   mshrCtl.io.resps.rxdat := rxdat.io.in
   mshrCtl.io.nestedwb := mainPipe.io.nestedwb
-  mshrCtl.io.replResp := directory.io.replResp
+  mshrCtl.io.replResp := directoryEventReg.replacement
   mshrCtl.io.aMergeTask := reqBuf.io.aMergeTask
   // TODO: This is ugly
   mshrCtl.io.pipeStatusVec(0) := (reqArb.io.status_vec)(1) // s2 status
-  mshrCtl.io.pipeStatusVec(1) := mainPipe.io.status_vec_toD(0) // s3 status
+  mshrCtl.io.pipeStatusVec(1) := mainPipe.io.status_vec_toD(3) // result capture
+  mshrCtl.io.pipeStatusVec(2) := mainPipe.io.status_vec_toD(0) // S3 apply
 
   /* Read and write release buffer */
   releaseBuf.io.r := reqArb.io.releaseBufRead_s2
+  // Second read port: direct ReplaceMSHR->TXDAT copyback path.
+  releaseBuf.io.r2 := mshrCtl.io.releaseBufDirectRd
+  mshrCtl.io.releaseBufDirectResp := releaseBuf.io.resp2
   val nestedWriteReleaseBuf,
+    nestedWriteReleaseBufExtra,
     sinkCWriteReleaseBuf,
+    sinkCWriteReleaseBufExtra,
     mpWriteReleaseBuf = Wire(Valid(new MSHRBufWrite()))
-  nestedWriteReleaseBuf.valid := mshrCtl.io.nestedwbDataId.valid
-  nestedWriteReleaseBuf.bits.data := mainPipe.io.nestedwbData
-  nestedWriteReleaseBuf.bits.id := mshrCtl.io.nestedwbDataId.bits
-  nestedWriteReleaseBuf.bits.beatMask := Fill(beatSize, true.B)
+  mshrCtl.io.sinkCProbeAckPayload := sinkC.io.releaseBufWrite.bits.data
+  mshrCtl.io.sinkCRefillWrite := sinkC.io.refillBufWrite
+  mshrCtl.io.nestedwbPayload := mainPipe.io.nestedwbData
+  nestedWriteReleaseBuf := mshrCtl.io.nestedReleaseWrites(0)
+  nestedWriteReleaseBufExtra := mshrCtl.io.nestedReleaseWrites(1)
+  def releaseSnapshotIsOlder(id: UInt): Bool =
+    (UIntToOH(id, mshrsAll) & mshrCtl.io.nestedReleaseAuthority).orR
   sinkCWriteReleaseBuf match { case x =>
     x := sinkC.io.releaseBufWrite
     x.bits.id := mshrCtl.io.releaseBufWriteId
+    x.valid := sinkC.io.releaseBufWrite.valid && !releaseSnapshotIsOlder(x.bits.id)
+  }
+  sinkCWriteReleaseBufExtra match { case x =>
+    x := mshrCtl.io.releaseBufWriteExtra
+    x.valid := mshrCtl.io.releaseBufWriteExtra.valid &&
+      !releaseSnapshotIsOlder(mshrCtl.io.releaseBufWriteExtra.bits.id)
   }
   mpWriteReleaseBuf := mainPipe.io.releaseBufWrite
+  mpWriteReleaseBuf.valid := mainPipe.io.releaseBufWrite.valid &&
+    !releaseSnapshotIsOlder(mainPipe.io.releaseBufWrite.bits.id)
   releaseBuf.io.w <> VecInit(Seq(
     nestedWriteReleaseBuf,
+    nestedWriteReleaseBufExtra,
     sinkCWriteReleaseBuf,
+    sinkCWriteReleaseBufExtra,
     mpWriteReleaseBuf
   ))
 
   /* Read and write refill buffer */
   refillBuf.io.r := reqArb.io.refillBufRead_s2
-  refillBuf.io.w <> VecInit(Seq(rxdat.io.refillBufWrite, sinkC.io.refillBufWrite))
+  // RefillBuf has no direct-path consumer; tie off the second read port.
+  refillBuf.io.r2.valid := false.B
+  refillBuf.io.r2.bits := 0.U.asTypeOf(new MSHRBufRead)
+  val nestedWriteRefillBuf = Wire(Valid(new MSHRBufWrite()))
+  nestedWriteRefillBuf.valid := mshrCtl.io.nestedwbRefillDataId.valid
+  nestedWriteRefillBuf.bits.data := mainPipe.io.nestedwbData
+  nestedWriteRefillBuf.bits.id := mshrCtl.io.nestedwbRefillDataId.bits
+  nestedWriteRefillBuf.bits.beatMask := Fill(beatSize, true.B)
+  val rxdatWriteRefillBuf = WireInit(rxdat.io.refillBufWrite)
+  val rxdatTargetsReleaseOwnedRefill =
+    (UIntToOH(rxdat.io.refillBufWrite.bits.id, mshrsAll) & mshrCtl.io.refillBufReleaseOwner).orR
+  // A CompData whose DBID belongs to the previous tenant of this TxnID must
+  // not overwrite the new tenant's RefillBuf (see MSHRCtl.rxdatStaleSlots).
+  val rxdatTargetsStaleSlot =
+    (UIntToOH(rxdat.io.refillBufWrite.bits.id, mshrsAll) & mshrCtl.io.rxdatStaleSlots).orR
+  rxdatWriteRefillBuf.valid := rxdat.io.refillBufWrite.valid &&
+    !rxdatTargetsReleaseOwnedRefill && !rxdatTargetsStaleSlot
+  // A Get-on-TRUNK DS snapshot is only a fallback.  Once matching
+  // ReleaseData owns RefillBuf, a later S5 snapshot must not overwrite the
+  // authoritative dirty payload.
+  val mainPipeWriteRefillBuf = WireInit(mainPipe.io.refillBufWrite)
+  val mainPipeTargetsReleaseOwnedRefill =
+    (UIntToOH(mainPipe.io.refillBufWrite.bits.id, mshrsAll) & mshrCtl.io.refillBufReleaseOwner).orR
+  mainPipeWriteRefillBuf.valid := mainPipe.io.refillBufWrite.valid && !mainPipeTargetsReleaseOwnedRefill
+  refillBuf.io.w <> VecInit(Seq(
+    rxdatWriteRefillBuf,
+    mshrCtl.io.sinkCRefillWriteApplied,
+    mainPipeWriteRefillBuf,
+    nestedWriteRefillBuf
+  ))
 
   io.prefetch.foreach { p =>
     p.train <> mainPipe.io.prefetchTrain.get
@@ -266,7 +359,13 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
 
   /* Connect l2 flush All channel */ 
   sinkA.io.cmoAll.foreach {cmoAll => cmoAll.cmoLineDone := mainPipe.io.cmoLineDone.getOrElse(false.B)}
-  sinkA.io.cmoAll.foreach {cmoAll => cmoAll.mshrValid := VecInit(mshrCtl.io.msInfo.map(m => m.valid)).reduce(_|_)}
+  sinkA.io.cmoAll.foreach { cmoAll =>
+    cmoAll.mshrValid := VecInit(
+      mshrCtl.io.refillInfo.map(_.valid) ++
+      mshrCtl.io.snoopInfo.map(_.valid) ++
+      mshrCtl.io.replaceInfo.map(_.valid)
+    ).reduce(_|_)
+  }
   sinkA.io.cmoAll.foreach {cmoAll => cmoAll.l2Flush := io.l2Flush.getOrElse(false.B)}
   mainPipe.io.cmoAllBlock.foreach {_ := sinkA.io.cmoAll.map(_.cmoAllBlock).getOrElse(false.B)}
 

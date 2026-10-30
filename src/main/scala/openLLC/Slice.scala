@@ -104,6 +104,7 @@ class Slice()(implicit p: Parameters) extends LLCModule {
     0.U.asTypeOf(new DSBlock()),
     RegNext(refillUnit.io.read.valid, false.B)
   )
+  dataStorage.io.writeFirst := mainPipe.io.toDS_s4.writeFirst
   mainPipe.io.rdataFromDS_s6 <> dataStorage.io.rdata
 
   directory.io.read <> reqArb.io.dirRead_s1
@@ -120,7 +121,14 @@ class Slice()(implicit p: Parameters) extends LLCModule {
   refillUnit.io.resp <> rxrspUp.io.out
   refillUnit.io.alloc <> mainPipe.io.refillReq_s4
 
-  memUnit.io.fromMainPipe <> mainPipe.io.toMemUnit
+  memUnit.io.fromMainPipe.alloc_s4 <> mainPipe.io.toMemUnit.alloc_s4
+  // A replace-snoop writeback and a MainPipe write share alloc_s6. MainPipe wins.
+  val wb_s6 = snpUnit.io.writeback
+  val mp_s6 = mainPipe.io.toMemUnit.alloc_s6
+  memUnit.io.fromMainPipe.alloc_s6.valid := mp_s6.valid || wb_s6.valid
+  memUnit.io.fromMainPipe.alloc_s6.bits := Mux(mp_s6.valid, mp_s6.bits, wb_s6.bits)
+  snpUnit.io.writebackAccept := wb_s6.valid && !mp_s6.valid
+  snpUnit.io.memInfo := memUnit.io.memInfo
   memUnit.io.urgentRead <> responseUnit.io.urgentRead
   memUnit.io.rnRxdat <> rxdatUp.io.out
   memUnit.io.rnRxrsp <> rxrspUp.io.out
@@ -137,6 +145,8 @@ class Slice()(implicit p: Parameters) extends LLCModule {
   snpUnit.io.in <> mainPipe.io.snoopTask_s4
   snpUnit.io.respInfo <> responseUnit.io.respInfo
   snpUnit.io.ack <> rxrspUp.io.out
+  snpUnit.io.snpRsp <> rxrspUp.io.out
+  snpUnit.io.snpData <> rxdatUp.io.out
 
   io.snpMask := txsnpUp.io.snpMask
 

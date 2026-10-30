@@ -36,8 +36,13 @@ class TXREQ(implicit p: Parameters) extends CoupledL2Module {
     val mshrReq = Flipped(DecoupledIO(new CHIREQ()))
     val out = DecoupledIO(new CHIREQ())
 
-    val pipeStatusVec = Flipped(Vec(5, ValidIO(new PipeStatusWithCHI)))
+    val pipeStatusVec = Flipped(Vec(6, ValidIO(new PipeStatusWithCHI)))
     val toReqArb = Output(new TXBlockBundle)
+
+    // Committed ReplaceMSHR releases waiting in the per-context TXREQ skids.
+    // They are not yet in the queue and do not appear in pipeStatusVec, so
+    // inflightCnt must add them explicitly.
+    val replacePendingCnt = Input(UInt(log2Up(mshrsAll + 1).W))
 
     val sliceId = Input(UInt(bankBits.W))
   })
@@ -45,8 +50,16 @@ class TXREQ(implicit p: Parameters) extends CoupledL2Module {
   assert(!io.pipeReq.valid || io.pipeReq.ready, "TXREQ should always be ready for pipeline req")
   require(chiOpt.isDefined)
 
-  // TODO: an mshrsAll-entry queue is too much, evaluate for a proper size later
-  val queue = Module(new Queue(new CHIREQ, entries = mshrsAll, flow = false))
+  // Worst-case flit pressure in the multi-context MSHR design:
+  //   normal reads (one CHI read per normal context)      <= mshrsAll
+  //   ReplaceMSHR releases (WriteBackFull/Evict per child) <= mshrsAll
+  // Snoop contexts do not issue TXREQ, so the bound is 2*mshrsAll (in the
+  // pre-split design one MSHR issued read->release sequentially and the bound
+  // was mshrsAll). The queue and gate must cover both classes or a stalled
+  // link overflows the always-ready pipeReq path and silently drops a flit.
+  // A replace release is counted as in flight from its skid capture in
+  // MSHRCtl until it leaves this queue.
+  val queue = Module(new Queue(new CHIREQ, entries = 2 * mshrsAll, flow = false))
   
   // Back pressure logic from TXREQ
   val queueCnt = queue.io.count
@@ -56,16 +69,21 @@ class TXREQ(implicit p: Parameters) extends CoupledL2Module {
   val pipeStatus_s1 = pipeStatus_s1_s5.head
   val pipeStatus_s2 = pipeStatus_s1_s5(1)
   val s2ReturnCredit = pipeStatus_s2.valid && !(pipeStatus_s2.bits.mshrTask && pipeStatus_s2.bits.toTXREQ)
-  // inflightCnt equals the number of reqs on s2~s5 that may flow into TXREQ soon, plus queueCnt.
+  // inflightCnt equals the number of reqs on s2~s5 that may flow into TXREQ soon, plus queueCnt,
+  // plus the ReplaceMSHR skid occupancy (those flits have left their sidecar but
+  // are still waiting in front of the MSHR->TXREQ arbiter).  Every skid entry is
+  // one replace context's single release flit, so the 2*mshrsAll bound below
+  // still holds: <= mshrsAll normal reads + <= mshrsAll replace releases.
   // The calculation of inflightCnt might be imprecise and leads to false positive back pressue.
   val inflightCnt = PopCount(Cat(pipeStatus_s2_s5.map(s => s.valid && s.bits.mshrTask && s.bits.toTXREQ))) +
 //    pipeStatus_s1.valid.asUInt +
-    1.U - s2ReturnCredit.asUInt + //Fix Timing: always take credit and s2 return if not take 
-    queueCnt
+    1.U - s2ReturnCredit.asUInt + //Fix Timing: always take credit and s2 return if not take
+    queueCnt +
+    io.replacePendingCnt
 
-  assert(inflightCnt <= mshrsAll.U, "in-flight overflow at TXREQ")
+  assert(inflightCnt <= (2 * mshrsAll + 4).U, "in-flight overflow at TXREQ")
 
-  val noSpace = inflightCnt >= mshrsAll.U
+  val noSpace = inflightCnt >= (2 * mshrsAll).U
 
   io.toReqArb.blockMSHRReqEntrance := noSpace
 

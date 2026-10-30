@@ -464,8 +464,7 @@ class StudentFilterTable(name: String = "")(implicit p: Parameters) extends BOPM
   }
 
   private def addOffset(addr: UInt, offset: SInt): UInt = {
-    val offsetBytes = signedExtend(offset.asUInt << offsetBits, fullAddrBits)
-    (addr + offsetBytes)(fullAddrBits - 1, 0)
+    BOPAddressAdd(addr, offset, offsetBits)
   }
 
   val io = IO(new Bundle {
@@ -1137,8 +1136,8 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   // NOTE: vaddr from l1 to l2 has no offset bits
   val s0_oldFullAddr = Cat(io.train.bits.vaddr.getOrElse(0.U), 0.U(offsetBits.W))
   val s0_oldFullAddrNoOff = s0_oldFullAddr(s0_oldFullAddr.getWidth-1, offsetBits)
-  val s0_newFullAddr = s0_oldFullAddr + signedExtend((issueOffset << offsetBits), fullAddrBits)
-  val s0_newPaddr = io.train.bits.addr + signedExtend((issueOffset << offsetBits), fullAddressBits)
+  val s0_newFullAddr = BOPAddressAdd(s0_oldFullAddr.pad(fullAddrBits), issueOffset.asSInt, offsetBits)
+  val s0_newPaddr = BOPAddressAdd(io.train.bits.addr, issueOffset.asSInt, offsetBits)
   val s0_crossPage = getPPN(s0_newFullAddr) =/= getPPN(s0_oldFullAddr) // unequal tags
 
   rrTable.io.r <> scoreTable.io.test
@@ -1242,7 +1241,7 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val issueEnable = (studentSelectedEnable || !teacherDisable) && issueGate
   val s0_oldAddr = io.train.bits.addr
   val s0_oldAddrNoOff = s0_oldAddr(s0_oldAddr.getWidth-1, offsetBits)
-  val s0_newAddr = s0_oldAddr + signedExtend((issueOffset << offsetBits), fullAddressBits)
+  val s0_newAddr = BOPAddressAdd(s0_oldAddr, issueOffset.asSInt, offsetBits)
   val s0_crossPage = getPPN(s0_newAddr) =/= getPPN(s0_oldAddr) // unequal tags
 
   rrTable.io.r <> scoreTable.io.test

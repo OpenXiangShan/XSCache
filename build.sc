@@ -102,6 +102,11 @@ object XSCache extends HasChisel with $file.common.XSCacheModule {
     override def sources = T.sources {
       Seq(
         PathRef(pwd / "src" / "test" / "scala" / "ReplacementPolicyTest.scala"),
+        PathRef(pwd / "src" / "test" / "scala" / "TimingPathOptimizationTest.scala"),
+        PathRef(pwd / "src" / "test" / "scala" / "ReplacementAdmissionPairMiter.scala"),
+        PathRef(pwd / "src" / "test" / "scala" / "GrantAdmissionOwnershipTest.scala"),
+        PathRef(pwd / "src" / "test" / "scala" / "TimingOwnershipBoundaryTest.scala"),
+        PathRef(pwd / "src" / "test" / "scala" / "CmoMonitorTest.scala"),
         PathRef(pwd / "src" / "test" / "scala" / "TestSplittedSRAM.scala")
       )
     }
