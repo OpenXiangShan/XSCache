@@ -816,6 +816,21 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val relCommitLocalValid = if (paramL2.dirRelSingleCycle) dirRelReq.RRIP_LOCAL_VALID else relLocalValid
   val relCommitPrefetch = if (paramL2.dirRelSingleCycle) dirRelReq.META.prefetch else relPrefetch
 
+  // A full-SRAM R miss returns its origin row in the first W cycle. Immediate W
+  // uses that response directly; a delayed W uses this per-request copy so an
+  // intervening dirrel-low read cannot replace the row before the RMW commit.
+  val relOriginHold = if (useOriginSram) Some(Reg(UInt(ways.W))) else None
+  val relOriginHoldValid = if (useOriginSram) Some(RegInit(false.B)) else None
+  if (useOriginSram) {
+    when (relActive && !relReplCAMHit && !relOriginHoldValid.get) {
+      relOriginHold.get := originSramRead_s2.get
+      relOriginHoldValid.get := true.B
+    }
+    when (dirRelGrant || (relActive && relConflict) || dirRelCommitFire) {
+      relOriginHoldValid.get := false.B
+    }
+  }
+
   // Class-level scheduling events, not per-request latency measurements. The
   // normal-block event requires an actual normal grant to be the only remaining
   // R/W-slot blocker; other wait reasons are non-exclusive hazard observations.
@@ -1158,7 +1173,11 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val relCommitReplCAMMatchNow = replCAMMatch(relCommitSet)
   val relCommitReplCAMHitNow = relCommitReplCAMMatchNow.orR
   val relCommitReplCAMIndexNow = PriorityEncoder(relCommitReplCAMMatchNow)
-  val relOriginBacking = if (useOriginSram) originSramRead_s2.get else originFF.get(relCommitSet)
+  val relOriginBacking = if (useOriginSram) {
+    Mux(relOriginHoldValid.get, relOriginHold.get, originSramRead_s2.get)
+  } else {
+    originFF.get(relCommitSet)
+  }
   val relReplCAMOrigin = if (useOriginSram) replCAM.get(relCommitReplCAMIndexNow).origin.get else 0.U(ways.W)
   val relOrigin = if (useRRIPSram) {
     Mux(relCommitReplCAMHitNow && useOriginSram.B, relReplCAMOrigin(relCommitWay), relOriginBacking(relCommitWay))
