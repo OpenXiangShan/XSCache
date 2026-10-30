@@ -88,10 +88,10 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
     val repl_en = Input(Bool())
     val repl_reset = Input(Bool())
 
-    // DRRIP release-type update (commit path): validated release-commit pulse
-    // from the EVT vPipe, serviced by the dedicated DirRel FSM below.
-    // Elaborated only when the DirRel path is enabled.
-    val repl_release = if (paramL2.enableDRRIPReleaseUpdate) Some(Input(Bool())) else None
+    // Acceptance-time release pulse and exact way from the EVT vPipe. WayValid
+    // uses the flit way; other releases use their DirRd-derived way.
+    val repl_release = if (enableRRIPReleaseUpdate) Some(Input(Bool())) else None
+    val repl_way = if (enableRRIPReleaseUpdate) Some(Input(UInt(wayBits.W))) else None
 
     val meta = Input(new L2Directory.Meta)
     val meta_way = Input(UInt(wayBits.W))
@@ -100,6 +100,9 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
     val meta_modified = Input(new L2Directory.MetaWriteMask)
     val tag_modify = Input(Bool())
     val tag_modified = Input(Bool())
+    val rrip_update = Input(Bool())
+    val rrip_prefetch = Input(Bool())
+    val rrip_refill_prefetch = Input(Bool())
 
     val rd_idle = Output(Bool())
     val rd_accept = Output(Bool())
@@ -116,6 +119,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
     val wb_aux = Input(Bool())
     val wb_accept = Output(Bool())
     val wb_done = Output(Bool())
+    val rel_idle = Output(Bool())
   })
 
   // Whether the meta was aggressively immediately trying to be written back on every modification.
@@ -435,59 +439,71 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   assert(!(fromDir_DirWbArbComp && !state_dirWrite.PreArb), "receiving DirWbArbComp on unexpected state (expecting PreArb)")
   assert(PopCount(state_dirWrite.asUInt) <= 1.U, "multiple active states in DirWriteFSM")
 
-  // ── DirRel FSM (DRRIP release-type update, commit path) ──────────────────
-  // Totally separate from the directory read/write (commit) machinery: a
-  // validated release-commit pulse from the EVT vPipe parks here until the
-  // directory's separate DirRel arbiter grants it. Never rides, shares, or
-  // depends on the DirRead/DirWrite (commit) FSMs. A pulse arriving while a
-  // previous DirRel is still pending is absorbed — the pending request covers
-  // the same (set, way) by TSHR construction. Elaborated only when the DirRel
-  // path is enabled (the repl_release input port exists only then).
-  if (paramL2.enableDRRIPReleaseUpdate) {
-    val fromDir_DirRelArbComp = fromDir_en && io.fromDir.DirRelArbComp
+  val dirRelActive = WireDefault(false.B)
+  val dirRelWay = WireDefault(0.U(wayBits.W))
+  val dirRelPrefetch = WireDefault(false.B)
+  val dirRelIdle = WireDefault(true.B)
+  io.rel_idle := dirRelIdle
 
+  // One pending release holds the exact way and acceptance-time provenance
+  // until Directory completes its update. Back-to-back same-PA EVT releases are
+  // excluded by the microarchitecture, so a second pulse is an assertion error.
+  if (enableRRIPReleaseUpdate) {
+    val fromDir_DirRelArbComp = fromDir_en && io.fromDir.DirRelArbComp
     val state_dirRel = RegInit(new DirRelFSM, DirRelFSM.init)
     val state_dirRel_next = WireInit(state_dirRel)
+    val pendingWay = Reg(UInt(wayBits.W))
+    val pendingLocalValid = Reg(Bool())
+    val pendingPrefetch = Reg(Bool())
 
     state_dirRel := state_dirRel_next
 
     when (io.repl_release.get) {
-      when (state_dirRel.NotYet || state_dirRel.Done) {
-        state_dirRel_next.PreArb := true.B
-        state_dirRel_next.Done := false.B
-      }
+      assert(state_dirRel.NotYet || state_dirRel.Done,
+        "back-to-back same-PA EVT release while DirRel is pending")
+      state_dirRel_next.PreArb := true.B
+      state_dirRel_next.Done := false.B
+      pendingWay := io.repl_way.get
+      pendingLocalValid := io.rd_done || io.meta_modified.prefetch
+      pendingPrefetch := io.meta.prefetch
     }
 
-    when (state_dirRel.PreArb) {
-      when (fromDir_DirRelArbComp) {
-        state_dirRel_next.PreArb := false.B
-        state_dirRel_next.Done := true.B
-      }
+    when (state_dirRel.PreArb && fromDir_DirRelArbComp) {
+      state_dirRel_next.PreArb := false.B
+      state_dirRel_next.Done := true.B
     }
 
     when (io.tshr_dealloc) {
       state_dirRel_next := DirRelFSM.init
     }
 
-    assert(!(fromDir_DirRelArbComp && !state_dirRel.PreArb), "receiving DirRelArbComp on unexpected state (expecting PreArb)")
-    assert(PopCount(state_dirRel.asUInt) <= 1.U, "multiple active states in DirRelFSM")
-
-    // Drive-time exclusion only: the DirRel FSM keeps its PreArb state while a
-    // sibling FSM occupies toDir and resumes once it clears — one TSHR never
-    // asserts two op types in the same cycle.
+    dirRelIdle := state_dirRel.NotYet || state_dirRel.Done
+    dirRelActive := state_dirRel.PreArb
+    dirRelWay := pendingWay
+    dirRelPrefetch := pendingPrefetch
     io.toDir.DirRel := state_dirRel.PreArb &&
       !(state_dirRead.PreArb || state_dirRead.ReplPreArb || state_dirWrite.PreArb)
+    io.toDir.RRIP_LOCAL_VALID := state_dirRel.PreArb && pendingLocalValid
+
+    assert(!(fromDir_DirRelArbComp && !state_dirRel.PreArb), "receiving DirRelArbComp on unexpected state (expecting PreArb)")
+    assert(PopCount(state_dirRel.asUInt) <= 1.U, "multiple active states in DirRelFSM")
   } else {
     io.toDir.DirRel := false.B
+    io.toDir.RRIP_LOCAL_VALID := false.B
   }
 
   // interactions with Directory
   io.toDir.TSHRID := io.tshrId
   io.toDir.PADDR := io.tshr_paddr
-  io.toDir.WAY := io.meta_way
+  io.toDir.WAY := Mux(dirRelActive, dirRelWay, io.meta_way)
   io.toDir.META := io.meta
+  io.toDir.META.prefetch := Mux(dirRelActive, dirRelPrefetch, io.meta.prefetch)
   io.toDir.META_WEN := io.meta_modified
+  io.toDir.META_WEN.prefetch := io.meta_modified.prefetch && !dirRelActive
   io.toDir.TAG_WEN := io.tag_modified
+  io.toDir.RRIP_UPDATE := io.rrip_update
+  io.toDir.RRIP_PREFETCH := io.rrip_prefetch
+  io.toDir.RRIP_REFILL_PREFETCH := io.rrip_refill_prefetch
   io.toDir.DirRd := state_dirRead.PreArb
   io.toDir.DirWb := state_dirWrite.PreArb && !io.wb_locked
   io.toDir.ReplRd := state_dirRead.ReplPreArb

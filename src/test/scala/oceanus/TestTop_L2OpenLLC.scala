@@ -267,14 +267,17 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       --l2-sets <n>             L2 sets per slice, 32 by default (power of two)
       --l2-ways <n>             L2 ways per slice, 4 by default (power of two)
       --l2-replacement <pol>    L2 replacement policy, drrip by default;
-                                plru is hardwired for 4 ways, drrip supports
-                                any power-of-two way count
+                                plru is hardwired for 4 ways; drrip/srrip/brrip
+                                support any power-of-two way count
       --l2-drrip-release-update <0|1>
                                 DRRIP release-type update via the arbitrated
-                                DirRel op at the EVT vPipe commit, 1 (on) by default
-      --l2-drrip-entrance-release-update <0|1>
-                                DRRIP release-type update at WayValid EVT
-                                entrances, 1 (on) by default
+                                DirRel op at EVT vPipe acceptance, 1 (on) by default
+      --l2-drrip-use-sram <0|1>   RRIP SRAM+CAM backend (1) or FF backend (0)
+      --l2-origin-use-sram <0|1>  origin SRAM (1) or FF-only backing (0)
+      --l2-dirrel-arbitration <mode>
+                                dirrel-high, rr (default), or dirrel-low
+      --l2-dirrel-single-cycle <0|1>
+                                single-cycle DirRel in the origin-FF backend
       --llc-sets <n>            OpenLLC sets per bank, 64 by default (power of two)
       --llc-ways <n>            OpenLLC ways per bank, 4 by default (power of two)
       --llc-banks <n>           OpenLLC banks, 1 by default (power of two)
@@ -299,7 +302,10 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
   var l2Ways = 4
   var l2Replacement = "drrip"
   var l2DRRIPReleaseUpdate = true
-  var l2DRRIPEntranceReleaseUpdate = true
+  var l2DRRIPUseSRAM = true
+  var l2OriginUseSRAM = true
+  var l2DirRelArbitration = "rr"
+  var l2DirRelSingleCycle = false
   var llcSets = 64
   var llcWays = 4
   var llcBanks = 1
@@ -318,7 +324,10 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       case "--l2-ways"  => l2Ways = args(i + 1).toInt; i += 2
       case "--l2-replacement" => l2Replacement = args(i + 1); i += 2
       case "--l2-drrip-release-update" => l2DRRIPReleaseUpdate = args(i + 1) == "1"; i += 2
-      case "--l2-drrip-entrance-release-update" => l2DRRIPEntranceReleaseUpdate = args(i + 1) == "1"; i += 2
+      case "--l2-drrip-use-sram" => l2DRRIPUseSRAM = args(i + 1) == "1"; i += 2
+      case "--l2-origin-use-sram" => l2OriginUseSRAM = args(i + 1) == "1"; i += 2
+      case "--l2-dirrel-arbitration" => l2DirRelArbitration = args(i + 1); i += 2
+      case "--l2-dirrel-single-cycle" => l2DirRelSingleCycle = args(i + 1) == "1"; i += 2
       case "--llc-sets" => llcSets = args(i + 1).toInt; i += 2
       case "--llc-ways" => llcWays = args(i + 1).toInt; i += 2
       case "--llc-banks" => llcBanks = args(i + 1).toInt; i += 2
@@ -333,8 +342,8 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
   require(numSlices >= 1 && numSlices <= 4, s"Unsupported slice count $numSlices under eSAM")
   require(tshrs >= 4, s"Unsupported TSHR count $tshrs (3 entries are reserved)")
   require(isPow2(l2Sets) && isPow2(l2Ways), s"L2 sets/ways must be powers of two: $l2Sets/$l2Ways")
-  require(l2Replacement == "plru" || l2Replacement == "drrip",
-    s"L2 replacement must be plru or drrip: $l2Replacement")
+  require(Seq("plru", "drrip", "srrip", "brrip").contains(l2Replacement),
+    s"L2 replacement must be plru, drrip, srrip, or brrip: $l2Replacement")
   require(isPow2(llcSets) && isPow2(llcWays) && isPow2(llcBanks),
     s"LLC sets/ways/banks must be powers of two: $llcSets/$llcWays/$llcBanks")
   require(llcMshrMemory >= 1 && llcMshrRefill >= 1,
@@ -347,8 +356,11 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       ways = l2Ways,
       sets = l2Sets,
       replacement = l2Replacement,
+      drripUseSRAM = l2DRRIPUseSRAM,
+      originUseSRAM = l2OriginUseSRAM,
       enableDRRIPReleaseUpdate = l2DRRIPReleaseUpdate,
-      enableDRRIPEntranceReleaseUpdate = l2DRRIPEntranceReleaseUpdate
+      dirRelArbitration = l2DirRelArbitration,
+      dirRelSingleCycle = l2DirRelSingleCycle
     )
     case CHIParametersKey => CHIParameters (
       issue = EnumCHIIssue.E,
