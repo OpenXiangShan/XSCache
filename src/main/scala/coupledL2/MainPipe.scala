@@ -75,6 +75,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       // Replacement metadata can synthesize a logical snoop hit even when
       // Directory misses. Only the original hit owns the reported DS way.
       val snoopDirectoryHit = Output(Bool())
+      val normalReservationDone = ValidIO(new MainpipeLeaseDone)
       // ReplaceMSHR's internal DS-capture task reaches ReleaseBuf in S5.
       // Allocation/arbiter acceptance alone is not sufficient evidence that
       // the old line is available for a following writeback.
@@ -87,8 +88,9 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       val refillWriteDone = ValidIO(new MainpipeLeaseDone)
       // A normal MSHR's L1-visible Grant/AccessAckData actually handshook
       // with GrantBuffer. MainPipe can drop an accepted MSHR task on retry,
-      // so this must be generated at SourceD fire rather than task ingress.
-      val grantSent = ValidIO(UInt(mshrBits.W))
+      // so capture the actual SourceD handoff with its held lease version.
+      // The registered receipt returns before the terminal lease event.
+      val grantSent = ValidIO(new MainpipeLeaseDone)
       // A C ReleaseData may directly update a currently installed DS/meta
       // line.  The matching normal MSHR must then retire through its
       // refill-only task without performing a second DS/meta write.
@@ -113,6 +115,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       val replRespRetry = Input(Bool())
       val snoopDataHolds = Flipped(Vec(mshrsAll, ValidIO(new MSHRInfo())))
       val postGrantReleaseHolds = Flipped(Vec(mshrsAll, ValidIO(new MSHRInfo())))
+      val postGrantReleaseLate = Flipped(ValidIO(new TaskBundle))
       // Registered paired-snoop result for a normal refill-only task that may
       // already have been accepted by RequestArb.
       // The ReplacerResult returning for the S3 refill task selects a
@@ -218,6 +221,109 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // Decide from the aligned result transaction, then apply ONLY this record.
   // The controller captures the same replacer decision at this edge; its
   // reservation remains owned until both the sidecar and physical commit apply.
+  // All normal actions are decided from one aligned Directory transaction.
+  // Apply only reads this record: need/init/payload cannot take a raw S3
+  // bypass, and the physical allocation slot was already claimed at S1.
+  class NormalS3Action extends Bundle {
+    val allocation = new MSHRRequest
+    val needMshr = Bool()
+    val needAcquire = Bool()
+    val acquireOnHit = Bool()
+    val acquireOnMiss = Bool()
+    val needProbe = Bool()
+    val needRelease = Bool()
+    val cmo = Bool()
+    val cmoHitInvalid = Bool()
+    val cmoAllBlock = Bool()
+    val alias = Bool()
+    val response = new TaskBundle
+    val directSourceD = Bool()
+    val readData = Bool()
+    val captureRefill = Bool()
+    val metaWrite = Bool()
+    val cmoInvalidate = Bool()
+    val meta = new MetaEntry
+  }
+  def decideNormal(task: TaskBundle, dir: DirResult, meta: MetaEntry,
+      invalidCmoWay: Bool): NormalS3Action = {
+    val action = WireInit(0.U.asTypeOf(new NormalS3Action))
+    val fromA = !task.mshrTask && task.fromA
+    val acq = fromA && (task.opcode === AcquireBlock || task.opcode === AcquirePerm)
+    val prefetch = fromA && task.opcode === Hint
+    val get = fromA && task.opcode === Get
+    val clean = fromA && task.opcode === CBOClean
+    action.cmoAllBlock := io.cmoAllBlock.getOrElse(false.B)
+    action.cmoHitInvalid := action.cmoAllBlock && invalidCmoWay
+    val flush = fromA && task.opcode === CBOFlush && !action.cmoHitInvalid
+    val inval = fromA && task.opcode === CBOInval
+    val wantsT = needT(task.opcode, task.param)
+    val promoteT = dir.hit && isT(meta.state)
+    action.cmo := clean || flush || inval
+    action.alias := acq && dir.hit && meta.clients(0) &&
+      meta.alias.getOrElse(0.U) =/= task.alias.getOrElse(0.U)
+    action.acquireOnHit := meta.state === BRANCH && wantsT && !prefetch
+    action.acquireOnMiss := acq || prefetch || get
+    action.needAcquire := task.fromA && (Mux(dir.hit,
+      action.acquireOnHit, action.acquireOnMiss) || action.cmo)
+    action.needProbe := dir.hit && meta.clients.orR && (
+      get && meta.state === TRUNK || clean && meta.state === TRUNK || flush || inval)
+    action.needRelease := dir.hit && (clean && (action.needProbe || meta.dirty) ||
+      flush && isValid(meta.state) || inval && isValid(meta.state))
+    action.needMshr := action.needAcquire || action.needProbe || action.alias
+
+    action.allocation.dirResult := dir
+    action.allocation.dirResult.meta := meta
+    action.allocation.task := task
+    action.allocation.task.bufIdx := 0.U
+    action.allocation.task.mshrTask := false.B
+    action.allocation.task.aliasTask.foreach(_ := action.alias)
+    action.allocation.task.wayMask := 0.U
+    val initial = action.allocation.state
+    initial.elements.foreach(_._2 := true.B)
+    when(task.fromA) {
+      initial.s_refill := action.cmo
+      initial.w_replResp := action.cmo || dir.hit
+      when(action.needAcquire) {
+        initial.s_acquire := action.cmoAllBlock
+        initial.s_rcompack.get := action.cmo
+        initial.w_grantfirst := action.cmoAllBlock
+        initial.w_grantlast := action.cmoAllBlock
+        initial.w_grant := action.cmoAllBlock
+      }
+      when(action.alias || action.needProbe && !(action.cmo && action.needRelease)) {
+        initial.s_rprobe := false.B
+        initial.w_rprobeackfirst := false.B
+        initial.w_rprobeacklast := false.B
+      }
+      when(action.needRelease) {
+        initial.s_release := false.B
+        initial.w_releaseack := false.B
+      }
+      when(action.cmo) { initial.s_cmoresp := false.B }
+    }
+    action.response := task
+    action.response.mshrId := (1 << (mshrBits - 1)).U + task.sourceId
+    action.response.opcode := odOpGen(task.opcode)
+    action.response.param := Mux(acq, Mux(task.param === NtoB && !promoteT, toB, toT), 0.U)
+    action.directSourceD := fromA && !action.needMshr && !action.response.opcode(0) &&
+      task.opcode =/= Hint && !action.cmoAllBlock
+    action.readData := dir.hit && (get || fromA && task.opcode === AcquireBlock)
+    action.captureRefill := (action.needProbe || action.alias) && action.readData
+    action.metaWrite := fromA && !action.needMshr && !get && !prefetch && !action.cmo
+    action.cmoInvalidate := inval && dir.hit
+    val alias = Mux(get || prefetch, meta.alias.getOrElse(0.U), task.alias.getOrElse(0.U))
+    action.meta := MetaEntry(
+      dirty = meta.dirty,
+      state = Mux(wantsT || promoteT, TRUNK, meta.state),
+      clients = Fill(clientBits, !dir.error),
+      alias = Some(alias),
+      pfsrc = dir.meta.prefetchSrc.getOrElse(0.U),
+      accessed = true.B,
+      tagErr = meta.tagErr,
+      dataErr = meta.dataErr,
+      cdpPfDepth = 0.U)
+    action
+  }
   class S3Decision extends Bundle {
     val task = new TaskBundle
     val token = new MainpipeLeaseToken
@@ -238,10 +344,242 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val grantInstallGeneration = UInt(8.W)
     val parentGeneration = UInt(8.W)
     val parentEpoch = Bool()
+    // A post-Grant ReleaseData holder is sampled with the same task/result
+    // record as the Directory decision.  Downstream B allocation must not
+    // re-read the live MSHRCtl holder after this record has been captured.
+    val postGrantReleaseSnoop = Bool()
+    // The SnoopMSHR data hold is part of the refill commit's ownership
+    // decision.  Keep the overlap result with the same S3 record so the
+    // apply-stage safety check does not read a moving MSHRCtl vector.
+    val normalRefillOverlapsSnoopHold = Bool()
+    // B-channel action and initial state are captured with the same result
+    // record.  Apply must consume this snapshot instead of rebuilding the
+    // wide probe/forwarding predicates from several metadata fields.
+    val bNeedProbe = Bool()
+    val bNeedDct = Bool()
+    val bNeedMshr = Bool()
+    val bAllocState = new FSMState()
+    val bDoFwd = Bool()
+    val bDoRespData = Bool()
+    val bFwdPassDirty = Bool()
+    // Forwarding cache state is sampled with the aligned Directory result;
+    // apply must not rebuild it from a later live metadata transaction.
+    val bFwdCacheState = UInt(3.W)
+    // Response cache state is sampled with the aligned Directory result;
+    // apply must not rebuild it from a later live metadata transaction.
+    val bRespCacheState = UInt(3.W)
+    // Directory metadata write enable for a B request is sampled from the
+    // aligned task/result record.  MSHR-owned B tasks must never use the
+    // sink-B directory-write path.
+    val bMetaWValid = Bool()
+    val bMeta = new MetaEntry
+    // SinkC Release/ReleaseData action is sampled with the same Directory
+    // result record. Apply must consume these bits rather than rebuild the
+    // C write/owner predicates from a moving S3 request and metadata bus.
+    val cWen = Bool()
+    val cMetaValid = Bool()
+    val cMeta = new MetaEntry
+    val cOrphanReleaseData = Bool()
+    val cReleaseDataDirectWrite = Bool()
+    val normal = new NormalS3Action
   }
   val s3Decision = RegInit(0.U.asTypeOf(Valid(new S3Decision)))
   val retryDecision = io.replResp.bits.validHold &&
     (io.replResp.bits.retry || io.fromMSHRCtl.replRespRetry)
+  val normalDecision = decideNormal(task_s3_decide.bits,
+    io.dirResp_s3, io.metaOnHit_s3, io.cmoHitInvalid)
+  val postGrantReleaseSnoop_decide = task_s3_decide.bits.fromB &&
+    io.fromMSHRCtl.postGrantReleaseHolds.map { holder =>
+      holder.valid && holder.bits.postGrantReleaseHold && holder.bits.refillCommitPending &&
+        holder.bits.set === task_s3_decide.bits.set && holder.bits.reqTag === task_s3_decide.bits.tag
+    }.reduce(_ || _)
+  val postGrantReleaseLate_decide = task_s3_decide.bits.fromB &&
+    io.fromMSHRCtl.postGrantReleaseLate.valid &&
+    io.fromMSHRCtl.postGrantReleaseLate.bits.set === task_s3_decide.bits.set &&
+    io.fromMSHRCtl.postGrantReleaseLate.bits.tag === task_s3_decide.bits.tag
+  val refillDecision_decide = task_s3_decide.bits.mshrTask && task_s3_decide.bits.fromA && (
+    task_s3_decide.bits.opcode === Grant || task_s3_decide.bits.opcode === GrantData ||
+      task_s3_decide.bits.opcode === AccessAckData || task_s3_decide.bits.opcode === HintAck
+  )
+  val replRespForTask_decide = io.replResp.bits.validHold && refillDecision_decide &&
+    io.replResp.bits.mshrId === task_s3_decide.bits.mshrId &&
+    io.replResp.bits.meta.state =/= INVALID && !io.replResp.bits.retry
+  val commitReplWay_decide = refillDecision_decide &&
+    (task_s3_decide.bits.replTask || replRespForTask_decide)
+  val normalRefillWay_decide = Mux(commitReplWay_decide,
+    io.replResp.bits.way, task_s3_decide.bits.way)
+  val normalRefillOverlapsSnoopHold_decide = refillDecision_decide &&
+    io.fromMSHRCtl.snoopDataHolds.map { snoop =>
+      snoop.valid && snoop.bits.blockRefill && snoop.bits.set === task_s3_decide.bits.set &&
+        snoop.bits.way === normalRefillWay_decide
+    }.reduce(_ || _)
+  // Freeze the B action at the result-record boundary.  Every input here is
+  // already the aligned Directory/meta response for task_s3_decide; no ready,
+  // credit, grantSent, or other downstream control is allowed into this
+  // snapshot.
+  val bNeedProbe_decide = task_s3_decide.bits.fromB && (
+    (isSnpOnceX(task_s3_decide.bits.chiOpcode.get) ||
+      isSnpQuery(task_s3_decide.bits.chiOpcode.get) ||
+      isSnpStashX(task_s3_decide.bits.chiOpcode.get)) &&
+      io.dirResp_s3.hit && io.metaOnHit_s3.state === TRUNK && io.metaOnHit_s3.clients.orR ||
+    (isSnpToB(task_s3_decide.bits.chiOpcode.get) ||
+      task_s3_decide.bits.chiOpcode.get === SnpCleanShared) &&
+      io.dirResp_s3.hit && io.metaOnHit_s3.state === TRUNK && io.metaOnHit_s3.clients.orR ||
+    (isSnpUniqueX(task_s3_decide.bits.chiOpcode.get) ||
+      task_s3_decide.bits.chiOpcode.get === SnpCleanInvalid ||
+      isSnpMakeInvalidX(task_s3_decide.bits.chiOpcode.get)) &&
+      io.dirResp_s3.hit && io.metaOnHit_s3.clients.orR ||
+    (io.errOnSnp_s3 || io.metaOnHit_s3.tagErr) && io.dirResp_s3.hit
+  )
+  val bNestableHit_decide = Mux(task_s3_decide.bits.snpHitRelease,
+    task_s3_decide.bits.snpHitReleaseMeta.state =/= INVALID,
+    io.dirResp_s3.hit)
+  val bNestableTagErr_decide = Mux(task_s3_decide.bits.snpHitRelease,
+    task_s3_decide.bits.snpHitReleaseMeta.tagErr,
+    io.metaOnHit_s3.tagErr) || io.errOnSnp_s3
+  val bNeedDct_decide = isSnpXFwd(task_s3_decide.bits.chiOpcode.get) &&
+    bNestableHit_decide && !bNestableTagErr_decide
+  val bNeedMshr_decide = bNeedProbe_decide || bNeedDct_decide ||
+    postGrantReleaseSnoop_decide || postGrantReleaseLate_decide
+  val bDoFwd_decide = isSnpXFwd(task_s3_decide.bits.chiOpcode.get) &&
+    (Mux(task_s3_decide.bits.snpHitRelease,
+      task_s3_decide.bits.snpHitReleaseMeta.state =/= INVALID,
+      io.dirResp_s3.hit)) &&
+    !(Mux(task_s3_decide.bits.snpHitRelease,
+      task_s3_decide.bits.snpHitReleaseMeta.tagErr,
+      io.metaOnHit_s3.tagErr) || io.errOnSnp_s3)
+  val bNestableState_decide = Mux(task_s3_decide.bits.snpHitRelease,
+    task_s3_decide.bits.snpHitReleaseMeta.state, io.metaOnHit_s3.state)
+  val bNestableDirty_decide = Mux(task_s3_decide.bits.snpHitRelease,
+    task_s3_decide.bits.snpHitReleaseMeta.dirty, io.metaOnHit_s3.dirty)
+  // Match the apply-stage nestable Directory record for the B data-response
+  // action.  This bit is consumed only by SinkB; non-B MSHR records must not
+  // manufacture a response-data action in the shared S3 record.
+  val bRespNestableHit_decide = task_s3_decide.bits.fromB && bNestableHit_decide
+  val bRetToSrc_decide = task_s3_decide.bits.retToSrc.getOrElse(false.B)
+  val bNeverRespData_decide = isSnpMakeInvalidX(task_s3_decide.bits.chiOpcode.get) ||
+    isSnpStashX(task_s3_decide.bits.chiOpcode.get) ||
+    isSnpQuery(task_s3_decide.bits.chiOpcode.get) ||
+    task_s3_decide.bits.chiOpcode.get === SnpOnceFwd ||
+    task_s3_decide.bits.chiOpcode.get === SnpUniqueFwd ||
+    task_s3_decide.bits.chiOpcode.get === SnpPreferUniqueFwd
+  val bShouldRespData_decide =
+    (bRespNestableHit_decide && (bNestableState_decide === TIP || bNestableState_decide === TRUNK) &&
+      bNestableDirty_decide) ||
+    (bRespNestableHit_decide && bNestableState_decide === TIP && !bNestableDirty_decide &&
+      task_s3_decide.bits.chiOpcode.get === SnpOnce) ||
+    (bRespNestableHit_decide && bRetToSrc_decide && isSnpXFwd(task_s3_decide.bits.chiOpcode.get)) ||
+    (bRespNestableHit_decide && bRetToSrc_decide && bNestableState_decide =/= INVALID &&
+      (task_s3_decide.bits.chiOpcode.get === SnpOnce ||
+        task_s3_decide.bits.chiOpcode.get === SnpUnique ||
+        task_s3_decide.bits.chiOpcode.get === SnpPreferUnique ||
+        isSnpToBNonFwd(task_s3_decide.bits.chiOpcode.get)))
+  val bDoRespData_decide = bShouldRespData_decide && !bNeverRespData_decide
+  val bFwdPassDirty_decide = bNestableHit_decide &&
+    (task_s3_decide.bits.chiOpcode.get === SnpUniqueFwd ||
+      task_s3_decide.bits.chiOpcode.get === SnpPreferUniqueFwd) &&
+    bNestableState_decide === TIP && bNestableDirty_decide
+  val bFwdCacheState_decide = WireInit(I)
+  when(bNestableHit_decide) {
+    when(isSnpToBFwd(task_s3_decide.bits.chiOpcode.get)) {
+      // FwdState describes the requesting RN, not this evicting snoopee.
+      bFwdCacheState_decide := SC
+    }.elsewhen(task_s3_decide.bits.chiOpcode.get === SnpUniqueFwd ||
+      task_s3_decide.bits.chiOpcode.get === SnpPreferUniqueFwd) {
+      bFwdCacheState_decide := Mux(
+        bNestableState_decide === TIP && bNestableDirty_decide, UD, UC)
+    }
+  }
+  val bRespCacheState_decide = WireInit(I)
+  when(bNestableHit_decide && !(io.dirResp_s3.error || io.dirResp_s3.meta.tagErr)) {
+    when(isSnpToB(task_s3_decide.bits.chiOpcode.get)) {
+      bRespCacheState_decide := Mux(task_s3_decide.bits.snpHitReleaseToInval, I, SC)
+    }
+    when(isSnpOnceX(task_s3_decide.bits.chiOpcode.get) ||
+      isSnpStashX(task_s3_decide.bits.chiOpcode.get) ||
+      isSnpQuery(task_s3_decide.bits.chiOpcode.get)) {
+      bRespCacheState_decide := Mux(
+        bNestableState_decide === BRANCH,
+        SC, Mux(bNestableDirty_decide, UD, UC))
+    }
+    when(isSnpOnceX(task_s3_decide.bits.chiOpcode.get)) {
+      when(task_s3_decide.bits.snpHitReleaseToClean && bNestableDirty_decide) {
+        bRespCacheState_decide := SC
+      }
+      when(task_s3_decide.bits.snpHitReleaseToInval) {
+        bRespCacheState_decide := I
+      }
+    }
+    when(task_s3_decide.bits.chiOpcode.get === SnpCleanShared) {
+      bRespCacheState_decide := Mux(isT(bNestableState_decide), UC, SC)
+    }
+  }
+  val bAllocState_decide = WireInit(0.U.asTypeOf(new FSMState()))
+  bAllocState_decide.elements.foreach(_._2 := true.B)
+  when(task_s3_decide.bits.fromB) {
+    // Preserve the original B allocation contract: every snoop MSHR starts
+    // with ProbeAck completion pending, even when no pProbe/DCT is needed.
+    bAllocState_decide.s_probeack := false.B
+    when(bNeedProbe_decide) {
+      bAllocState_decide.s_pprobe := false.B
+      bAllocState_decide.w_pprobeackfirst := false.B
+      bAllocState_decide.w_pprobeacklast := false.B
+    }
+    when(bNeedDct_decide) {
+      bAllocState_decide.s_dct.get := false.B
+    }
+  }
+  val cWen_decide = task_s3_decide.bits.fromC &&
+    isParamFromT(task_s3_decide.bits.param) && task_s3_decide.bits.opcode(0) &&
+    io.dirResp_s3.hit
+  val cMetaValid_decide = task_s3_decide.bits.fromC && io.dirResp_s3.hit
+  val cMeta_decide = MetaEntry(
+    dirty = io.metaOnHit_s3.dirty || cWen_decide,
+    state = Mux(isParamFromT(task_s3_decide.bits.param), TIP, io.metaOnHit_s3.state),
+    clients = Fill(clientBits, !isToN(task_s3_decide.bits.param)),
+    alias = io.metaOnHit_s3.alias,
+    accessed = io.metaOnHit_s3.accessed,
+    tagErr = Mux(cWen_decide, task_s3_decide.bits.denied, io.metaOnHit_s3.tagErr),
+    dataErr = Mux(cWen_decide, task_s3_decide.bits.corrupt, io.metaOnHit_s3.dataErr),
+    pfsrc = io.metaOnHit_s3.prefetchSrc.getOrElse(0.U),
+    cdpPfDepth = io.metaOnHit_s3.cdpPfDepth.getOrElse(0.U)
+  )
+  val cOrphanReleaseData_decide = task_s3_decide.bits.fromC &&
+    task_s3_decide.bits.opcode === ReleaseData &&
+    isParamFromT(task_s3_decide.bits.param) && !io.dirResp_s3.hit
+  val cReleaseDataDirectWrite_decide = cWen_decide &&
+    task_s3_decide.bits.opcode === ReleaseData &&
+    isParamFromT(task_s3_decide.bits.param)
+  val bMeta_decide = Mux(
+    isSnpToN(task_s3_decide.bits.chiOpcode.get) || task_s3_decide.bits.snpHitReleaseToInval, MetaEntry(),
+    MetaEntry(
+      dirty = false.B,
+      state = Mux(task_s3_decide.bits.chiOpcode.get === SnpCleanShared, io.metaOnHit_s3.state, BRANCH),
+      clients = io.metaOnHit_s3.clients,
+      alias = io.metaOnHit_s3.alias,
+      accessed = io.metaOnHit_s3.accessed,
+      tagErr = io.metaOnHit_s3.tagErr,
+      dataErr = io.metaOnHit_s3.dataErr,
+      pfsrc = io.metaOnHit_s3.prefetchSrc.getOrElse(0.U),
+      cdpPfDepth = io.metaOnHit_s3.cdpPfDepth.getOrElse(0.U)
+    )
+  )
+  // Keep the B directory-write decision aligned with the task/result record.
+  // In particular, a B-channel MSHR task is an internal completion and must
+  // not be mistaken for a fresh sink-B request at the shared metadata port.
+  val bMetaWValid_decide = task_s3_decide.bits.fromB && !task_s3_decide.bits.mshrTask &&
+    io.dirResp_s3.hit && (
+      task_s3_decide.bits.snpHitReleaseToInval || (!bNeedMshr_decide &&
+      (!isSnpOnce(task_s3_decide.bits.chiOpcode.get) ||
+        (task_s3_decide.bits.snpHitReleaseToClean &&
+          task_s3_decide.bits.snpHitReleaseMeta.dirty)) &&
+      !isSnpStashX(task_s3_decide.bits.chiOpcode.get) &&
+      !isSnpQuery(task_s3_decide.bits.chiOpcode.get) &&
+      (!bDoFwd_decide || !isSnpOnceFwd(task_s3_decide.bits.chiOpcode.get)) && (
+        io.metaOnHit_s3.state === TIP ||
+        io.metaOnHit_s3.state === BRANCH && isSnpToN(task_s3_decide.bits.chiOpcode.get) ||
+        bDoFwd_decide && io.metaOnHit_s3.state === TRUNK
+      )))
   s3Decision.valid := task_s3_decide.valid
   when(task_s3_decide.valid) {
     s3Decision.bits.task := task_s3_decide.bits
@@ -264,6 +602,25 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     s3Decision.bits.grantInstallGeneration := io.fromMSHRCtl.grantInstallGeneration
     s3Decision.bits.parentGeneration := io.fromMSHRCtl.replParentGeneration
     s3Decision.bits.parentEpoch := io.fromMSHRCtl.replParentEpoch
+    s3Decision.bits.postGrantReleaseSnoop := postGrantReleaseSnoop_decide || postGrantReleaseLate_decide
+    s3Decision.bits.normalRefillOverlapsSnoopHold := normalRefillOverlapsSnoopHold_decide
+    s3Decision.bits.bNeedProbe := bNeedProbe_decide
+    s3Decision.bits.bNeedDct := bNeedDct_decide
+    s3Decision.bits.bNeedMshr := bNeedMshr_decide
+    s3Decision.bits.bAllocState := bAllocState_decide
+    s3Decision.bits.bDoFwd := bDoFwd_decide
+    s3Decision.bits.bDoRespData := bDoRespData_decide
+    s3Decision.bits.bFwdPassDirty := bFwdPassDirty_decide
+    s3Decision.bits.bFwdCacheState := bFwdCacheState_decide
+    s3Decision.bits.bRespCacheState := bRespCacheState_decide
+    s3Decision.bits.bMetaWValid := bMetaWValid_decide
+    s3Decision.bits.bMeta := bMeta_decide
+    s3Decision.bits.cWen := cWen_decide
+    s3Decision.bits.cMetaValid := cMetaValid_decide
+    s3Decision.bits.cMeta := cMeta_decide
+    s3Decision.bits.cOrphanReleaseData := cOrphanReleaseData_decide
+    s3Decision.bits.cReleaseDataDirectWrite := cReleaseDataDirectWrite_decide
+    s3Decision.bits.normal := normalDecision
   }
   val task_s3 = Wire(Valid(new TaskBundle))
   task_s3.valid := s3Decision.valid
@@ -286,7 +643,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val meta_s3         = dirResult_s3.meta
   val metaOnHit_s3    = s3Decision.bits.metaOnHit
   val req_s3          = task_s3.bits
-  val cmoHitInvalid   = io.cmoAllBlock.getOrElse(false.B) && s3Decision.bits.cmoHitInvalid
+  val normalAction = s3Decision.bits.normal
+  val cmoHitInvalid   = normalAction.cmoHitInvalid
 
   val mshr_req_s3     = req_s3.mshrTask
   val sink_req_s3     = !mshr_req_s3
@@ -334,8 +692,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val cmo_cbo_retention_s3      = req_cbo_clean_s3 || req_cbo_flush_s3
   val cmo_cbo_s3                = req_cbo_clean_s3 || req_cbo_flush_s3 || req_cbo_inval_s3
 
-  val cache_alias               = req_acquire_s3 && dirResult_s3.hit && metaOnHit_s3.clients(0) &&
-                              metaOnHit_s3.alias.getOrElse(0.U) =/= req_s3.alias.getOrElse(0.U)
+  val cache_alias               = normalAction.alias
 
   // *NOTICE: 'nestable_*' must not be used in A Channel related logics.
   val nestable_dirResult_s3     = Wire(chiselTypeOf(dirResult_s3))
@@ -406,32 +763,14 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   /* ======== Interact with MSHR ======== */
   // *NOTICE: A Channel requests should be blocked by RequestBuffer when MSHR nestable,
   //          'nestable_*' must not be used here.
-  val acquire_on_miss_s3 = req_acquire_s3 || req_prefetch_s3 || req_get_s3
-  val acquire_on_hit_s3 = metaOnHit_s3.state === BRANCH && req_needT_s3 && !req_prefetch_s3
-  val need_acquire_s3_a = req_s3.fromA && (Mux(
-    dirResult_s3.hit,
-    acquire_on_hit_s3,
-    acquire_on_miss_s3
-  ) || cmo_cbo_s3)
-  val need_probe_s3_a = dirResult_s3.hit && metaOnHit_has_clients_s3 && (
-    req_get_s3 && (metaOnHit_s3.state === TRUNK) ||
-    req_cbo_clean_s3 && (metaOnHit_s3.state === TRUNK) ||
-    req_cbo_flush_s3 ||
-    req_cbo_inval_s3
-  )
-  val need_release_s3_a = dirResult_s3.hit && (
-    // Delegate the first probe as well: if the parent probes first, its dirty
-    // data lands in RefillBuf and a later sidecar would capture stale DS data
-    // after a second, data-less probe. A clean response may conservatively
-    // write back the unchanged line through the same sidecar path.
-    req_cbo_clean_s3 && (need_probe_s3_a || metaOnHit_s3.dirty) ||
-    req_cbo_flush_s3 && (isValid(metaOnHit_s3.state)) ||
-    req_cbo_inval_s3 && (isValid(metaOnHit_s3.state))
-  )
-  val need_cmoresp_s3_a = cmo_cbo_s3
-  val need_compack_s3_a = !cmo_cbo_s3
-
-  val need_mshr_s3_a = need_acquire_s3_a || need_probe_s3_a || cache_alias
+  val acquire_on_hit_s3 = normalAction.acquireOnHit
+  val acquire_on_miss_s3 = normalAction.acquireOnMiss
+  val need_acquire_s3_a = normalAction.needAcquire
+  val need_probe_s3_a = normalAction.needProbe
+  val need_release_s3_a = normalAction.needRelease
+  val need_cmoresp_s3_a = normalAction.cmo
+  val need_compack_s3_a = !normalAction.cmo
+  val need_mshr_s3_a = normalAction.needMshr
   
   /**
     * 1. For SnpOnce/SnpOnceFwd, SnpQuery, and SnpStash, only the latest copy of the cacheline is needed without changing
@@ -448,10 +787,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     *
     */
   // whether L2 should do forwarding or not
-  val expectFwd = isSnpXFwd(req_s3.chiOpcode.get)
-  val canFwd = nestable_dirResult_s3.hit &&
-    !(Mux(req_s3.snpHitRelease, req_s3.snpHitReleaseMeta.tagErr, s3Decision.bits.metaOnHit.tagErr) || s3Decision.bits.errOnSnp)
-  val doFwd = expectFwd && canFwd
+  // Consume the registered B forwarding decision captured with the aligned
+  // Directory result.  Rebuilding this action from live metadata here would
+  // reopen the apply-stage B response/data ownership cone.
+  val doFwd = s3Decision.bits.bDoFwd
   val need_pprobe_s3_b_snpStable = req_s3.fromB && (
     isSnpOnceX(req_s3.chiOpcode.get) || isSnpQuery(req_s3.chiOpcode.get) || isSnpStashX(req_s3.chiOpcode.get)
   ) && dirResult_s3.hit && metaOnHit_s3.state === TRUNK && metaOnHit_has_clients_s3
@@ -465,25 +804,21 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     isSnpMakeInvalidX(req_s3.chiOpcode.get)
   ) && dirResult_s3.hit && metaOnHit_has_clients_s3
   val need_pprobe_s3_b_snpNDERR = req_s3.fromB && (s3Decision.bits.errOnSnp || s3Decision.bits.metaOnHit.tagErr) && dirResult_s3.hit
-  val need_pprobe_s3_b = need_pprobe_s3_b_snpStable || need_pprobe_s3_b_snpToB ||
-    need_pprobe_s3_b_snpToN || need_pprobe_s3_b_snpNDERR
+  // Consume the registered S3 B decision.  The per-kind terms above remain
+  // available for observability, while the control path uses one frozen bit.
+  val need_pprobe_s3_b = s3Decision.bits.bNeedProbe
   // Forwarding requires both the snoop response to the HN and CompData to
   // the requesting RN. The direct path emits only one task, so even a hit
   // with no L1 clients needs a SnoopMSHR to schedule both completions.
-  val need_dct_s3_b = doFwd // DCT
+  val need_dct_s3_b = s3Decision.bits.bNeedDct
   // A post-Grant TtoN ReleaseData has left the newest line in the matching
   // normal RefillBuf. Directory correctly reports no client, but the direct
   // B path has no access to that buffer and would incorrectly send SnpResp
   // without data. Allocate a paired SnoopMSHR to return SnpRespData instead.
   // Once the deferred commit has fully landed (refillCommitPending=0) the
   // Directory/DS are up to date and the direct path is both safe and simpler.
-  val postGrantReleaseSnoop = sinkB_req_s3 && (
-    io.fromMSHRCtl.postGrantReleaseHolds.map { holder =>
-      holder.valid && holder.bits.postGrantReleaseHold && holder.bits.refillCommitPending &&
-        holder.bits.set === req_s3.set && holder.bits.reqTag === req_s3.tag
-    }.reduce(_ || _)
-  )
-  val need_mshr_s3_b = need_pprobe_s3_b || need_dct_s3_b || postGrantReleaseSnoop
+  val postGrantReleaseSnoop = s3Decision.bits.postGrantReleaseSnoop
+  val need_mshr_s3_b = s3Decision.bits.bNeedMshr
 
   val need_mshr_s3 = need_mshr_s3_a || need_mshr_s3_b
 
@@ -510,45 +845,25 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     task.wayMask := 0.U(cacheParams.ways.W)
     // TODO
   }
+  when(sinkA_req_s3) {
+    io.toMSHRCtl.mshr_alloc_s3.bits := normalAction.allocation
+  }
+  // Both the allocation and direct hit/noalloc path return the same claim.
+  // Sequence distinguishes canceled offers; generation advances only on alloc.
+  io.toMSHRCtl.normalReservationDone.valid := task_s3.valid && sinkA_req_s3
+  io.toMSHRCtl.normalReservationDone.bits.mshrId := req_s3.mshrId
+  io.toMSHRCtl.normalReservationDone.bits.mshrContext := 0.U
+  io.toMSHRCtl.normalReservationDone.bits.token := leaseToken_s3
 
   /* ======== Resps to SinkA/B/C Reqs ======== */
   val sink_resp_s3 = WireInit(0.U.asTypeOf(Valid(new TaskBundle)))
   val sink_resp_s3_a_promoteT = dirResult_s3.hit && isT(metaOnHit_s3.state)
 
-  // whether L2 should respond data to HN or not
-  val retToSrc = req_s3.retToSrc.getOrElse(false.B)
-  val neverRespData = isSnpMakeInvalidX(req_s3.chiOpcode.get) ||
-    isSnpStashX(req_s3.chiOpcode.get) ||
-    isSnpQuery(req_s3.chiOpcode.get) ||
-    req_s3.chiOpcode.get === SnpOnceFwd ||
-    req_s3.chiOpcode.get === SnpUniqueFwd ||
-    req_s3.chiOpcode.get === SnpPreferUniqueFwd
-  val shouldRespData_dirty = nestable_dirResult_s3.hit && 
-    (nestable_meta_s3.state === TIP || nestable_meta_s3.state === TRUNK) && nestable_meta_s3.dirty
-  // For SnpOnce, always response data under UC when L1 was BRANCH
-  val shouldRespData_once =  nestable_dirResult_s3.hit && 
-    nestable_meta_s3.state === TIP && !nestable_meta_s3.dirty &&
-    req_s3.chiOpcode.get === SnpOnce
-  // For forwarding snoops, if the RetToSrc value is 1, must return a copy is the cache line is Dirty or Clean.
-  val shouldRespData_retToSrc_fwd = nestable_dirResult_s3.hit && retToSrc && isSnpXFwd(req_s3.chiOpcode.get)
-  // For non-forwarding snoops, if RetToSrc is 1 the snoopee must return a copy
-  // of any cache line it holds, not only a Shared one.  A clean exclusive
-  // copy (TIP, dirty=0) used to fall through all four terms above and answer
-  // SnpResp with no data; the line was then invalidated, so the only copy was
-  // destroyed and the requester read stale data from downstream (tl-test:
-  // uncached Get "Data mismatch" on an address never written by any agent).
-  val shouldRespData_retToSrc_nonFwd = nestable_dirResult_s3.hit && retToSrc && nestable_meta_s3.state =/= INVALID && (
-    req_s3.chiOpcode.get === SnpOnce ||
-    req_s3.chiOpcode.get === SnpUnique ||
-    req_s3.chiOpcode.get === SnpPreferUnique ||
-    isSnpToBNonFwd(req_s3.chiOpcode.get)
-  )
-  val shouldRespData = shouldRespData_dirty || shouldRespData_once || shouldRespData_retToSrc_fwd || shouldRespData_retToSrc_nonFwd
-  val doRespData = shouldRespData && !neverRespData
+  // Consume the B data-response action captured with the aligned Directory
+  // result. The apply stage sees only the registered S3 decision record.
+  val doRespData = s3Decision.bits.bDoRespData
   dontTouch(doRespData)
-  dontTouch(shouldRespData)
-  dontTouch(neverRespData)
-  
+
   // On directory hit under non-invalidating snoop nesting WriteCleanFull, 
   // excluding SnpStashX and SnpQuery:
   //  1. SnpCleanShared[1-sink_resp]  : UD -> UC_PD, UC -> UC, SC -> SC
@@ -571,58 +886,13 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   //    ALL -> I, snoopee invalidates local copy
   //
   // Resp[2: 0] = {PassDirty, CacheState[1: 0]}
-  val respCacheState = WireInit(I)
+  val respCacheState = s3Decision.bits.bRespCacheState
   val respPassDirty = doRespData && nestable_dirResult_s3.hit && isT(nestable_meta_s3.state) && nestable_meta_s3.dirty &&
     (req_s3.chiOpcode.get =/= SnpOnce || req_s3.snpHitRelease) &&
     !(isSnpStashX(req_s3.chiOpcode.get) || isSnpQuery(req_s3.chiOpcode.get))
-
-  when (nestable_dirResult_s3.hit && !tagError_s3) {
-    when (isSnpToB(req_s3.chiOpcode.get)) {
-      respCacheState := Mux(req_s3.snpHitReleaseToInval, I, SC)
-    }
-    when (isSnpOnceX(req_s3.chiOpcode.get) || isSnpStashX(req_s3.chiOpcode.get) || isSnpQuery(req_s3.chiOpcode.get)) {
-      /**
-      * NOTICE: On Stash and Query:
-      * the cache state must maintain unchanged on nested copy-back writes
-      */
-      respCacheState := Mux(
-        nestable_meta_s3.state === BRANCH,
-        SC,
-        Mux(nestable_meta_s3.dirty, UD, UC)
-      )
-    }
-    when (isSnpOnceX(req_s3.chiOpcode.get)) {
-      // On SnpOnce/SnpOnceFwd nesting WriteCleanFull, turn UD to SC
-      when (req_s3.snpHitReleaseToClean && nestable_meta_s3.dirty) {
-        respCacheState := SC
-      }
-      // On SnpOnce/SnpOnceFwd nesting WriteBack*/WriteEvict*, turn UD to I
-      when (req_s3.snpHitReleaseToInval) {
-        respCacheState := I
-      }
-    }
-    when (req_s3.chiOpcode.get === SnpCleanShared) {
-      respCacheState := Mux(isT(nestable_meta_s3.state), UC, SC)
-    }
-  }
-
   // FwdState[2: 0] = {PassDirty, CacheState[1: 0]}
-  val fwdCacheState = WireInit(I)
-  val fwdPassDirty = WireInit(false.B)
-  when (nestable_dirResult_s3.hit) {
-    when (isSnpToBFwd(req_s3.chiOpcode.get)) {
-      // FwdState describes the requesting RN, not this evicting snoopee.
-      fwdCacheState := SC
-    }
-    when (req_s3.chiOpcode.get === SnpUniqueFwd || req_s3.chiOpcode.get === SnpPreferUniqueFwd) {
-      when (nestable_meta_s3.state === TIP && nestable_meta_s3.dirty) {
-        fwdCacheState := UD
-        fwdPassDirty := true.B
-      }.otherwise {
-        fwdCacheState := UC
-      }
-    }
-  }
+  val fwdCacheState = s3Decision.bits.bFwdCacheState
+  val fwdPassDirty = s3Decision.bits.bFwdPassDirty
 
   val sink_resp_s3_b_meta = MetaEntry()
   val sink_resp_s3_b_metaWen = Wire(Bool())
@@ -631,12 +901,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   sink_resp_s3.bits := task_s3.bits
   sink_resp_s3.bits.mshrId := (1 << (mshrBits-1)).U + sink_resp_s3.bits.sourceId
   when (req_s3.fromA) {
-    sink_resp_s3.bits.opcode := odOpGen(req_s3.opcode)
-    sink_resp_s3.bits.param := Mux (
-      req_acquire_s3,
-      Mux(req_s3.param === NtoB && !sink_resp_s3_a_promoteT, toB, toT),
-      0.U // reserved
-    )
+    sink_resp_s3.bits := normalAction.response
   }.elsewhen (req_s3.fromB) {
 
     sink_resp_s3.bits.opcode := 0.U
@@ -709,7 +974,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val hasData_s3_chi = source_req_s3.toTXDAT // whether to respond data to CHI-side
   val hasData_s3 = hasData_s3_tl || hasData_s3_chi
 
-  val need_data_a = dirResult_s3.hit && (req_get_s3 || req_acquireBlock_s3)
+  val need_data_a = normalAction.readData
   val need_data_b = sinkB_req_s3 && (doRespData || doFwd || nestable_dirResult_s3.hit && nestable_meta_s3.state === TRUNK)
   // Old-line capture is exclusively owned by ReplaceMSHR. Normal MSHR
   // requests snapshot a hit line into their own RefillBuf before probing.
@@ -717,9 +982,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // forwards it to the sidecar's ReleaseBuf entry at S5.
   val ren = need_data_a || need_data_b || mshr_replace_capture_s3 || grantVictimCap_s3
 
-  val wen_c = sinkC_req_s3 && isParamFromT(req_s3.param) && req_s3.opcode(0) && dirResult_s3.hit
-  io.toMSHRCtl.orphanReleaseData := task_s3.valid && sinkC_req_s3 &&
-    req_s3.opcode === ReleaseData && isParamFromT(req_s3.param) && !dirResult_s3.hit
+  val wen_c = s3Decision.bits.cWen
+  io.toMSHRCtl.orphanReleaseData := task_s3.valid && s3Decision.bits.cOrphanReleaseData
   val wen_mshr = req_s3.dsWen && (
     mshr_snpRespX_s3 || mshr_snpRespDataX_s3 ||
     mshr_writeCleanFull_s3 || mshr_writeBackFull_s3 || 
@@ -727,16 +991,13 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     mshr_refill_s3 && !need_repl && !retry && !mshr_defer_refill_write_s3
   )
   val wen = wen_c || wen_mshr
-  io.toMSHRCtl.releaseDataDirectWrite.valid := task_s3.valid && sinkC_req_s3 &&
-    req_s3.opcode === ReleaseData && isParamFromT(req_s3.param) && wen_c
+  io.toMSHRCtl.releaseDataDirectWrite.valid := task_s3.valid &&
+    s3Decision.bits.cReleaseDataDirectWrite
   io.toMSHRCtl.releaseDataDirectWrite.bits := req_s3
   val normalRefillDSWrite = task_s3.valid && mshr_refill_s3 &&
     req_s3.mshrContext === 0.U && wen_mshr && !need_repl && !retry &&
     !mshr_defer_refill_write_s3
-  val normalRefillOverlapsSnoopHold = io.fromMSHRCtl.snoopDataHolds.map { snoop =>
-    snoop.valid && snoop.bits.blockRefill && snoop.bits.set === req_s3.set &&
-      snoop.bits.way === Mux(commitReplWay, s3Decision.bits.repl.bits.way, req_s3.way)
-  }.reduce(_ || _)
+  val normalRefillOverlapsSnoopHold = s3Decision.bits.normalRefillOverlapsSnoopHold
   when (normalRefillDSWrite) {
     assert(!normalRefillOverlapsSnoopHold,
       "normal refill must not overwrite a DS way held for SnoopMSHR data")
@@ -794,12 +1055,12 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // sidecar, so it cannot retain this snapshot in ReleaseBuf. RefillBuf is
   // private to the normal context and is later overwritten by ProbeAckData or
   // CompData when either supplies newer data.
-  val need_write_refillBuf = (need_probe_s3_a || cache_alias) && need_data_a
+  val need_write_refillBuf = normalAction.captureRefill
 
   /* ======== Write Directory ======== */
   // B, C: Requests from Channel B (RXSNP) and Channel C would only downgrade permission,
   //       so there is no need to use 'nestable_*'.
-  val metaW_valid_s3_a = sinkA_req_s3 && !need_mshr_s3_a && !req_get_s3 && !req_prefetch_s3 && !cmo_cbo_s3 // get & prefetch that hit will not write meta
+  val metaW_valid_s3_a = normalAction.metaWrite
   // Also write directory on:
   //  1. SnpOnce nesting WriteCleanFull under UD (SnpOnceFwd always needs MSHR) for UD -> SC
   // no-client fwd snoops (direct path): toN-fwd -> INVALID, toB-fwd -> BRANCH,
@@ -811,15 +1072,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // snpHitReleaseToInval describes the RN giving up the line, even for a
   // shared snoop: its response reports I and the sidecar is consumed.
   val invalidateNestedReleaseHit = req_s3.snpHitReleaseToInval
-  val metaW_valid_s3_b = sinkB_req_s3 && dirResult_s3.hit &&
-    (invalidateNestedReleaseHit || (!need_mshr_s3_b &&
-    (!isSnpOnce(req_s3.chiOpcode.get) || (req_s3.snpHitReleaseToClean && req_s3.snpHitReleaseMeta.dirty)) &&
-    !isSnpStashX(req_s3.chiOpcode.get) && !isSnpQuery(req_s3.chiOpcode.get) &&
-    (!doFwd || !isSnpOnceFwd(req_s3.chiOpcode.get)) && (
-      metaOnHit_s3.state === TIP || metaOnHit_s3.state === BRANCH && isSnpToN(req_s3.chiOpcode.get) ||
-      doFwd && metaOnHit_s3.state === TRUNK
-    )))
-  val metaW_valid_s3_c = sinkC_req_s3 && dirResult_s3.hit
+  val metaW_valid_s3_b = s3Decision.bits.bMetaWValid
+  val metaW_valid_s3_c = task_s3.valid && s3Decision.bits.cMetaValid
   // MSHR writes use their reserved way; dirResult_s3 is not a lookup for
   // these tasks. Sidecar ordering cancels a consumed CMO before release,
   // and CopyBack tasks carry no Directory/DS write enables.
@@ -827,50 +1081,12 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     req_s3.metaWen && !(mshr_refill_s3 && (retry || mshr_defer_refill_write_s3)) ||
       grantMergeInstall_s3
   )
-  val metaW_valid_s3_cmo = req_cbo_inval_s3 && dirResult_s3.hit
+  val metaW_valid_s3_cmo = normalAction.cmoInvalidate
   require(clientBits == 1)
 
-  val metaW_s3_a_alias = Mux(
-    req_get_s3 || req_prefetch_s3,
-    metaOnHit_s3.alias.getOrElse(0.U),
-    req_s3.alias.getOrElse(0.U)
-  )
-
-  val metaW_s3_a = MetaEntry(
-    dirty = metaOnHit_s3.dirty,
-    state = Mux(req_needT_s3 || sink_resp_s3_a_promoteT, TRUNK, metaOnHit_s3.state),
-    clients = Fill(clientBits, Mux(l2Error_s3, false.B, true.B)),
-    alias = Some(metaW_s3_a_alias),
-    pfsrc = meta_s3.prefetchSrc.getOrElse(0.U),
-    accessed = true.B,
-    tagErr = metaOnHit_s3.tagErr,
-    dataErr = metaOnHit_s3.dataErr,
-    cdpPfDepth = 0.U,
-  )
-  val metaW_s3_b = Mux(isSnpToN(req_s3.chiOpcode.get) || invalidateNestedReleaseHit, MetaEntry(),
-    MetaEntry(
-      dirty = false.B,
-      state = Mux(req_s3.chiOpcode.get === SnpCleanShared, metaOnHit_s3.state, BRANCH),
-      clients = metaOnHit_s3.clients,
-      alias = metaOnHit_s3.alias,
-      accessed = metaOnHit_s3.accessed,
-      tagErr = metaOnHit_s3.tagErr,
-      dataErr = metaOnHit_s3.dataErr,
-      pfsrc = metaOnHit_s3.prefetchSrc.getOrElse(0.U),
-      cdpPfDepth = metaOnHit_s3.cdpPfDepth.getOrElse(0.U)
-    )
-  )
-  val metaW_s3_c = MetaEntry(
-    dirty = metaOnHit_s3.dirty || wen_c,
-    state = Mux(isParamFromT(req_s3.param), TIP, metaOnHit_s3.state),
-    clients = Fill(clientBits, !isToN(req_s3.param)),
-    alias = metaOnHit_s3.alias,
-    accessed = metaOnHit_s3.accessed,
-    tagErr = Mux(wen_c, req_s3.denied, metaOnHit_s3.tagErr),
-    dataErr = Mux(wen_c, req_s3.corrupt, metaOnHit_s3.dataErr), // update error when write DS
-    pfsrc = metaOnHit_s3.prefetchSrc.getOrElse(0.U),
-    cdpPfDepth = metaOnHit_s3.cdpPfDepth.getOrElse(0.U)
-  )
+  val metaW_s3_a = normalAction.meta
+  val metaW_s3_b = s3Decision.bits.bMeta
+  val metaW_s3_c = s3Decision.bits.cMeta
 
   // use merge_meta if mergeA
   val metaW_s3_mshr = WireInit(Mux(req_s3.mergeA, req_s3.aMergeTask.meta, req_s3.meta))
@@ -930,12 +1146,12 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val isD_s3 = Mux(
     mshr_req_s3,
     mshr_cmoresp_s3 && !io.cmoAllBlock.getOrElse(false.B) || mshr_refill_s3 && !retry && !mshr_refill_only_s3,
-    req_s3.fromC || req_s3.fromA && !need_mshr_s3_a && !data_unready_s3_tl && req_s3.opcode =/= Hint && !io.cmoAllBlock.getOrElse(false.B)
+    req_s3.fromC || normalAction.directSourceD
   )
   val isD_s3_ready = Mux(
     mshr_req_s3,
     mshr_cmoresp_s3 && !io.cmoAllBlock.getOrElse(false.B) || mshr_refill_s3 && !retry && !mshr_refill_only_s3,
-    req_s3.fromC || req_s3.fromA && !need_mshr_s3_a && !data_unready_s3_tl && req_s3.opcode =/= Hint && !d_s3_latch.B
+    req_s3.fromC // normal A responses are latched (d_s3_latch == true)
   )
   val isTXRSP_s3 = Mux(
     mshr_req_s3,
@@ -1171,7 +1387,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   leaseDone.bits.token := Mux1H(leaseEnds.map(x => x._1 -> x._3))
   assert(PopCount(leaseEnds.map(_._1)) <= 1.U,
     "one local execution slot cannot complete two source leases in the same cycle")
-  io.toMSHRCtl.mainpipeLeaseDone := RegNext(leaseDone, 0.U.asTypeOf(leaseDone))
+  val terminalReceipt = RegNext(leaseDone, 0.U.asTypeOf(leaseDone))
+  // SourceD handoff receipts apply first. Retain the issued owner/token for
+  // one more edge before returning its lease; the existing return/ack keeps
+  // the allocation pinned until the controller has consumed both receipts.
+  io.toMSHRCtl.mainpipeLeaseDone := RegNext(terminalReceipt, 0.U.asTypeOf(terminalReceipt))
 
   when (task_s4.valid && !req_drop_s4) {
     task_s5.bits := task_s4.bits
@@ -1377,52 +1597,9 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   /* ======== Other Signals Assignment ======== */
   // Initial state assignment
   // ! Caution: s_ and w_ are false-as-valid
-  when (req_s3.fromA) {
-    alloc_state.s_refill := cmo_cbo_s3
-    alloc_state.w_replResp := cmo_cbo_s3 || dirResult_s3.hit
-    // need Acquire downwards
-    when (need_acquire_s3_a) {
-      alloc_state.s_acquire := io.cmoAllBlock.getOrElse(false.B)
-      alloc_state.s_rcompack.get := !need_compack_s3_a
-      alloc_state.w_grantfirst := io.cmoAllBlock.getOrElse(false.B)
-      alloc_state.w_grantlast := io.cmoAllBlock.getOrElse(false.B)
-      alloc_state.w_grant := io.cmoAllBlock.getOrElse(false.B)
-    }
-    // need Probe for alias
-    // need Probe when Get hits on a TRUNK block
-    // A CMO that needs a lower-level writeback (need_release_s3_a) delegates
-    // probe+capture+release to a CMO-mode ReplaceMSHR, so the parent context
-    // must not probe the line itself (a double Probe would violate CHI/TL
-    // ordering: no second Probe before the first ProbeAck returns).
-    when (cache_alias || need_probe_s3_a && !(cmo_cbo_s3 && need_release_s3_a)) {
-      alloc_state.s_rprobe := false.B
-      alloc_state.w_rprobeackfirst := false.B
-      alloc_state.w_rprobeacklast := false.B
-    }
-    // need Release dirty block downwards by CMO
-    when (need_release_s3_a) {
-      alloc_state.s_release := false.B
-      alloc_state.w_releaseack := false.B
-    }
-    // need CMOAck
-    when (need_cmoresp_s3_a) {
-      alloc_state.s_cmoresp := false.B
-    }
-  }
+  when(req_s3.fromA) { alloc_state := normalAction.allocation.state }
 
-  when (req_s3.fromB) {
-    alloc_state.s_probeack := false.B
-    // need pprobe
-    when (need_pprobe_s3_b) {
-      alloc_state.s_pprobe := false.B
-      alloc_state.w_pprobeackfirst := false.B
-      alloc_state.w_pprobeacklast := false.B
-    }
-    // need forwarding response
-    when (need_dct_s3_b) {
-      alloc_state.s_dct.get := false.B
-    }
-  }
+  when (req_s3.fromB) { alloc_state := s3Decision.bits.bAllocState }
 
   val d = Seq(d_s5, d_s4, d_s3)
   val txreq = Seq(txreq_s5, txreq_s4, txreq_s3)
@@ -1435,10 +1612,21 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   arb(txdat, io.toTXDAT, Some("toTXDAT"))
 
   val sourceDTask = io.toSourceD.bits.task
-  io.toMSHRCtl.grantSent.valid := io.toSourceD.fire && sourceDTask.mshrTask &&
+  val grantHandoff = Wire(Valid(new MainpipeLeaseDone))
+  grantHandoff.valid := io.toSourceD.fire && sourceDTask.mshrTask &&
     sourceDTask.mshrContext === 0.U && !sourceDTask.refillOnly &&
     sourceDTask.deferRefillWrite && !sourceDTask.cmoTask
-  io.toMSHRCtl.grantSent.bits := sourceDTask.mshrId
+  grantHandoff.bits.mshrId := sourceDTask.mshrId
+  grantHandoff.bits.mshrContext := sourceDTask.mshrContext
+  grantHandoff.bits.token := Mux1H(Seq(
+    d_s5.fire -> leaseToken_s5, d_s4.fire -> leaseToken_s4, d_s3.fire -> leaseToken_s3))
+  // GrantBuffer owns task AND data on this handshake. Only a complete
+  // versioned receipt crosses back to MSHRCtl; no raw ready/fire bypass
+  // reaches source invalidation, cancellation, or the next issue permit.
+  val grantReceipt = RegInit(0.U.asTypeOf(Valid(new MainpipeLeaseDone)))
+  grantReceipt.valid := grantHandoff.valid
+  when(grantHandoff.valid) { grantReceipt.bits := grantHandoff.bits }
+  io.toMSHRCtl.grantSent := grantReceipt
 
   io.error.valid := task_s5.valid
   io.error.bits.valid := l2Error_s5 // if not enableECC, should be false

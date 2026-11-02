@@ -48,6 +48,10 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     val sidecarReservationHold = Output(Bool())
     val reservedB = Output(Bool())
     val contextReservation = Output(Bool())
+    val normalReserveRequest = DecoupledIO(new TaskBundle)
+    val normalReserveAck = Flipped(ValidIO(new NormalSlotReservation))
+    val normalReserveConsume = Output(Bool())
+    val normalReserveCancel = Output(Bool())
 
     /* read/write directory */
     val dirRead_s1 = DecoupledIO(new DirRead()) // To directory, read meta/tag
@@ -190,10 +194,36 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
 
   /* Channel interaction from s1 */
   val A_task = io.sinkA.bits
+  // The upstream candidate is still revocable until its real S1 handshake.
+  // A registered claim binds one concrete slot before the Directory read.
+  // Reconfirm the complete retained request: input-flow and CMO-all candidates
+  // may change while unconsumed, including optional training/alias fields.
+  val normalReservedTask = io.normalReserveAck.bits.task
+  // CMO-all enumerates set/way internally; unused fields are sourced from
+  // the blocked external A bus and need not stay stable. Its logical identity
+  // is that set/way, and execution uses the retained complete payload below.
+  val sameCmoAllLine = A_task.cmoAll && normalReservedTask.cmoAll &&
+    A_task.set === normalReservedTask.set && A_task.way === normalReservedTask.way
+  val normalReservationMatches = io.sinkA.valid &&
+    (sameCmoAllLine || A_task.asUInt === normalReservedTask.asUInt)
+  val normalYieldForB = RegInit(false.B)
+  val normalReserved = io.normalReserveAck.valid && normalReservationMatches && !normalYieldForB
+  io.normalReserveCancel := io.normalReserveAck.valid && (!normalReservationMatches || normalYieldForB)
+  io.normalReserveConsume := io.sinkA.fire
+  io.normalReserveRequest.bits := A_task
   val B_task = Mux(bPending.valid, bPending.bits, io.sinkB.bits)
   val C_task = io.sinkC.bits
   val block_A =
     io.fromMSHRCtl.blockA_s1 || io.fromMainPipe.blockA_s1 || io.fromGrantBuffer.blockSinkReqEntrance.blockA_s1
+  // An older claim keeps priority while A can execute. If a newly live
+  // sidecar/snoop blocks that A, return the unconsumed claim before admitting
+  // a later B. Otherwise B can be the response that releases A's blocker,
+  // while normalReserved forbids that B forever (and may hold its last slot).
+  when(!io.normalReserveAck.valid) {
+    normalYieldForB := false.B
+  }.elsewhen(normalReservationMatches && block_A && io.sinkB.valid) {
+    normalYieldForB := true.B
+  }
   val block_B =
     io.fromMSHRCtl.blockB_s1 || io.fromMainPipe.blockB_s1 || io.fromGrantBuffer.blockSinkReqEntrance.blockB_s1 ||
       io.fromTXDAT.blockSinkBReqEntrance ||
@@ -212,7 +242,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     Seq(
       io.sinkC.valid && !block_C && !bPending.valid,
       bPending.valid && bServiceReserved && !blockReservedB,
-      io.sinkA.valid && !block_A && !bPending.valid && !io.sinkB.valid
+      io.sinkA.valid && normalReserved && !block_A && !bPending.valid
     )
   ).asUInt
 
@@ -230,12 +260,25 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val sink_ready_basic = localTransitionIdle && (bPending.valid || !admitMshrTurn) &&
     io.dirRead_s1.ready && resetFinish && !mshr_task_s1.valid && s2_ready
 
-  io.sinkA.ready := sink_ready_basic && !block_A && !sinkValids(0) && !bPending.valid && !io.sinkB.valid
+  io.normalReserveRequest.valid := localTransitionIdle && resetFinish &&
+    !mshr_task_s1.valid && !bPending.valid && io.sinkA.valid && !block_A &&
+    !io.normalReserveAck.valid && !sinkValids(0) && !io.sinkB.valid
+  // An acknowledged A claim predates a later B candidate. Let it execute
+  // before capturing that B: a CMO claim can reserve the last eligible S/R
+  // index, so making the A wait for that blocked B would deadlock.
+  io.sinkA.ready := sink_ready_basic && normalReserved && !block_A &&
+    !sinkValids(0) && !bPending.valid
+  when(io.sinkA.fire) {
+    assert(io.dirRead_s1.fire && normalReserved,
+      "a normal Directory read must consume its registered concrete slot")
+    assert(sameCmoAllLine || A_task.asUInt === normalReservedTask.asUInt,
+      "normal reservation must retain the complete upstream request")
+  }
   // Upstream handshake captures the complete B, without reading Directory.
   // The next stage creates service/slot ownership; actual execution is a
   // separate handshake and never has to preempt ReplaceMSHR in the same cycle.
   io.sinkB.ready := localTransitionIdle && !admitMshrTurn && resetFinish &&
-    !mshr_task_s1.valid && !bPending.valid && !block_B && !sinkValids(0)
+    !mshr_task_s1.valid && !bPending.valid && !normalReserved && !block_B && !sinkValids(0)
   io.sinkC.ready := sink_ready_basic && !block_C && !bPending.valid
   bExecute := sink_ready_basic && sinkValids(1)
   when(io.sinkB.fire) {
@@ -254,6 +297,10 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   chnl_task_s1.valid := localTransitionIdle && (bPending.valid || !admitMshrTurn) &&
     io.dirRead_s1.ready && sinkValids.orR && resetFinish
   chnl_task_s1.bits := ParallelPriorityMux(sinkValids, Seq(C_task, B_task, A_task))
+  when(sinkValids(2) && !sinkValids(0) && !sinkValids(1)) {
+    chnl_task_s1.bits := normalReservedTask
+    chnl_task_s1.bits.mshrId := io.normalReserveAck.bits.id
+  }
 
   // mshr_task_s1 is s1_[reg]
   // task_s1 is [wire] to s2_reg
@@ -343,7 +390,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   noFreeWay := sameSetCnt >= cacheParams.ways.U
    */
   io.taskToPipe_s2 := task_s2
-  io.taskLeaseToken_s2 := RegEnable(mshrLeaseToken_s1, s1_fire)
+  io.taskLeaseToken_s2 := RegEnable(Mux(mshr_task_s1.valid,
+    mshrLeaseToken_s1, io.normalReserveAck.bits.token), s1_fire)
 
   // MSHR task
   val mshrTask_s2 = task_s2.valid && task_s2.bits.mshrTask
@@ -412,7 +460,10 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   io.status_s1.aCandidateSet := A_task.set
   io.status_s1.aCandidateTag := A_task.tag
   io.status_s1.bCandidateValid := bPending.valid || io.sinkB.valid
-  io.status_s1.bValid := bPending.valid || io.sinkB.valid && !block_B
+  // A later uncaptured B does not own this transition ahead of an older
+  // acknowledged A claim. Its candidate remains visible for conservative
+  // owner deferral, but must not create an A<->B admission wait cycle.
+  io.status_s1.bValid := bPending.valid || io.sinkB.valid && !block_B && !normalReserved
   io.status_s1.bToN := (bPending.valid || io.sinkB.valid) && isSnpToN(B_task.chiOpcode.get)
   io.status_s1.bFire := bExecute
   io.status_s1.cReleaseData := io.sinkC.valid && C_task.opcode === ReleaseData

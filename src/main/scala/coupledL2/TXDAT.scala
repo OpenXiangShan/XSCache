@@ -44,7 +44,7 @@ class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     val pipeStatusVec = Flipped(Vec(6, ValidIO(new PipeStatusWithCHI)))
     val reservedB = Input(Bool())
     val toReqArb = Output(new TXDATBlockBundle)
-    // Pulse only after the final data beat leaves the TXDAT channel.
+    // Registered event after the final data beat leaves the TXDAT channel.
     val done = ValidIO(new TaskBundle)
   })
 
@@ -60,9 +60,9 @@ class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   //     (S/R are mutually exclusive per slot)
   // The pre-split bound of mshrsAll no longer holds; see TXREQ for details.
   // Use customized SRAM: dual_port, max 256bits:
-  val queue = Module(new Queue(new TaskBundle(), entries = 2 * mshrsAll, flow = true))
-  val queueData0 = Module(new Queue(new DSBeat(), entries = 2 * mshrsAll, flow = true))
-  val queueData1 = Module(new Queue(new DSBeat(), entries = 2 * mshrsAll, flow = true))
+  val queue = Module(new Queue(new TaskBundle(), entries = 2 * mshrsAll, flow = false))
+  val queueData0 = Module(new Queue(new DSBeat(), entries = 2 * mshrsAll, flow = false))
+  val queueData1 = Module(new Queue(new DSBeat(), entries = 2 * mshrsAll, flow = false))
   val enqData = Mux(io.in.valid, io.in.bits.data, io.mshrIn.bits.data).asTypeOf(Vec(beatSize, new DSBeat))
 
   // Back pressure logic from TXDAT
@@ -127,8 +127,12 @@ class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   when (io.out.fire) {
     beatValids := VecInit(next_beatsOH.asBools)
   }
-  io.done.valid := io.out.fire && !next_beatsOH.orR
-  io.done.bits := taskR.task
+  // One terminal event per cycle is the physical channel's maximum rate.
+  // MSHRCtl consumes this Valid every cycle; the owner keeps its outstanding
+  // snoop/copyback obligation until then. Capture the task continuously so
+  // external ready drives only the event FF, not every payload write enable.
+  io.done.valid := RegNext(io.out.fire && !next_beatsOH.orR, false.B)
+  io.done.bits := RegNext(taskR.task)
 
   def getBeat(data: UInt, beatsOH: UInt): (UInt, UInt) = {
     // get one beat from data according to beatsOH

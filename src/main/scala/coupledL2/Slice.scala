@@ -60,7 +60,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
 
   val reqArb = Module(new RequestArb())
   val mainPipe = Module(new MainPipe())
-  val reqBuf = Module(new RequestBuffer())
+  val reqBuf = Module(new RequestBuffer(flow = false))
   val mshrCtl = Module(new MSHRCtl())
   private val mbistPl = MbistPipeline.PlaceMbistPipeline(2, "L2Slice", p(L2ParamKey).hasMbist)
   sinkC.io.msInfo := mshrCtl.io.refillInfo
@@ -114,6 +114,10 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   mshrCtl.io.bServiceStart := reqArb.io.bServiceStart
   mshrCtl.io.sidecarReservationHold := reqArb.io.sidecarReservationHold
   mshrCtl.io.contextReservation := reqArb.io.contextReservation
+  mshrCtl.io.normalReserveRequest <> reqArb.io.normalReserveRequest
+  reqArb.io.normalReserveAck := mshrCtl.io.normalReserveAck
+  mshrCtl.io.normalReserveConsume := reqArb.io.normalReserveConsume
+  mshrCtl.io.normalReserveCancel := reqArb.io.normalReserveCancel
   txdat.io.reservedB := reqArb.io.reservedB
   txrsp.io.reservedB := reqArb.io.reservedB
   reqArb.io.fromMSHRCtl := mshrCtl.io.toReqArb
@@ -188,6 +192,9 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   mshrCtl.io.txrspDone := txrsp.io.done
   mshrCtl.io.grantStatus := grantBuf.io.grantStatus
   mshrCtl.io.resps.sinkC := sinkC.io.resp
+  mshrCtl.io.sinkCProbeRouteRequest := sinkC.io.probeRouteRequest
+  sinkC.io.probeRouteReady := mshrCtl.io.sinkCProbeRouteReady
+  mshrCtl.io.sinkCProbeRouteDone := sinkC.io.probeRouteDone
   mshrCtl.io.sinkCReleaseData := sinkC.io.releaseData
   mshrCtl.io.resps.rxrsp := rxrsp.io.in
   mshrCtl.io.resps.rxdat := rxdat.io.in
@@ -242,11 +249,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   // RefillBuf has no direct-path consumer; tie off the second read port.
   refillBuf.io.r2.valid := false.B
   refillBuf.io.r2.bits := 0.U.asTypeOf(new MSHRBufRead)
-  val nestedWriteRefillBuf = Wire(Valid(new MSHRBufWrite()))
-  nestedWriteRefillBuf.valid := mshrCtl.io.nestedwbRefillDataId.valid
-  nestedWriteRefillBuf.bits.data := mainPipe.io.nestedwbData
-  nestedWriteRefillBuf.bits.id := mshrCtl.io.nestedwbRefillDataId.bits
-  nestedWriteRefillBuf.bits.beatMask := Fill(beatSize, true.B)
+  val nestedWriteRefillBuf = mshrCtl.io.nestedRefillWrite
   val rxdatWriteRefillBuf = WireInit(rxdat.io.refillBufWrite)
   val rxdatTargetsReleaseOwnedRefill =
     (UIntToOH(rxdat.io.refillBufWrite.bits.id, mshrsAll) & mshrCtl.io.refillBufReleaseOwner).orR

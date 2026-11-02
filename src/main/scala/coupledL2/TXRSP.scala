@@ -41,12 +41,13 @@ class TXRSP(implicit p: Parameters) extends CoupledL2Module {
     val reservedB = Input(Bool())
     val toReqArb = Output(new TXRSPBlockBundle)
     // Metadata is kept alongside CHIRSP so sidecar completion waits for the
-    // actual external response handshake rather than queue insertion.
+    // actual external response handshake rather than queue insertion. The
+    // terminal event is returned one cycle after that handshake.
     val done = ValidIO(new TaskBundle)
   })
 
   assert(!io.pipeRsp.valid || io.pipeRsp.bits.toTXRSP, "txChannel is wrong for TXRSP")
-  assert(io.pipeRsp.ready, "TXRSP should never be full")
+  assert(!io.pipeRsp.valid || io.pipeRsp.ready, "TXRSP pipe response must obey Decoupled backpressure")
   require(chiOpt.isDefined)
 
   // Worst-case response pressure in the multi-context MSHR design:
@@ -94,10 +95,13 @@ class TXRSP(implicit p: Parameters) extends CoupledL2Module {
   assert(queue.io.deq.valid === taskQueue.io.deq.valid,
     "TXRSP response and task queues must remain synchronized")
 
-  io.pipeRsp.ready := true.B
+  io.pipeRsp.ready := queue.io.enq.ready
   io.mshrRsp.ready := !io.pipeRsp.valid && !noSpaceForSinkBReq && !noSpaceForMSHRReq
-  io.done.valid := io.out.fire
-  io.done.bits := taskQueue.io.deq.bits
+  // This dedicated event stage accepts one response every cycle with no
+  // backpressure. The matching task follows the same edge as the actual fire;
+  // owner reservations are released only when MSHRCtl receives this event.
+  io.done.valid := RegNext(io.out.fire, false.B)
+  io.done.bits := RegNext(taskQueue.io.deq.bits)
 
   def toCHIRSPBundle(task: TaskBundle): CHIRSP = {
     val rsp = WireInit(0.U.asTypeOf(new CHIRSP()))
