@@ -254,17 +254,24 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     }
   }
 
-  val p_prefill = RegInit(false.B)
+  val p_prefill_miss = RegInit(false.B)
+  val p_prefill_hit = RegInit(false.B)
+  val p_prefill_any = p_prefill_miss || p_prefill_hit
+
+  assert(!(p_prefill_miss && p_prefill_hit),
+    "REQ vPipe miss-prefill and conflict-hit prefill overlapped")
+  assert(!(p_prefill_hit && p_hit_lock_active),
+    "REQ vPipe conflict-hit prefill unexpectedly owns a hit-lock")
 
   val rxevb_unsatisfied_evictback = rxevb_evictback &&
                                     dirResult.state > MetaState.I && dirResult.hit &&
                                     dirResult.way === rxevb.Way &&
-                                    !p_prefill
+                                    !p_prefill_any
 
   val rxevb_satisfied_evictback = rxevb_evictback &&
                                   (dirResult.state === MetaState.I || !dirResult.hit || 
                                    dirResult.way =/= rxevb.Way ||
-                                   p_prefill)
+                                   p_prefill_any)
   // ----------------------------------------------------------------
 
   // -- Enchantment modules and signals of downstream RX channels
@@ -339,7 +346,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val p_unlock_source = Reg(UInt(mshrIndexWidth.W))
 
-  val p_prefill_meta = Reg(new L2Directory.Meta)
+  val p_prefill_miss_meta = Reg(new L2Directory.Meta)
 
   // --------------------------------
   val issue_up_rd_compdata_first = Wire(Bool())
@@ -1325,21 +1332,21 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                       meta_wr_alias_makeunique
 
   // --------------------------------
-  val prefill_meta_wr_state = p_prefill && (meta_wr_state_UU || 
-                                            meta_wr_state_US || 
+  val prefill_meta_wr_state = p_prefill_any && (meta_wr_state_UU ||
+                                            meta_wr_state_US ||
                                             meta_wr_state_S || 
                                             meta_wr_state_I)
 
-  val prefill_meta_wr_dirty = p_prefill && (meta_wr_dirty_set ||
+  val prefill_meta_wr_dirty = p_prefill_any && (meta_wr_dirty_set ||
                                             meta_wr_dirty_clr)
   
-  val prefill_meta_wr_client = p_prefill && (meta_wr_client_set ||
+  val prefill_meta_wr_client = p_prefill_any && (meta_wr_client_set ||
                                              meta_wr_client_clr)
 
-  val prefill_meta_wr_alias = p_prefill && meta_wr_alias
+  val prefill_meta_wr_alias = p_prefill_any && meta_wr_alias
 
   when (prefill_meta_wr_state) {
-    p_prefill_meta.state := ParallelMux(Seq(
+    p_prefill_miss_meta.state := ParallelMux(Seq(
       (meta_wr_state_UU, MetaState.UU),
       (meta_wr_state_US, MetaState.US),
       (meta_wr_state_S , MetaState.S ),
@@ -1348,46 +1355,51 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   }
 
   when (prefill_meta_wr_dirty) {
-    p_prefill_meta.dirty := meta_wr_dirty_set
+    p_prefill_miss_meta.dirty := meta_wr_dirty_set
   }
 
   when (prefill_meta_wr_client) {
-    p_prefill_meta.clients.zip(p_rxreq_client).foreach { case (meta, client) =>
+    p_prefill_miss_meta.clients.zip(p_rxreq_client).foreach { case (meta, client) =>
       meta := client && meta_wr_client_set
     }
   }
 
   when (prefill_meta_wr_alias) {
-    p_prefill_meta.alias := p_rxreq.TagAlias
+    p_prefill_miss_meta.alias := p_rxreq.TagAlias
   }
 
   // --------------------------------
-  val repl_tshr_meta_wr = p_prefill && io.repl_done
-  val tshr_meta_wr_state_UU = meta_wr_state_UU && !p_prefill
-  val tshr_meta_wr_state_US = meta_wr_state_US && !p_prefill
-  val tshr_meta_wr_state_S = meta_wr_state_S && !p_prefill
-  val tshr_meta_wr_state_I = meta_wr_state_I && !p_prefill
+  val repl_tshr_meta_wr = p_prefill_any && io.repl_done
+  val tshr_meta_wr_state_UU = meta_wr_state_UU && !p_prefill_miss
+  val tshr_meta_wr_state_US = meta_wr_state_US && !p_prefill_miss
+  val tshr_meta_wr_state_S = meta_wr_state_S && !p_prefill_miss
+  val tshr_meta_wr_state_I = meta_wr_state_I && !p_prefill_miss
 
-  val tshr_meta_wr_state = !p_prefill && (meta_wr_state_UU ||
+  // Miss-prefill defers local allocation until ReplRd completes. Conflict-hit
+  // prefill applies the allocating response immediately so later snoops see
+  // the actual local owner, then commits the latest local state at repl_done.
+  val tshr_meta_wr_state = !p_prefill_miss && (meta_wr_state_UU ||
                                           meta_wr_state_US ||
                                           meta_wr_state_S ||
                                           meta_wr_state_I) ||
                            repl_tshr_meta_wr
 
-  val tshr_meta_wr_dirty = !p_prefill && (meta_wr_dirty_set ||
+  val tshr_meta_wr_dirty = !p_prefill_miss && (meta_wr_dirty_set ||
                                           meta_wr_dirty_clr) ||
                            repl_tshr_meta_wr
 
-  val tshr_meta_wr_client = !p_prefill && (meta_wr_client_set ||
+  val tshr_meta_wr_client = !p_prefill_miss && (meta_wr_client_set ||
                                            meta_wr_client_clr) ||
                             repl_tshr_meta_wr
 
-  val tshr_meta_wr_alias = !p_prefill && meta_wr_alias ||
+  val tshr_meta_wr_alias = !p_prefill_miss && meta_wr_alias ||
                            repl_tshr_meta_wr
 
   val tshr_meta_wr_prefetch = repl_tshr_meta_wr ||
-                              (!p_prefill && tshr_meta_wr_state &&
-                               (p_rxreq_readshared || p_rxreq_readunique || p_rxreq_makeunique))
+                              (!p_prefill_miss && tshr_meta_wr_state && (
+                                p_rxreq_readshared || p_rxreq_readunique || p_rxreq_makeunique ||
+                                (p_prefill_hit && (p_rxreq_stashshared || p_rxreq_stashunique))
+                              ))
 
   val tshr_tag_wr = repl_tshr_meta_wr
 
@@ -1395,33 +1407,54 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   io.tshr_meta_write_en.state := tshr_meta_wr_state
   io.tshr_meta_write_meta.state := Mux(
-    p_prefill, 
-    p_prefill_meta.state, 
-    ParallelMux(Seq(
-      (meta_wr_state_UU, MetaState.UU),
-      (meta_wr_state_US, MetaState.US),
-      (meta_wr_state_S , MetaState.S ),
-      (meta_wr_state_I , MetaState.I )
-  )))
+    p_prefill_miss,
+    p_prefill_miss_meta.state,
+    Mux(
+      p_prefill_hit && io.repl_done,
+      dirResult.state,
+      ParallelMux(Seq(
+        (meta_wr_state_UU, MetaState.UU),
+        (meta_wr_state_US, MetaState.US),
+        (meta_wr_state_S , MetaState.S ),
+        (meta_wr_state_I , MetaState.I )
+      ))
+    )
+  )
 
   io.tshr_meta_write_en.dirty := tshr_meta_wr_dirty
   io.tshr_meta_write_meta.dirty := Mux(
-    p_prefill,
-    p_prefill_meta.dirty,
-    meta_wr_dirty_set
+    p_prefill_miss,
+    p_prefill_miss_meta.dirty,
+    Mux(p_prefill_hit && io.repl_done, dirResult.dirty, meta_wr_dirty_set)
   )
 
   io.tshr_meta_write_en.clients.zip(p_rxreq_client).foreach { case (en, client) => 
     en := client && tshr_meta_wr_client 
   }
-  io.tshr_meta_write_meta.clients.zip(p_rxreq_client.zip(p_prefill_meta.clients)).foreach { case (meta, client) =>
-    meta := Mux(p_prefill, client._2, client._1 && meta_wr_client_set)
+  io.tshr_meta_write_meta.clients.zipWithIndex.foreach { case (meta, i) =>
+    meta := Mux(
+      p_prefill_miss,
+      p_prefill_miss_meta.clients(i),
+      Mux(
+        p_prefill_hit && io.repl_done,
+        dirResult.clients(i),
+        p_rxreq_client(i) && meta_wr_client_set
+      )
+    )
   }
 
   io.tshr_meta_write_en.alias := tshr_meta_wr_alias
-  io.tshr_meta_write_meta.alias := Mux(p_prefill, p_prefill_meta.alias, p_rxreq.TagAlias)
+  io.tshr_meta_write_meta.alias := Mux(
+    p_prefill_miss,
+    p_prefill_miss_meta.alias,
+    Mux(p_prefill_hit && io.repl_done, dirResult.alias, p_rxreq.TagAlias)
+  )
   io.tshr_meta_write_en.prefetch := tshr_meta_wr_prefetch
-  io.tshr_meta_write_meta.prefetch := Mux(p_prefill, p_prefill_meta.prefetch, false.B)
+  io.tshr_meta_write_meta.prefetch := Mux(
+    p_prefill_miss || (p_prefill_hit && !io.repl_done),
+    p_prefill_miss_meta.prefetch,
+    Mux(p_prefill_hit && io.repl_done, dirResult.prefetch, false.B)
+  )
   // ----------------------------------------------------------------
 
   // -- Interactions with TSHR local data and Data Storage Read
@@ -1527,7 +1560,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     s_rd_up_comp := false.B
   }
 
-  val up_txrsp_meta_state = Mux(p_prefill, p_prefill_meta.state, dirResult.state)
+  val up_txrsp_meta_state = Mux(p_prefill_any, p_prefill_miss_meta.state, dirResult.state)
 
   val up_txrsp_opcode = ParallelPriorityMux(Seq(
     (s_rd_up_comp, CCHIOpcode.Comp.U)
@@ -1613,7 +1646,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     s_rd_up_compdata2 := false.B
   }
 
-  val up_txdat_meta_state = Mux(p_prefill, p_prefill_meta.state, dirResult.state)
+  val up_txdat_meta_state = Mux(p_prefill_any, p_prefill_miss_meta.state, dirResult.state)
 
   val up_txdat_resp = ParallelPriorityMux(Seq(
     (p_rxreq_readunique, CCHIResp.UC.U),
@@ -1643,17 +1676,20 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // -- Interactions with replacer and eviction through loop-back REQ
   val txreq_evictback_peer = io.UpTXEVB.fire
 
-  val expect_replace = rxreq_hit_lock_conflict ||
-                       !dirResult.hit && (
-                         rxreq_readunique ||
-                         rxreq_readshared ||
-                         rxreq_makeunique ||
-                         rxreq_stashshared ||
-                         rxreq_stashunique
-                       )
+  val expect_miss_replace = !dirResult.hit && (
+                              rxreq_readunique ||
+                              rxreq_readshared ||
+                              rxreq_makeunique ||
+                              rxreq_stashshared ||
+                              rxreq_stashunique
+                            )
 
+  val expect_replace = rxreq_hit_lock_conflict || expect_miss_replace
+
+  // The peer refiller owns the conflicted old way. Conflict-hit prefill must
+  // not require an old-line DirWb before starting its own ReplRd.
   val allow_replace = w_s_repl &&
-                      (!io.tshr_meta_modified || io.dir_wb_done) &&
+                      (p_prefill_hit || !io.tshr_meta_modified || io.dir_wb_done) &&
                       ((dn_rxrsp_comp || dn_rxdat_compdata_first || dn_rxdat_datasepresp_first) ||
                       (!w_rd_dn_comp && (!w_rd_dn_data0 || !w_rd_dn_data2)))
 
@@ -1668,9 +1704,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   }
 
   when (rxreq_fire) {
-    p_prefill := expect_replace
-    p_prefill_meta := 0.U.asTypeOf(p_prefill_meta)
-    p_prefill_meta.prefetch := expect_replace && (rxreq_stashshared || rxreq_stashunique)
+    p_prefill_miss := expect_miss_replace
+    p_prefill_hit := rxreq_hit_lock_conflict
+    p_prefill_miss_meta := 0.U.asTypeOf(p_prefill_miss_meta)
+    p_prefill_miss_meta.prefetch := expect_replace && (rxreq_stashshared || rxreq_stashunique)
   }
 
   // If the replacer picked an INVALID way whose stale tag aliases this very request (the line
@@ -1694,7 +1731,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val evict_not_needed = evict_self_alias || evict_victim_invalid
 
   when (io.repl_done) {
-    p_prefill := false.B
+    p_prefill_miss := false.B
+    p_prefill_hit := false.B
     s_repl := false.B
     when (w_s_evict_up_evict) {
       w_s_evict_up_evict := false.B
@@ -1706,8 +1744,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     s_evict_up_evict := false.B
   }
 
-  val lock_dir = (p_prefill && io.repl_done) || rxevb_unsatisfied_evictback
-  val lock_ds = (p_prefill && io.repl_done) || rxevb_unsatisfied_evictback
+  val lock_dir = (p_prefill_any && io.repl_done) || rxevb_unsatisfied_evictback
+  val lock_ds = (p_prefill_any && io.repl_done) || rxevb_unsatisfied_evictback
 
   val unlock_self_evictback = RegNext(meta_wr_state_evictback_I) && !meta_wr_state_evictback_I
   val unlock_self_noevict = RegNext(io.repl_done && w_s_evict_up_evict && evict_not_needed)
@@ -1762,11 +1800,13 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // 2. Trigger Directory write-back immediately on refill transactions to commit the un-committed 
   //    I state into Directory on reuse.
   // 3. Trigger Directory write-back immediately on EvictBack to commit the un-commited meta.
-  // 4. Commit modified meta before a scheduled replacement read can wait on it.
+  // 4. Commit modified meta before an ordinary miss replacement read can wait
+  //    on it. Conflict-hit prefill must not write the surrendered old line.
+  val dir_meta_stale = (io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept
   io.dir_wb_aux := hit_lock_response ||
                    io.self_unlock_dir || unlock_self_noevict ||
-                   ((io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept && expect_replace) ||
-                   ((io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept && rxevb_satisfied_evictback)
+                   (dir_meta_stale && expect_miss_replace) ||
+                   (dir_meta_stale && rxevb_satisfied_evictback)
 
   assert(!(unlock_self_evictback && (io.tshr_meta_modified || io.tshr_tag_modified)),
     "EvictBack self-unlock with un-committed meta/tag: aux drop would strand a commit")
@@ -1789,7 +1829,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // read has landed -- otherwise a third-party refill can re-select the slot and overwrite the
   // victim data before this EvictBack has read it. (Previously released immediately.)
   val evictback_peer_unlock_dir_immediate = rxevb_unsatisfied_evictback && io.ds_rd_done ||
-                                            (rxevb_satisfied_evictback && (p_prefill || dirResult.way =/= rxevb.Way ||
+                                            (rxevb_satisfied_evictback && (p_prefill_any || dirResult.way =/= rxevb.Way ||
                                                                            (!io.tshr_meta_modified && !io.tshr_tag_modified)))
 
   val sched_evictback_peer_unlock_dir = rxevb_evictback &&
@@ -1897,9 +1937,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // ----------------------------------------------------------------
 
   // -- Blocking same-PA RXSNP, on waiting of L1 CompAck
-  io.blockRBE.EVT := p_prefill
+  io.blockRBE.EVT := p_prefill_any
   io.blockRBE.SNP := w_rd_up_compack || s_repl
-  io.blockRBE.EVB := (active && !p_prefill) ||
+  io.blockRBE.EVB := (active && !p_prefill_any) ||
                      w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds ||
                      w_evict_peer_commit_dir ||
                      evict_active
