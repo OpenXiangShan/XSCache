@@ -22,6 +22,11 @@ class TimingPathOptimizationHarness extends Module {
     val offsetBytes = (io.offset.pad(width).asUInt << offBits)(width - 1, 0)
     BOPAddressAdd(addr, io.offset, offBits) === (addr + offsetBytes)(width - 1, 0)
   }
+  // CDP's default degree uses fixed positive one/two-line offsets. Check
+  // their constant-specialized hardware against the original byte add too.
+  val cdpAddressChecks = Seq(1, 2).map { lines =>
+    BOPAddressAdd(io.addr, lines.S, 6) === (io.addr + (lines * 64).U)(49, 0)
+  }
   val eccChecks = Seq(1, 8, 64, 128).zipWithIndex.map { case (bits, i) =>
     val code = new SECDEDCode
     val width = code.width(bits)
@@ -33,7 +38,7 @@ class TimingPathOptimizationHarness extends Module {
     io.errors(i) := decoded.error
     decoded.error === legacyError
   }
-  io.equal := (addressChecks ++ eccChecks).reduce(_ && _)
+  io.equal := (addressChecks ++ cdpAddressChecks ++ eccChecks).reduce(_ && _)
 }
 
 /** Combinational equivalence plus errors in every data/check-bit position. */
@@ -89,7 +94,7 @@ object TestTimingPathOptimizations extends App with ChiselSim {
         dut.io.errors(3).expect(true.B)
       }
     }
-    println("PASS: BOP address equivalence (4 configurations), SECDED legacy equivalence, 137 single-bit and 9316 double-bit injections on 3 payloads")
+    println("PASS: BOP address equivalence (4 configurations), CDP fixed +1/+2-line equivalence, SECDED legacy equivalence, 137 single-bit and 9316 double-bit injections on 3 payloads")
   }
 }
 
