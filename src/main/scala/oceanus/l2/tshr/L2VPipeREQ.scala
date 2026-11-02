@@ -98,6 +98,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     val repl_resp = Input(new L2Directory.ReplReadResult)
     val repl_meta = Input(new L2Directory.Meta)   // victim way meta latched at ReplRdResp
 
+    val repl_lock_req = Output(Bool())
+    val repl_lock_way = Output(UInt(wayBits.W))
+    val repl_lock_conflict = Input(Bool())
+    val repl_lock_release = Output(Bool())
+
     val dir_wb_locked = Output(Bool())
     val dir_wb_cancel = Output(Bool())
     val dir_wb_aux = Output(Bool())
@@ -222,6 +227,34 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val (rxreq_satisfied_writeuniquefull, rxreq_unsatisfied_writeuniquefull) = satisfied(CCHIOpcode.WriteUniqueFull, MetaState.US)
   val (rxreq_satisfied_readunique, rxreq_unsatisfied_readunique) = satisfied(CCHIOpcode.ReadUnique, MetaState.US)
   val (rxreq_satisfied_makeunique, rxreq_unsatisfied_makeunique) = satisfied(CCHIOpcode.MakeUnique, MetaState.US)
+
+  val rxreq_unsatisfied_unique = rxreq_unsatisfied_readunique ||
+                                 rxreq_unsatisfied_makeunique ||
+                                 rxreq_unsatisfied_stashunique
+
+  val rxreq_hit_lock_conflict = rxreq_unsatisfied_unique &&
+                                dirResult.hit && io.repl_lock_conflict
+
+  val rxreq_hit_lock_accept = rxreq_unsatisfied_unique &&
+                              dirResult.hit && !io.repl_lock_conflict
+
+  val p_hit_lock_active = RegInit(false.B)
+  val p_hit_lock_release = RegInit(false.B)
+  val p_hit_lock_release_done = RegInit(false.B)
+  val p_hit_lock_way = Reg(UInt(wayBits.W))
+
+  io.repl_lock_req := rxreq_fire && rxreq_hit_lock_accept
+  io.repl_lock_way := Mux(rxreq_fire, dirResult.way, p_hit_lock_way)
+  io.repl_lock_release := p_hit_lock_active && p_hit_lock_release
+
+  when (rxreq_fire) {
+    p_hit_lock_active := rxreq_hit_lock_accept
+    p_hit_lock_release := false.B
+    p_hit_lock_release_done := false.B
+    when (rxreq_hit_lock_accept) {
+      p_hit_lock_way := dirResult.way
+    }
+  }
 
   val p_prefill = RegInit(false.B)
 
@@ -408,7 +441,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2 ||
                s_evict_dn_compack ||
                w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds ||
-               w_evict_peer_commit_dir
+               w_evict_peer_commit_dir ||
+               p_hit_lock_active
 
   io.free := !active
 
@@ -1179,6 +1213,44 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                       (dn_rxdat_compdata_first_UD_PD || dn_rxdat_datasepresp_first_UD_PD || dn_rxrsp_comp_UD_PD)
   // --------------------------------
 
+  // Hold an unsatisfied initial-hit way until the original request's final
+  // allocating response has been committed by a meta-only DirWb.
+  val hit_lock_response = p_hit_lock_active && (
+                            (p_rxreq_makeunique && dn_rxrsp_comp) ||
+                            ((p_rxreq_readunique || p_rxreq_stashunique) && (
+                              dn_rxdat_compdata_first ||
+                              dn_rxdat_datasepresp_first ||
+                              dn_rxrsp_comp
+                            ))
+                          )
+
+  when (hit_lock_response) {
+    p_hit_lock_release := true.B
+  }
+
+  when (io.dir_wb_accept && p_hit_lock_release) {
+    p_hit_lock_release := false.B
+    p_hit_lock_release_done := true.B
+  }
+
+  // The Directory clears lockTable one cycle after the DirWb grant. Keep the
+  // TSHR active through that edge so its idle check cannot race the clear.
+  when (p_hit_lock_release_done) {
+    p_hit_lock_active := false.B
+    p_hit_lock_release_done := false.B
+  }
+
+  assert(!(rxreq_fire && p_hit_lock_active),
+    "RXREQ entered while a previous hit-way reservation was still active")
+
+  when (io.tshr_dealloc) {
+    assert(!p_hit_lock_active, "TSHR deallocated with a live hit-way reservation")
+    p_hit_lock_active := false.B
+    p_hit_lock_release := false.B
+    p_hit_lock_release_done := false.B
+  }
+  // --------------------------------
+
   // - StashShared related meta/tag updates
   val meta_wr_state_stashshared_UU_unsat = active && p_rxreq_stashshared && (
                                              dn_rxdat_compdata_first_UC ||
@@ -1581,12 +1653,14 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // -- Interactions with replacer and eviction through loop-back REQ
   val txreq_evictback_peer = io.UpTXEVB.fire
 
-  val expect_replace = !dirResult.hit && (
-                           rxreq_readunique ||
-                           rxreq_readshared ||
-                           rxreq_makeunique ||
-                           rxreq_stashshared ||
-                           rxreq_stashunique)
+  val expect_replace = rxreq_hit_lock_conflict ||
+                       !dirResult.hit && (
+                         rxreq_readunique ||
+                         rxreq_readshared ||
+                         rxreq_makeunique ||
+                         rxreq_stashshared ||
+                         rxreq_stashunique
+                       )
 
   val allow_replace = w_s_repl &&
                       (!io.tshr_meta_modified || io.dir_wb_done) &&
@@ -1698,7 +1772,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // 2. Trigger Directory write-back immediately on refill transactions to commit the un-committed 
   //    I state into Directory on reuse.
   // 3. Trigger Directory write-back immediately on EvictBack to commit the un-commited meta.
-  io.dir_wb_aux := io.self_unlock_dir || unlock_self_noevict ||
+  io.dir_wb_aux := p_hit_lock_release ||
+                   io.self_unlock_dir || unlock_self_noevict ||
                    ((io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept && expect_replace) ||
                    ((io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept && rxevb_satisfied_evictback)
 
