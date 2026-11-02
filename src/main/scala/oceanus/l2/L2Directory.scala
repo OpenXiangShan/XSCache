@@ -1256,9 +1256,8 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   }
   val dirRelFire = dirRelCommitFire && useRRIPRelease.B
 
-  // Every ordinary refill clear retains the original one-cycle delay. A
-  // same-cycle lock acquire wins over the clear, and a new release grant
-  // re-registers pendClearValid below (Chisel last-wins).
+  // Legacy delayed-clear structure. Ordinary refill and hit-hold releases now
+  // clear directly at the DirWb commit, so pendClearValid remains deasserted.
   when(pendClearValid) {
     when(blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U) {
       lockTable(pendClearIdx).valid := false.B
@@ -1280,14 +1279,14 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     lockTable(s3_tshr).hitHold := false.B
   }
 
-  // Release mark at the owner's fill-commit DirWb grant: ownership is structural
-  // per TSHR and exact set/way. A non-owner or meta-only write never releases.
-  // The clear lands one cycle later via pendClear, so the way stays unpickable
-  // through the grant cycle + 1. An older refill may still retire its replCAM
-  // ownership after a same-slot hit-hold handoff, but must not clear the new hold.
+  // Release at the owner's fill-commit DirWb grant: ownership is structural
+  // per TSHR and exact set/way. The tag/meta commit is visible from the next
+  // cycle, so the way can be released at this same edge without a clear/idle
+  // race. A non-owner or meta-only write never releases. An older refill may
+  // still retire replCAM ownership after a same-slot hit-hold handoff, but
+  // must not clear the new hold.
   when(dirWbUnlock && !lockTable(winDirWb).hitHold) {
-    pendClearValid := true.B
-    pendClearIdx := winDirWb
+    lockTable(winDirWb).valid := false.B
   }
 
   val dirWbHitLockRelease = grantDirWb && winReq.REPL_LOCK_RELEASE &&
