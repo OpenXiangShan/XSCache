@@ -1269,7 +1269,7 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val s1_req = Reg(new PrefetchReq)
   val s1_issueOffset = RegInit(0.S(offsetWidth.W))
   // Flow through while empty, but do not propagate downstream ready back to s1.
-  val reqSkidBuffer = Module(new Queue(new PBestOffsetReq, entries = 1, pipe = false, flow = true))
+  val reqSkidBuffer = Module(new Queue(new PBestOffsetReq, entries = 1, pipe = false, flow = false))
 
   s0_ready := delayQueue.io.in.ready && scoreTable.io.req.ready && studentTrainReady && s1_ready
   s1_ready := reqSkidBuffer.io.enq.ready || !s1_req_valid
