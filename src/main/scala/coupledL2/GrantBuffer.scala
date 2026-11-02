@@ -118,6 +118,7 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   val inflightGrant = RegInit(VecInit(Seq.fill(grantBufInflightSize){
     0.U.asTypeOf(Valid(new InflightGrantEntry))
   }))
+  val inflight_full = Cat(inflightGrant.map(_.valid)).andR
 
   val dtaskOpcode = io.d_task.bits.task.opcode
   val mergeAtask = WireInit(0.U.asTypeOf(new TaskBundle()))
@@ -169,11 +170,8 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   grantQueueData0.io.enq.bits.data := enqData(0)
   grantQueueData1.io.enq.valid := grantQueue.io.enq.valid
   grantQueueData1.io.enq.bits.data := enqData(1)
-  io.d_task.ready := true.B // GrantBuf should always be ready
-
   val grantQueueCnt = grantQueue.io.count
   val full = !grantQueue.io.enq.ready
-  assert(!(full && io.d_task.valid), "GrantBuf full and RECEIVE new task, back pressure failed")
 
   // =========== dequeue entry and fire ===========
   require(beatSize == 2)
@@ -240,7 +238,7 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   }
   // TODO: this may not need 10 entries, but this does not take much space
   val pftQueueLen = 10
-  val pftRespQueue = prefetchOpt.map(_ => Module(new Queue(pftRespEntry, entries = pftQueueLen, flow = true)))
+  val pftRespQueue = prefetchOpt.map(_ => Module(new Queue(pftRespEntry, entries = pftQueueLen, flow = false)))
   prefetchOpt.map { _ =>
     pftRespQueue.get.io.enq.valid := io.d_task.valid && dtaskOpcode === HintAck &&
       io.d_task.bits.task.fromL2pft.getOrElse(false.B)
@@ -257,8 +255,25 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
     resp.bits.pfSource := pftRespQueue.get.io.deq.bits.pfSource
     pftRespQueue.get.io.deq.ready := resp.ready
 
-    assert(pftRespQueue.get.io.enq.ready, "pftRespQueue should never be full, no back pressure logic")
   }
+  // The downstream pipeline is decoupled from GrantBuffer.  Admission must
+  // consume a real queue/inflight credit: the old unconditional ready relied
+  // on an assertion and could accept a task while the FIFO or GrantAck table
+  // was full.  HintAck without a merge is not stored in grantQueue, so it can
+  // still pass with no FIFO credit; prefetch HintAck uses its own queue credit.
+  val taskNeedsQueue = dtaskOpcode =/= HintAck || io.d_task.bits.task.mergeA
+  val taskNeedsInflight = dtaskOpcode === Grant || dtaskOpcode === GrantData ||
+    io.d_task.bits.task.mergeA
+  val taskNeedsPrefetch = dtaskOpcode === HintAck &&
+    io.d_task.bits.task.fromL2pft.getOrElse(false.B)
+  val grantQueueReady = grantQueue.io.enq.ready &&
+    grantQueueData0.io.enq.ready && grantQueueData1.io.enq.ready
+  val prefetchQueueReady = prefetchOpt.map(_ => pftRespQueue.get.io.enq.ready).getOrElse(true.B)
+  io.d_task.ready := (!taskNeedsQueue || grantQueueReady) &&
+    (!taskNeedsInflight || !inflight_full) &&
+    (!taskNeedsPrefetch || prefetchQueueReady)
+  assert(!(full && io.d_task.fire && taskNeedsQueue),
+    "GrantBuf accepted a queued task without FIFO credit")
   // If no prefetch, there never should be HintAck
   // assert(prefetchOpt.nonEmpty.B || !io.d_task.valid || dtaskOpcode =/= HintAck)
 
@@ -271,7 +286,6 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
     entry.bits.set    := io.d_task.bits.task.set
     entry.bits.tag    := io.d_task.bits.task.tag
   }
-  val inflight_full = Cat(inflightGrant.map(_.valid)).andR
   assert(!(inflight_full & (io.d_task.fire && (dtaskOpcode === Grant || dtaskOpcode === GrantData || io.d_task.bits.task.mergeA))), "inflightGrant entries overflow")
 
   // report status to SourceB to block same-addr Probe
@@ -287,7 +301,12 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
     inflightGrant(io.e.bits.sink).valid := false.B
   }
 
-  io.e.ready := true.B
+  // E is a response to a concrete Grant owner.  Do not consume an early or
+  // out-of-range GrantAck through an unconditional ready path.
+  val eOwnerValid = VecInit((0 until grantBufInflightSize).map { i =>
+    io.e.bits.sink === i.U && inflightGrant(i).valid
+  }).asUInt.orR
+  io.e.ready := eOwnerValid
 
   // =========== handle blocking - capacity conflict ===========
   // Credits include every admitted pipeline reservation, including S1.
