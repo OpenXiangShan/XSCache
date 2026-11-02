@@ -90,7 +90,7 @@ class TXREQ(implicit p: Parameters) extends CoupledL2Module {
   queue.io.enq.valid := io.pipeReq.valid || io.mshrReq.valid && !noSpace
   queue.io.enq.bits := Mux(io.pipeReq.valid, io.pipeReq.bits, io.mshrReq.bits)
 
-  io.pipeReq.ready := true.B
+  io.pipeReq.ready := queue.io.enq.ready
   io.mshrReq.ready := !io.pipeReq.valid && !noSpace
 
   // Decoupled2LCredit(queue.io.deq, io.out)

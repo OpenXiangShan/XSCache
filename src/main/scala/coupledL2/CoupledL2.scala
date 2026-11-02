@@ -797,8 +797,8 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     val mshrPCrdGrants = mmioGrants ++ slicesGrants.flatten
     val mshrEntryCount = mshrPCrdQuerys.length
 
-    val pCrdQueue_s2 = Module(new Queue(new PCrdGranted, entries = mshrEntryCount - 2))
-    val pCrdQueue_s3 = Module(new Queue(new PCrdGranted, entries = 2))
+    val pCrdQueue_s2 = Module(new Queue(new PCrdGranted, entries = mshrEntryCount - 2, pipe = false, flow = false))
+    val pCrdQueue_s3 = Module(new Queue(new PCrdGranted, entries = 2, pipe = false, flow = false))
     pCrdQueue_s3.io.enq <> pCrdQueue_s2.io.deq
 
     val mshrPCrdHits = mshrPCrdQuerys.map((_, pCrdQueue_s3.io.deq)).map { case (q, h) =>
@@ -820,12 +820,14 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     ArbPerf(twoLevelArb(mshrPCrdArbIn, mshrPCrdArbOut, Some("pcrdgrant")), "pcrdgrant_arb")
     mshrPCrdGrants.zip(mshrPCrdArbGrants).foreach { case (grant, arb) => grant := arb }
 
-    val pCrdGrantValid_s1 = RegNext(isPCrdGrant)
-    val pCrdGrantType_s1 = RegNext(rxrsp.bits.pCrdType)
-    val pCrdGrantSrcID_s1 = RegNext(rxrsp.bits.srcID)
-    pCrdQueue_s2.io.enq.valid := pCrdGrantValid_s1
-    pCrdQueue_s2.io.enq.bits.pCrdType := pCrdGrantType_s1
-    pCrdQueue_s2.io.enq.bits.srcID := pCrdGrantSrcID_s1
+    val pCrdGrantFire = rxrsp.fire && isPCrdGrant
+    // The PCrdGrant descriptor enters the credit-controlled queue on the
+    // same handshake as RXRSP.  Keeping the descriptor and its admission
+    // credit in one Decoupled transaction prevents a delayed valid from
+    // overrunning a queue that became full in the meantime.
+    pCrdQueue_s2.io.enq.valid := pCrdGrantFire
+    pCrdQueue_s2.io.enq.bits.pCrdType := rxrsp.bits.pCrdType
+    pCrdQueue_s2.io.enq.bits.srcID := rxrsp.bits.srcID
     val grantCnt = RegInit(0.U(64.W))
     when (pCrdQueue_s3.io.deq.ready) {
       grantCnt := grantCnt + 1.U
@@ -851,10 +853,14 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     val rxrspSliceReady = Cat(slices.zipWithIndex.map {
       case (s, i) => s.io.out.rx.rsp.ready && rxrspSliceID === i.U
     }).orR
-    rxrsp.ready := rxrsp.bits.opcode === PCrdGrant || Mux(
+    rxrsp.ready := Mux(
+      isPCrdGrant,
+      pCrdQueue_s2.io.enq.ready,
+      Mux(
       rxrspIsStashPrefetch,
       stashRxRspReady,
-      Mux(rxrspIsMMIO, mmio.io.rx.rsp.ready, rxrspSliceReady)
+        Mux(rxrspIsMMIO, mmio.io.rx.rsp.ready, rxrspSliceReady)
+      )
     )
 
     val rxdat = Wire(DecoupledIO(new CHIDAT))

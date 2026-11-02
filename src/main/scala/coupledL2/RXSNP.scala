@@ -42,7 +42,7 @@ class RXSNP(
   })
 
   val rxsnp = Wire(io.rxsnp.cloneType)
-  val queue = Module(new Queue(io.rxsnp.bits.cloneType, 2, flow = false))
+  val queue = Module(new Queue(io.rxsnp.bits.cloneType, 2, pipe = false, flow = false))
   rxsnp <> queue.io.deq
   queue.io.enq <> io.rxsnp
   val task = Wire(new TaskBundle)
