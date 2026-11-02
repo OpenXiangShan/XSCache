@@ -240,7 +240,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val p_hit_lock_active = RegInit(false.B)
   val p_hit_lock_release = RegInit(false.B)
-  val p_hit_lock_release_done = RegInit(false.B)
   val p_hit_lock_way = Reg(UInt(wayBits.W))
 
   io.repl_lock_req := rxreq_fire && rxreq_hit_lock_accept
@@ -250,7 +249,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   when (rxreq_fire) {
     p_hit_lock_active := rxreq_hit_lock_accept
     p_hit_lock_release := false.B
-    p_hit_lock_release_done := false.B
     when (rxreq_hit_lock_accept) {
       p_hit_lock_way := dirResult.way
     }
@@ -1229,15 +1227,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   }
 
   when (io.dir_wb_accept && p_hit_lock_release) {
-    p_hit_lock_release := false.B
-    p_hit_lock_release_done := true.B
-  }
-
-  // The Directory clears lockTable one cycle after the DirWb grant. Keep the
-  // TSHR active through that edge so its idle check cannot race the clear.
-  when (p_hit_lock_release_done) {
     p_hit_lock_active := false.B
-    p_hit_lock_release_done := false.B
+    p_hit_lock_release := false.B
   }
 
   assert(!(rxreq_fire && p_hit_lock_active),
@@ -1247,7 +1238,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     assert(!p_hit_lock_active, "TSHR deallocated with a live hit-way reservation")
     p_hit_lock_active := false.B
     p_hit_lock_release := false.B
-    p_hit_lock_release_done := false.B
   }
   // --------------------------------
 
@@ -1772,7 +1762,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // 2. Trigger Directory write-back immediately on refill transactions to commit the un-committed 
   //    I state into Directory on reuse.
   // 3. Trigger Directory write-back immediately on EvictBack to commit the un-commited meta.
-  io.dir_wb_aux := p_hit_lock_release ||
+  // 4. Commit modified meta before a scheduled replacement read can wait on it.
+  io.dir_wb_aux := hit_lock_response ||
                    io.self_unlock_dir || unlock_self_noevict ||
                    ((io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept && expect_replace) ||
                    ((io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept && rxevb_satisfied_evictback)
