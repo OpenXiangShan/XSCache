@@ -101,8 +101,7 @@ class L2Configuration(
   val eSAM: Boolean,
   val slices: Seq[Int],
   val upstream: L2UpstreamTable = L2UpstreamTable.defaults,
-  // Whole-BOP switch. Off drains bop.io.req and builds no prefetch queues, so
-  // the REQ arbiter stays single-input. On is the branch default.
+  // Static BOP generation switch. Other producers retain their own switches.
   val bopEnable: Boolean = false,
   // Issue switch, independent of bopEnable. Off keeps training and the queues
   // but forces every queue output invalid, so nothing reaches a slice.
@@ -363,8 +362,10 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   } else Nil
   val recvReqFire = pfRecvReqs.map(_.fire).reduceOption(_ || _).getOrElse(false.B)
 
-  val bop = Module(new OceanusBOP(config.bopParams))
-  bop.io.delayLatency := delayLatency
+  val bop = Option.when(config.bopEnable)(Module(new OceanusBOP(config.bopParams)))
+  bop.foreach(_.io.delayLatency := delayLatency)
+  val bopReqValid = bop.map(_.io.req.valid).getOrElse(false.B)
+  val bopReqBits = bop.map(_.io.req.bits).getOrElse(0.U(paramL2.physicalAddrWidth.W))
   val bopTrainArb = Module(new L2PrefetchTrainArb(config.sliceNum, config.pfTrainEnable))
   bopTrainArb.io.in.zip(slices).foreach { case (sink, source) =>
     sink.valid := source.io.bopTrain.valid
@@ -372,9 +373,11 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   }
   // Reference MainPipe.scala:750-759 filters needHint before slice arbitration.
   // Disabled events cannot consume a choice or displace another slice's pulse.
-  bop.io.train.valid := bopTrainArb.io.out.valid
-  bop.io.train.bits := bopTrainArb.io.out.bits.paddr
-  bopTrainArb.io.out.ready := bop.io.train.ready
+  bop.foreach { learner =>
+    learner.io.train.valid := bopTrainArb.io.out.valid
+    learner.io.train.bits := bopTrainArb.io.out.bits.paddr
+  }
+  bopTrainArb.io.out.ready := bop.map(_.io.train.ready).getOrElse(true.B)
   vbopStub.foreach { stub =>
     // Intent (3a refinement): slice training is a lossy Valid event pulse;
     // copy it even when PBOP's independent learner is momentarily not ready.
@@ -403,7 +406,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       counts.io.total(1)(source) := rawBop
       counts.io.total(2)(source) := rawCDP
       counts.io.total(3)(source) := rawCDP
-      counts.io.accepted(0)(source) := bop.io.train.fire && selectedOrigin === entry.nid.U
+      counts.io.accepted(0)(source) := bop.map(_.io.train.fire).getOrElse(false.B) && selectedOrigin === entry.nid.U
       vbopStub.foreach { learner =>
         counts.io.accepted(1)(source) := learner.io.trainAccepted && selectedOrigin === entry.nid.U
       }
@@ -443,14 +446,14 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     case _ => map4(addr)
   }
   val pfQueues: Seq[DecoupledIO[FlitREQ]] = if (!config.bopEnable && !config.pfRecvEnable && !config.stubMode) {
-    bop.io.req.ready := true.B
+    bop.foreach(_.io.req.ready := true.B)
     Nil
   } else {
     val prefetchTarget = config.sliceNum match {
-      case 1 => map1(bop.io.req.bits)
-      case 2 => map2(bop.io.req.bits)
-      case 3 => map3(bop.io.req.bits)
-      case _ => map4(bop.io.req.bits)
+      case 1 => map1(bopReqBits)
+      case 2 => map2(bopReqBits)
+      case 3 => map3(bopReqBits)
+      case _ => map4(bopReqBits)
     }
     val queues = Seq.tabulate(config.sliceNum) { i =>
       val sourceQueues = pfSourceSlots.zipWithIndex.map { case (source, sourceIdx) =>
@@ -459,8 +462,8 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
         val queue = Module(new OverwriteQueue(new FlitREQ, entries = entries))
         queue.suggestName(s"pfQueue_${i}_src${source}")
         pfQueueOverwriteBySource(i)(sourceIdx) := queue.io.overwrite
-        val fromBop = (source == L2PfSource.PBOP).B && bop.io.req.valid && prefetchTarget === config.slices(i).U &&
-          (!config.stubMode || config.bopEnable).B && (if (config.stubMode) bopControlEnable else true.B)
+        val fromBop = (source == L2PfSource.PBOP).B && bopReqValid && prefetchTarget === config.slices(i).U &&
+          config.bopEnable.B && (if (config.stubMode) bopControlEnable else true.B)
         val fromRecv = if (config.pfRecvEnable && !config.stubMode) {
           // pfRecvReqs.ready is driven by the slice REQ arbiter below. A direct
           // fire owns the flit; queue admission is the fallback route only.
@@ -473,7 +476,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
         queue.io.enq.valid := fromBop || fromRecv || fromStub
         val bopBits = WireInit(0.U.asTypeOf(new FlitREQ))
         bopBits.Opcode := CCHIOpcode.StashShared.U
-        bopBits.Addr := bop.io.req.bits
+        bopBits.Addr := bopReqBits
         bopBits.TgtID := config.slices(i).U
         bopBits.SrcID := config.pfSrcID.U
         bopBits.TxnID := L2PrefetchTxnID.encode(
@@ -509,7 +512,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       val chosen = PriorityEncoderOH(VecInit(candidates).asUInt)
       val issued = Wire(Decoupled(new FlitREQ))
       issued.valid := candidates.reduce(_ || _) && prefetchIssueAllowed &&
-        (if (config.stubMode) true.B else bopControlEnable)
+        (if (config.stubMode) true.B else if (config.bopEnable) bopControlEnable else recvControlEnable)
       issued.bits := Mux1H(pfSourcePriority.zip(chosen.asBools).map { case (source, hit) =>
         hit -> sourceQueues.find(_._1 == source).get._2.io.deq.bits
       })
@@ -531,14 +534,14 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       }
       issued
     }
-    when(bop.io.req.valid) {
+    when(bopReqValid) {
       assert(PopCount(VecInit(config.slices.map(nid => prefetchTarget === nid.U))) === 1.U,
         "BOP request must demux to exactly one prefetch queue")
     }
     // Ready is the selected source queue's enqueue ready, not dequeue ready:
     // dequeue backpressure must not reject training. OverwriteQueue itself is
     // always ready, so this remains a source-local admission boundary.
-    bop.io.req.ready := true.B
+    bop.foreach(_.io.req.ready := true.B)
     queues
   }
 
@@ -554,14 +557,16 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     }
   } else Nil
 
-  when (bop.io.req.fire || recvReqFire || vbopStub.map(_.io.req.fire).getOrElse(false.B) ||
+  when (bop.map(_.io.req.fire).getOrElse(false.B) || recvReqFire || vbopStub.map(_.io.req.fire).getOrElse(false.B) ||
     cdp.map(_.io.req.fire).getOrElse(false.B)) {
     pfSequence := pfSequence + 1.U
   }
 
-  XSPerfAccumulate("oceanus_bop_cross_page_drop", bop.io.crossPageDrop)
-  XSPerfAccumulate("oceanus_bop_disabled_drop", bop.io.disabledDrop)
-  XSPerfAccumulate("oceanus_bop_delay_queue_full_drop", bop.io.delayQueueFullDrop)
+  bop.foreach { learner =>
+    XSPerfAccumulate("oceanus_bop_cross_page_drop", learner.io.crossPageDrop)
+    XSPerfAccumulate("oceanus_bop_disabled_drop", learner.io.disabledDrop)
+    XSPerfAccumulate("oceanus_bop_delay_queue_full_drop", learner.io.delayQueueFullDrop)
+  }
 
   slices.zipWithIndex.foreach { case (slice, i) =>
     slice.io.consts.sliceIdx := i.U
