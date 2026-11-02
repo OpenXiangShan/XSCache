@@ -54,12 +54,9 @@ class SnoopMSHRIO(implicit p: Parameters) extends MSHRIO {
   val releaseBufCopyDone = Input(Bool())
   val nestedReleaseWritePending = Input(Bool())
   val nestedReleaseWriteDone = Input(Bool())
-  // Export the exact B-side state transition to the paired normal context.
-  // The normal may have started as a Directory miss and cannot infer this
-  // from its own stale Directory snapshot.
-  val postGrantReleaseResponseToN = Output(Bool())
-  val postGrantReleaseResponseToB = Output(Bool())
-  val postGrantReleaseResponseToClean = Output(Bool())
+  // Frozen operation provenance, consumed with the registered task at
+  // prepare. The controller binds its paired owner and outcome before issue.
+  val postGrantReleaseResponse = Output(Bool())
   // MainPipe acceptance only queues a CHI snoop response. Keep this context
   // visible until its terminal TXRSP/TXDAT handshake, so same-address A/B
   // requests cannot pass through the response queueing window.
@@ -251,7 +248,17 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
 
   // A post-Grant ReleaseData proves the client no longer owns this block.
   // Waiting for a new ProbeAck would deadlock against the C release path.
-  io.tasks.source_b.valid := valid && !state.s_pprobe && !normalPostGrantReleasePending && !io.pairSearchPending
+  val nestedwbMatch = valid && dirResult.hit && meta.state =/= INVALID &&
+    dirResult.set === io.nestedwb.set && dirResult.tag === io.nestedwb.tag
+  // The accepted notification arrives one cycle after the Probe packet became
+  // irrevocable. A Release can replace an unissued Probe only before that
+  // edge; in the notification cycle its already-owned ProbeAck is mandatory.
+  val nestedwbCompletesUnissuedProbe = nestedwbMatch && !state.s_pprobe &&
+    !sourceBProbeIssued && !io.sourceBAccepted
+  val nestedReleaseReplacesProbe = nestedwbCompletesUnissuedProbe &&
+    (io.nestedwb.c_set_dirty || io.nestedwb.c_set_tip)
+  io.tasks.source_b.valid := valid && !state.s_pprobe && !normalPostGrantReleasePending &&
+    !io.pairSearchPending && !nestedReleaseReplacesProbe
   io.tasks.source_b.bits := 0.U.asTypeOf(new SourceBReq)
   io.tasks.source_b.bits.tag := dirResult.tag
   io.tasks.source_b.bits.set := dirResult.set
@@ -268,7 +275,8 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   // still in flight and emits a data-less SnpResp, dropping the only copy of
   // the line's newest dirty data.
   val mpProbeAckValid = valid && !state.s_probeack && !mpCopyValid &&
-    (state.w_pprobeacklast || (normalPostGrantReleasePayload && !sourceBProbeIssued)) &&
+    (state.w_pprobeacklast ||
+      (normalPostGrantReleasePayload && !sourceBProbeIssued && !io.sourceBAccepted)) &&
     (!normalPostGrantReleasePending || normalPostGrantReleasePayload)
   val mpDctValid = valid && !state.s_dct.getOrElse(true.B) && state.s_probeack
   val mainpipeIntent = Wire(Decoupled(new TaskBundle))
@@ -397,18 +405,13 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
     io.resps.rxrsp.valid || io.resps.rxdat.valid || io.releaseBufCopyDone ||
     io.snpRespDone || io.dctDone || leaseNestedEvent || leaseOwnerControlsChanged ||
     io.nestedReleaseWritePending || io.nestedReleaseWriteDone ||
-    io.tasks.source_b.fire
-  val mainpipeIssuedVariant = MainpipeLeaseIO.freeze(io.tasks.preparedLease,
+    io.sourceBAccepted
+  val mainpipeIssuedOperation = MainpipeLeaseIO.freeze(io.tasks.preparedLease,
     mainpipeIntent, io.tasks.mainpipe,
-    Mux(mpCopyValid, 0.U(4.W), Mux(mpProbeAckValid, 1.U(4.W), 2.U(4.W))), mainpipeInvalidate)
-  val postGrantReleaseResponseFire = io.tasks.mainpipe.fire && mainpipeIssuedVariant === 1.U &&
-    normalPostGrantReleasePayload
-  io.postGrantReleaseResponseToN := postGrantReleaseResponseFire &&
-    io.tasks.mainpipe.bits.meta.state === INVALID
-  io.postGrantReleaseResponseToB := postGrantReleaseResponseFire &&
-    io.tasks.mainpipe.bits.meta.state === BRANCH
-  io.postGrantReleaseResponseToClean := postGrantReleaseResponseFire &&
-    !io.tasks.mainpipe.bits.meta.dirty
+    Cat(normalPostGrantReleasePayload,
+      Mux(mpCopyValid, 0.U(2.W), Mux(mpProbeAckValid, 1.U(2.W), 2.U(2.W)))), mainpipeInvalidate)
+  val mainpipeIssuedVariant = mainpipeIssuedOperation(1, 0)
+  io.postGrantReleaseResponse := mainpipeIssuedOperation(2) && mainpipeIssuedVariant === 1.U
 
   when (io.tasks.mainpipe.fire && mainpipeIssuedVariant === 1.U && postGrantUsesReleaseBuf) {
     assert(probeAckTask.txChannel === CHIChannel.TXDAT &&
@@ -426,7 +429,7 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
       "standalone ProbeAckData must not force SnpRespData")
   }
 
-  when (io.tasks.source_b.fire) {
+  when (io.sourceBAccepted) {
     state.s_pprobe := true.B
     sourceBProbeIssued := true.B
   }
@@ -475,7 +478,7 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
 
   val mayRetire = state.s_pprobe && state.s_probeack && state.s_dct.getOrElse(true.B) &&
     snpRespDone && (!doFwd || dctDone) && !io.nestedReleaseWritePending &&
-    (!sourceBProbeIssued || state.w_pprobeacklast) && !io.pairSearchPending && !io.sourceBHold
+    (!sourceBProbeIssued || state.w_pprobeacklast) && !io.pairSearchPending && !io.sourceBHold && !io.sinkCOwnerHold
   val retirementPending = RegInit(false.B)
   retirementPending := mayRetire && !io.tasks.preparedLease.held.valid && !io.tasks.preparedLease.proposalHeld && !mainpipeInvalidate
   val willFree = retirementPending && mayRetire &&
@@ -526,8 +529,6 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   // relinquished the client, so it can directly complete the snoop.  Once B
   // has fired, its ProbeAck remains mandatory; completing here would free the
   // context before that already-issued response arrives.
-  val nestedwbMatch = valid && dirResult.hit && meta.state =/= INVALID &&
-    dirResult.set === io.nestedwb.set && dirResult.tag === io.nestedwb.tag
   // Post-Grant snoops often miss Directory (tag not installed yet). Still claim
   // the nestedwb dirty beat into ReleaseBuf[S] by request address.
   // Use only the registered pending latch here: the live pending IO is derived
@@ -536,8 +537,7 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   // A same-cycle alloc+nestedwb miss is covered by the late RefillBuf copy.
   val nestedwbPostGrantMatch = valid && normalPostGrantReleasePendingLatched &&
     req.set === io.nestedwb.set && req.tag === io.nestedwb.tag
-  val nestedwbCompletesUnissuedProbe = nestedwbMatch && !state.s_pprobe
-  when (nestedwbCompletesUnissuedProbe && (io.nestedwb.c_set_dirty || io.nestedwb.c_set_tip)) {
+  when (nestedReleaseReplacesProbe) {
     state.s_pprobe := true.B
     state.w_pprobeackfirst := true.B
     state.w_pprobeacklast := true.B

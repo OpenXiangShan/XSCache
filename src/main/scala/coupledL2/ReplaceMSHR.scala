@@ -55,7 +55,9 @@ class ReplaceMSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   // Registered local admission phase protects a possible B capture before
   // its exact same-line service reservation is applied on the following edge.
   val localReservationHold = Input(Bool())
+  val sinkCOwnerHold = Input(Bool())
   val sourceBHold = Input(Bool())
+  val sourceBAccepted = Input(Bool())
   // The whole nested snoop has completed, including forwarded CompData.
   val snoopDoneCount = Input(UInt(log2Ceil(mshrsAll + 3).W))
   // Keep the snapshot current so a later CMO commit cannot restore stale
@@ -415,7 +417,7 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     io.releaseDataSeen || io.victimDataCaptured || io.victimDataNeedsWriteback ||
     io.nestedReleaseWritePending ||
     io.snoopStarted || io.snoopDoneCount.orR || io.snoopMeta.valid || io.snoopToInvalDone ||
-    io.copyBackDone || io.parentRelease || io.tasks.source_b.fire ||
+    io.copyBackDone || io.parentRelease || io.sourceBAccepted ||
     io.tasks.txreq.fire || io.tasks.txdat.fire || io.tasks.txrsp.fire
   val mainpipeIssuedVariant = MainpipeLeaseIO.freeze(io.tasks.preparedLease,
     mainpipeIntent, io.tasks.mainpipe,
@@ -434,7 +436,7 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   compAckRsp.traceTag := false.B
   io.tasks.txrsp.valid := valid && compAckPending
 
-  when (io.tasks.source_b.fire) {
+  when (io.sourceBAccepted) {
     probeSent := true.B
   }
   when (io.tasks.txreq.fire) {
@@ -549,22 +551,20 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
       compReceived := true.B
     }
   }
-  // An invalidating snoop that found no release in flight consumes the sidecar.
-  // Retire in the same cycle, as before, unless another reserved response is
-  // still travelling -- retiring then would make that response's completion
-  // arrive at an invalid sidecar. snoopInFlightNext subtracts this snoop's own
-  // reservation, so the single-snoop case is unchanged.
+  // An invalidating snoop consumes this sidecar after all reserved response
+  // deltas have applied. Retirement reads the registered current tally, never
+  // the combinational start-minus-done result; a last completion costs a cycle.
   // Retiring frees the txnID/ReleaseBuf for reuse, so it must also wait until
   // the skid has handed the release flit to TXREQ.  For the first branch
   // !releaseSent already implies an empty skid; the explicit term documents
   // the invariant.  The releaseAck branch implies the flit left long ago.
-  val consumedRetire = (snoopConsumed || io.snoopToInvalDone) && !releaseSent &&
-    !io.txreqPending && snoopInFlightNext === 0.U
+  val consumedRetire = snoopConsumed && !releaseSent &&
+    !io.txreqPending && !snoopInFlight && !io.snoopStarted
   val transportRetire = releaseAck && !compAckPending &&
     (!needsCopyBack || copyBackComplete || io.copyBackDone) &&
     !snoopInFlight && !io.snoopStarted && !io.txreqPending
   val retireEligible = valid && (consumedRetire || transportRetire) &&
-    !io.nestedReleaseWritePending && !io.sourceBHold
+    !io.nestedReleaseWritePending && !io.sourceBHold && !io.sinkCOwnerHold
   val mayRetire = retireEligible && !io.localReservationHold
   val retirementPending = RegInit(false.B)
   retirementPending := retireEligible && !io.tasks.preparedLease.held.valid && !io.tasks.preparedLease.proposalHeld && !mainpipeInvalidate
