@@ -354,21 +354,34 @@ class Directory(implicit p: Parameters) extends L2Module {
   // lookups.  Otherwise a fill whose replacer state has not changed since
   // allocation re-picks its own tentative way and is spuriously redirected
   // to MaskToOH (measured: 99.8% of all fallbacks are such self-collisions).
-  val normalOccWayMask_s1 = VecInit(io.refillInfo.zipWithIndex.map { case (s, i) =>
-    Mux(
+  // Sample each owner's local match/way at the read edge, before reducing
+  // across owners. The existing S2 -> S3 boundary then reduces only FFs;
+  // admission and the complete address/hold cone no longer feed a global
+  // way reduction and its wide clock enable in the same stage. These local
+  // samples update unconditionally: reqValid_s2 alone identifies a read, and
+  // the S3 record below retains exactly that read's snapshot.
+  def sampleOwnerWayMask(mask: UInt): UInt = {
+    // An explicit register type is required by MaskToOH's elaboration-time
+    // width queries; RegNext(UInt) otherwise leaves this width inferred.
+    val snapshot = RegInit(0.U(ways.W))
+    snapshot := mask
+    snapshot
+  }
+  val normalOwnerWayMasks_s2 = io.refillInfo.zipWithIndex.map { case (s, i) =>
+    sampleOwnerWayMask(Mux(
       s.valid && (s.bits.set === req_s1.set) && (s.bits.blockRefill || s.bits.dirHit) &&
         req_s1.mshrId =/= i.U,
       UIntToOH(s.bits.way, ways),
       0.U(ways.W)
-    )
-  }).reduceTree(_ | _)
-  val snoopWayHoldMask_s1 = VecInit(io.snoopInfo.map(s =>
-    Mux(
+    ))
+  }
+  val snoopOwnerWayMasks_s2 = io.snoopInfo.map(s =>
+    sampleOwnerWayMask(Mux(
       s.valid && (s.bits.set === req_s1.set) && s.bits.blockRefill,
       UIntToOH(s.bits.way, ways),
       0.U(ways.W)
-    )
-  )).reduceTree(_ | _)
+    ))
+  )
   // ReplaceMSHR owns the victim ReleaseBuf independently of its normal parent.
   // The Directory way only needs protection until the parent's deferred refill
   // commit is visible: parentAttached drops at the parent's retire edge, which
@@ -376,33 +389,41 @@ class Directory(implicit p: Parameters) extends L2Module {
   // new tag/meta at that way are already installed before the hold releases.
   // Holding the way for the sidecar's whole writeback lifetime shrinks
   // freeWayMask for dozens of extra cycles and degrades victim selection.
-  val replaceWayHoldMask_s1 = VecInit(io.replaceInfo.map(s =>
-    Mux(
+  val replaceOwnerWayMasks_s2 = io.replaceInfo.map(s =>
+    sampleOwnerWayMask(Mux(
       s.valid && s.bits.parentAttached && (s.bits.set === req_s1.set),
       UIntToOH(s.bits.way, ways),
       0.U(ways.W)
-    )
-  )).reduceTree(_ | _)
-  val occWayMask_s1 = normalOccWayMask_s1 | snoopWayHoldMask_s1 | replaceWayHoldMask_s1 |
-    Mux(refillReqValid_s3 || reqValid_s3 && io.resp.bits.hit, UIntToOH(io.resp.bits.way, ways), 0.U(ways.W))
-
-  val occWayMask_s2 = RegEnable(occWayMask_s1, io.read.fire && io.read.bits.refill)
-  val snoopWayHoldMask_s2 = RegEnable(snoopWayHoldMask_s1, io.read.fire && io.read.bits.refill)
-  val replaceWayHoldMask_s2 = RegEnable(replaceWayHoldMask_s1, io.read.fire && io.read.bits.refill)
-  // Debug-only copies for fallback-cause decomposition (same sampling window).
-  val normalOccWayMask_s2 = RegEnable(normalOccWayMask_s1, io.read.fire && io.read.bits.refill)
-  val selfOccWayMask_s1 = VecInit(io.refillInfo.zipWithIndex.map { case (s, i) =>
-    Mux(
+    ))
+  )
+  val pipelineWayMask_s2 = sampleOwnerWayMask(Mux(
+    refillReqValid_s3 || reqValid_s3 && io.resp.bits.hit,
+    UIntToOH(io.resp.bits.way, ways), 0.U(ways.W)))
+  val normalOccWayMask_s2 = VecInit(normalOwnerWayMasks_s2).reduceTree(_ | _)
+  val snoopWayHoldMask_s2 = VecInit(snoopOwnerWayMasks_s2).reduceTree(_ | _)
+  val replaceWayHoldMask_s2 = VecInit(replaceOwnerWayMasks_s2).reduceTree(_ | _)
+  val occWayMask_s2 = Wire(UInt(ways.W))
+  occWayMask_s2 := normalOccWayMask_s2 | snoopWayHoldMask_s2 |
+    replaceWayHoldMask_s2 | pipelineWayMask_s2
+  val selfOwnerWayMasks_s2 = io.refillInfo.zipWithIndex.map { case (s, i) =>
+    sampleOwnerWayMask(Mux(
       s.valid && (s.bits.set === req_s1.set) && (s.bits.blockRefill || s.bits.dirHit) &&
         io.read.bits.mshrId === i.U,
       UIntToOH(s.bits.way, ways),
       0.U(ways.W)
-    )
-  }).reduceTree(_ | _)
-  val selfOccWayMask_s2 = RegEnable(selfOccWayMask_s1, io.read.fire && io.read.bits.refill)
+    ))
+  }
+  val selfOccWayMask_s2 = VecInit(selfOwnerWayMasks_s2).reduceTree(_ | _)
+  // Assertions and counters execute at S3, so retain the same sampled read
+  // rather than consulting the next cycle's unconditional owner snapshots.
+  val snoopWayHoldMask_s3 = RegEnable(snoopWayHoldMask_s2, 0.U(ways.W), refillReqValid_s2)
+  val replaceWayHoldMask_s3 = RegEnable(replaceWayHoldMask_s2, 0.U(ways.W), refillReqValid_s2)
+  val normalOccWayMask_s3 = RegEnable(normalOccWayMask_s2, 0.U(ways.W), refillReqValid_s2)
+  val selfOccWayMask_s3 = RegEnable(selfOccWayMask_s2, 0.U(ways.W), refillReqValid_s2)
 
   io.retryFastFwd := occWayMask_s2.andR && refillReqValid_s2
-  val freeWayMask_s3 = RegEnable(~occWayMask_s2, refillReqValid_s2)
+  val freeWayMask_s3 = RegInit(0.U(ways.W))
+  when(refillReqValid_s2) { freeWayMask_s3 := ~occWayMask_s2 }
   val refillRetry = RegEnable(occWayMask_s2.andR, refillReqValid_s2)
 
   // val hitWay = OHToUInt(hitVec)
@@ -421,9 +442,9 @@ class Directory(implicit p: Parameters) extends L2Module {
   val hit_s3 = Cat(hitVec).orR || req_s3.cmoAll
   val wayOH_s3 = Mux(req_s3.cmoAll, cmoWayOH_s3, Mux(hit_s3, hitOH, finalReplOH))
   when (reqValid_s3 && req_s3.refill && !hit_s3) {
-    assert(!(wayOH_s3 & snoopWayHoldMask_s2).orR,
+    assert(!(wayOH_s3 & snoopWayHoldMask_s3).orR,
       "a refill replacement must not select a DS way held by SnoopMSHR data")
-    assert(!(wayOH_s3 & replaceWayHoldMask_s2).orR,
+    assert(!(wayOH_s3 & replaceWayHoldMask_s3).orR,
       "a refill replacement must not select a DS way held by ReplaceMSHR")
   }
   val way_s3 = OHToUInt(wayOH_s3)
@@ -447,20 +468,20 @@ class Directory(implicit p: Parameters) extends L2Module {
   // requesting MSHR's own tentative way (spurious self-collision), another
   // normal context, a ReplaceMSHR hold, or a SnoopMSHR hold.
   XSPerfAccumulate("repl_fallback_selfWay_cnt",
-    chosenBlocked_s3 && (chosenOH & selfOccWayMask_s2).orR)
+    chosenBlocked_s3 && (chosenOH & selfOccWayMask_s3).orR)
   XSPerfAccumulate("repl_fallback_normalOther_cnt",
-    chosenBlocked_s3 && (chosenOH & normalOccWayMask_s2 & ~selfOccWayMask_s2).orR)
+    chosenBlocked_s3 && (chosenOH & normalOccWayMask_s3 & ~selfOccWayMask_s3).orR)
   XSPerfAccumulate("repl_fallback_replaceHold_cnt",
-    chosenBlocked_s3 && (chosenOH & replaceWayHoldMask_s2).orR)
+    chosenBlocked_s3 && (chosenOH & replaceWayHoldMask_s3).orR)
   XSPerfAccumulate("repl_fallback_snoopHold_cnt",
-    chosenBlocked_s3 && (chosenOH & snoopWayHoldMask_s2).orR)
+    chosenBlocked_s3 && (chosenOH & snoopWayHoldMask_s3).orR)
   // Occupancy level of each mask at lookup time (sum over lookups).
   XSPerfAccumulate("lookup_occ_normal_sum",
-    Mux(replLookup_s3, PopCount(normalOccWayMask_s2), 0.U))
+    Mux(replLookup_s3, PopCount(normalOccWayMask_s3), 0.U))
   XSPerfAccumulate("lookup_occ_replace_sum",
-    Mux(replLookup_s3, PopCount(replaceWayHoldMask_s2), 0.U))
+    Mux(replLookup_s3, PopCount(replaceWayHoldMask_s3), 0.U))
   XSPerfAccumulate("lookup_occ_snoop_sum",
-    Mux(replLookup_s3, PopCount(snoopWayHoldMask_s2), 0.U))
+    Mux(replLookup_s3, PopCount(snoopWayHoldMask_s3), 0.U))
   XSPerfAccumulate("repl_lookup_total", io.replResp.valid)
   XSPerfAccumulate("repl_retry_cnt", io.replResp.valid && io.replResp.bits.retry)
   XSPerfAccumulate("repl_victim_valid_total",
@@ -524,10 +545,17 @@ class Directory(implicit p: Parameters) extends L2Module {
   // its own bank.  dirSetSplit = 1 keeps the SRAMs unsplit and degenerates to
   // the original arbitration (every write blocks every read).
   def bankOf(set: UInt): UInt = if (setBankCount == 1) 0.U else set(setBankBits - 1, 0)
-  val readBank = bankOf(io.read.bits.set)
-  val metaWriteConflict = io.metaWReq.valid && readBank === bankOf(io.metaWReq.bits.set)
-  val tagWriteConflict = io.tagWReq.valid && readBank === bankOf(io.tagWReq.bits.set)
-  val replacerWriteConflict = replacerWen && readBank === bankOf(req_s3.set)
+  // Decode each bank once and use a one-hot intersection for admission. This
+  // keeps the same-bank test balanced when a multi-bank directory is used,
+  // while dirSetSplit=1 naturally reduces to the original all-write stall.
+  def bankOH(set: UInt): UInt = UIntToOH(bankOf(set), setBankCount)
+  val readBankOH = bankOH(io.read.bits.set)
+  val metaWriteConflict = io.metaWReq.valid &&
+    (readBankOH & bankOH(io.metaWReq.bits.set)).orR
+  val tagWriteConflict = io.tagWReq.valid &&
+    (readBankOH & bankOH(io.tagWReq.bits.set)).orR
+  val replacerWriteConflict = replacerWen &&
+    (readBankOH & bankOH(req_s3.set)).orR
   val dirReadReady = !metaWriteConflict && !tagWriteConflict && !replacerWriteConflict
   io.read.ready := dirReadReady
   // Directory write-port breakdown for by_dir attribution: read-side stalls
