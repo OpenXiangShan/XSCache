@@ -58,8 +58,9 @@ class Slice()(implicit p: Parameters) extends LLCModule {
   val directory = Module(new Directory())
   val dataStorage = Module(new DataStorage())
 
-  val reqBuf = Module(new RequestBuffer())
-  val reqArb = Module(new RequestArb())
+  private val reqBufEntries = 8
+  val reqBuf = Module(new RequestBuffer(reqBufEntries))
+  val reqArb = Module(new RequestArb(reqBufEntries))
   val mainPipe = Module(new MainPipe())
   val refillUnit = Module(new RefillUnit())
   val memUnit = Module(new MemUnit())
@@ -90,6 +91,8 @@ class Slice()(implicit p: Parameters) extends LLCModule {
   reqBuf.io.in <> rxreqUp.io.task
 
   reqArb.io.busTask_s1 <> reqBuf.io.out
+  reqArb.io.busCandidates := reqBuf.io.candidates
+  reqBuf.io.eligible := reqArb.io.busEligible
   reqArb.io.refillTask_s1 <> refillUnit.io.task
   reqArb.io.pipeInfo <> mainPipe.io.pipeInfo
   reqArb.io.refillInfo <> refillUnit.io.refillInfo
