@@ -408,20 +408,22 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   io.tasks.txdat.valid := copyBackTaskValid && mode === ReplaceMSHRMode.victim
   io.tasks.txdat.bits := copyBackTask
   val mainpipeIntent = Wire(Decoupled(new TaskBundle))
+  val mainpipeIssuedVariant = Wire(UInt(4.W))
   mainpipeIntent.valid := captureTaskValid ||
     (copyBackTaskValid && mode =/= ReplaceMSHRMode.victim) ||
     (releaseTaskValid && mode =/= ReplaceMSHRMode.victim)
-  mainpipeIntent.bits := Mux(captureTaskValid, captureTask,
-    Mux(copyBackTaskValid, copyBackTask, releaseTask))
+  mainpipeIntent.bits := Mux(mainpipeIssuedVariant === 0.U, captureTask,
+    Mux(mainpipeIssuedVariant === 1.U, copyBackTask, releaseTask))
   val mainpipeInvalidate = io.alloc.valid || io.sinkC.valid || io.rxrsp.valid ||
     io.releaseDataSeen || io.victimDataCaptured || io.victimDataNeedsWriteback ||
     io.nestedReleaseWritePending ||
     io.snoopStarted || io.snoopDoneCount.orR || io.snoopMeta.valid || io.snoopToInvalDone ||
     io.copyBackDone || io.parentRelease || io.sourceBAccepted ||
     io.tasks.txreq.fire || io.tasks.txdat.fire || io.tasks.txrsp.fire
-  val mainpipeIssuedVariant = MainpipeLeaseIO.freeze(io.tasks.preparedLease,
+  mainpipeIssuedVariant := MainpipeLeaseIO.freeze(io.tasks.preparedLease,
     mainpipeIntent, io.tasks.mainpipe,
-    Mux(captureTaskValid, 0.U(4.W), Mux(copyBackTaskValid, 1.U(4.W), 2.U(4.W))), mainpipeInvalidate)
+    Mux(captureTaskValid, 0.U(4.W), Mux(copyBackTaskValid, 1.U(4.W), 2.U(4.W))),
+    Mux(captureTaskValid, 3.U(3.W), 4.U(3.W)), mainpipeInvalidate)
   // Comp for WriteEvictOrEvict is the only response that owes CompAck.  The
   // flit stays valid until TXRSP accepts it; retiring earlier would drop it.
   val compAckRsp = io.tasks.txrsp.bits

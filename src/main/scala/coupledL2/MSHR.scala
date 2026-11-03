@@ -65,7 +65,14 @@ class NormalSlotReservation(implicit p: Parameters) extends CoupledL2Bundle {
   val token = new MainpipeLeaseToken
   val task = new TaskBundle
 }
+// Arbitration sees only a registered operation identity and its QoS hint.
+// The allocation generation and controller sequence are bound by the winner.
+class MainpipeCandidate extends Bundle {
+  val operation = UInt(4.W)
+  val qosClass = UInt(3.W)
+}
 class MainpipeLeaseIO(implicit p: Parameters) extends CoupledL2Bundle {
+  val candidate = ValidIO(new MainpipeCandidate)
   val prepare = Flipped(ValidIO(new MainpipeLeaseToken))
   val held = Flipped(ValidIO(new MainpipeLeaseToken))
   val cancel = ValidIO(new MainpipeLeaseToken)
@@ -75,22 +82,23 @@ class MainpipeLeaseIO(implicit p: Parameters) extends CoupledL2Bundle {
   val proposalHeld = Output(Bool())
 }
 object MainpipeLeaseIO {
-  // Source proposal is a real stage BEFORE group arbitration. It pins this
-  // allocation and freezes payload/variant while all RR inputs read only FFs.
-  // A coincident event may revoke a proposal selected at this edge; the
-  // versioned group lease then cancels and returns without consuming source.
+  // The source proposal contains no TaskBundle. Only a registered group
+  // winner can materialize a payload, one cycle after acquiring its lease.
+  // Events before/during materialization revoke the exact winning token.
   def freeze(port: MainpipeLeaseIO, intent: DecoupledIO[TaskBundle],
-      output: DecoupledIO[TaskBundle], variant: UInt, invalidate: Bool): UInt = {
+      output: DecoupledIO[TaskBundle], variant: UInt, qosClass: UInt, invalidate: Bool): UInt = {
     val task = Reg(chiselTypeOf(intent.bits))
     val operation = Reg(UInt(4.W))
+    val proposalClass = Reg(UInt(3.W))
     val proposal = RegInit(false.B)
+    val payloadFrozen = RegInit(false.B)
     val token = Reg(chiselTypeOf(port.prepare.bits))
     val issued = RegInit(false.B)
     val canceled = RegInit(false.B)
     port.proposalHeld := proposal
     when(!proposal && !port.held.valid && intent.valid && port.canPrepare && !invalidate) {
-      task := intent.bits
       operation := variant
+      proposalClass := qosClass
       proposal := true.B
     }
     when(proposal && invalidate) { proposal := false.B }
@@ -100,13 +108,28 @@ object MainpipeLeaseIO {
       token := port.prepare.bits
       issued := false.B
       canceled := invalidate
+      // Materialize at the winner/lease edge.  The group prepared register
+      // samples the source on the following edge, so retaining this payload
+      // here removes the live intent -> prepared-D path.  If the winner is
+      // no longer current at this edge, leave the payload unfrozen; the
+      // registered lease will be canceled by the next-cycle recheck.
+      payloadFrozen := intent.valid && variant === operation
+      when (intent.valid && variant === operation) {
+        task := intent.bits
+      }
     }.elsewhen(!port.held.valid) {
       issued := false.B
       canceled := false.B
+      payloadFrozen := false.B
     }.elsewhen(!issued && invalidate) {
       canceled := true.B
     }
-    port.cancel.valid := port.held.valid && !issued && (canceled || invalidate)
+    // Recheck narrow readiness/variant after winner registration. The source
+    // may have received a response on the selection edge. Once materialized,
+    // the event-cancel path protects the frozen payload through final issue.
+    val materializationCurrent = intent.valid && variant === operation
+    port.cancel.valid := port.held.valid && !issued &&
+      (canceled || invalidate || (!payloadFrozen && !materializationCurrent))
     port.cancel.bits := token
   // A live invalidate is a broad per-source event (allocation, response,
   // grant/transport completion, and owner bookkeeping).  It must not retract
@@ -118,9 +141,16 @@ object MainpipeLeaseIO {
   // output, so use its registered edge when narrowing the veto to avoid a
   // combinational source/arbiter loop.
   val prepareSeen = RegNext(port.prepare.valid, false.B)
-  output.valid := Mux(port.held.valid, !issued && !port.cancel.valid,
-    proposal && (!invalidate || !prepareSeen))
-    output.bits := task
+    port.candidate.valid := Mux(port.held.valid, !issued && !port.cancel.valid,
+      proposal && (!invalidate || !prepareSeen))
+    port.candidate.bits.operation := operation
+    port.candidate.bits.qosClass := proposalClass
+    output.valid := port.held.valid && !issued && !port.cancel.valid
+    output.bits := Mux(port.held.valid, task, 0.U.asTypeOf(intent.bits))
+    when(output.valid && !payloadFrozen) {
+      task := intent.bits
+      payloadFrozen := true.B
+    }
     intent.ready := false.B
     when(output.fire) {
       assert(port.held.valid && !port.cancel.valid, "issue must own an uncanceled frozen variant")
@@ -1960,15 +1990,15 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
 
   mainpipeIntent.bits := ParallelPriorityMux(
     Seq(
-      mp_repl_read_valid -> mp_repl_read,
-      mp_grant_valid -> mp_grant,
-      mp_normal_refill_revalidate_valid -> mp_normal_refill_revalidate,
-      mp_normal_refill_commit_valid -> mp_normal_refill_commit,
-      mp_release_valid -> mp_release,
-      mp_cbwrdata_valid -> mp_cbwrdata,
-      mp_probeack_valid -> mp_probeack,
-      mp_dct_valid -> mp_dct,
-      mp_cmometaw_valid -> mp_cmometaw
+      (mainpipeIssuedVariant === 0.U) -> mp_repl_read,
+      (mainpipeIssuedVariant === 1.U) -> mp_grant,
+      (mainpipeIssuedVariant === 2.U) -> mp_normal_refill_revalidate,
+      (mainpipeIssuedVariant === 3.U) -> mp_normal_refill_commit,
+      (mainpipeIssuedVariant === 4.U) -> mp_release,
+      (mainpipeIssuedVariant === 5.U) -> mp_cbwrdata,
+      (mainpipeIssuedVariant === 6.U) -> mp_probeack,
+      (mainpipeIssuedVariant === 7.U) -> mp_dct,
+      (mainpipeIssuedVariant === 8.U) -> mp_cmometaw
     )
   )
   mainpipeIntent.bits.reqSource := req.reqSource
@@ -1977,8 +2007,16 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     mp_repl_read_valid, mp_grant_valid, mp_normal_refill_revalidate_valid,
     mp_normal_refill_commit_valid, mp_release_valid, mp_cbwrdata_valid,
     mp_probeack_valid, mp_dct_valid, mp_cmometaw_valid)).asUInt)
+  val grantOpcode = odOpGen(req.opcode)
+  val grantClass = grantOpcode === Grant || grantOpcode === GrantData ||
+    grantOpcode === AccessAckData || grantOpcode === HintAck
+  val mainpipeClass = Mux((req.fromB && mainpipeVariant =/= 8.U) ||
+    mainpipeVariant === 6.U || mainpipeVariant === 7.U, 0.U(3.W),
+    Mux(mainpipeVariant === 1.U && grantClass, 1.U(3.W),
+      Mux(mainpipeVariant === 0.U || mainpipeVariant === 2.U || mainpipeVariant === 3.U,
+        2.U(3.W), 4.U(3.W))))
   mainpipeIssuedVariant := MainpipeLeaseIO.freeze(io.tasks.preparedLease,
-    mainpipeIntent, io.tasks.mainpipe, mainpipeVariant, mainpipeInvalidate)
+    mainpipeIntent, io.tasks.mainpipe, mainpipeVariant, mainpipeClass, mainpipeInvalidate)
 
   val mp_valid = io.tasks.mainpipe.valid
   val mp = io.tasks.mainpipe.bits
