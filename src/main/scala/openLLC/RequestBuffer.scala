@@ -32,9 +32,6 @@ class RequestBuffer(entries: Int = 8)(implicit p: Parameters) extends LLCModule 
 
   /* Data Structure */
   val buffer = RegInit(VecInit(Seq.fill(entries)(0.U.asTypeOf(Valid(new Task())))))
-  // Eligibility changes as in-flight dependencies drain. Arbitrate over the
-  // currently eligible entries and advance the RR pointer only on consumption.
-  val issueArb = Module(new RRArbiter(new Task(), entries, initLastGrant = true))
   io.candidates := buffer
 
   val in   = io.in
@@ -52,19 +49,48 @@ class RequestBuffer(entries: Int = 8)(implicit p: Parameters) extends LLCModule 
     entry.bits := in.bits
   }
 
-  /* Issue */
-  issueArb.io.in.zip(buffer).zip(io.eligible).foreach { case ((in, e), eligible) =>
-    in.valid := e.valid && eligible
-    in.bits  := e.bits
+  /* Age-based issue arbitration */
+  // For each pair i < j, ageOlder(i)(j) means entry i was enqueued first.
+  // Allocating a new request only changes the relations in its matrix row/column.
+  val agePairCount = entries * (entries - 1) / 2
+  val ageOlderUpper = RegInit(VecInit(Seq.fill(agePairCount)(false.B)))
+  def agePairIndex(i: Int, j: Int): Int = {
+    require(i < j)
+    i * (2 * entries - i - 1) / 2 + (j - i - 1)
   }
-  issueArb.io.out.ready := out.ready
+  def isOlder(i: Int, j: Int): Bool = {
+    if (i == j) true.B
+    else if (i < j) ageOlderUpper(agePairIndex(i, j))
+    else !ageOlderUpper(agePairIndex(j, i))
+  }
 
-  out.valid := issueArb.io.out.valid
-  out.bits := issueArb.io.out.bits
+  for (i <- 0 until entries; j <- i + 1 until entries) {
+    val pairIndex = agePairIndex(i, j)
+    when(alloc && insertIdx === i.U && buffer(j).valid) {
+      ageOlderUpper(pairIndex) := false.B
+    }.elsewhen(alloc && insertIdx === j.U && buffer(i).valid) {
+      ageOlderUpper(pairIndex) := true.B
+    }
+  }
+
+  val issueValid = VecInit(buffer.zip(io.eligible).map { case (entry, eligible) =>
+    entry.valid && eligible
+  })
+  val oldestEligible = VecInit((0 until entries).map { i =>
+    issueValid(i) && (0 until entries).filter(_ != i).map { j =>
+      !issueValid(j) || isOlder(i, j)
+    }.reduce(_ && _)
+  })
+  val anyEligible = issueValid.asUInt.orR
+  assert(!anyEligible || PopCount(oldestEligible) === 1.U,
+    "RequestBuffer age matrix must select exactly one oldest eligible entry")
+
+  out.valid := anyEligible
+  out.bits := Mux1H(oldestEligible, buffer.map(_.bits))
 
   /* Dealloc */
   when(out.fire) {
-    val entry = buffer(issueArb.io.chosen)
+    val entry = buffer(OHToUInt(oldestEligible))
     entry.valid := false.B
   }
 
