@@ -303,9 +303,9 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
   var l2Replacement = "drrip"
   var l2DRRIPReleaseUpdate = true
   var l2DRRIPUseSRAM = true
-  var l2OriginUseSRAM = true
+  var l2OriginUseSRAM = false
   var l2DirRelArbitration = "rr"
-  var l2DirRelSingleCycle = false
+  var l2DirRelSingleCycle = true
   var llcSets = 64
   var llcWays = 4
   var llcBanks = 1

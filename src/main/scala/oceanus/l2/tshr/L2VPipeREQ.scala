@@ -139,6 +139,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     // with the stale DS-read copy ahead of the L1's authoritative beats.
     val L1EVT_data_pending = Input(Bool())
 
+    // Incoming EVT is WriteBackFull; clean Evict may bypass conflict-hit prefill.
+    val L1EVT_wbFull = Input(Bool())
+
     val L2EVT_opcode = Valid(UInt(paramCHI.reqOpcodeWidth.W))
   })
 
@@ -453,7 +456,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                s_evict_dn_compack ||
                w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds ||
                w_evict_peer_commit_dir ||
-               w_hit_lock_release
+               w_hit_lock_release || s_hit_lock_release
 
   io.free := !active
 
@@ -1750,8 +1753,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     s_evict_up_evict := false.B
   }
 
-  val lock_dir = (p_prefill_any && io.repl_done) || rxevb_unsatisfied_evictback
-  val lock_ds = (p_prefill_any && io.repl_done) || rxevb_unsatisfied_evictback
+  val lock_on_miss = p_prefill_miss && io.repl_done
+  val lock_on_hit = p_prefill_hit && !io.repl_done
+  val lock_dir = lock_on_miss || lock_on_hit || rxevb_unsatisfied_evictback
+  val lock_ds = lock_on_miss || lock_on_hit || rxevb_unsatisfied_evictback
 
   val unlock_self_evictback = RegNext(meta_wr_state_evictback_I) && !meta_wr_state_evictback_I
   val unlock_self_noevict = RegNext(io.repl_done && w_s_evict_up_evict && evict_not_needed)
@@ -1943,13 +1948,16 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // ----------------------------------------------------------------
 
   // -- Blocking same-PA RXSNP, on waiting of L1 CompAck
-  io.blockRBE.EVT := p_prefill_any
+  io.blockRBE.EVT := p_prefill_miss
   io.blockRBE.SNP := w_rd_up_compack || s_repl
   io.blockRBE.EVB := (active && !p_prefill_any) ||
                      w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds ||
                      w_evict_peer_commit_dir ||
                      evict_active
   io.blockRBE.REQ := active
+
+  assert(!(p_prefill_hit && io.L1EVT_wbFull),
+    "EVT WriteBackFull entered during conflict-hit prefill")
 
   assert(!(rxevb_unsatisfied_evictback && active), 
     "TSHR @ %m REQ vPipe passed unsatisfied EvictBack on active non-replace non-invalid transaction")

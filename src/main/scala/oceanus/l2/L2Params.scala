@@ -47,12 +47,12 @@ case class L2Params(
     dataECC: Option[String] = Some("secded"),
     replacement: String = "drrip",
     drripUseSRAM: Boolean = true,
-    originUseSRAM: Boolean = true,
+    originUseSRAM: Boolean = false,
     // DRRIP release-type updates use the arbitrated DirRel operation issued
     // when the EVT vPipe accepts an Evict/WriteBackFull.
     enableDRRIPReleaseUpdate: Boolean = true,
     dirRelArbitration: String = "rr",
-    dirRelSingleCycle: Boolean = false,
+    dirRelSingleCycle: Boolean = true,
     enableDRRIPEntranceReleaseUpdate: Boolean = true,
 ) {
     require(Seq("dirrel-high", "rr", "dirrel-low").contains(dirRelArbitration),
