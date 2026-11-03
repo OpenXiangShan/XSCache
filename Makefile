@@ -92,8 +92,8 @@ L2_DRRIP_RELEASE_UPDATE ?= 1
 L2_DRRIP_USE_SRAM ?= 1
 # DirRel arbitration: dirrel-high, rr, or dirrel-low
 L2_DIRREL_ARBITRATION ?= rr
-L2_ORIGIN_USE_SRAM ?= 1
-L2_DIRREL_SINGLE_CYCLE ?= 0
+L2_ORIGIN_USE_SRAM ?= 0
+L2_DIRREL_SINGLE_CYCLE ?= 1
 # set TOP_L2TOP_PERF=1 to elaborate all XSPerf performance counters (release
 # default is off); exposes the log dump/clean pins on the generated top
 TOP_L2TOP_PERF ?= 0

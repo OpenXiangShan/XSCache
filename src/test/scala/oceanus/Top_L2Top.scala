@@ -112,10 +112,10 @@ Usage: Top_L2Top [<--option> <values>]
   var numSlices = 4
   var numTshr = 32
   var drripUseSRAM = true
-  var originUseSRAM = true
+  var originUseSRAM = false
   var enableDRRIPReleaseUpdate = true
   var dirRelArbitration = "rr"
-  var dirRelSingleCycle = false
+  var dirRelSingleCycle = true
 
   def parseBoolean(option: String, value: String): Boolean = {
     require(value == "0" || value == "1", s"$option expects 0 or 1, got $value")

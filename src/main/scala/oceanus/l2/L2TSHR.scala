@@ -425,7 +425,6 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   // RBE drain priority chain: EVT > SNP > EVB > REQ.
   // NOTE: keyed on io.valid (queue occupancy, registered) rather than io.out.valid
   // (drain fire) — the latter closes a combinational cycle through vPipeSNP.blockRBE.EVT
-  rbeEVT.io.blockFromTSHR := false.B
   rbeSNP.io.blockFromTSHR := rbeEVT.io.valid
   rbeEVB.io.blockFromTSHR := rbeEVT.io.valid || rbeSNP.io.valid
   rbeREQ.io.blockFromTSHR := rbeEVT.io.valid || rbeSNP.io.valid || rbeEVB.io.valid
@@ -605,6 +604,8 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   vPipeREQ.io.L1EVT_active := vPipeEVT.io.EVT_active
   vPipeREQ.io.L1EVT_data_pending := vPipeEVT.io.EVT_data_pending
+  vPipeREQ.io.L1EVT_wbFull := vPipeEVT.io.UpRXEVT.valid &&
+                              vPipeEVT.io.UpRXEVT.bits.Opcode === CCHIOpcode.WriteBackFull.U
 
   // connections between TX channels and TSHR local modules
   io.DnTXREQ <> vPipeREQ.io.DnTXREQ
@@ -679,12 +680,18 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   vPipeREQ.io.repl_resp := replResult
   vPipeREQ.io.repl_meta := replResultMeta
 
+  proxyDir.io.repl_lock_req := vPipeREQ.io.repl_lock_req
+  proxyDir.io.repl_lock_way := vPipeREQ.io.repl_lock_way
+  vPipeREQ.io.repl_lock_conflict := proxyDir.io.repl_lock_conflict
+  proxyDir.io.repl_lock_release := vPipeREQ.io.repl_lock_release
+
   proxyDir.io.wb_aux := vPipeREQ.io.dir_wb_aux
 
   meta_commit_valid := proxyDir.io.wb_accept
 
   meta_valid := proxyDir.io.rd_done
   tshr_wb_done_dir := proxyDir.io.wb_done && proxyDir.io.rel_idle
+  rbeEVT.io.blockFromTSHR := !proxyDir.io.rel_idle
 
   // Data Storage Proxy
   val proxyDS = Module(new L2TSHRDataStorageProxy(tshrId))
