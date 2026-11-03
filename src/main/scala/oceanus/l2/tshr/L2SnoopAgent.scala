@@ -155,6 +155,7 @@ class L2SnoopAgent(val sliceNum: Int)(implicit val p: Parameters) extends Module
   val serviceOpcode = Reg(UInt(2.W))
   val serviceFromSNP = RegInit(false.B)
   val serviceFromREQ = RegInit(false.B)
+  val servicePreserveClient = RegInit(false.B)
 
   val seenData0 = RegInit(false.B)
   val passDirtyReg = RegInit(false.B)
@@ -198,6 +199,9 @@ class L2SnoopAgent(val sliceNum: Int)(implicit val p: Parameters) extends Module
     io.tshr_dirResult.clients.asUInt.orR &&
     startUop.CLIENTS.asUInt.orR &&
     (io.tshr_dirResult.alias =/= startUop.ALIAS)
+  when (startService) {
+    servicePreserveClient := startFromREQ && aliasMismatch
+  }
   val (startNeedSnoop, startOpcode) =
     SnoopOpcodeDerive(intentOf(startUop), io.tshr_dirResult.state, io.tshr_dirResult.clients.asUInt, io.tshr_dirResult.hit, aliasMismatch)
 
@@ -218,9 +222,9 @@ class L2SnoopAgent(val sliceNum: Int)(implicit val p: Parameters) extends Module
   val datBeat2 = datMatch && io.UpRXDAT.bits.DataID === 1.U
 
   val done = rspMatch || (datBeat2 && seenData0)
-  // SNP opcodes 0x00-0x03 place SnpToShared/SnpToClean after the client-clearing opcodes; inserting an opcode changes clear_client_en semantics.
-  val clear_client_en = done && (serviceOpcode === CCHIOpcode.SnpMakeInvalid.U || serviceOpcode === CCHIOpcode.SnpToInvalid.U)
-  // clear_client_en trusts CHI-compliant core behavior and does not inspect the final response state for I.
+  val invalidatingService = serviceOpcode === CCHIOpcode.SnpMakeInvalid.U || serviceOpcode === CCHIOpcode.SnpToInvalid.U
+  // Alias back-invalidation preserves ownership through the subsequent grant; other invalidating completions clear it.
+  val clear_client_en = done && invalidatingService && !servicePreserveClient
   io.tshr_meta_write_en := 0.U.asTypeOf(new L2Directory.MetaWriteMask)
   io.tshr_meta_write_en.clients(0) := clear_client_en
   io.tshr_meta_write_meta := 0.U.asTypeOf(new L2Directory.Meta)

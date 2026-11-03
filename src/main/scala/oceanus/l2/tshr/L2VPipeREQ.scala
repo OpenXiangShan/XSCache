@@ -517,7 +517,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.toSA.SnpCompAck := false.B // TODO: interact with upstream data sending
 
   io.toSA.CLIENTS := io.fromClientTable
-  io.toSA.ALIAS := Mux(rxreq_readonce, dirResult.alias, rxreq.TagAlias)
+  val rxreq_aliasable = rxreq_readunique || rxreq_readshared || rxreq_makeunique
+  io.toSA.ALIAS := Mux(rxreq_aliasable, rxreq.TagAlias, dirResult.alias)
 
   io.toSA.isL2Evict := rxevb_evictback
 
@@ -1157,7 +1158,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                      dn_rxrsp_comp
 
   val meta_wr_client_makeunique_set = active && p_rxreq_makeunique &&
-                                      !p_rxreq_client_present &&
                                       issue_up_rd_comp
 
   val meta_wr_alias_makeunique = meta_wr_client_makeunique_set
@@ -1188,7 +1188,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                      (dn_rxdat_compdata_first_UD_PD || dn_rxdat_datasepresp_first_UD_PD || dn_rxrsp_comp_UD_PD)
 
   val meta_wr_client_readunique_set = active && p_rxreq_readunique &&
-                                      !p_rxreq_client_present &&
                                       (issue_up_rd_comp || issue_up_rd_compdata_first)
 
   val meta_wr_alias_readunique = meta_wr_client_readunique_set
@@ -1235,7 +1234,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                      (dn_rxdat_compdata_first_UD_PD || dn_rxdat_datasepresp_first_UD_PD)
 
   val meta_wr_client_readshared_set = active && p_rxreq_readshared &&
-                                      !p_rxreq_client_present &&
                                       (issue_up_rd_comp || issue_up_rd_compdata_first)
 
   val meta_wr_alias_readshared = meta_wr_client_readshared_set
