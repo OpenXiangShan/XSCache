@@ -24,11 +24,13 @@ import scala.math.min
 import utility.XSPerfAccumulate
 import xscache.chi.HasCHIOpcodes
 
-class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo with HasCHIOpcodes {
+class RequestArb(entries: Int = 8)(implicit p: Parameters) extends LLCModule with HasClientInfo with HasCHIOpcodes {
   val io = IO(new Bundle() {
     /* receive incoming tasks from s1 */
     val busTask_s1 = Flipped(DecoupledIO(new Task()))
     val refillTask_s1 = Flipped(DecoupledIO(new Task()))
+    val busCandidates = Input(Vec(entries, Valid(new Task())))
+    val busEligible = Output(Vec(entries, Bool()))
 
     /* read local/client directory */
     val dirRead_s1 = DecoupledIO(new DirRead())
@@ -55,7 +57,6 @@ class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo wi
   val pipeInfo   = io.pipeInfo
   val refillInfo = io.refillInfo
   val respInfo   = io.respInfo
-  val snpInfo    = io.snpInfo
   val memInfo    = io.memInfo
 
   val task_s1 = Wire(Valid(new Task()))
@@ -66,69 +67,76 @@ class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo wi
 
   val tag_s1   = task_s1.bits.tag
   val set_s1   = task_s1.bits.set
-  val reqID_s1 = task_s1.bits.reqID
-
-  val isReadNotSharedDirty_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === ReadNotSharedDirty
-  val isReadUnique_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === ReadUnique
-  val isStashOnceShared_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === StashOnceShared
-  val isCleanInvalid_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === CleanInvalid
-  val isCleanShared_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === CleanShared
-  val isWriteCleanFull_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === WriteCleanFull
-
-  val isRead_s1  = isReadNotSharedDirty_s1 || isReadUnique_s1 || isStashOnceShared_s1
-  val isClean_s1 = isCleanInvalid_s1 || isCleanShared_s1 || isWriteCleanFull_s1
-
-  // To prevent data hazards caused by read-after-write conflicts in the directory,
-  // blocking is required when the set of s1 is the same as that of s2 or s3
-  val sameSet_s2 = pipeInfo.s2_valid && pipeInfo.s2_set(minSetBits - 1, 0) === set_s1(minSetBits - 1, 0)
-  val sameSet_s3 = pipeInfo.s3_valid && pipeInfo.s3_set(minSetBits - 1, 0) === set_s1(minSetBits - 1, 0)
-  // Snoop tasks caused by replacements may be issued at S4 stage,
-  // so blocking is required when the set of S1 matches S4.
-  val sameSet_s4  = pipeInfo.s4_valid && pipeInfo.s4_set(minSetBits - 1, 0) === set_s1(minSetBits - 1, 0)
-  val sameAddr_s5 = pipeInfo.s5_valid && Cat(pipeInfo.s5_tag, pipeInfo.s5_set) === Cat(tag_s1, set_s1)
-  val sameAddr_s6 = pipeInfo.s6_valid && Cat(pipeInfo.s6_tag, pipeInfo.s6_set) === Cat(tag_s1, set_s1)
-
-  val sameReqID_s2 = pipeInfo.s2_valid && pipeInfo.s2_reqID === reqID_s1
-  val sameReqID_s3 = pipeInfo.s3_valid && pipeInfo.s3_reqID === reqID_s1
-  val sameReqID_s4 = pipeInfo.s4_valid && pipeInfo.s4_reqID === reqID_s1
-  val sameReqID_s5 = pipeInfo.s5_valid && pipeInfo.s5_reqID === reqID_s1
-  val sameReqID_s6 = pipeInfo.s6_valid && pipeInfo.s6_reqID === reqID_s1
 
   // Since the stages within the MainPipe are non-blocking, when the sum of the requests being processed
-  // in the buffer and the potential requests that might occupy the buffer in the MainPipe exceeds the 
+  // in the buffer and the potential requests that might occupy the buffer in the MainPipe exceeds the
   // total number of buffer entries, new requests need to be blocked from entering the MainPipe.
   val inflight_refill    = PopCount(refillInfo.map(e => e.valid))
-  val inflight_snoop     = PopCount(snpInfo.map(e => e.valid))
   val inflight_response  = PopCount(respInfo.map(e => e.valid))
   val inflight_memAccess = PopCount(memInfo.map(e => e.valid))
-  val potential_refill, potential_snoop = PopCount(Seq(pipeInfo.s2_valid, pipeInfo.s3_valid, pipeInfo.s4_valid))
+  val potential_refill = PopCount(Seq(pipeInfo.s2_valid, pipeInfo.s3_valid, pipeInfo.s4_valid))
   val potential_response, potential_memAccess = PopCount(pipeInfo.valids)
 
-  val blockByMainPipe = sameSet_s2 || sameSet_s3 || sameSet_s4 || sameAddr_s5 || sameAddr_s6 ||
-    sameReqID_s2 || sameReqID_s3 || sameReqID_s4 || sameReqID_s5 || sameReqID_s6
-  val blockByRefill = !task_s1.bits.refillTask && (
-    Cat(refillInfo.map(e => e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag_s1, set_s1))).orR ||
-    Cat(refillInfo.map(e => e.valid && e.bits.reqID === reqID_s1)).orR ||
-    (inflight_refill +& potential_refill) >= mshrs.refill.U
-  )
-  val blockByResp = !task_s1.bits.refillTask && (
-    Cat(respInfo.map(e => e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag_s1, set_s1))).orR ||
-    Cat(respInfo.map(e => e.valid && e.bits.reqID === reqID_s1)).orR ||
-    (inflight_response +& potential_response) >= mshrs.response.U
-  )
-  val blockBySnp = !task_s1.bits.refillTask && (
-    Cat(snpInfo.map(e => e.valid && e.bits.reqID === reqID_s1)).orR ||
-    (inflight_snoop +& potential_snoop) >= mshrs.snoop.U
-  )
-  val blockByMem = Cat(memInfo.map(e =>
-    e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag_s1, set_s1) &&
-      e.bits.opcode === WriteNoSnpFull &&
-      (task_s1.bits.refillTask || isClean_s1 || !e.bits.w_datRsp && isRead_s1)
-  )).orR ||
-    Cat(memInfo.map(e => e.valid && e.bits.reqID === reqID_s1 && !task_s1.bits.refillTask)).orR ||
-    (inflight_memAccess +& potential_memAccess) >= mshrs.memory.U
+  // Evaluate each buffered candidate before arbitration. This predicate only
+  // depends on the task and existing pipeline/buffer state, never on the grant.
+  def blocked(task: Task): Bool = {
+    val tag = task.tag
+    val set = task.set
+    val reqID = task.reqID
+    val isReadNotSharedDirty_s1 = !task.refillTask && task.chiOpcode === ReadNotSharedDirty
+    val isReadUnique_s1 = !task.refillTask && task.chiOpcode === ReadUnique
+    val isStashOnceShared_s1 = !task.refillTask && task.chiOpcode === StashOnceShared
+    val isCleanInvalid_s1 = !task.refillTask && task.chiOpcode === CleanInvalid
+    val isCleanShared_s1 = !task.refillTask && task.chiOpcode === CleanShared
+    val isWriteCleanFull_s1 = !task.refillTask && task.chiOpcode === WriteCleanFull
 
-  val blockEntrance = blockByMainPipe || blockByRefill || blockByResp || blockByMem
+    val isRead_s1  = isReadNotSharedDirty_s1 || isReadUnique_s1 || isStashOnceShared_s1
+    val isClean_s1 = isCleanInvalid_s1 || isCleanShared_s1 || isWriteCleanFull_s1
+
+    // To prevent data hazards caused by read-after-write conflicts in the directory,
+    // blocking is required when the set of s1 is the same as that of s2 or s3
+    val sameSet_s2 = pipeInfo.s2_valid && pipeInfo.s2_set(minSetBits - 1, 0) === set(minSetBits - 1, 0)
+    val sameSet_s3 = pipeInfo.s3_valid && pipeInfo.s3_set(minSetBits - 1, 0) === set(minSetBits - 1, 0)
+    // Snoop tasks caused by replacements may be issued at S4 stage,
+    // so blocking is required when the set of S1 matches S4.
+    val sameSet_s4  = pipeInfo.s4_valid && pipeInfo.s4_set(minSetBits - 1, 0) === set(minSetBits - 1, 0)
+    val sameAddr_s5 = pipeInfo.s5_valid && Cat(pipeInfo.s5_tag, pipeInfo.s5_set) === Cat(tag, set)
+    val sameAddr_s6 = pipeInfo.s6_valid && Cat(pipeInfo.s6_tag, pipeInfo.s6_set) === Cat(tag, set)
+
+    val sameReqID_s2 = pipeInfo.s2_valid && pipeInfo.s2_reqID === reqID
+    val sameReqID_s3 = pipeInfo.s3_valid && pipeInfo.s3_reqID === reqID
+    val sameReqID_s4 = pipeInfo.s4_valid && pipeInfo.s4_reqID === reqID
+    val sameReqID_s5 = pipeInfo.s5_valid && pipeInfo.s5_reqID === reqID
+    val sameReqID_s6 = pipeInfo.s6_valid && pipeInfo.s6_reqID === reqID
+
+    val blockByMainPipe = sameSet_s2 || sameSet_s3 || sameSet_s4 || sameAddr_s5 || sameAddr_s6 ||
+      sameReqID_s2 || sameReqID_s3 || sameReqID_s4 || sameReqID_s5 || sameReqID_s6
+    val blockByRefill = !task.refillTask && (
+      Cat(refillInfo.map(e => e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag, set))).orR ||
+      Cat(refillInfo.map(e => e.valid && e.bits.reqID === reqID)).orR ||
+      (inflight_refill +& potential_refill) >= mshrs.refill.U
+    )
+    val blockByResp = !task.refillTask && (
+      Cat(respInfo.map(e => e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag, set))).orR ||
+      Cat(respInfo.map(e => e.valid && e.bits.reqID === reqID)).orR ||
+      (inflight_response +& potential_response) >= mshrs.response.U
+    )
+    val blockByMem = Cat(memInfo.map(e =>
+      e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag, set) &&
+        e.bits.opcode === WriteNoSnpFull &&
+        (task.refillTask || isClean_s1 || !e.bits.w_datRsp && isRead_s1)
+    )).orR ||
+      Cat(memInfo.map(e => e.valid && e.bits.reqID === reqID && !task.refillTask)).orR ||
+      (inflight_memAccess +& potential_memAccess) >= mshrs.memory.U
+
+    blockByMainPipe || blockByRefill || blockByResp || blockByMem
+  }
+
+  io.busEligible.zip(io.busCandidates).foreach { case (eligible, candidate) =>
+    eligible := candidate.valid && !blocked(candidate.bits)
+  }
+
+  val blockEntrance = blocked(task_s1.bits)
 
   task_s1.valid := io.dirRead_s1.ready && (io.busTask_s1.valid || io.refillTask_s1.valid) && !blockEntrance
   task_s1.bits := Mux(io.refillTask_s1.valid, io.refillTask_s1.bits, io.busTask_s1.bits)
