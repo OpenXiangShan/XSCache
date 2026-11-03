@@ -1471,12 +1471,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                           meta_wr_dirty_clr) ||
                            repl_tshr_meta_wr
 
-  val tshr_meta_wr_client = !p_prefill_miss && (meta_wr_client_set ||
-                                           meta_wr_client_clr) ||
-                            repl_tshr_meta_wr
+  val tshr_meta_wr_client = (!p_prefill_miss && (meta_wr_client_set ||
+                                            meta_wr_client_clr) ||
+                             repl_tshr_meta_wr) && !p_rxreq_readonce
 
-  val tshr_meta_wr_alias = !p_prefill_miss && meta_wr_alias ||
-                           repl_tshr_meta_wr
+  val tshr_meta_wr_alias = (!p_prefill_miss && meta_wr_alias ||
+                            repl_tshr_meta_wr) && !p_rxreq_readonce
 
   val tshr_meta_wr_prefetch = repl_tshr_meta_wr ||
                               (!p_prefill_miss && tshr_meta_wr_state && (
