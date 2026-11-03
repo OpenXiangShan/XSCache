@@ -2322,10 +2322,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
    */
   val mshrTask = Wire(Decoupled(new TaskBundle()))
   // The three context types share one MainPipe admission port, but their
-  // payloads are independent.  Group them so each group only arbitrates
-  // mshrsAll inputs and registers its winner; the cross-group stage then
-  // only sees three candidates.  This keeps the class masks, RR and payload
-  // mux at 16 inputs instead of 48 in a single cycle.
+  // payloads are independent. Group arbitration carries only narrow source
+  // identities. A registered winner acquires the source lease BEFORE its
+  // payload is materialized and captured into the group's prepared register.
   val mshrTaskGroups: Seq[Seq[DecoupledIO[TaskBundle]]] = Seq(
     refillMshrs.map(_.io.tasks.mainpipe),
     snoopMshrs.map(_.io.tasks.mainpipe),
@@ -2342,35 +2341,22 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     snoopMshrs.map(_.io.tasks.preparedLease),
     replaceMshrs.map(_.io.tasks.preparedLease)
   )
-  def isGrantOp(op: UInt) = op === TLMessages.Grant || op === TLMessages.GrantData ||
-    op === TLMessages.AccessAckData || op === TLMessages.HintAck
-  def mshrTaskClass(t: DecoupledIO[TaskBundle]): UInt = {
-    val isResp = t.bits.mshrContext === 1.U ||
-      (t.bits.mshrContext === 0.U && t.bits.fromB)
-    val isGrant = t.bits.mshrContext === 0.U && !t.bits.refillOnly && isGrantOp(t.bits.opcode)
-    val isCommitOrLookup = t.bits.mshrContext === 0.U &&
-      (t.bits.refillOnly || t.bits.replTask || t.bits.normalRefillRevalidate)
-    val isCapture = t.bits.mshrContext === 2.U && t.bits.replaceCapture
-    Mux(isResp, 0.U(3.W),
-      Mux(isGrant, 1.U(3.W),
-        Mux(isCommitOrLookup, 2.U(3.W),
-          Mux(isCapture, 3.U(3.W), 4.U(3.W)))))
-  }
-  val mshrTaskClasses = mshrTaskSources.map(mshrTaskClass)
+  val mshrTaskCandidates = mshrTaskLeasePorts.flatten.map(_.candidate)
+  val mshrTaskClasses = mshrTaskCandidates.map(_.bits.qosClass)
   // Register each source's class while it is valid.  The arbitration then
   // reads a register instead of the deferGrant -> opcode -> class cone; a
   // task type change is visible one cycle later, which only shifts a QoS
   // hint and cannot affect correctness (the starvation guard stays).
-  val mshrTaskClassReg = mshrTaskSources.zip(mshrTaskClasses).map { case (t, c) =>
+  val mshrTaskClassReg = mshrTaskCandidates.zip(mshrTaskClasses).map { case (t, c) =>
     val r = RegInit(0.U(3.W))
     when(t.valid) { r := c }
     r
   }
-  val mshrTaskWaitCnt = mshrTaskSources.map { t =>
+  val mshrTaskWaitCnt = mshrTaskSources.zip(mshrTaskCandidates).map { case (t, candidate) =>
     val cnt = RegInit(0.U(6.W))
     when(t.fire) {
       cnt := 0.U
-    }.elsewhen(t.valid && !t.ready) {
+    }.elsewhen(candidate.valid && !t.ready) {
       cnt := Mux(cnt === 63.U, 63.U, cnt + 1.U)
     }
     cnt
@@ -2379,9 +2365,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     Mux(w === 63.U, 0.U(3.W), c)
   }
   // A source scheduled to retire at this edge cannot grant a fresh lease.
-  val mshrTaskSrcValids = VecInit(mshrTaskSources.zip(mshrTaskLeasePorts.flatten).map {
-    case (source, lease) => source.valid
-  }).asUInt
+  val mshrTaskSrcValids = VecInit(mshrTaskCandidates.map(_.valid)).asUInt
 
   // Per-group arbitration: best effective class, then round-robin inside it.
   val mshrTaskGroupOffsets = mshrTaskGroups.scanLeft(0)(_ + _.size).take(nMshrTaskGroups)
@@ -2408,14 +2392,19 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // registers a return request; the source acknowledges its exact version
   // before the group can refill. Issued operations retain the lease until
   // their final local MainPipe/buffer reference completes. Sources freeze
-  // payload and variant on prepare, and revoke by a versioned event cancel.
-  class MSHRPreparedTask extends Bundle {
-    val task = new TaskBundle()
+  // variant before arbitration, materialize payload only after winning, and
+  // revoke by a versioned event cancel at either stage.
+  class MSHRTaskWinner extends Bundle {
     val group = UInt(log2Up(nMshrTaskGroups).W)
     val source = UInt(log2Up(mshrTaskGroupSize).W)
+    val operation = UInt(4.W)
     val qosClass = UInt(3.W)
+    val waitCycles = UInt(6.W)
     val token = new MainpipeLeaseToken
     val completion = Valid(new PairedCompletion)
+  }
+  class MSHRPreparedTask extends MSHRTaskWinner {
+    val task = new TaskBundle()
   }
   class MSHRTaskTicket extends Bundle {
     val group = UInt(log2Up(nMshrTaskGroups).W)
@@ -2425,6 +2414,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val mshrTaskPreparedValid = Seq.fill(nMshrTaskGroups)(RegInit(false.B))
   val mshrTaskPrepared = Seq.fill(nMshrTaskGroups)(
     RegInit(0.U.asTypeOf(new MSHRPreparedTask)))
+  val mshrTaskLeaseValid = Seq.fill(nMshrTaskGroups)(RegInit(false.B))
+  val mshrTaskWinners = Seq.fill(nMshrTaskGroups)(RegInit(0.U.asTypeOf(new MSHRTaskWinner)))
   val mshrTaskLeaseReturning = Seq.fill(nMshrTaskGroups)(RegInit(false.B))
   val mshrTaskLeaseReturnSent = Seq.fill(nMshrTaskGroups)(RegInit(false.B))
   val mshrTaskLeaseAwaitPipe = Seq.fill(nMshrTaskGroups)(RegInit(false.B))
@@ -2434,13 +2425,23 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     Mux(mshrTaskGroupWait(g) === 63.U, 0.U(3.W), mshrTaskPrepared(g).qosClass)
   }
   val mshrTaskGroupCancel = (0 until nMshrTaskGroups).map { g =>
-    val sourceOH = UIntToOH(mshrTaskPrepared(g).source, mshrTaskGroupSize)
+    val sourceOH = UIntToOH(mshrTaskWinners(g).source, mshrTaskGroupSize)
     Mux1H(sourceOH, mshrTaskLeasePorts(g).map(_.cancel))
   }
+  def completionCurrent(completion: ValidIO[PairedCompletion]): Bool = {
+    val targetOH = UIntToOH(completion.bits.target, mshrsAll)
+    !completion.valid || (Mux1H(targetOH, refillMshrs.map(_.io.status.valid)) &&
+      Mux1H(targetOH, mshrTaskGenerations(0)) === completion.bits.targetGeneration &&
+      Mux1H(targetOH, refillMshrs.map(_.io.status.bits.set)) === completion.bits.targetSet &&
+      Mux1H(targetOH, refillMshrs.map(_.io.status.bits.reqTag)) === completion.bits.targetTag)
+  }
+  val mshrTaskWinnerCurrent = (0 until nMshrTaskGroups).map { g =>
+    mshrTaskLeaseValid(g) && !mshrTaskLeaseReturning(g) && !mshrTaskGroupCancel(g).valid &&
+      VecInit(mshrTaskGenerations(g))(mshrTaskWinners(g).source) === mshrTaskWinners(g).token.generation &&
+      completionCurrent(mshrTaskWinners(g).completion)
+  }
   val mshrTaskGroupReady = (0 until nMshrTaskGroups).map { g =>
-    mshrTaskPreparedValid(g) && !mshrTaskLeaseReturning(g) &&
-      !mshrTaskGroupCancel(g).valid &&
-      VecInit(mshrTaskGenerations(g))(mshrTaskPrepared(g).source) === mshrTaskPrepared(g).token.generation
+    mshrTaskPreparedValid(g) && mshrTaskWinnerCurrent(g)
   }
 
   // The cross-group arbiter transports only a narrow ticket.  Register that
@@ -2519,108 +2520,144 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
 
   (0 until nMshrTaskGroups).foreach { g =>
-    val preparedOut = Wire(Decoupled(new MSHRPreparedTask))
+    val winnerOut = Wire(Decoupled(new MSHRTaskWinner))
     val candidates = groupCandidates(g, groupValids(g))
-    val preparedInputs = groupOf(g).zipWithIndex.map { case (s, i) =>
-      val in = Wire(Decoupled(new MSHRPreparedTask))
+    val winnerInputs = mshrTaskLeasePorts(g).zipWithIndex.map { case (lease, i) =>
+      val in = Wire(Decoupled(new MSHRTaskWinner))
       in.valid := candidates(i)
-      in.bits.task := s.bits
       in.bits.group := g.U
       in.bits.source := i.U
+      in.bits.operation := lease.candidate.bits.operation
       in.bits.qosClass := groupClasses(g)(i)
+      in.bits.waitCycles := mshrTaskWaitCnt(mshrTaskGroupOffsets(g) + i)
       in.bits.token.generation := mshrTaskGenerations(g)(i)
       in.bits.token.sequence := mshrTaskLeaseSequence(g)
       in.bits.completion := 0.U.asTypeOf(in.bits.completion)
       if (g == 1) {
+        // Bind the paired identity at the narrow winner edge. The outcome is
+        // derived from the winner payload on the following prepared edge.
         val pair = snoopPairs(i)
-        val outcome = Mux(s.bits.meta.state === INVALID, 1.U,
-          Mux(s.bits.meta.state === BRANCH, 2.U, Mux(!s.bits.meta.dirty, 3.U, 0.U)))
-        in.bits.completion.valid := snoopMshrs(i).io.postGrantReleaseResponse && outcome.orR
+        in.bits.completion.valid := lease.candidate.bits.operation(2) &&
+          lease.candidate.bits.operation(1, 0) === 1.U
         in.bits.completion.bits.target := pair.bits.normal.bits.id
         in.bits.completion.bits.targetGeneration := pair.bits.normal.bits.generation
         in.bits.completion.bits.targetSet := pair.bits.normal.bits.set
         in.bits.completion.bits.targetTag := pair.bits.normal.bits.tag
         in.bits.completion.bits.source := i.U
         in.bits.completion.bits.sourceToken := in.bits.token
-        in.bits.completion.bits.outcome := outcome
         when(in.fire && in.bits.completion.valid) {
           assert(snoopPairNormalValid(i) && pair.bits.postGrantPending && pair.bits.payloadReady,
-            "paired completion prepare must bind the live post-Grant normal owner")
-          assert(s.bits.set === pair.bits.normal.bits.set && s.bits.tag === pair.bits.normal.bits.tag,
-            "paired completion must bind the frozen operation's line")
+            "paired winner must bind the live post-Grant normal owner")
         }
       }
       in
     }
-    ArbPerf(twoLevelArb(preparedInputs, preparedOut, Some(s"mshr_task_group_$g")),
+    ArbPerf(twoLevelArb(winnerInputs, winnerOut, Some(s"mshr_task_group_$g")),
       s"mshr_task_group_${g}_arb")
-    preparedOut.ready := !mshrTaskPreparedValid(g)
+    winnerOut.ready := !mshrTaskLeaseValid(g)
+    val winner = mshrTaskWinners(g)
+    val sourceOH = UIntToOH(winner.source, mshrTaskGroupSize)
+    val payload = Mux1H(sourceOH, groupOf(g).map(_.bits))
+    val payloadValid = Mux1H(sourceOH, groupOf(g).map(_.valid))
+    val payloadOperation = Mux1H(sourceOH, mshrTaskLeasePorts(g).map(_.candidate.bits.operation))
+    val preparePayload = mshrTaskWinnerCurrent(g) && !mshrTaskPreparedValid(g) && payloadValid &&
+      payloadOperation === winner.operation
     val granted = mshrTask.fire && mshrTaskIssuePermitGroupOH(g)
-    val sourceOH = UIntToOH(mshrTaskPrepared(g).source, mshrTaskGroupSize)
-    val returnRequest = mshrTaskPreparedValid(g) && mshrTaskLeaseReturning(g) &&
+    val returnRequest = mshrTaskLeaseValid(g) && mshrTaskLeaseReturning(g) &&
       !mshrTaskLeaseAwaitPipe(g) && !mshrTaskLeaseReturnSent(g)
     mshrTaskLeasePorts(g).zipWithIndex.foreach { case (lease, i) =>
-      lease.prepare.valid := preparedOut.fire && preparedOut.bits.source === i.U
-      lease.prepare.bits := preparedOut.bits.token
-      lease.held.valid := mshrTaskPreparedValid(g) && sourceOH(i)
-      lease.held.bits := mshrTaskPrepared(g).token
+      lease.prepare.valid := winnerOut.fire && winnerOut.bits.source === i.U
+      lease.prepare.bits := winnerOut.bits.token
+      lease.held.valid := mshrTaskLeaseValid(g) && sourceOH(i)
+      lease.held.bits := winner.token
       lease.release.valid := returnRequest && sourceOH(i)
-      lease.release.bits := mshrTaskPrepared(g).token
+      lease.release.bits := winner.token
+    }
+    // The 16:1 payload mux reads ONLY the registered winner one-hot. Neither
+    // a live RR decision nor class/age arbitration enters this data path.
+    when(preparePayload) {
+      mshrTaskPreparedValid(g) := true.B
+      mshrTaskPrepared(g).task := payload
+      mshrTaskPrepared(g).group := winner.group
+      mshrTaskPrepared(g).source := winner.source
+      mshrTaskPrepared(g).operation := winner.operation
+      mshrTaskPrepared(g).qosClass := winner.qosClass
+      mshrTaskPrepared(g).waitCycles := winner.waitCycles
+      mshrTaskPrepared(g).token := winner.token
+      mshrTaskPrepared(g).completion := winner.completion
+      if (g == 1) {
+        val outcome = Mux(payload.meta.state === INVALID, 1.U,
+          Mux(payload.meta.state === BRANCH, 2.U, Mux(!payload.meta.dirty, 3.U, 0.U)))
+        mshrTaskPrepared(g).completion.valid := winner.completion.valid && outcome.orR
+        mshrTaskPrepared(g).completion.bits.outcome := outcome
+        when(winner.completion.valid) {
+          assert(payload.set === winner.completion.bits.targetSet &&
+            payload.tag === winner.completion.bits.targetTag && completionCurrent(winner.completion),
+            "paired payload must retain the winner's normal owner and line")
+        }
+      }
+      assert(payload.mshrId === winner.source && payload.mshrContext === g.U,
+        "materialized payload must belong to the registered group winner")
     }
     val returnAck = Mux1H(sourceOH, mshrTaskLeasePorts(g).map(_.released))
-    when(preparedOut.fire) {
-      mshrTaskPreparedValid(g) := true.B
-      mshrTaskPrepared(g) := preparedOut.bits
+    when(winnerOut.fire) {
+      mshrTaskLeaseValid(g) := true.B
+      mshrTaskWinners(g) := winnerOut.bits
+      mshrTaskPreparedValid(g) := false.B
       mshrTaskLeaseReturning(g) := false.B
       mshrTaskLeaseReturnSent(g) := false.B
       mshrTaskLeaseAwaitPipe(g) := false.B
       mshrTaskLeaseSequence(g) := mshrTaskLeaseSequence(g) + 1.U
       mshrTaskGroupWait(g) := 0.U
     }.elsewhen(returnAck.valid) {
-      assert(mshrTaskPreparedValid(g) && mshrTaskLeaseReturning(g) &&
+      assert(mshrTaskLeaseValid(g) && mshrTaskLeaseReturning(g) &&
         mshrTaskLeaseReturnSent(g) && !mshrTaskLeaseAwaitPipe(g) &&
-        returnAck.bits.asUInt === mshrTaskPrepared(g).token.asUInt,
-        "prepared lease acknowledgment must match its outstanding return")
+        returnAck.bits.asUInt === winner.token.asUInt,
+        "winner lease acknowledgment must match its outstanding return")
       assert(!mshrTaskTicketValid || !mshrTaskTicketGroupOH(g),
         "ticket must drain before the source lifetime lease is released")
+      mshrTaskLeaseValid(g) := false.B
       mshrTaskPreparedValid(g) := false.B
       mshrTaskLeaseReturning(g) := false.B
       mshrTaskLeaseReturnSent(g) := false.B
       mshrTaskGroupWait(g) := 0.U
-    }.elsewhen(mshrTaskPreparedValid(g) && !mshrTaskLeaseReturning(g) &&
-      (granted || !mshrTaskGroupReady(g))) {
-      // Event cancellation immediately revokes this version; its registered
-      // return/ack drains the old ticket before a fresh snapshot can exist.
+    }.elsewhen(mshrTaskLeaseValid(g) && !mshrTaskLeaseReturning(g) &&
+      (granted || !mshrTaskWinnerCurrent(g))) {
+      // Cancellation works before payload exists as well as after prepared.
+      // Both cases return/ack the winning token before another can be chosen.
       mshrTaskLeaseReturning(g) := true.B
       mshrTaskLeaseAwaitPipe(g) := granted
       mshrTaskGroupWait(g) := 0.U
     }.elsewhen(mshrTaskLeaseReturning(g)) {
       mshrTaskGroupWait(g) := 0.U
-    }.elsewhen(mshrTaskPreparedValid(g)) {
+    }.elsewhen(mshrTaskLeaseValid(g)) {
       mshrTaskGroupWait(g) := Mux(mshrTaskGroupWait(g) === 63.U, 63.U, mshrTaskGroupWait(g) + 1.U)
     }
     when(mshrTaskGroupCancel(g).valid) {
-      assert(mshrTaskPreparedValid(g) && !mshrTaskLeaseAwaitPipe(g) &&
-        mshrTaskGroupCancel(g).bits.asUInt === mshrTaskPrepared(g).token.asUInt,
-        "source cancellation must name its unissued prepared version")
-      assert(!granted, "canceled prepared operation must never issue")
+      assert(mshrTaskLeaseValid(g) && !mshrTaskLeaseAwaitPipe(g) &&
+        mshrTaskGroupCancel(g).bits.asUInt === winner.token.asUInt,
+        "source cancellation must name its unissued winning version")
+      assert(!granted, "canceled winning operation must never issue")
     }
     when(returnRequest) { mshrTaskLeaseReturnSent(g) := true.B }
     val localDone = io.fromMainPipe.mainpipeLeaseDone
     when(localDone.valid && localDone.bits.mshrContext === g.U) {
-      assert(mshrTaskPreparedValid(g) && mshrTaskLeaseReturning(g) &&
-        mshrTaskLeaseAwaitPipe(g) && localDone.bits.mshrId === mshrTaskPrepared(g).source &&
-        localDone.bits.token.asUInt === mshrTaskPrepared(g).token.asUInt,
+      assert(mshrTaskLeaseValid(g) && mshrTaskPreparedValid(g) && mshrTaskLeaseReturning(g) &&
+        mshrTaskLeaseAwaitPipe(g) && localDone.bits.mshrId === winner.source &&
+        localDone.bits.token.asUInt === winner.token.asUInt,
         "MainPipe terminal event must match the issued source lease version")
       mshrTaskLeaseAwaitPipe(g) := false.B
     }
     groupOf(g).zipWithIndex.foreach { case (s, i) =>
-      // Preparing a task/ticket is revocable; only final issue transfers
-      // ownership and advances the source's task state machine.
-      s.ready := granted && mshrTaskTicket.source === i.U
+      s.ready := granted && mshrTaskIssuePermit.source === i.U
     }
-    assert(!preparedOut.fire || !mshrTaskPreparedValid(g),
-      "a prepared task must drain or cancel before the group can reload")
+    assert(!winnerOut.fire || !mshrTaskLeaseValid(g),
+      "a winning lease must drain or cancel before the group can reload")
+    when(mshrTaskPreparedValid(g)) {
+      assert(mshrTaskLeaseValid(g) && mshrTaskPrepared(g).source === winner.source &&
+        mshrTaskPrepared(g).token.asUInt === winner.token.asUInt,
+        "prepared payload must retain its winner and token")
+    }
   }
   // The preparation/ticket stages cannot consume a source.  An issued task
   // drains its local references and returns the lease before fresh preparation.
