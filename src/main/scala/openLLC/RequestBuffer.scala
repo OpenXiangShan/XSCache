@@ -20,18 +20,22 @@ package xscache.openLLC
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
-import utility.{FastArbiter}
 import xscache.chi.HasCHIOpcodes
 
 class RequestBuffer(entries: Int = 8)(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   val io = IO(new Bundle() {
     val in = Flipped(DecoupledIO(new Task()))
     val out = DecoupledIO(new Task())
+    val candidates = Output(Vec(entries, Valid(new Task())))
+    val eligible = Input(Vec(entries, Bool()))
   })
 
   /* Data Structure */
   val buffer = RegInit(VecInit(Seq.fill(entries)(0.U.asTypeOf(Valid(new Task())))))
-  val issueArb = Module(new FastArbiter(new Task(), entries))
+  // Eligibility changes as in-flight dependencies drain. Arbitrate over the
+  // currently eligible entries and advance the RR pointer only on consumption.
+  val issueArb = Module(new RRArbiter(new Task(), entries, initLastGrant = true))
+  io.candidates := buffer
 
   val in   = io.in
   val out  = io.out
@@ -49,11 +53,11 @@ class RequestBuffer(entries: Int = 8)(implicit p: Parameters) extends LLCModule 
   }
 
   /* Issue */
-  issueArb.io.in.zip(buffer).foreach { case (in, e) =>
-    in.valid := e.valid
+  issueArb.io.in.zip(buffer).zip(io.eligible).foreach { case ((in, e), eligible) =>
+    in.valid := e.valid && eligible
     in.bits  := e.bits
   }
-  issueArb.io.out.ready := true.B
+  issueArb.io.out.ready := out.ready
 
   out.valid := issueArb.io.out.valid
   out.bits := issueArb.io.out.bits
