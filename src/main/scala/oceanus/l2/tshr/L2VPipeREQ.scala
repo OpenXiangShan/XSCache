@@ -238,17 +238,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val rxreq_hit_lock_accept = rxreq_unsatisfied_unique &&
                               dirResult.hit && !io.repl_lock_conflict
 
-  val p_hit_lock_active = RegInit(false.B)
-  val p_hit_lock_release = RegInit(false.B)
   val p_hit_lock_way = Reg(UInt(wayBits.W))
 
   io.repl_lock_req := rxreq_fire && rxreq_hit_lock_accept
   io.repl_lock_way := Mux(rxreq_fire, dirResult.way, p_hit_lock_way)
-  io.repl_lock_release := p_hit_lock_active && p_hit_lock_release
 
   when (rxreq_fire) {
-    p_hit_lock_active := rxreq_hit_lock_accept
-    p_hit_lock_release := false.B
     when (rxreq_hit_lock_accept) {
       p_hit_lock_way := dirResult.way
     }
@@ -260,8 +255,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   assert(!(p_prefill_miss && p_prefill_hit),
     "REQ vPipe miss-prefill and conflict-hit prefill overlapped")
-  assert(!(p_prefill_hit && p_hit_lock_active),
-    "REQ vPipe conflict-hit prefill unexpectedly owns a hit-lock")
 
   val rxevb_unsatisfied_evictback = rxevb_evictback &&
                                     dirResult.state > MetaState.I && dirResult.hit &&
@@ -403,6 +396,19 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val w_s_repl = RegInit(false.B) // Waiting to schedule Directory Replacer Read
   val s_repl = RegInit(false.B) // Scheduling Directory Replacer Read
 
+  val w_hit_lock_release = RegInit(false.B) // Waiting for allocating response and final meta-only Directory Write-Back to release hit-way reservation
+  val s_hit_lock_release = RegInit(false.B) // Scheduling hit-way reservation release with final meta-only Directory Write-Back
+
+  io.repl_lock_release := w_hit_lock_release && s_hit_lock_release
+
+  when (rxreq_fire) {
+    w_hit_lock_release := rxreq_hit_lock_accept
+    s_hit_lock_release := false.B
+  }
+
+  assert(!(p_prefill_hit && w_hit_lock_release),
+    "REQ vPipe conflict-hit prefill unexpectedly owns a hit-lock")
+
   val w_s_evict_up_evict = RegInit(false.B) // Waiting to schedule local eviction RXREQ EvictBack
   val s_evict_up_evict = RegInit(false.B) // Scheduling local eviction RXREQ EvictBack
 
@@ -447,7 +453,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                s_evict_dn_compack ||
                w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds ||
                w_evict_peer_commit_dir ||
-               p_hit_lock_active
+               w_hit_lock_release
 
   io.free := !active
 
@@ -1220,7 +1226,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // Hold an unsatisfied initial-hit way until the original request's final
   // allocating response has been committed by a meta-only DirWb.
-  val hit_lock_response = p_hit_lock_active && (
+  val hit_lock_response = w_hit_lock_release && (
                             (p_rxreq_makeunique && dn_rxrsp_comp) ||
                             ((p_rxreq_readunique || p_rxreq_stashunique) && (
                               dn_rxdat_compdata_first ||
@@ -1230,21 +1236,21 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                           )
 
   when (hit_lock_response) {
-    p_hit_lock_release := true.B
+    s_hit_lock_release := true.B
   }
 
-  when (io.dir_wb_accept && p_hit_lock_release) {
-    p_hit_lock_active := false.B
-    p_hit_lock_release := false.B
+  when (io.dir_wb_accept && s_hit_lock_release) {
+    w_hit_lock_release := false.B
+    s_hit_lock_release := false.B
   }
 
-  assert(!(rxreq_fire && p_hit_lock_active),
+  assert(!(rxreq_fire && w_hit_lock_release),
     "RXREQ entered while a previous hit-way reservation was still active")
 
   when (io.tshr_dealloc) {
-    assert(!p_hit_lock_active, "TSHR deallocated with a live hit-way reservation")
-    p_hit_lock_active := false.B
-    p_hit_lock_release := false.B
+    assert(!w_hit_lock_release, "TSHR deallocated with a live hit-way reservation")
+    w_hit_lock_release := false.B
+    s_hit_lock_release := false.B
   }
   // --------------------------------
 
