@@ -91,6 +91,7 @@ object L2SnoopAgent {
 
   class PathFromSnoopAgent extends PathFromSnoopAgentUOPs {
     val PASSDIRTY = Bool()
+    val RESP = UInt(3.W)
   }
 }
 
@@ -238,20 +239,26 @@ class L2SnoopAgent(val sliceNum: Int)(implicit val p: Parameters) extends Module
     Mux(datBeat0 || datBeat2, dataPassDirty, false.B)
   )
 
+  val sa_resp = Mux(rspMatch, io.UpRXRSP.bits.Resp,
+                Mux(datBeat0 || datBeat2, io.UpRXDAT.bits.Resp, CCHIResp.I.U))
+
   io.fromSAForSNP.SnpResp := (rspMatch && doneForSNP) || directForSNP
   io.fromSAForSNP.SnpRespData0 := datBeat0 && serviceFromSNP
   io.fromSAForSNP.SnpRespData2 := datBeat2 && serviceFromSNP
   io.fromSAForSNP.PASSDIRTY := doneForSNP && pdValid && passDirty
+  io.fromSAForSNP.RESP := sa_resp
 
   io.fromSAForREQ.SnpResp := (rspMatch && doneForREQ) || directForREQ
   io.fromSAForREQ.SnpRespData0 := datBeat0 && serviceFromREQ
   io.fromSAForREQ.SnpRespData2 := datBeat2 && serviceFromREQ
   io.fromSAForREQ.PASSDIRTY := doneForREQ && pdValid && passDirty
+  io.fromSAForREQ.RESP := sa_resp
 
   io.fromSA.SnpResp := io.fromSAForSNP.SnpResp || io.fromSAForREQ.SnpResp
   io.fromSA.SnpRespData0 := io.fromSAForSNP.SnpRespData0 || io.fromSAForREQ.SnpRespData0
   io.fromSA.SnpRespData2 := io.fromSAForSNP.SnpRespData2 || io.fromSAForREQ.SnpRespData2
   io.fromSA.PASSDIRTY := io.fromSAForSNP.PASSDIRTY || io.fromSAForREQ.PASSDIRTY
+  io.fromSA.RESP := sa_resp
 
   io.dbg.slotSNPValid := slotSNPValid
   io.dbg.slotREQValid := slotREQValid

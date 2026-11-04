@@ -203,6 +203,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val rxreq_readunique = rxreq_opcode.is(CCHIOpcode.ReadUnique)
   val rxreq_readshared = rxreq_opcode.is(CCHIOpcode.ReadShared)
+  val rxreq_readonce = rxreq_opcode.is(CCHIOpcode.ReadOnce)
   val rxreq_makeunique = rxreq_opcode.is(CCHIOpcode.MakeUnique)
   val rxreq_stashshared = rxreq_opcode.is(CCHIOpcode.StashShared)
   val rxreq_stashunique = rxreq_opcode.is(CCHIOpcode.StashUnique)
@@ -516,7 +517,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.toSA.SnpCompAck := false.B // TODO: interact with upstream data sending
 
   io.toSA.CLIENTS := io.fromClientTable
-  io.toSA.ALIAS := rxreq.TagAlias
+  io.toSA.ALIAS := Mux(rxreq_readonce, dirResult.alias, rxreq.TagAlias)
 
   io.toSA.isL2Evict := rxevb_evictback
 
@@ -570,7 +571,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                issue_txreq_readunique ||
                                issue_txreq_makeunique ||
                                issue_txreq_stashshared ||
-                               issue_txreq_stashunique
+                               issue_txreq_stashunique ||
+                               issue_txreq_readonce && configInclusiveReadOnce.B
 
   val reissue_txreq = io.fromPCreditPool
 
@@ -725,6 +727,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     (p_rxreq_makeunique,      false.B),
     (p_rxreq_stashshared,     false.B),
     (p_rxreq_stashunique,     false.B),
+    (p_rxreq_readonce,        false.B),
     (p_rxreq_evictback,       false.B)
   ))
 
@@ -747,6 +750,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     (p_rxreq_makeunique,      NoOrdering.U),
     (p_rxreq_stashshared,     NoOrdering.U),
     (p_rxreq_stashunique,     NoOrdering.U),
+    (p_rxreq_readonce,        NoOrdering.U),
     (p_rxreq_evictback,       NoOrdering.U)
   ))
 
@@ -784,6 +788,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  StashShared         ReadNotSharedDirty    1
   //  -  StashUnique         ReadUnique            1
   //                         MakeReadUnique        1
+  //  -  ReadOnce            ReadOnce              1
+  //                         ReadNotSharedDirty    1 (configInclusiveReadOnce)
   //  -  EvictBack           WriteBackFull         1
   //                         WriteEvictOrEvict     1
   //                         WriteEvictFull        1
@@ -794,6 +800,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     (p_rxreq_makeunique,      true.B),
     (p_rxreq_stashshared,     true.B),
     (p_rxreq_stashunique,     true.B),
+    (p_rxreq_readonce,        true.B),
     (p_rxreq_evictback,       true.B)
   ))
 
@@ -806,6 +813,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //  -  StashShared         ReadNotSharedDirty    1
   //  -  StashUnique         ReadUnique            1
   //                         MakeReadUnique        1
+  //  -  ReadOnce            ReadOnce              0
+  //                         ReadNotSharedDirty    1 (configInclusiveReadOnce)
   //  -  EvictBack           WriteEvictOrEvict     1
   //                         WriteBackFull         0
   //                         WriteEvictFull        0
@@ -816,6 +825,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     (p_rxreq_makeunique,      true.B),
     (p_rxreq_stashshared,     true.B),
     (p_rxreq_stashunique,     true.B),
+    (p_rxreq_readonce,        configInclusiveReadOnce.B),
     (p_rxreq_evictback && (evictback_txreq_opcode === CHI_WriteEvictOrEvict.U), true.B)
   ))
 
@@ -866,12 +876,13 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val dn_rxrsp_respsepdata = dn_rxrsp_opcode.is(CHI_RespSepData)
   val dn_rxrsp_compdbidresp = dn_rxrsp_opcode.is(CHI_CompDBIDResp)
 
-  // Unsatisfied ReadShared/ReadUnique/StashShared/StashUnique
+  // Unsatisfied ReadShared/ReadUnique/StashShared/StashUnique/ReadOnce
   // expects a downstream Comp or CompData / DataSepResp + RespSepData
   val expect_dn_rd_comp_and_data = rxreq_unsatisfied_readshared ||
                                    rxreq_unsatisfied_readunique ||
                                    rxreq_unsatisfied_stashshared ||
-                                   rxreq_unsatisfied_stashunique
+                                   rxreq_unsatisfied_stashunique ||
+                                   rxreq_unsatisfied_readonce
 
   // MakeUnique expects a dataless downstream Comp only (no data beats will follow)
   val expect_dn_rd_comp_only = rxreq_unsatisfied_makeunique
@@ -1100,6 +1111,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // -- Interactions with TSHR local meta
   val dn_rxrsp_comp_UD_PD = dn_rxrsp_comp && io.DnRXRSP.bits.Resp.get === CHIFieldResp.Comp_UD_PD.U
 
+  val dn_rxdat_compdata_first_I = dn_rxdat_compdata_first && io.DnRXDAT.bits.Resp.get === CHIFieldResp.CompData_I.U
   val dn_rxdat_compdata_first_UC = dn_rxdat_compdata_first && io.DnRXDAT.bits.Resp.get === CHIFieldResp.CompData_UC.U
   val dn_rxdat_compdata_first_UD_PD = dn_rxdat_compdata_first && io.DnRXDAT.bits.Resp.get === CHIFieldResp.CompData_UD_PD.U
   val dn_rxdat_compdata_first_SC = dn_rxdat_compdata_first && io.DnRXDAT.bits.Resp.get === CHIFieldResp.CompData_SC.U
@@ -1107,6 +1119,29 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val dn_rxdat_datasepresp_first_UC = dn_rxdat_datasepresp_first && io.DnRXDAT.bits.Resp.get === CHIFieldResp.DataSepResp_UC.U
   val dn_rxdat_datasepresp_first_UD_PD = dn_rxdat_datasepresp_first && io.DnRXDAT.bits.Resp.get === CHIFieldResp.DataSepResp_UD_PD.U
   val dn_rxdat_datasepresp_first_SC = dn_rxdat_datasepresp_first && io.DnRXDAT.bits.Resp.get === CHIFieldResp.DataSepResp_SC.U
+
+  when (p_rxreq_readonce && dn_rxdat_compdata_first) {
+    if (configInclusiveReadOnce) {
+      assert(dn_rxdat_compdata_first_SC || dn_rxdat_compdata_first_UC || dn_rxdat_compdata_first_UD_PD,
+        "The subsequent of upstream ReadOnce received CompData with unexpected Resp from downstream (expecting SC, UC, UD_PD)")
+    } else {
+      assert(dn_rxdat_compdata_first_I || dn_rxdat_compdata_first_UC,
+        "The subsequent of upstream ReadOnce received CompData with unexpected Resp from downstream (expecting I, UC)")
+    }
+  }
+
+  when (p_rxreq_readonce && dn_rxdat_datasepresp_first) {
+    if (configInclusiveReadOnce) {
+      assert(dn_rxdat_datasepresp_first_SC || dn_rxdat_datasepresp_first_UC || dn_rxdat_datasepresp_first_UD_PD,
+        "The subsequent of upstream ReadOnce received DataSepResp with unexpected Resp from downstream (expecting SC, UC, UD_PD)")
+    } else {
+      assert(dn_rxdat_datasepresp_first_UC,
+        "The subsequent of upstream ReadOnce received DataSepResp with unexpected Resp from downstream (expecting UC)")
+    }
+  }
+
+  assert(!(p_rxreq_readonce && dn_rxrsp_comp),
+    "The subsequent of upstream ReadOnce received an unexpected dataless Comp from downstream")
 
   // - MakeUnique related meta/tag updates
   val meta_wr_state_makeunique_UU_sat = active && p_rxreq_makeunique &&
@@ -1206,6 +1241,41 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val meta_wr_alias_readshared = meta_wr_client_readshared_set
   // --------------------------------
 
+  // - ReadOnce related meta/tag updates
+  val sa_resp_unique = io.fromSA.RESP === CCHIResp.UC.U ||
+                       io.fromSA.RESP === CCHIResp.UC_PD.U
+
+  val meta_wr_state_readonce_US_sat = active && p_rxreq_readonce &&
+                                      sa_resp_decision &&
+                                      dirResult.state === MetaState.UU &&
+                                      dirResult.clients.asUInt.orR &&
+                                      !sa_resp_unique
+
+  val meta_wr_state_readonce_UU_unsat = active && p_rxreq_readonce &&
+                                        configInclusiveReadOnce.B && (
+                                          dn_rxdat_compdata_first_UC ||
+                                          dn_rxdat_compdata_first_UD_PD ||
+                                          dn_rxdat_datasepresp_first_UC ||
+                                          dn_rxdat_datasepresp_first_UD_PD
+                                        )
+
+  val meta_wr_state_readonce_S_unsat = active && p_rxreq_readonce &&
+                                       configInclusiveReadOnce.B && (
+                                         dn_rxdat_compdata_first_SC ||
+                                         dn_rxdat_datasepresp_first_SC
+                                       )
+
+  val meta_wr_state_readonce_UU = meta_wr_state_readonce_UU_unsat
+  val meta_wr_state_readonce_US = meta_wr_state_readonce_US_sat
+  val meta_wr_state_readonce_S  = meta_wr_state_readonce_S_unsat
+
+  val meta_wr_dirty_readonce_set = active && p_rxreq_readonce &&
+                                   configInclusiveReadOnce.B && (
+                                     dn_rxdat_compdata_first_UD_PD ||
+                                     dn_rxdat_datasepresp_first_UD_PD
+                                   )
+  // --------------------------------
+
   // - StashUnique related meta/tag updates
   val meta_wr_state_stashunique_UU_unsat = active && p_rxreq_stashunique &&
                                            (dn_rxdat_compdata_first || dn_rxdat_datasepresp_first || dn_rxrsp_comp) &&
@@ -1302,15 +1372,18 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val meta_wr_state_UU = meta_wr_state_readunique_UU ||
                          meta_wr_state_readshared_UU ||
+                         meta_wr_state_readonce_UU ||
                          meta_wr_state_makeunique_UU ||
                          meta_wr_state_stashunique_UU ||
                          meta_wr_state_stashshared_UU
 
   val meta_wr_state_US = meta_wr_state_readshared_US ||
+                         meta_wr_state_readonce_US ||
                          meta_wr_state_stashunique_US ||
                          meta_wr_state_stashshared_US
 
   val meta_wr_state_S = meta_wr_state_readshared_S ||
+                        meta_wr_state_readonce_S ||
                         meta_wr_state_stashshared_S
 
   val meta_wr_state_I = meta_wr_state_evictback_I
@@ -1319,6 +1392,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val meta_wr_dirty_set = meta_wr_dirty_sa_set ||
                           meta_wr_dirty_readunique_set ||
+                          meta_wr_dirty_readonce_set ||
                           meta_wr_dirty_readshared_set ||
                           meta_wr_dirty_makeunique_set ||
                           meta_wr_dirty_stashunique_set ||
@@ -1397,12 +1471,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                           meta_wr_dirty_clr) ||
                            repl_tshr_meta_wr
 
-  val tshr_meta_wr_client = !p_prefill_miss && (meta_wr_client_set ||
-                                           meta_wr_client_clr) ||
-                            repl_tshr_meta_wr
+  val tshr_meta_wr_client = (!p_prefill_miss && (meta_wr_client_set ||
+                                            meta_wr_client_clr) ||
+                             repl_tshr_meta_wr) && !p_rxreq_readonce
 
-  val tshr_meta_wr_alias = !p_prefill_miss && meta_wr_alias ||
-                           repl_tshr_meta_wr
+  val tshr_meta_wr_alias = (!p_prefill_miss && meta_wr_alias ||
+                            repl_tshr_meta_wr) && !p_rxreq_readonce
 
   val tshr_meta_wr_prefetch = repl_tshr_meta_wr ||
                               (!p_prefill_miss && tshr_meta_wr_state && (
@@ -1485,6 +1559,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val ds_rd_readunique = ds_rd_readunique_sat || ds_rd_readunique_unsat
 
   val ds_rd_readshared = rxreq_readshared && dirResult.hit
+  val ds_rd_readonce = rxreq_readonce && dirResult.hit
 
   // *NOTE: If SA received SnpRespData from upstream, the DS Read would be dropped by Data Storage Proxy.
   val ds_rd_evictback = p_rxreq_evictback &&
@@ -1500,6 +1575,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val ds_rd = !io.tbuf_modified && (ds_rd_readunique ||
                                     ds_rd_readshared ||
+                                    ds_rd_readonce ||
                                     ds_rd_evictback ||
                                     rxevb_prefill_hit_need_data)
 
@@ -1510,11 +1586,15 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val ds_cancel_readshared = p_rxreq_readshared &&
                              sa_respdata_first
 
+  val ds_cancel_readonce = p_rxreq_readonce &&
+                           sa_respdata_first
+
   val ds_cancel_evictback = p_rxreq_evictback &&
                             dn_rxrsp_comp
 
   val ds_cancel = ds_cancel_readunique ||
                   ds_cancel_readshared ||
+                  ds_cancel_readonce ||
                   ds_cancel_evictback
 
   when (ds_rd) {
@@ -1608,6 +1688,14 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val up_txdat_compdata0 = io.UpTXDAT.fire && io.UpTXDAT.bits.Opcode === CCHIOpcode.CompData.U && io.UpTXDAT.bits.DataID === 0.U
   val up_txdat_compdata2 = io.UpTXDAT.fire && io.UpTXDAT.bits.Opcode === CCHIOpcode.CompData.U && io.UpTXDAT.bits.DataID === 1.U
 
+  val up_txdat_compdata_last = (up_txdat_compdata0 && !s_rd_up_compdata2) ||
+                               (up_txdat_compdata2 && !s_rd_up_compdata0)
+
+  val ds_wb_cancel_readonce_bypass = p_rxreq_readonce &&
+                                     !configInclusiveReadOnce.B &&
+                                     dirResult.state === MetaState.I &&
+                                     up_txdat_compdata_last
+
   val allow_up_rd_compdata0 = !w_ds_resp && !w_snpresp0 && !w_rd_dn_data0 && !io.L1EVT_active && io.tbuf_data0_valid
   val allow_up_rd_compdata2 = !w_ds_resp && !w_snpresp2 && !w_rd_dn_data2 && !io.L1EVT_active && io.tbuf_data2_valid
 
@@ -1615,9 +1703,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                             (!rxreq_client_present || rxreq.ExpCompData)
                                 
   val sched_up_rd_compdata_sat_readshared = rxreq_satisfied_readshared
+  val sched_up_rd_compdata_sat_readonce = rxreq_satisfied_readonce
 
   val sched_up_rd_compdata_sat = sched_up_rd_compdata_sat_readunique ||
-                                 sched_up_rd_compdata_sat_readshared
+                                 sched_up_rd_compdata_sat_readshared ||
+                                 sched_up_rd_compdata_sat_readonce
 
   val sched_up_rd_compdata_unsat_readunique = (rxreq_unsatisfied_readunique &&
                                                rxreq.ExpCompData) ||
@@ -1626,9 +1716,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                                (dn_rxrsp_comp || dn_rxdat_compdata_first || dn_rxdat_datasepresp_first))
 
   val sched_up_rd_compdata_unsat_readshared = rxreq_unsatisfied_readshared
+  val sched_up_rd_compdata_unsat_readonce = rxreq_unsatisfied_readonce
 
   val sched_up_rd_compdata_unsat = sched_up_rd_compdata_unsat_readunique ||
-                                   sched_up_rd_compdata_unsat_readshared
+                                   sched_up_rd_compdata_unsat_readshared ||
+                                   sched_up_rd_compdata_unsat_readonce
 
   val sched_up_rd_compdata = sched_up_rd_compdata_sat ||
                              sched_up_rd_compdata_unsat
@@ -1666,7 +1758,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val up_txdat_resp = ParallelPriorityMux(Seq(
     (p_rxreq_readunique, CCHIResp.UC.U),
-    (p_rxreq_readshared, Mux(up_txdat_meta_state === MetaState.UU || meta_wr_state_UU, CCHIResp.UC.U, CCHIResp.SC.U))
+    (p_rxreq_readshared, Mux(up_txdat_meta_state === MetaState.UU || meta_wr_state_UU, CCHIResp.UC.U, CCHIResp.SC.U)),
+    (p_rxreq_readonce, CCHIResp.UC.U)
   ))
 
   val up_txdat_dataid = Mux(s_rd_up_compdata0, 0.U, 1.U) // TODO: cirtical word first maybe
@@ -1681,7 +1774,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.UpTXDAT.bits.Resp := up_txdat_resp
   io.UpTXDAT.bits.DataSource := 0.U // TODO: DataSource
   io.UpTXDAT.bits.CBusy := 0.U //  TODO: CBusy, may be assigned in TSHR top
-  io.UpTXDAT.bits.WayValid := true.B
+  io.UpTXDAT.bits.WayValid := !p_rxreq_readonce
   io.UpTXDAT.bits.Way := dirResult.way
   io.UpTXDAT.bits.DataID := up_txdat_dataid
   io.UpTXDAT.bits.TraceTag := false.B // TODO: TraceTag propagation
@@ -1692,9 +1785,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // -- Interactions with replacer and eviction through loop-back REQ
   val txreq_evictback_peer = io.UpTXEVB.fire
 
+  val expect_replace_readonce = if (configInclusiveReadOnce) rxreq_readonce else false.B
+
   val expect_miss_replace = !dirResult.hit && (
                               rxreq_readunique ||
                               rxreq_readshared ||
+                              expect_replace_readonce ||
                               rxreq_makeunique ||
                               rxreq_stashshared ||
                               rxreq_stashunique
@@ -1804,8 +1900,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                       rxevb_satisfied_evictback && dirResult.way === rxevb.Way ||
                       p_rxreq_evictback && sa_resp_last
 
+  // A Bypass ReadOnce miss leaves meta I and allocates no DS line. Drop its transient
+  // buffer only after the final upstream beat has been accepted, so deallocation
+  // cannot strand modified state or leak it into the next TSHR life.
   io.ds_wb_cancel := w_evict_dn_comp || w_evict_dn_compdbid ||
-                     s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2 || s_evict_dn_compack
+                     s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2 || s_evict_dn_compack ||
+                     ds_wb_cancel_readonce_bypass
 
   // 1. Activate Directory write-back immediately on replacement Directory lock released by eviction
   //    to clear the replacer reading lock in Directory.
