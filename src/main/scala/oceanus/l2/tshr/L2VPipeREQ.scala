@@ -1492,9 +1492,16 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                          fire_txreq_writeevictorevict ||
                          fire_txreq_writebackfull)
 
+  // A satisfied conflict-hit EVB still needs the surrendered line for nested
+  // snoops. Preserve it before allowing the peer refiller to commit the way.
+  val prefill_hit_data_ready = io.tbuf_data0_valid && io.tbuf_data2_valid
+  val rxevb_prefill_hit = rxevb_evictback && p_prefill_hit
+  val rxevb_prefill_hit_need_data = rxevb_prefill_hit && !prefill_hit_data_ready
+
   val ds_rd = !io.tbuf_modified && (ds_rd_readunique ||
                                     ds_rd_readshared ||
-                                    ds_rd_evictback)
+                                    ds_rd_evictback ||
+                                    rxevb_prefill_hit_need_data)
 
   val ds_cancel_readunique = p_rxreq_readunique &&
                              (sa_respdata_first ||
@@ -1839,9 +1846,14 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // slot re-selectable by unrelated refills. Release it only after this EvictBack's Data Storage
   // read has landed -- otherwise a third-party refill can re-select the slot and overwrite the
   // victim data before this EvictBack has read it. (Previously released immediately.)
+  // A satisfied conflict-hit EVB follows the same ordering when its buffer is incomplete:
+  // preserve the surrendered line before either peer lock can release a competing refill.
   val evictback_peer_unlock_dir_immediate = rxevb_unsatisfied_evictback && io.ds_rd_done ||
-                                            (rxevb_satisfied_evictback && (p_prefill_any || dirResult.way =/= rxevb.Way ||
-                                                                           (!io.tshr_meta_modified && !io.tshr_tag_modified)))
+                                            (rxevb_satisfied_evictback &&
+                                             !rxevb_prefill_hit_need_data &&
+                                             (p_prefill_any ||
+                                              dirResult.way =/= rxevb.Way ||
+                                              (!io.tshr_meta_modified && !io.tshr_tag_modified)))
 
   val sched_evictback_peer_unlock_dir = rxevb_evictback &&
                                         !evictback_peer_unlock_dir_immediate
@@ -1856,7 +1868,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val allow_evictback_peer_unlock_dir = w_s_evict_peer_unlock_dir &&
                                         Mux(p_rxevb_unsatisfied,
                                             io.ds_rd_done || ds_cancel_evictback || fire_txreq_evict,
-                                            io.dir_wb_done)
+                                            Mux(p_prefill_hit,
+                                                prefill_hit_data_ready,
+                                                io.dir_wb_done))
 
   val evictback_peer_unlock_dir_late = allow_evictback_peer_unlock_dir
 
@@ -1872,13 +1886,16 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   }
 
   val evictback_peer_unlock_ds_immediate = rxevb_unsatisfied_evictback && io.ds_rd_done ||
-                                           rxevb_satisfied_evictback
+                                           (rxevb_satisfied_evictback &&
+                                            !rxevb_prefill_hit_need_data)
 
   val sched_evictback_peer_unlock_ds = rxevb_evictback &&
                                        !evictback_peer_unlock_ds_immediate
 
   val allow_evictback_peer_unlock_ds = w_s_evict_peer_unlock_ds &&
-                                       (io.ds_rd_done || ds_cancel_evictback || fire_txreq_evict)
+                                       Mux(p_prefill_hit,
+                                           prefill_hit_data_ready,
+                                           io.ds_rd_done || ds_cancel_evictback || fire_txreq_evict)
 
   val evictback_peer_unlock_ds_late = allow_evictback_peer_unlock_ds
 
@@ -1902,6 +1919,16 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     unlock_ds := evictback_peer_unlock_ds_immediate && rxevb.TshrId === i.U ||
                  evictback_peer_unlock_ds_late && p_rxevb.TshrId === i.U
   }}
+
+  assert(!(rxevb_prefill_hit_need_data &&
+           (evictback_peer_unlock_dir_immediate ||
+            evictback_peer_unlock_ds_immediate)),
+    "TSHR @ %m conflict-hit EVB released peer locks before preserving data")
+
+  assert(!((evictback_peer_unlock_dir_late ||
+            evictback_peer_unlock_ds_late) &&
+           p_prefill_hit && !prefill_hit_data_ready),
+    "TSHR @ %m conflict-hit EVB unlocked peer with incomplete preserved data")
 
   if (configNonAgedDirArb) {
     // -- EVB Directory commit acknowledgement (non-aged Directory arbitration)
