@@ -60,6 +60,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
     val UpTXRSP = Decoupled(new FlitDnRSP)
     val UpTXDAT = Decoupled(new FlitDnDAT)
+    val hintReady = Output(Bool())
 
     val UpTXEVB = Decoupled(new L2VPipeREQ.FlitEVB)
 
@@ -1755,6 +1756,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     // ReadOnce is issued by read-only agents (ICache / PTW); a clean shared copy is enough.
     (p_rxreq_readonce, CCHIResp.SC.U)
   ))
+
+  // A pointer reservation needs both halves, before either half is consumed.
+  io.hintReady := s_rd_up_compdata0 && s_rd_up_compdata2 &&
+    allow_up_rd_compdata0 && allow_up_rd_compdata2
 
   val up_txdat_dataid = Mux(s_rd_up_compdata0, 0.U, 1.U) // TODO: cirtical word first maybe
 

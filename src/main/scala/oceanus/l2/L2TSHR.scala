@@ -110,6 +110,8 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
     val self_unlock_dir_ack = Input(Bool())
 
     val valid = Output(Bool())
+    val hintLock = Input(Bool())
+    val hintSafe = Output(Bool())
 
     val bopPerf = Output(Vec(L2BOPPerf.names.size, Bool()))
     val bopPerfSource = Output(Vec(L2BOPPerf.names.size, UInt(L2PfSource.Width.W)))
@@ -168,7 +170,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
   val tshr_wb_done_dir = Wire(Bool())
   val tshr_wb_done_ds = Wire(Bool())
 
-  val tshr_dealloc = tshr_inactive && tshr_wb_done_dir && tshr_wb_done_ds && !tshr_enter
+  val tshr_dealloc = tshr_inactive && tshr_wb_done_dir && tshr_wb_done_ds && !tshr_enter && !io.hintLock
 
   val tshr_valid = RegInit(false.B)
 
@@ -321,18 +323,18 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
 
   val tshr_buffer_wen_last = WireInit(false.B)
 
-  when (tshr_buffer_wen_DS) {
+  when (tshr_buffer_wen_DS && !io.hintLock) {
     tshr_buffer_0 := io.fromDS.DATA(255, 0)
     tshr_buffer_2 := io.fromDS.DATA(511, 256)
   }
 
   assert(!(tshr_dealloc && tshr_buffer_modified), "TSHR @ %m deallocated with un-committed modified data")
 
-  when (tshr_buffer_wen_UpRXDAT_0) { tshr_buffer_0 := io.UpRXDAT.bits.Data }
-  when (tshr_buffer_wen_UpRXDAT_2) { tshr_buffer_2 := io.UpRXDAT.bits.Data }
+  when (tshr_buffer_wen_UpRXDAT_0 && !io.hintLock) { tshr_buffer_0 := io.UpRXDAT.bits.Data }
+  when (tshr_buffer_wen_UpRXDAT_2 && !io.hintLock) { tshr_buffer_2 := io.UpRXDAT.bits.Data }
 
-  when (tshr_buffer_wen_DnRXDAT_0) { tshr_buffer_0 := io.DnRXDAT.bits.Data.get }
-  when (tshr_buffer_wen_DnRXDAT_2) { tshr_buffer_2 := io.DnRXDAT.bits.Data.get }
+  when (tshr_buffer_wen_DnRXDAT_0 && !io.hintLock) { tshr_buffer_0 := io.DnRXDAT.bits.Data.get }
+  when (tshr_buffer_wen_DnRXDAT_2 && !io.hintLock) { tshr_buffer_2 := io.DnRXDAT.bits.Data.get }
 
   /*
   tshr_buffer_halfWritten_x_q: Indicating that the TSHR Buffer was partially/halfy written.
@@ -438,18 +440,18 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
   val rbeEVB = Module(new L2RBE(new L2VPipeREQ.FlitEVB))
   val rbeREQ = Module(new L2RBE(new L2BufferedREQ(pfTrainEnable)))
 
-  io.toAlloc.busy.EVT := !rbeEVT.io.in.ready
-  io.toAlloc.busy.SNP := !rbeSNP.io.in.ready
-  io.toAlloc.busy.EVB := !rbeEVB.io.in.ready
-  io.toAlloc.busy.REQ := !rbeREQ.io.in.ready
+  io.toAlloc.busy.EVT := !rbeEVT.io.in.ready || io.hintLock
+  io.toAlloc.busy.SNP := !rbeSNP.io.in.ready || io.hintLock
+  io.toAlloc.busy.EVB := !rbeEVB.io.in.ready || io.hintLock
+  io.toAlloc.busy.REQ := !rbeREQ.io.in.ready || io.hintLock
 
   // RBE drain priority chain: EVT > SNP > EVB > REQ.
   // NOTE: keyed on io.valid (queue occupancy, registered) rather than io.out.valid
   // (drain fire) — the latter closes a combinational cycle through vPipeSNP.blockRBE.EVT
-  rbeEVT.io.blockFromTSHR := false.B
-  rbeSNP.io.blockFromTSHR := rbeEVT.io.valid
-  rbeEVB.io.blockFromTSHR := rbeEVT.io.valid || rbeSNP.io.valid
-  rbeREQ.io.blockFromTSHR := rbeEVT.io.valid || rbeSNP.io.valid || rbeEVB.io.valid
+  rbeEVT.io.blockFromTSHR := io.hintLock || (false.B)
+  rbeSNP.io.blockFromTSHR := io.hintLock || (rbeEVT.io.valid)
+  rbeEVB.io.blockFromTSHR := io.hintLock || (rbeEVT.io.valid || rbeSNP.io.valid)
+  rbeREQ.io.blockFromTSHR := io.hintLock || (rbeEVT.io.valid || rbeSNP.io.valid || rbeEVB.io.valid)
 
   // PathVPipeBlock.EVB is only meaningful on the vPipe (blockRBE) side;
   // there is no EVB vPipe to block an RBE, so tie it off here
@@ -758,6 +760,19 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
 
   fastArb(Seq(vPipeEVT.io.UpTXRSP, vPipeREQ.io.UpTXRSP), io.UpTXRSP, Some("UpTXRSP"))
 
+  // Do not reserve a TSHR with an entering nested operation or a write in
+  // flight. Queued, blocked RBEs may remain pending; locking their issue avoids
+  // waiting for a nested request which itself waits for this refill to finish.
+  io.hintSafe := tshr_valid && vPipeREQ.io.hintReady &&
+    vPipeEVT.io.free && vPipeSNP.io.free && !tshr_enter &&
+    !rbeEVT.io.out.valid && !rbeSNP.io.out.valid &&
+    !rbeEVB.io.out.valid && !rbeREQ.io.out.valid &&
+    !io.fromDS.DSBufRdResp && !tshr_buffer_wen_RXDAT_0 && !tshr_buffer_wen_RXDAT_2
+  when(io.hintLock) {
+    assert(tshr_valid && !tshr_enter, "reserved TSHR released or reused")
+    assert(!tshr_buffer_wen_DS && !tshr_buffer_wen_RXDAT_0 && !tshr_buffer_wen_RXDAT_2,
+      "write to a hint-reserved TSHR")
+  }
   io.UpTXDAT <> vPipeREQ.io.UpTXDAT
   io.UpTXDAT.bits.Data := Mux(io.UpTXDAT.bits.DataID === 0.U, tshr_buffer_0, tshr_buffer_2)
 

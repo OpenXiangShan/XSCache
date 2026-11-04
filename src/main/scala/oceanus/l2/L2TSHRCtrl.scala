@@ -39,7 +39,7 @@ trait L2SliceLocatable {
   def getTxnIDFromTSHRId(tshrId: Int) = (tshrId.U << log2Ceil(sliceNum)) | sliceIdx.U(log2Ceil(sliceNum).W)
 }
 
-class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val nodeId: Int, val pfTrainEnable: Boolean = false)(implicit val p: Parameters) extends Module
+class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val nodeId: Int, val pfTrainEnable: Boolean = false, val hintTargets: Seq[Int] = Nil, val hintMissEntries: Int = 16)(implicit val p: Parameters) extends Module
     with HasL2Params 
     with L2SliceLocatable
     with HasCCHIParameters {
@@ -62,6 +62,8 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
     val UpRXDAT = Flipped(Valid(new FlitUpDAT))
     val UpTXRSP = Decoupled(new FlitDnRSP)
     val UpTXDAT = Decoupled(new FlitDnDAT)
+    val refillHint = Decoupled(new L2RefillHint(paramCCHI.TxnID_Width, paramCCHI.UpstreamNodeID_Width))
+    val hintTXDAT = Decoupled(new FlitDnDAT)
 
     val DnRXRSP = Flipped(Valid(new CHIBundleRSP))
     val DnRXDAT = Flipped(Valid(new CHIBundleDAT))
@@ -225,7 +227,67 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   fastArb(tshrs.map(_.io.UpTXSNP), io.UpTXSNP, Some("TSHRsToUpTXSNP"))
 
   fastArb(tshrs.map(_.io.UpTXRSP), io.UpTXRSP, Some("TSHRsToUpTXRSP"))
-  fastArb(tshrs.map(_.io.UpTXDAT), io.UpTXDAT, Some("TSHRsToUpTXDAT"))
+  if (hintTargets.nonEmpty) {
+    val hintIndexWidth = math.max(1, log2Ceil(nMSHR))
+    val pointers = Module(new L2HintPointerQueue(hintIndexWidth))
+    val reserved = RegInit(VecInit(Seq.fill(nMSHR)(false.B)))
+    val candidates = Module(new RRArbiter(UInt(hintIndexWidth.W), nMSHR))
+    val isDcache = tshrs.map(t => hintTargets.map(n => t.io.UpTXDAT.bits.TgtID === n.U).reduce(_ || _))
+    tshrs.zipWithIndex.foreach { case (t, i) =>
+      t.io.hintLock := reserved(i)
+      candidates.io.in(i).valid := t.io.hintSafe && !reserved(i) && isDcache(i) &&
+        t.io.UpTXDAT.bits.TxnID < hintMissEntries.U
+      candidates.io.in(i).bits := i.U
+    }
+    val chosen = candidates.io.out.bits
+    val chosenDat = VecInit(tshrs.map(_.io.UpTXDAT.bits))(chosen)
+    io.refillHint.valid := candidates.io.out.valid && pointers.io.enq.ready
+    io.refillHint.bits.sourceId := chosenDat.TxnID
+    io.refillHint.bits.targetId := chosenDat.TgtID
+    io.refillHint.bits.isKeyword := false.B // both halves ready; DataID 0 first
+    candidates.io.out.ready := io.refillHint.ready && pointers.io.enq.ready
+    pointers.io.enq.valid := candidates.io.out.valid && io.refillHint.ready
+    pointers.io.enq.bits := chosen
+    when(io.refillHint.fire) {
+      reserved(chosen) := true.B
+      assert(chosenDat.DataID === 0.U && chosenDat.Opcode === CCHIOpcode.CompData.U)
+    }
+
+    val head = pointers.io.out.bits
+    val selected = VecInit(tshrs.map(_.io.UpTXDAT.valid))(head)
+    io.hintTXDAT.valid := pointers.io.out.valid && selected
+    io.hintTXDAT.bits := VecInit(tshrs.map(_.io.UpTXDAT.bits))(head)
+    pointers.io.out.ready := io.hintTXDAT.fire
+    when(pointers.io.out.valid) {
+      assert(reserved(head) && selected, "hint pointer lost its TSHR data")
+      assert(io.hintTXDAT.bits.DataID === pointers.io.second.asUInt,
+        "hint pointer selected the wrong data beat")
+    }
+    when(pointers.io.out.fire && pointers.io.second) { reserved(head) := false.B }
+
+    // Separate selection trees over the existing per-TSHR registers. The
+    // scheduled L1D read has priority; unrelated TSHRs may serve IFU/PTW at
+    // the same time, without copying any payload into another buffer.
+    val other = Wire(Vec(nMSHR, Decoupled(new FlitDnDAT)))
+    tshrs.zipWithIndex.foreach { case (t, i) =>
+      other(i).valid := t.io.UpTXDAT.valid && !isDcache(i)
+      other(i).bits := t.io.UpTXDAT.bits
+      val scheduled = pointers.io.out.valid && head === i.U
+      t.io.UpTXDAT.ready := Mux(isDcache(i), scheduled && io.hintTXDAT.ready, other(i).ready)
+      assert(!(scheduled && other(i).fire), "TSHR data read port collision")
+    }
+    fastArb(other.toSeq, io.UpTXDAT, Some("TSHRsToOtherUpTXDAT"))
+    XSPerfAccumulate("hint_parallel_other_dat", io.hintTXDAT.fire && io.UpTXDAT.fire)
+    XSPerfAccumulate("hint_sent", io.refillHint.fire)
+    XSPerfAccumulate("hint_pointer_full", candidates.io.out.valid && pointers.io.full)
+  } else {
+    tshrs.foreach(_.io.hintLock := false.B)
+    io.refillHint.valid := false.B
+    io.refillHint.bits := 0.U.asTypeOf(io.refillHint.bits)
+    io.hintTXDAT.valid := false.B
+    io.hintTXDAT.bits := 0.U.asTypeOf(io.hintTXDAT.bits)
+    fastArb(tshrs.map(_.io.UpTXDAT), io.UpTXDAT, Some("TSHRsToUpTXDAT"))
+  }
 
   fastArb(tshrs.map(_.io.DnTXREQ), io.DnTXREQ, Some("TSHRsToDnTXREQ"))
 

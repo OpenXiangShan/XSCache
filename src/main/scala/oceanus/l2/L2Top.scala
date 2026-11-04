@@ -133,7 +133,9 @@ class L2Configuration(
   val vbopStubEnable: Boolean = false,
   val cdpStubEnable: Boolean = false,
   val vbopParams: OceanusVBOPParameters = OceanusVBOPParameters(),
-  val cdpParams: OceanusCDPParameters = OceanusCDPParameters()
+  val cdpParams: OceanusCDPParameters = OceanusCDPParameters(),
+  val hintEnable: Boolean = false,
+  val hintMissEntries: Int = 16
 ) {
   def sliceNum = slices.size
   // Training enables cache event observation even without an algorithm sink.
@@ -168,6 +170,9 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     val pfTlb = if (config.pfTlbEnable) Some(new L2PrefetchTlbIO) else None
     val pfTrain = if (config.pfTrainEnable) Some(Input(Vec(t1NIDs.size, new L2PrefetchTrainSideband))) else None
 
+    val refillHint = Vec(t1NIDs.size, Valid(new L2RefillHint(
+      p(xscache.oceanus.compactchi.CCHIParametersKey).TxnID_Width,
+      p(xscache.oceanus.compactchi.CCHIParametersKey).UpstreamNodeID_Width)))
     val chi = new CHIRNFInterface
   })
 
@@ -236,7 +241,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   // ----------------------------------------------------------------
 
   //
-  val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId, config.pfTrainEnable)(
+  val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId, config.pfTrainEnable, if (config.hintEnable) t1NIDs else Nil, config.hintMissEntries)(
     p.alterPartial { case L2CDPObserveEnableKey => config.cdpObserveEnable })))
 
   // Source controls gate issue. delay_latency drives both BOP delay queues;
@@ -769,8 +774,65 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
           "slice data TgtID must not be the prefetch SrcID")
       }
     }}
-    fastArb(preArb_DnDATs(i), port._1, Some(s"DnDAT_$i"))
+    if (!config.hintEnable || i >= t1NIDs.size) {
+      fastArb(preArb_DnDATs(i), port._1, Some(s"DnDAT_$i"))
+    } else {
+      preArb_DnDATs(i).foreach(_.ready := false.B)
+    }
   }}
+
+  slices.foreach { s =>
+    s.io.refillHint.ready := false.B
+    s.io.hintTXDAT.ready := false.B
+  }
+  io.refillHint.foreach { h =>
+    h.valid := false.B
+    h.bits := 0.U.asTypeOf(h.bits)
+  }
+  if (config.hintEnable) {
+    val hintArbs = Seq.fill(t1NIDs.size)(Module(new Arbiter(
+      chiselTypeOf(io.refillHint.head.bits), config.sliceNum)))
+    val slicePointers = Seq.fill(t1NIDs.size)(Module(new L2HintPointerQueue(
+      math.max(1, log2Ceil(config.sliceNum)))))
+    for (ch <- t1NIDs.indices) {
+      val arb = hintArbs(ch)
+      val pointers = slicePointers(ch)
+      val dat = port_DnDATs(ch)._1
+      slices.zipWithIndex.foreach { case (s, i) =>
+        arb.io.in(i).valid := s.io.refillHint.valid && s.io.refillHint.bits.targetId === t1NIDs(ch).U
+        arb.io.in(i).bits := s.io.refillHint.bits
+      }
+      // Contract: L1D never backpressures DAT. No credit/ready qualification
+      // is needed at hint issue; both FIFOs reserve the same fixed schedule.
+      arb.io.out.ready := pointers.io.enq.ready
+      pointers.io.enq.valid := arb.io.out.valid
+      pointers.io.enq.bits := arb.io.chosen
+      io.refillHint(ch).valid := arb.io.out.fire
+      io.refillHint(ch).bits := arb.io.out.bits
+      val head = pointers.io.out.bits
+      dat.valid := pointers.io.out.valid && VecInit(slices.map(_.io.hintTXDAT.valid))(head) &&
+        VecInit(slices.map(_.io.hintTXDAT.bits.TgtID))(head) === t1NIDs(ch).U
+      dat.bits := VecInit(slices.map(_.io.hintTXDAT.bits))(head)
+      pointers.io.out.ready := dat.fire
+      when(pointers.io.out.valid) {
+        assert(dat.valid && dat.bits.TgtID === t1NIDs(ch).U, "slice pointer/data mismatch")
+        assert(dat.bits.DataID === pointers.io.second.asUInt, "slice pointer beat mismatch")
+      }
+      XSPerfAccumulate(s"hint_slice_pointer_full_$ch", arb.io.out.valid && pointers.io.full)
+      XSPerfAccumulate(s"hint_sent_$ch", io.refillHint(ch).valid)
+      XSPerfAccumulate(s"hint_due_backpressure_$ch", pointers.io.out.valid && !dat.ready)
+    }
+    slices.zipWithIndex.foreach { case (s, i) =>
+      s.io.refillHint.ready := t1NIDs.indices.map { ch =>
+        s.io.refillHint.bits.targetId === t1NIDs(ch).U && hintArbs(ch).io.in(i).ready
+      }.reduce(_ || _)
+      s.io.hintTXDAT.ready := t1NIDs.indices.map { ch =>
+        val q = slicePointers(ch)
+        q.io.out.valid && q.io.out.bits === i.U && port_DnDATs(ch)._1.ready &&
+          s.io.hintTXDAT.bits.TgtID === t1NIDs(ch).U
+      }.reduce(_ || _)
+    }
+  }
 
   // Assert: a slice-emitted UpTXDAT flit must target a configured upstream port
   // NID (Type-1 or Type-4). Same stall-forever failure mode as UpTXRSP above.
