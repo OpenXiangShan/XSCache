@@ -22,12 +22,12 @@ class L2R08Observe(implicit val p: Parameters) extends Module with HasL2Params {
   // Keep observer memories as memories through CHIRRTL. Dynamic writes into
   // a Reg Vec from every TSHR expand into replicated mux/decode trees and
   // make full-model generation unnecessarily large.
-  val source = Mem(paramL2.sets, Vec(paramL2.ways, UInt(4.W)))
-  val tag = Mem(paramL2.sets, Vec(paramL2.ways, UInt(tagWidth.W)))
+  val source = Seq.fill(paramL2.ways)(Mem(paramL2.sets, UInt(4.W)))
+  val tag = Seq.fill(paramL2.ways)(Mem(paramL2.sets, UInt(tagWidth.W)))
   val init = RegInit(true.B)
   val initSet = RegInit(0.U(setBits.W))
   when (init) {
-    source.write(initSet, VecInit(Seq.fill(paramL2.ways)(0.U(4.W))))
+    source.foreach(_.write(initSet, 0.U(4.W)))
     when (initSet === (paramL2.sets - 1).U) { init := false.B }
       .otherwise { initSet := initSet + 1.U }
   }
@@ -35,27 +35,30 @@ class L2R08Observe(implicit val p: Parameters) extends Module with HasL2Params {
   def tagOf(pa: UInt): UInt = pa(paramL2.physicalAddrWidth - 1, offsetBits + setBits)
   val evictedSources = io.evict.map { e =>
     val s = setOf(e.bits)
-    val matches = VecInit((0 until paramL2.ways).map(w => source(s)(w) =/= 0.U && tag(s)(w) === tagOf(e.bits)))
+    val matches = VecInit((0 until paramL2.ways).map(w => source(w)(s) =/= 0.U && tag(w)(s) === tagOf(e.bits)))
     val usedNow = io.demand.map(d => d.valid && d.bits === e.bits).reduce(_ || _)
     val unused = e.valid && !usedNow && !init
     when(e.valid && !init) { assert(PopCount(matches) <= 1.U, "R08 observation duplicate lineage tag") }
-    when(e.valid && !init && matches.asUInt.orR) {
-      source.write(s, VecInit(Seq.fill(paramL2.ways)(0.U(4.W))), matches.toSeq)
+    for (w <- 0 until paramL2.ways) {
+      when(e.valid && !init && matches(w)) { source(w).write(s, 0.U(4.W)) }
     }
-    Mux(unused, Mux1H(matches, source(s)), 0.U)
+    Mux(unused, Mux1H(matches, VecInit(source.map(_(s)))), 0.U)
   }
   for(d <- io.demand) {
     val s = setOf(d.bits)
-    val matches = (0 until paramL2.ways).map(w => tag(s)(w) === tagOf(d.bits))
-    when(d.valid && !init && matches.reduce(_ || _)) {
-      source.write(s, VecInit(Seq.fill(paramL2.ways)(0.U(4.W))), matches)
+    val matches = (0 until paramL2.ways).map(w => tag(w)(s) === tagOf(d.bits))
+    for (w <- 0 until paramL2.ways) {
+      when(d.valid && !init && matches(w)) { source(w).write(s, 0.U(4.W)) }
     }
   }
   when(io.install.valid && !init) {
     val s = setOf(io.install.bits.paddr)
-    val lane = (0 until paramL2.ways).map(w => io.install.bits.way === w.U)
-    source.write(s, VecInit(Seq.fill(paramL2.ways)(io.install.bits.source)), lane)
-    tag.write(s, VecInit(Seq.fill(paramL2.ways)(tagOf(io.install.bits.paddr))), lane)
+    for (w <- 0 until paramL2.ways) {
+      when(io.install.bits.way === w.U) {
+        source(w).write(s, io.install.bits.source)
+        tag(w).write(s, tagOf(io.install.bits.paddr))
+      }
+    }
   }
   XSPerfAccumulate("r08_insert_prefetch", io.install.valid && io.install.bits.prefetch)
   XSPerfAccumulate("r08_insert_demand", io.install.valid && !io.install.bits.prefetch)
