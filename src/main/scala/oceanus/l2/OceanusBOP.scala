@@ -222,6 +222,7 @@ object OceanusBOPParameters {
 class OceanusBOP(val params: OceanusBOPParameters = OceanusBOPParameters())(implicit outer: Parameters)
   extends OceanusVBOPModule()(OceanusVBOP.configured(outer, OceanusBOPParameters.geometry(params))) {
   val io = IO(new Bundle {
+    val enable = Input(Bool())
     val delayLatency = Input(UInt(10.W))
     val train = Flipped(Decoupled(UInt(fullAddressBits.W)))
     val req = Decoupled(UInt(fullAddressBits.W))
@@ -229,10 +230,10 @@ class OceanusBOP(val params: OceanusBOPParameters = OceanusBOPParameters())(impl
     val disabledDrop = Output(Bool())
     val delayQueueFullDrop = Output(Bool())
   })
-  val delayQueue = Module(new OceanusVDelayQueue("oceanus_pbop"))
-  val recentRequestTable = Module(new OceanusVRecentRequestTable("oceanus_pbop"))
-  val scoreTable = Module(new OceanusVOffsetScoreTable("oceanus_pbop"))
-  val student = if (enableStudentCover) Some(Module(new OceanusVStudentCoverageLearner("oceanus_pbop"))) else None
+  val delayQueue = Module(new OceanusVDelayQueue("oceanus_pbop")(p))
+  val recentRequestTable = Module(new OceanusVRecentRequestTable("oceanus_pbop")(p))
+  val scoreTable = Module(new OceanusVOffsetScoreTable("oceanus_pbop")(p))
+  val student = if (enableStudentCover) Some(Module(new OceanusVStudentCoverageLearner("oceanus_pbop")(p))) else None
   val studentTrainReady = student.map(_.io.train.ready).getOrElse(true.B)
   val teacherOffset = scoreTable.io.prefetchOffset
   val teacherDisable = scoreTable.io.prefetchDisable
@@ -241,7 +242,7 @@ class OceanusBOP(val params: OceanusBOPParameters = OceanusBOPParameters())(impl
   val issueGate = if (issueGateEnable) issueConf(scoreTable.io.phaseEndPulse, teacherDisable) else true.B
   val issueEnable = (studentSelectedEnable || !teacherDisable) && issueGate
   val cstEnable = Constantin.createRecord("pbop_enable0", initValue=1)
-  val enable = cstEnable.orR
+  val enable = io.enable && cstEnable.orR
   val newAddress = io.train.bits + signedExtend(issueOffset << offsetBits, fullAddressBits)
   val crossPageNow = getPPN(newAddress) =/= getPPN(io.train.bits)
   class Request extends Bundle {
@@ -281,7 +282,8 @@ class OceanusBOP(val params: OceanusBOPParameters = OceanusBOPParameters())(impl
   skid.io.deq.ready := io.req.ready
   io.crossPageDrop := io.train.fire && crossPageNow
   io.disabledDrop := io.train.fire && !crossPageNow && !issueEnable
-  io.delayQueueFullDrop := delayQueue.io.in.valid && delayQueue.full
+  io.delayQueueFullDrop := delayQueue.io.fullDrop
+  XSPerfAccumulate("bop_drop_for_external_disable", io.train.fire && !enable)
   XSPerfAccumulate("bop_train", io.train.fire)
   XSPerfAccumulate("bop_req", io.req.fire)
   XSPerfAccumulate("bop_student_takeover", io.train.fire && studentSelectedEnable)
@@ -302,9 +304,9 @@ private[l2] class OceanusBOPDelayQueue(name: String, params: OceanusBOPParameter
     val out = Decoupled(UInt(fullAddrBits.W))
     val fullDrop = Output(Bool())
   })
-  val queue = Module(new OceanusVDelayQueue(name))
+  val queue = Module(new OceanusVDelayQueue(name)(p))
   queue.io.pfCtrlOfDelayLatency := io.delayLatency
   queue.io.in <> io.in
   io.out <> queue.io.out
-  io.fullDrop := queue.io.in.valid && queue.full
+  io.fullDrop := queue.io.fullDrop
 }
