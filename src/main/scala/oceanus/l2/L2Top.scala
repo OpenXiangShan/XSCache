@@ -366,23 +366,25 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   bop.foreach(_.io.delayLatency := delayLatency)
   val bopReqValid = bop.map(_.io.req.valid).getOrElse(false.B)
   val bopReqBits = bop.map(_.io.req.bits).getOrElse(0.U(paramL2.physicalAddrWidth.W))
-  val bopTrainArb = Module(new L2PrefetchTrainArb(config.sliceNum, config.pfTrainEnable))
+  val bopTrainArb = Module(new L2PrefetchTrainArb(config.sliceNum, config.pfTrainEnable, buffered = true))
   bopTrainArb.io.in.zip(slices).foreach { case (sink, source) =>
     sink.valid := source.io.bopTrain.valid
     sink.bits := source.io.bopTrain.bits
   }
-  // Reference MainPipe.scala:750-759 filters needHint before slice arbitration.
-  // Disabled events cannot consume a choice or displace another slice's pulse.
-  bop.foreach { learner =>
-    learner.io.train.valid := bopTrainArb.io.out.valid
-    learner.io.train.bits := bopTrainArb.io.out.bits.paddr
+  // Reference Prefetcher: train.ready is always true; each BOP owns an
+  // independent four-entry drop-new input FIFO. Cache events never replay.
+  val pbopTrainInput = bop.map { learner =>
+    val input = Module(new Queue(chiselTypeOf(bopTrainArb.io.out.bits), 4))
+    input.io.enq.valid := bopTrainArb.io.out.fire
+    input.io.enq.bits := bopTrainArb.io.out.bits
+    learner.io.train.valid := input.io.deq.valid
+    learner.io.train.bits := input.io.deq.bits.paddr
+    input.io.deq.ready := learner.io.train.ready
+    input
   }
-  bopTrainArb.io.out.ready := bop.map(_.io.train.ready).getOrElse(true.B)
+  bopTrainArb.io.out.ready := true.B
   vbopStub.foreach { stub =>
-    // Intent (3a refinement): slice training is a lossy Valid event pulse;
-    // copy it even when PBOP's independent learner is momentarily not ready.
-    // It cannot be replayed by the cache, and VBOP owns its own drop-new queue.
-    stub.io.train.valid := bopTrainArb.io.out.valid
+    stub.io.train.valid := bopTrainArb.io.out.fire
     stub.io.train.bits := bopTrainArb.io.out.bits
   }
 
@@ -390,7 +392,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   // or the provenance source of an old prefetched line. Evictions have their
   // own bucket because their origin request no longer belongs to this event.
   val trainAccounting = if (config.pfTrainEnable) Some(Module(new L2PrefetchTrainCounters(
-    config.upstream.entries.size + 1, 2 * config.sliceNum * nMSHR))) else None
+    config.upstream.entries.size + 1, 2 * config.sliceNum * nMSHR, delayedRows = Set(0, 1)))) else None
   trainAccounting.foreach { counts =>
     val origins = VecInit(slices.flatMap(_.io.trainSourceNID.get.toSeq))
     val bopRaw = slices.flatMap(_.io.bopTrainRaw.get.toSeq)
@@ -406,7 +408,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       counts.io.total(1)(source) := rawBop
       counts.io.total(2)(source) := rawCDP
       counts.io.total(3)(source) := rawCDP
-      counts.io.accepted(0)(source) := bop.map(_.io.train.fire).getOrElse(false.B) && selectedOrigin === entry.nid.U
+      counts.io.accepted(0)(source) := pbopTrainInput.map(_.io.enq.fire).getOrElse(false.B) && selectedOrigin === entry.nid.U
       vbopStub.foreach { learner =>
         counts.io.accepted(1)(source) := learner.io.trainAccepted && selectedOrigin === entry.nid.U
       }

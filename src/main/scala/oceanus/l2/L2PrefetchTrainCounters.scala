@@ -5,9 +5,11 @@ import chisel3.util._
 
 // R10 observation only. An event is accepted at the learner admission boundary.
 // All other raw one-cycle events (disabled, filtered, arbitration or queue loss)
-// are dropped. Rows are BOP, VBOP, CDP VPN and CDP Filter; columns are upstream
+// are dropped. With pre-arbitration buffering, total-accepted additionally
+// includes events pending in the slice queues; report actual drop events and
+// boundary occupancy separately. Rows are BOP, VBOP, CDP VPN and CDP Filter; columns are upstream
 // physical SrcIDs followed by an eviction bucket. There is no replay/flow control.
-class L2PrefetchTrainCounters(sources: Int, maxEvents: Int) extends Module {
+class L2PrefetchTrainCounters(sources: Int, maxEvents: Int, delayedRows: Set[Int] = Set.empty) extends Module {
   val io = IO(new Bundle {
     val total = Input(Vec(4, Vec(sources, UInt(log2Ceil(maxEvents+1).W))))
     val accepted = Input(Vec(4, Vec(sources, Bool())))
@@ -21,8 +23,13 @@ class L2PrefetchTrainCounters(sources: Int, maxEvents: Int) extends Module {
     val dropped = RegInit(0.U(64.W))
     total := total + io.total(sink)(source)
     accepted := accepted + io.accepted(sink)(source)
-    dropped := dropped + (io.total(sink)(source) - io.accepted(sink)(source).asUInt)
-    assert(io.accepted(sink)(source).asUInt <= io.total(sink)(source), "R10 acceptance without raw event")
+    dropped := dropped + (io.total(sink)(source).pad(64) - io.accepted(sink)(source).asUInt.pad(64))
+    if (delayedRows.contains(sink)) {
+      assert(accepted + io.accepted(sink)(source) <= total + io.total(sink)(source),
+        "R10 cumulative acceptance without raw event")
+    } else {
+      assert(io.accepted(sink)(source).asUInt <= io.total(sink)(source), "R10 acceptance without raw event")
+    }
     assert(total === (accepted + dropped), "R10 accepted + dropped != total")
     io.totals(sink)(source) := total
     io.accepts(sink)(source) := accepted
