@@ -19,15 +19,24 @@ object L2PrefetchTrainSelect {
   }
 }
 
-class L2PrefetchTrainArb(inputs: Int, sideband: Boolean)(implicit p: Parameters) extends Module {
+class L2PrefetchTrainArb(inputs: Int, sideband: Boolean, buffered: Boolean = false)(implicit p: Parameters) extends Module {
   val io = IO(new Bundle {
     val in = Flipped(Vec(inputs, Valid(new L2PrefetchTrain(sideband))))
     val out = Decoupled(new L2PrefetchTrain(sideband))
   })
   val arb = Module(new FastArbiter(new L2PrefetchTrain(sideband), inputs))
-  arb.io.in.zip(io.in).foreach { case (sink, source) =>
-    sink.valid := L2PrefetchTrainSelect.enabled(source)
-    sink.bits := source.bits
+  // One entry per slice before arbitration, matching coupledL2 MainPipe.
+  // Non-pipelined queue: a full queue may drop a simultaneous replacement.
+  val queues = if (buffered) Seq.fill(inputs)(Module(new Queue(new L2PrefetchTrain(sideband), 1))) else Nil
+  arb.io.in.zip(io.in).zipWithIndex.foreach { case ((sink, source), i) =>
+    if (buffered) {
+      queues(i).io.enq.valid := L2PrefetchTrainSelect.enabled(source)
+      queues(i).io.enq.bits := source.bits
+      sink <> queues(i).io.deq
+    } else {
+      sink.valid := L2PrefetchTrainSelect.enabled(source)
+      sink.bits := source.bits
+    }
   }
   io.out <> arb.io.out
 }
