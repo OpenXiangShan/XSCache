@@ -177,7 +177,7 @@ package oceanus.l2
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
-import utility.{ChiselDB, Constantin, XSPerfAccumulate}
+import utility.{ChiselDB, Constantin, XSPerfAccumulate, XSPerfReference}
 import utility.sram.{SRAMTemplate, SramBroadcastBundle}
 
 case class OceanusBOPParameters(
@@ -285,6 +285,12 @@ class OceanusBOP(val params: OceanusBOPParameters = OceanusBOPParameters())(impl
   XSPerfAccumulate("bop_train", io.train.fire)
   XSPerfAccumulate("bop_req", io.req.fire)
   XSPerfAccumulate("bop_student_takeover", io.train.fire && studentSelectedEnable)
+  XSPerfAccumulate("bop_teacher_selected", io.train.fire && !studentSelectedEnable)
+  XSPerfReference("bop_teacher_current_offset", teacherOffset.asSInt.pad(64).asUInt)
+  XSPerfReference("bop_student_current_offset", student.map(_.io.selectedOffset.asSInt.pad(64).asUInt).getOrElse(teacherOffset.asSInt.pad(64).asUInt))
+  XSPerfReference("bop_current_issue_offset", issueOffset.asSInt.pad(64).asUInt)
+  XSPerfReference("bop_current_student_enable", studentSelectedEnable.asUInt)
+  emitOffsetDistCounters("training_issue_offset", issueOffset.asSInt, io.train.fire)
   emitOffsetDistCounters("prefetch_sent_issue_offset", skid.io.deq.bits.issueOffset, io.req.fire)
 }
 

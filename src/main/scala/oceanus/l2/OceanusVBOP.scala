@@ -66,7 +66,7 @@ package oceanus.l2
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.{Parameters, Field}
-import utility.{ChiselDB, Constantin, MemReqSource, ParallelPriorityMux, XSPerfAccumulate, TwoLevelRRArbiter, ArbPerf}
+import utility.{ChiselDB, Constantin, MemReqSource, ParallelPriorityMux, XSPerfAccumulate, TwoLevelRRArbiter, ArbPerf, XSPerfReference}
 import utility.sram.{SRAMTemplate, SramBroadcastBundle}
 import freechips.rocketchip.util.SeqToAugmentedSeq
 import oceanus.l2._
@@ -936,6 +936,9 @@ class OceanusVBOPBuffer(implicit p: Parameters) extends OceanusVBOPModule {
   when(io.in.valid && !matches && !(previous && previousVA === io.in.bits.va) && !free.asUInt.orR) {
     fullDrops := fullDrops + 1.U
   }
+  XSPerfAccumulate("request_buffer_full_drop", io.in.valid && !matches &&
+    !(previous && previousVA === io.in.bits.va) && !free.asUInt.orR)
+  XSPerfReference("request_buffer_pending", PopCount(valids))
   dontTouch(fullDrops)
 }
 
@@ -967,6 +970,10 @@ class OceanusVBOP(val params: OceanusVBOPParameters = OceanusVBOPParameters())(i
   input.io.enq.valid := io.train.valid && io.train.bits.trainEnable.get
   input.io.enq.bits := io.train.bits
   io.trainAccepted := input.io.enq.fire
+  XSPerfAccumulate("vbop_train_raw", input.io.enq.valid)
+  XSPerfAccumulate("vbop_train_accept", input.io.enq.fire)
+  XSPerfAccumulate("vbop_train_drop", input.io.enq.valid && !input.io.enq.ready)
+  XSPerfReference("vbop_train_pending", input.io.count)
   val overwritten = RegInit(0.U(64.W)) // legacy observation name: counts drop-new
   when(input.io.enq.valid && !input.io.enq.ready) { overwritten := overwritten + 1.U }
   val delayQueue = Module(new OceanusVDelayQueue("oceanus_vbop")(p))
@@ -1021,6 +1028,12 @@ class OceanusVBOP(val params: OceanusVBOPParameters = OceanusVBOPParameters())(i
   XSPerfAccumulate("bop_train", input.io.deq.fire)
   XSPerfAccumulate("bop_req", io.req.fire)
   XSPerfAccumulate("bop_student_takeover", input.io.deq.fire && studentSelectedEnable)
+  XSPerfAccumulate("bop_teacher_selected", input.io.deq.fire && !studentSelectedEnable)
+  XSPerfReference("bop_teacher_current_offset", teacherOffset.asSInt.pad(64).asUInt)
+  XSPerfReference("bop_student_current_offset", student.map(_.io.selectedOffset.asSInt.pad(64).asUInt).getOrElse(teacherOffset.asSInt.pad(64).asUInt))
+  XSPerfReference("bop_current_issue_offset", issueOffset.asSInt.pad(64).asUInt)
+  XSPerfReference("bop_current_student_enable", studentSelectedEnable.asUInt)
+  emitOffsetDistCounters("training_issue_offset", issueOffset.asSInt, input.io.deq.fire)
   XSPerfAccumulate("bop_drop_for_external_disable", input.io.deq.fire && !enable)
   XSPerfAccumulate("bop_drop_for_auto_disable", input.io.deq.fire && enable && !issueEnable)
   emitOffsetDistCounters("prefetch_sent_issue_offset", reqFilter.io.out.bits.issueOffset, io.req.fire)

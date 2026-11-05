@@ -129,6 +129,14 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   assert(!io.DnRXRSP.valid || (PopCount(tshrs.map(_.io.DnRXRSP.valid)) =/= 0.U), "DnRXRSP valid but no TSHR selected, flit lost")
   assert(!io.DnRXDAT.valid || (PopCount(tshrs.map(_.io.DnRXDAT.valid)) =/= 0.U), "DnRXDAT valid but no TSHR selected, flit lost")
   io.bopTrain := L2PrefetchTrainSelect.local(tshrs.map(_.io.bopTrain))
+  val rawBopTrains = PopCount(tshrs.map(_.io.bopTrain.valid))
+  val eligibleBopTrains = PopCount(tshrs.map(t => L2PrefetchTrainSelect.enabled(t.io.bopTrain)))
+  XSPerfAccumulate("bop_train_raw", rawBopTrains)
+  XSPerfAccumulate("bop_train_eligible", eligibleBopTrains)
+  XSPerfAccumulate("bop_train_disabled", rawBopTrains - eligibleBopTrains)
+  XSPerfAccumulate("bop_train_local_unselected", eligibleBopTrains - io.bopTrain.valid.asUInt)
+  XSPerfAccumulate("bop_train_slice_selected", io.bopTrain.valid)
+
   if (pfTrainEnable) {
     tshrs.zipWithIndex.foreach { case (t,i) =>
       io.bopTrainRaw.get(i) := t.io.bopTrain.valid
