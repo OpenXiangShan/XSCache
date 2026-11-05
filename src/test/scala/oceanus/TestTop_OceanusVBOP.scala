@@ -40,12 +40,19 @@ class VBOPComparison(val geometry: OceanusVBOPParameters)(implicit val p: Parame
     val dutTranslations = Output(UInt(64.W))
     val accepted = Output(UInt(64.W))
     val dropped = Output(UInt(64.W))
+    val learnerCycleEqual = Output(Bool())
   })
   val referenceGeometry = ref.BOPParameters(rrTableEntries=geometry.rrTableEntries,
     rrTagBits=geometry.rrTagBits, scoreBits=geometry.scoreBits, roundMax=geometry.roundMax,
     badScore=geometry.badScore, tlbReplayCnt=geometry.tlbReplayCnt,
     dQEntries=geometry.dQEntries, dQLatency=geometry.dQLatency,
-    dQMaxLatency=geometry.dQMaxLatency, offsetList=geometry.offsetList)
+    dQMaxLatency=geometry.dQMaxLatency, offsetList=geometry.offsetList,
+    crossPage=geometry.crossPage, useDelayOut=geometry.useDelayOut,
+    enableStudentCover=geometry.enableStudentCover, studentPoolSize=geometry.studentPoolSize,
+    studentFilterTableBits=geometry.studentFilterTableBits, studentFilterEntryBits=geometry.studentFilterEntryBits,
+    studentHashMode=geometry.studentHashMode, studentCovThreshold=geometry.studentCovThreshold,
+    issueGateEnable=geometry.issueGateEnable, issueConfThreshold=geometry.issueConfThreshold,
+    samePagePA=geometry.samePagePA)
   val reference = Module(new ref.VBestOffsetPrefetch()(p.alterPartial { case ref.VBOPKey => referenceGeometry }))
   val dut = Module(new OceanusVBOP(geometry))
   val adapter = Module(new L2PrefetchTlbAdapter)
@@ -61,7 +68,7 @@ class VBOPComparison(val geometry: OceanusVBOPParameters)(implicit val p: Parame
   referenceInput.io.enq.bits.paddr := io.train.bits.paddr
   reference.io.train <> referenceInput.io.deq
   reference.io.enable := io.enable
-  reference.io.pbopCrossPage := true.B
+  reference.io.fdbkDegree := 1.U
   reference.io.pfCtrlOfDelayLatency := 0.U
   reference.io.resp.valid := false.B
   reference.io.resp.bits := 0.U.asTypeOf(reference.io.resp.bits)
@@ -122,6 +129,24 @@ class VBOPComparison(val geometry: OceanusVBOPParameters)(implicit val p: Parame
   io.originalNeedT := dut.io.originalNeedT
   io.actualNeedT := dut.io.issuedNeedT
   io.downgraded := read(dut.needTDowngraded)
+  // Compare teacher and student state at every cycle, including idle cycles.
+  val teacherEqual = io.refLearning.valid === io.dutLearning.valid && io.refLearning.bits === io.dutLearning.bits &&
+    read(rs.io.phaseEndPulse) === read(ds.io.phaseEndPulse) &&
+    read(rs.io.phaseBestOffsetCommitted) === read(ds.io.phaseBestOffsetCommitted) &&
+    read(rs.io.phaseIssueEnable) === read(ds.io.phaseIssueEnable)
+  val studentEqual = (reference.student, dut.student) match {
+    case (Some(a), Some(b)) =>
+      read(a.io.train.fire) === read(b.io.train.fire) &&
+      read(a.selectedOffset) === read(b.selectedOffset) &&
+      read(a.selectedValid) === read(b.selectedValid) &&
+      read(a.selectedEnable) === read(b.selectedEnable) &&
+      read(a.phaseTrainCount) === read(b.phaseTrainCount) &&
+      read(a.state) === read(b.state) &&
+      a.pool.zip(b.pool).map { case (x,y) => read(x.asUInt) === read(y.asUInt) }.reduce(_ && _)
+    case (None, None) => true.B
+    case _ => false.B
+  }
+  io.learnerCycleEqual := teacherEqual && studentEqual
   val accepted = RegInit(0.U(64.W))
   when(read(dut.input.io.deq.valid) && read(dut.input.io.deq.ready)) { accepted := accepted + 1.U }
   io.accepted := accepted
@@ -179,6 +204,7 @@ object TestTop_OceanusVBOP extends App with ChiselSim {
       dut.io.tlbReady.poke(true.B); dut.io.latency.poke(1.U)
       dut.reset.poke(true.B); dut.clock.step(8); dut.reset.poke(false.B)
       def sample(): Unit = {
+        assert(flag(dut.io.learnerCycleEqual), s"teacher/student per-cycle mismatch $kind/$seed")
         if(flag(dut.io.refLearning.valid)) refLearning += value(dut.io.refLearning.bits)
         if(flag(dut.io.dutLearning.valid)) dutLearning += value(dut.io.dutLearning.bits)
         if(flag(dut.io.refRequest.valid)) refRequests += ((value(dut.io.refRequest.bits),flag(dut.io.refNeedT)))
@@ -215,8 +241,8 @@ object TestTop_OceanusVBOP extends App with ChiselSim {
       assert((defaults || downgraded > 0) && value(dut.io.downgraded) == downgraded)
       assert(value(dut.io.dropped)==0)
       assert(value(dut.io.accepted) == count - (count+18)/19, "trainEnable acceptance count")
-      assert(value(dut.io.refTranslations)==refRequests.size)
-      assert(value(dut.io.dutTranslations)==dutRequests.size, "default must translate same-page predictions too")
+      assert(value(dut.io.refTranslations)==value(dut.io.dutTranslations), "cross-page translation count")
+      assert(value(dut.io.dutTranslations)<=dutRequests.size, "same-page predictions bypass translation")
       assert(value(dut.io.commits)>=2, s"no learned phase commit $kind/$seed")
       totalSequences += 1; totalIssued += refRequests.size
       def digest(values: Seq[BigInt]): String = java.security.MessageDigest.getInstance("SHA-256")
