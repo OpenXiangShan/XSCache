@@ -1,0 +1,51 @@
+package oceanus.l2
+
+import chisel3._
+import chisel3.util._
+import org.chipsalliance.cde.config.Parameters
+import utility._
+
+// Observation-only lineage survives DirRel's provenance clear. A release is
+// not demand use and does not terminate the line's lifetime. Pending refills
+// consumed before installation already carry source=0 at the tag commit.
+class L2R08Observe(implicit val p: Parameters) extends Module with HasL2Params {
+  val io = IO(new Bundle {
+    val install = Input(Valid(new Bundle {
+      val paddr = UInt(paramL2.physicalAddrWidth.W)
+      val way = UInt(wayBits.W)
+      val source = UInt(L2PfSource.Width.W)
+      val prefetch = Bool()
+    }))
+    val demand = Input(Vec(nMSHR, Valid(UInt(paramL2.physicalAddrWidth.W))))
+    val evict = Input(Vec(nMSHR, Valid(UInt(paramL2.physicalAddrWidth.W))))
+  })
+  val source = RegInit(VecInit(Seq.fill(paramL2.sets)(VecInit(Seq.fill(paramL2.ways)(0.U(4.W))))))
+  val tag = Reg(Vec(paramL2.sets, Vec(paramL2.ways, UInt(tagWidth.W))))
+  def setOf(pa: UInt): UInt = pa(offsetBits + setBits - 1, offsetBits)
+  def tagOf(pa: UInt): UInt = pa(paramL2.physicalAddrWidth - 1, offsetBits + setBits)
+  val evictedSources = io.evict.map { e =>
+    val s = setOf(e.bits)
+    val matches = VecInit((0 until paramL2.ways).map(w => source(s)(w) =/= 0.U && tag(s)(w) === tagOf(e.bits)))
+    val usedNow = io.demand.map(d => d.valid && d.bits === e.bits).reduce(_ || _)
+    val unused = e.valid && !usedNow
+    when(e.valid) { assert(PopCount(matches) <= 1.U, "R08 observation duplicate lineage tag") }
+    for(w <- 0 until paramL2.ways) { when(e.valid && matches(w)) { source(s)(w) := 0.U } }
+    Mux(unused, Mux1H(matches, source(s)), 0.U)
+  }
+  for(d <- io.demand) {
+    val s = setOf(d.bits)
+    for(w <- 0 until paramL2.ways) {
+      when(d.valid && tag(s)(w) === tagOf(d.bits)) { source(s)(w) := 0.U }
+    }
+  }
+  when(io.install.valid) {
+    val s = setOf(io.install.bits.paddr)
+    source(s)(io.install.bits.way) := io.install.bits.source
+    tag(s)(io.install.bits.way) := tagOf(io.install.bits.paddr)
+  }
+  XSPerfAccumulate("r08_insert_prefetch", io.install.valid && io.install.bits.prefetch)
+  XSPerfAccumulate("r08_insert_demand", io.install.valid && !io.install.bits.prefetch)
+  for(s <- 1 until 16) {
+    XSPerfAccumulate(s"r08_unused_evict_source${s}", PopCount(evictedSources.map(_ === s.U)))
+  }
+}

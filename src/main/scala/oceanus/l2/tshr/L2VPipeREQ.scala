@@ -40,6 +40,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val io = IO(new Bundle {
     val bopPerf = Output(new L2BOPReqPerf)
+    val r08Demand = Output(Valid(UInt(paramL2.physicalAddrWidth.W)))
+    val r08Evict = Output(Valid(UInt(paramL2.physicalAddrWidth.W)))
 
     val consts = Input(new L2TSHRConsts(sliceNum))
 
@@ -2165,6 +2167,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     L2PrefetchTxnID.decode(p_rxreq.TxnID), L2PfSource.NoWhere.U)
   io.bopPerf.activeDemand := active && p_rxreq.SrcID =/= io.consts.pfSrcID &&
     (p_rxreq_readshared || p_rxreq_readunique || p_rxreq_makeunique)
+  io.r08Demand.valid := rxreq_fire && rxreq_demand && dirResult.hit
+  io.r08Demand.bits := io.tshr_paddr
+  io.r08Evict.valid := meta_wr_state_evictback_I && io.tshr_meta_write_en.state &&
+    io.tshr_meta_write_meta.state === MetaState.I && dirResult.hit && dirResult.state =/= MetaState.I
+  io.r08Evict.bits := io.tshr_paddr
   io.bopPerf.useful := prefetched_hit_consume
   // Count redundant only at REQ execution, never at allocation/queue issue.
   io.bopPerf.redundant := rxreq_fire && requestFromPrefetch && rxreq_satisfied_stashshared

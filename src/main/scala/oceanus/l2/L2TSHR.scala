@@ -46,6 +46,8 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
     val consts = Input(new L2TSHRConsts(sliceNum))
 
     val toDir = Output(new L2Directory.PathToDirectory)
+    val r08Demand = Output(Valid(UInt(paramL2.physicalAddrWidth.W)))
+    val r08Evict = Output(Valid(UInt(paramL2.physicalAddrWidth.W)))
     val fromDir = Input(new L2Directory.PathFromDirectory)
 
     val toDS = Output(new L2DataStorage.PathTSHRToDataStorage)
@@ -640,6 +642,8 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
       io.UpRXREQ.SrcID === io.consts.pfSrcID && io.UpRXREQ.Opcode === StashShared.U &&
       vPipeREQ.io.bopPerf.activeDemand
   }
+  io.r08Demand := vPipeREQ.io.r08Demand
+  io.r08Evict := vPipeREQ.io.r08Evict
   io.bopPerf(L2BOPPerf.Useful) := vPipeREQ.io.bopPerf.useful
   io.bopPerf(L2BOPPerf.Late) := bopLate
   io.bopPerf(L2BOPPerf.Redundant) := vPipeREQ.io.bopPerf.redundant

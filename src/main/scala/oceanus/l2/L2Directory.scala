@@ -308,6 +308,12 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     val toDir   = Input(Vec(nMSHR, new L2Directory.PathToDirectory))
     val fromDir = Output(Vec(nMSHR, new L2Directory.PathFromDirectory))
     val tshrIdle = Input(Vec(nMSHR, Bool()))
+    val r08Install = Output(Valid(new Bundle {
+      val paddr = UInt(paramL2.physicalAddrWidth.W)
+      val way = UInt(wayBits.W)
+      val source = UInt(L2PfSource.Width.W)
+      val prefetch = Bool()
+    }))
     val debugStateWrite = if (enableDirStateProbe) {
       Some(Output(new Bundle {
         val valid = Bool()
@@ -975,6 +981,21 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   when(s3_valid && s3_isDirRd) {
     assert(PopCount(hitVec) <= 1.U,
       "Directory: multiple ways hit (tag uniqueness)")
+  }
+
+  io.r08Install.valid := grantDirWb && winReq.TAG_WEN
+  io.r08Install.bits.paddr := winReq.PADDR
+  io.r08Install.bits.way := winReq.WAY
+  io.r08Install.bits.source := winReq.META.pfSource
+  io.r08Install.bits.prefetch := winReq.RRIP_REFILL_PREFETCH
+  val r08DemandHitPrefetch = replWen && s3_isDirRd && !s3_rrip_prefetch &&
+    entry_s3.meta.pfSource =/= 0.U && useDRRIP.B
+  val r08Promote = r08DemandHitPrefetch &&
+    (s3_repl >> (way_s3 << 1))(1, 0) =/= 0.U
+  XSPerfAccumulate("r08_demand_hit_prefetch", r08DemandHitPrefetch)
+  XSPerfAccumulate("r08_demand_promote_prefetch", r08Promote)
+  for (source <- 1 until 16) {
+    XSPerfAccumulate(s"r08_demand_promote_source${source}", r08Promote && entry_s3.meta.pfSource === source.U)
   }
 
   // ══════════════════════════════════════════════════════════════════

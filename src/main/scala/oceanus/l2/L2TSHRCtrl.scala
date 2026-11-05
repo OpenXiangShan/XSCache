@@ -243,6 +243,13 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
 
   // -- Directory connections
   val directory = Module(new Directory)
+  // Keep lineage storage out of production configurations with perf disabled.
+  if (p(LogUtilsOptionsKey).enablePerf) {
+    val r08 = Module(new L2R08Observe)
+    r08.io.install := directory.io.r08Install
+    r08.io.demand := VecInit(tshrs.map(_.io.r08Demand))
+    r08.io.evict := VecInit(tshrs.map(_.io.r08Evict))
+  }
 
   directory.io.toDir.zip(tshrs.map(_.io.toDir)).foreach { case (sink, source) => { 
     sink := source 
