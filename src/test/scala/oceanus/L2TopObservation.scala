@@ -406,7 +406,9 @@ object L2TopObservation {
   }
 
   private val slice0 = privateField[Seq[L2TSHRCtrl]](module, "slices").head
-  private val bop = privateField[OceanusBOP](module, "bop")
+  private val bop = module.bop
+  private def bopBool(f: OceanusBOP => Bool): Bool = bop.map(b => boreRead(f(b))).getOrElse(false.B)
+  private def bopUInt(f: OceanusBOP => UInt): UInt = bop.map(b => boreRead(f(b))).getOrElse(0.U)
   private val slices = privateField[Seq[L2TSHRCtrl]](module, "slices")
   private val pfQueues = privateField[Seq[DecoupledIO[FlitREQ]]](module, "pfQueues")
   private val pfQueueOverwriteBySource = privateField[Vec[Vec[Bool]]](module, "pfQueueOverwriteBySource")
@@ -957,22 +959,22 @@ object L2TopObservation {
     count
   }
 
-  io.bopTrainFire := boreRead(bop.io.train.valid) && boreRead(bop.io.train.ready)
+  io.bopTrainFire := bopBool(_.io.train.valid) && bopBool(_.io.train.ready)
   io.bopTrainFireCount := accumulate(io.bopTrainFire)
   io.bopTrainReceiveCount := io.bopTrainFireCount
   slices.zipWithIndex.foreach { case (slice, sliceIdx) =>
     io.sliceTrainPulseCount(sliceIdx) := accumulate(boreRead(slice.io.bopTrain.valid))
     io.sliceEvictBackFireCount(sliceIdx) := accumulate(io.sliceEvictBackFire(sliceIdx))
   }
-  io.bopTrainAddr := boreRead(bop.io.train.bits)
-  io.bopReqAddr := boreRead(bop.io.req.bits)
+  io.bopTrainAddr := bopUInt(_.io.train.bits)
+  io.bopReqAddr := bopUInt(_.io.req.bits)
   // Drop pulses qualify the current training attempt before the edge. req.bits
   // still contains the preceding attempt until that edge updates the register.
-  io.bopDropAddr := boreRead(privateField[UInt](bop, "newAddress"))
-  val bopReqValid = boreRead(bop.io.req.valid)
-  val bopReqReady = boreRead(bop.io.req.ready)
-  val bopTrainValid = boreRead(bop.io.train.valid)
-  val bopTrainReady = boreRead(bop.io.train.ready)
+  io.bopDropAddr := bopUInt(_.newAddress)
+  val bopReqValid = bopBool(_.io.req.valid)
+  val bopReqReady = bopBool(_.io.req.ready)
+  val bopTrainValid = bopBool(_.io.train.valid)
+  val bopTrainReady = bopBool(_.io.train.ready)
   io.bopReqValid := bopReqValid
   io.bopReqReady := bopReqReady
   io.bopReqEnqReady := bopReqReady
@@ -1065,9 +1067,9 @@ object L2TopObservation {
   }
   io.bopPrefetchIssue := io.bopPrefetchIssueBySlice.asUInt.orR
   io.bopPrefetchIssueAddr := Mux1H(io.bopPrefetchIssueBySlice.zip(io.bopPrefetchIssueAddrBySlice))
-  io.bopCrossPageDrop := boreRead(bop.io.crossPageDrop)
-  io.bopDisabledDrop := boreRead(bop.io.disabledDrop)
-  io.bopDelayQueueFullDrop := boreRead(bop.io.delayQueueFullDrop)
+  io.bopCrossPageDrop := bopBool(_.io.crossPageDrop)
+  io.bopDisabledDrop := bopBool(_.io.disabledDrop)
+  io.bopDelayQueueFullDrop := bopBool(_.io.delayQueueFullDrop)
   io.bopTrainStall := bopTrainValid && !bopTrainReady
 
   io.tshr0Counts.wUnlockDs := accumulate(wUnlockDs0)

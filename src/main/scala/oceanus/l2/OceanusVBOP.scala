@@ -66,7 +66,7 @@ package oceanus.l2
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.{Parameters, Field}
-import utility.{ChiselDB, Constantin, MemReqSource, ParallelPriorityMux, XSPerfAccumulate, TwoLevelRRArbiter, ArbPerf, XSPerfReference}
+import utility.{ChiselDB, Constantin, MemReqSource, ParallelPriorityMux, XSPerfAccumulate, TwoLevelRRArbiter, ArbPerf, XSPerfReference, XSPerfHistogram, SelectByFn}
 import utility.sram.{SRAMTemplate, SramBroadcastBundle}
 import freechips.rocketchip.util.SeqToAugmentedSeq
 import oceanus.l2._
@@ -794,6 +794,7 @@ class OceanusVStudentCoverageLearner(name: String = "")(implicit p: Parameters) 
 
 class OceanusVDelayQueue(name: String = "")(implicit p: Parameters) extends  OceanusVBOPModule{
   val io = IO(new Bundle(){
+    val fullDrop = Output(Bool())
     val pfCtrlOfDelayLatency = Input(UInt(10.W))
     val in = Flipped(DecoupledIO(UInt(noOffsetAddrBits.W)))
     val out = DecoupledIO(UInt(fullAddrBits.W))
@@ -842,6 +843,7 @@ class OceanusVDelayQueue(name: String = "")(implicit p: Parameters) extends  Oce
     valids(head) := false.B
     head := head + 1.U
   }
+  io.fullDrop := io.in.valid && full
   io.in.ready := true.B
   io.out.valid := outValid
   io.out.bits := Cat(queue(head).addrNoOffset, 0.U(offsetBits.W))
@@ -984,7 +986,7 @@ class OceanusVBOP(val params: OceanusVBOPParameters = OceanusVBOPParameters())(i
   rrTable.io.w <> delayQueue.io.out
   delayQueue.io.pfCtrlOfDelayLatency := io.delayLatency
   // Upstream dfd3edcf: all three learners consume the same accepted event.
-  val student = if (enableStudentCover) Some(Module(new OceanusVStudentCoverageLearner("oceanus_vbop"))) else None
+  val student = if (enableStudentCover) Some(Module(new OceanusVStudentCoverageLearner("oceanus_vbop")(p))) else None
   val studentTrainReady = student.map(_.io.train.ready).getOrElse(true.B)
   val phaseEnd = scoreTable.io.phaseEndPulse
   val teacherOffset = scoreTable.io.prefetchOffset

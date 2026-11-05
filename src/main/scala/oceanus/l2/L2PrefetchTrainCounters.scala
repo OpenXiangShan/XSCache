@@ -23,7 +23,7 @@ class L2PrefetchTrainCounters(sources: Int, maxEvents: Int, delayedRows: Set[Int
     val dropped = RegInit(0.U(64.W))
     total := total + io.total(sink)(source)
     accepted := accepted + io.accepted(sink)(source)
-    dropped := dropped + (io.total(sink)(source).pad(64) - io.accepted(sink)(source).asUInt.pad(64))
+    dropped := (dropped + io.total(sink)(source)) - io.accepted(sink)(source).asUInt
     if (delayedRows.contains(sink)) {
       assert(accepted + io.accepted(sink)(source) <= total + io.total(sink)(source),
         "R10 cumulative acceptance without raw event")

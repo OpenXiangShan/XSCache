@@ -98,8 +98,8 @@ class TestTopDrain(cfg: L2Configuration)(implicit p: Parameters) extends TestTop
     case (e, valid) => valid && e.waiting
   }))
   add("vbop.delay", PopCount(read(v.delayQueue.valids)))
-  add("pbop.delay", PopCount(read(field[Vec[Bool]](field[AnyRef](module.bop, "delayQueue"), "valid"))))
-  add("pbop.output", module.bop.io.req.valid)
+  add("pbop.delay", PopCount(read(field[Vec[Bool]](field[AnyRef](module.bop.get, "delayQueue"), "valids"))))
+  add("pbop.output", module.bop.get.io.req.valid)
   val cdp = module.cdp.get
   val send = cdp.sentUnit.get
   add("cdp.entries", PopCount(read(send.valids)))
@@ -117,8 +117,8 @@ class TestTopDrain(cfg: L2Configuration)(implicit p: Parameters) extends TestTop
     for (stage <- Seq(lane.s1_req, lane.s2_req, lane.s3_req).zipWithIndex)
       add(s"cdp.detect$i.${stage._2}", stage._1.valid)
   } else {
-    add("pbop.delay", PopCount(read(field[Vec[Bool]](field[AnyRef](module.bop, "delayQueue"), "valid"))))
-    add("pbop.output", module.bop.io.req.valid)
+    add("pbop.delay", PopCount(read(field[Vec[Bool]](field[AnyRef](module.bop.get, "delayQueue"), "valids"))))
+    add("pbop.output", module.bop.get.io.req.valid)
   }
   module.slices.zipWithIndex.foreach { case (slice, s) =>
     field[Seq[L2TSHR]](slice, "tshrs").zipWithIndex.foreach { case (t, i) =>

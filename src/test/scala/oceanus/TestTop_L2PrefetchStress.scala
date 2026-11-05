@@ -78,8 +78,8 @@ class TestTopStress(cfg: L2Configuration)(implicit p: Parameters) extends Stress
   def field[T](owner: AnyRef,name: String): T = {
     val f=owner.getClass.getDeclaredField(name); f.setAccessible(true); f.get(owner).asInstanceOf[T]
   }
-  add("pbop.delay",PopCount(read(field[Vec[Bool]](field[AnyRef](module.bop,"delayQueue"),"valid"))),16)
-  add("pbop.output",module.bop.io.req.valid)
+  add("pbop.delay",PopCount(read(field[Vec[Bool]](field[AnyRef](module.bop.get,"delayQueue"),"valids"))),16)
+  add("pbop.output",module.bop.get.io.req.valid)
   val cdp=module.cdp.get;val send=cdp.sentUnit.get
   add("cdp.entries",PopCount(read(send.valids)),16)
   add("cdp.tlbHeld",send.tlbHeld);add("cdp.query1",send.pftS1);add("cdp.query2",send.pftS2)

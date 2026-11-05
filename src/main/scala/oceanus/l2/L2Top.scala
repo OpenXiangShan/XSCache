@@ -361,9 +361,24 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     }
   } else Nil
   val recvReqFire = pfRecvReqs.map(_.fire).reduceOption(_ || _).getOrElse(false.B)
+  // Producer-to-slice boundary, alongside the existing downstream-read counts.
+  // This corresponds to coupledL2 TopDownMonitor's l2prefetchSent boundary (slice admission).
+  for ((name, source) <- Seq("vbop" -> L2PfSource.BOP, "pbop" -> L2PfSource.PBOP,
+    "sms" -> L2PfSource.SMS, "stream" -> L2PfSource.Stream, "stride" -> L2PfSource.Stride,
+    "berti" -> L2PfSource.Berti, "cdp" -> L2PfSource.CDP, "tp" -> L2PfSource.TP, "nl" -> L2PfSource.NL)) {
+    val sent = slices.map { s =>
+      val req = s.io.UpRXREQ
+      req.fire && req.bits.SrcID === config.pfSrcID.U && L2PrefetchTxnID.decode(req.bits.TxnID) === source.U
+    }
+    XSPerfAccumulate(s"pfB_${name}_sent_to_slice", PopCount(sent))
+  }
+
 
   val bop = Option.when(config.bopEnable)(Module(new OceanusBOP(config.bopParams)))
-  bop.foreach(_.io.delayLatency := delayLatency)
+  bop.foreach { learner =>
+    learner.io.delayLatency := delayLatency
+    learner.io.enable := bopControlEnable
+  }
   val bopReqValid = bop.map(_.io.req.valid).getOrElse(false.B)
   val bopReqBits = bop.map(_.io.req.bits).getOrElse(0.U(paramL2.physicalAddrWidth.W))
   val bopTrainArb = Module(new L2PrefetchTrainArb(config.sliceNum, config.pfTrainEnable, buffered = true))
@@ -422,22 +437,23 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
         val accepted = counts.io.accepted(row)(source).asUInt
         XSPerfAccumulate(s"r10_${name}_src${entry.nid}_raw", raw)
         XSPerfAccumulate(s"r10_${name}_src${entry.nid}_accepted", accepted)
-        XSPerfAccumulate(s"r10_${name}_src${entry.nid}_gap", raw.pad(64) - accepted.pad(64))
+        XSPerfAccumulate(s"r10_${name}_src${entry.nid}_gap", (raw.zext - accepted.zext).pad(64).asUInt)
         XSPerfReference(s"r10_${name}_src${entry.nid}_raw_lifetime", counts.io.totals(row)(source))
         XSPerfReference(s"r10_${name}_src${entry.nid}_accepted_lifetime", counts.io.accepts(row)(source))
         XSPerfReference(s"r10_${name}_src${entry.nid}_dropped_lifetime", counts.io.drops(row)(source))
       }
       val localSelected = PopCount(slices.map(s => s.io.bopTrain.valid &&
         (s.io.bopTrain.bits.sourceId.get >> p(xscache.oceanus.compactchi.CCHIParametersKey).TxnID_Width) === entry.nid.U))
-      val sliceAdmissions = PopCount(bopTrainArb.queues.map(q => q.io.enq.fire &&
-        (q.io.enq.bits.sourceId.get >> p(xscache.oceanus.compactchi.CCHIParametersKey).TxnID_Width) === entry.nid.U))
-      val pending = PopCount(bopTrainArb.queues.map(q => q.io.deq.valid &&
-        (q.io.deq.bits.sourceId.get >> p(xscache.oceanus.compactchi.CCHIParametersKey).TxnID_Width) === entry.nid.U))
+      val sliceAdmissions = PopCount(bopTrainArb.io.admitted.map(q => q.valid &&
+        (q.bits.sourceId.get >> p(xscache.oceanus.compactchi.CCHIParametersKey).TxnID_Width) === entry.nid.U))
+      val pending = PopCount(bopTrainArb.io.pending.map(q => q.valid &&
+        (q.bits.sourceId.get >> p(xscache.oceanus.compactchi.CCHIParametersKey).TxnID_Width) === entry.nid.U))
       val broadcast = bopTrainArb.io.out.fire && selectedOrigin === entry.nid.U
       XSPerfAccumulate(s"r10_bop_src${entry.nid}_disabled_or_local_drop", rawBop - localSelected)
       XSPerfAccumulate(s"r10_bop_src${entry.nid}_slice_queue_drop", localSelected - sliceAdmissions)
       XSPerfReference(s"r10_bop_src${entry.nid}_slice_pending", pending)
-      for ((name, row, exists) <- Seq(("pbop", 0, bop.nonEmpty), ("vbop", 1, vbopStub.nonEmpty))) {
+      XSPerfReference(s"r10_bop_src${entry.nid}_slice_pending_after_cycle", (pending +& sliceAdmissions) - broadcast.asUInt)
+      for ((name, row) <- Seq("pbop" -> 0, "vbop" -> 1)) {
         val inputDrop = broadcast && !counts.io.accepted(row)(source)
         XSPerfAccumulate(s"r10_${name}_src${entry.nid}_input_drop", inputDrop)
         XSPerfAccumulate(s"r10_${name}_src${entry.nid}_physical_drop",

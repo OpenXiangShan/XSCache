@@ -136,17 +136,20 @@ class VBOPComparison(val geometry: OceanusVBOPParameters)(implicit val p: Parame
     read(rs.io.phaseIssueEnable) === read(ds.io.phaseIssueEnable)
   val studentEqual = (reference.student, dut.student) match {
     case (Some(a), Some(b)) =>
-      read(a.io.train.fire) === read(b.io.train.fire) &&
+      (read(a.io.train.valid) && read(a.io.train.ready)) === (read(b.io.train.valid) && read(b.io.train.ready)) &&
       read(a.selectedOffset) === read(b.selectedOffset) &&
       read(a.selectedValid) === read(b.selectedValid) &&
       read(a.selectedEnable) === read(b.selectedEnable) &&
       read(a.phaseTrainCount) === read(b.phaseTrainCount) &&
       read(a.state) === read(b.state) &&
-      a.pool.zip(b.pool).map { case (x,y) => read(x.asUInt) === read(y.asUInt) }.reduce(_ && _)
+      a.pool.zip(b.pool).map { case (x,y) => read(x).asUInt === read(y).asUInt }.reduce(_ && _)
     case (None, None) => true.B
     case _ => false.B
   }
   io.learnerCycleEqual := teacherEqual && studentEqual
+  when(!reset.asBool && !io.learnerCycleEqual) {
+    printf(p"VBOP_CYCLE teacher=$teacherEqual student=$studentEqual rphase=${read(rs.io.phaseEndPulse)} dphase=${read(ds.io.phaseEndPulse)} rlearn=${io.refLearning.bits} dlearn=${io.dutLearning.bits}\n")
+  }
   val accepted = RegInit(0.U(64.W))
   when(read(dut.input.io.deq.valid) && read(dut.input.io.deq.ready)) { accepted := accepted + 1.U }
   io.accepted := accepted

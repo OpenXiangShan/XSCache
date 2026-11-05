@@ -163,7 +163,7 @@ class StressTopEvents(cfg: L2Configuration)(implicit p: Parameters) extends Stre
   }
   for(s <- 0 until cfg.sliceNum) {
     val v = module.vbopStub.get.io.req
-    val b = module.bop.io.req
+    val b = module.bop.get.io.req
     val c = module.cdp.get.io.req
     probe.produced(s) := Cat(
       read(c.valid) && read(c.ready) && bank(read(c.bits.paddr))===s.U,

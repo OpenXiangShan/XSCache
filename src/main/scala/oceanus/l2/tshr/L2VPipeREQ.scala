@@ -213,6 +213,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val rxreq_stashunique = rxreq_opcode.is(CCHIOpcode.StashUnique)
 
   val rxreq_demand = rxreq.SrcID =/= io.consts.pfSrcID
+  // Old-directory demand reads, including Type-4 ReadOnce/Get equivalents.
+  val demandRead = rxreq_fire && rxreq_demand &&
+    (rxreq_readshared || rxreq_readunique || rxreq_readonce || rxreq_makeunique)
+  XSPerfAccumulate("demand_read_access", demandRead)
+  XSPerfAccumulate("demand_read_hit", demandRead && dirResult.hit)
+  XSPerfAccumulate("demand_read_miss", demandRead && !dirResult.hit)
   // coupledL2 MainPipe:173 includes AcquirePerm in req_acquire_s3; :759-766
   // trains eligible misses/prefetched hits (plus mergeA). MakeUnique is its
   // base counterpart. Train RS/RU/MU misses and prefetched hits alike.

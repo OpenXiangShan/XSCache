@@ -44,7 +44,7 @@ class TestTopCDPC5(cfg: L2Configuration)(implicit p: Parameters) extends TestTop
   val entries = read(s.entries)
   add("enable", module.cdpControlEnable)
   add("wrap.sequence", module.pfSequence)
-  add("wrap.advance", fire(module.bop.io.req) || read(module.recvReqFire) || fire(module.vbopStub.get.io.req) || fire(c.io.req))
+  add("wrap.advance", fire(module.bop.get.io.req) || read(module.recvReqFire) || fire(module.vbopStub.get.io.req) || fire(c.io.req))
   for ((name, t) <- Seq("vpn" -> c.io.vpnTrain, "filter" -> c.io.filterTrain))
     event(name, t.valid, "pa" -> t.bits.paddr, "victim" -> t.bits.evictPaddr,
       "va" -> t.bits.vaddr, "hit" -> t.bits.hit, "prefetched" -> t.bits.prefetched,

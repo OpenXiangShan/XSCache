@@ -1,3 +1,29 @@
+/** *************************************************************************************
+ * Copyright (c) 2020-2021 Institute of Computing Technology, Chinese Academy of Sciences
+ * Copyright (c) 2020-2021 Peng Cheng Laboratory
+ *
+ * XiangShan is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ * http://license.coscl.org.cn/MulanPSL2
+ *
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+ * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ *
+ * See the Mulan PSL v2 for more details.
+ *
+ *
+ * Acknowledgement
+ *
+ * This implementation is inspired by several key papers:
+ * [1] Pierre Michaud. "[A Best-Offset Prefetcher.](https://inria.hal.science/hal-01165600/)" 2nd Data Prefetching
+ * Championship (DPC). 2015.
+ * [2] Pierre Michaud. "[Best-Offset Hardware Prefetching.](https://doi.org/10.1109/HPCA.2016.7446087)" IEEE
+ * International Symposium on High Performance Computer Architecture (HPCA). 2016.
+ * *************************************************************************************
+ */
+
 // Independent oracle: coupledL2 300515bc7b2f65ca988041a984204489d80ec2fb.
 // Algorithm bodies copied verbatim; standalone geometry/IO, inactive DFT pins
 // and optional same-page test control are the only adaptations.
@@ -49,6 +75,7 @@ case object VBOPKey extends Field[BOPParameters](BOPParameters())
 trait HasBOPParams {
   implicit val p: Parameters
   def bopParams = p(VBOPKey)
+  def degreeBits = 2
   def fullVAddrBits = 50
   def fullAddressBits = p(L2ParamsKey).physicalAddrWidth
   def fullAddrBits = if (virtualTrain) fullVAddrBits else fullAddressBits

@@ -111,7 +111,7 @@ object Phase2Observation {
     obs.generated.foreach(_ := 0.U)
     obs.generated(1) := PopCount(top.pfRecvReqs.map(r => read(r.valid)))
     obs.generated(2) := top.vbopStub.map(v => read(v.io.req.valid) && read(v.io.req.ready)).getOrElse(false.B)
-    obs.generated(3) := read(top.bop.io.req.valid) && read(top.bopControlEnable)
+    obs.generated(3) := top.bop.map(b => read(b.io.req.valid) && read(top.bopControlEnable)).getOrElse(false.B)
     obs.generated(9) := top.cdp.map(c => read(c.io.req.valid) && read(c.io.req.ready)).getOrElse(false.B)
     obs
   }

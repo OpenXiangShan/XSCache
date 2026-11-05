@@ -102,6 +102,9 @@ object L2TopTrainStimulus extends ChiselSim {
 class L2TopTrainChecker(dut: TestTop_L2Top) extends ChiselSim {
   case class Expected(addr: BigInt, src: BigInt, txn: BigInt, vpn: BigInt, source: BigInt, enable: Boolean, at: Int, late: Boolean, opcode: BigInt)
   private val waiting = mutable.Map.empty[(Int, Int), Expected]
+  private type TrainEvent = (BigInt, BigInt, BigInt, Boolean)
+  private val sliceBuffered = Array.fill[Option[TrainEvent]](dut.l2cfg.sliceNum)(None)
+  private val pbopBuffered = mutable.Queue.empty[TrainEvent]
   var accepts = 0; var executions = 0; var misses = 0; var hits = 0
   var disabled = 0; var internal = 0; var lateHits = 0; var simultaneousAccepts = 0; var simultaneousTrains = 0
   // Count disabled raw inputs before arbitration, and actual enabled BOP fires.
@@ -114,7 +117,9 @@ class L2TopTrainChecker(dut: TestTop_L2Top) extends ChiselSim {
     (value(e.paddr), value(e.vaddr.get), value(e.reqSource.get), flag(e.trainEnable.get))
   def pending: Int = waiting.size
   def sample(cycle: Int): Unit = dut.trainObservation.foreach { obs =>
-    if (dut.reset.peek().litValue != 0) waiting.clear()
+    if (dut.reset.peek().litValue != 0) {
+      waiting.clear(); sliceBuffered.indices.foreach(i => sliceBuffered(i)=None); pbopBuffered.clear()
+    }
     else {
       val accepted = dut.io.t1p.zipWithIndex.flatMap { case (port, index) =>
         if (flag(port.UpREQ.valid) && flag(port.UpREQ.ready)) {
@@ -129,7 +134,8 @@ class L2TopTrainChecker(dut: TestTop_L2Top) extends ChiselSim {
         else None
       }.toMap
       if (accepted.size > 1) simultaneousAccepts += 1
-      val local = mutable.ArrayBuffer.empty[(BigInt, BigInt, BigInt, Boolean)]
+      val local = mutable.ArrayBuffer.empty[TrainEvent]
+      val localBySlice = Array.fill[Option[TrainEvent]](dut.l2cfg.sliceNum)(None)
       obs.req.zipWithIndex.foreach { case (row, s) =>
         val trained = mutable.ArrayBuffer.empty[(BigInt, BigInt, BigInt, Boolean)]
         row.zipWithIndex.foreach { case (r, t) =>
@@ -171,18 +177,26 @@ class L2TopTrainChecker(dut: TestTop_L2Top) extends ChiselSim {
         disabledBeforeArb += trained.count(e => !e._4)
         if (enabled.nonEmpty && enabled.size != trained.size) mixedLocal += 1
         assert(flag(obs.sliceValid(s)) == enabled.nonEmpty)
-        if (enabled.nonEmpty) { assert(event(obs.sliceEvent(s)) == enabled.head); local += enabled.head }
+        if (enabled.nonEmpty) { assert(event(obs.sliceEvent(s)) == enabled.head); local += enabled.head; localBySlice(s)=Some(enabled.head) }
       }
       if (local.size > 1) simultaneousTrains += 1
       val raw = obs.req.flatten.filter(r => flag(r.train))
       if (raw.exists(r => !flag(r.event.trainEnable.get)) && local.nonEmpty) mixedGlobal += 1
-      assert(flag(obs.globalValid) == local.nonEmpty)
-      if (local.nonEmpty) assert(local.contains(event(obs.globalEvent)), s"global arbiter mixed payload ${event(obs.globalEvent)} from $local")
-      // Intent (1c-1): check the actual BOP boundary against the independently
-      // checked global event; disabled events never reach scoring/delay/RR.
-      val expectedBopValid = flag(obs.globalValid) && flag(obs.globalEvent.trainEnable.get)
-      assert(flag(dut.observation.bopTrainValid) == expectedBopValid, s"trainEnable gate mismatch cycle=$cycle")
-      if (!expectedBopValid) assert(!flag(dut.observation.bopTrainFire))
+      // Independent one-entry pipe=true/flow=false queues before arbitration.
+      val oldSlice = sliceBuffered.clone()
+      assert(flag(obs.globalValid) == oldSlice.exists(_.nonEmpty), s"buffered global valid cycle=$cycle")
+      val selected = if(flag(obs.globalValid)) oldSlice.indexWhere(_.contains(event(obs.globalEvent))) else -1
+      if(flag(obs.globalValid)) assert(selected>=0, s"global arbiter mixed payload cycle=$cycle")
+      // Independent four-entry PBOP input FIFO, default pipe=false/flow=false.
+      val expectedBopValid = dut.l2cfg.bopEnable && pbopBuffered.nonEmpty
+      assert(flag(dut.observation.bopTrainValid) == expectedBopValid, s"buffered PBOP valid cycle=$cycle")
+      val canEnqueue = pbopBuffered.size < 4
+      if(expectedBopValid) assert(value(dut.observation.bopTrainAddr)==pbopBuffered.front._1, s"PBOP FIFO order cycle=$cycle")
+      if(flag(dut.observation.bopTrainFire)) { assert(expectedBopValid); pbopBuffered.dequeue() }
+      if(dut.l2cfg.bopEnable && flag(obs.globalValid) && canEnqueue) pbopBuffered.enqueue(event(obs.globalEvent))
+      if(selected>=0) sliceBuffered(selected)=None
+      for(i <- sliceBuffered.indices if localBySlice(i).nonEmpty && (oldSlice(i).isEmpty || selected==i))
+        sliceBuffered(i)=localBySlice(i)
       if (flag(obs.globalValid)) assert(flag(obs.globalEvent.trainEnable.get), "disabled global training")
       if (flag(dut.observation.bopTrainFire)) acceptedByBop += 1
     }
