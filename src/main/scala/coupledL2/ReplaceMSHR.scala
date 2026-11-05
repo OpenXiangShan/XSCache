@@ -409,21 +409,28 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   io.tasks.txdat.bits := copyBackTask
   val mainpipeIntent = Wire(Decoupled(new TaskBundle))
   val mainpipeIssuedVariant = Wire(UInt(4.W))
+  // Registered by the lease below, so the payload mux's select is a register
+  // output rather than the live capture/copyback/release priority.
+  val mainpipeProposedVariant = Reg(UInt(4.W))
   mainpipeIntent.valid := captureTaskValid ||
     (copyBackTaskValid && mode =/= ReplaceMSHRMode.victim) ||
     (releaseTaskValid && mode =/= ReplaceMSHRMode.victim)
-  mainpipeIntent.bits := Mux(mainpipeIssuedVariant === 0.U, captureTask,
-    Mux(mainpipeIssuedVariant === 1.U, copyBackTask, releaseTask))
+  // Select with the registered operation the lease returns, which is the
+  // value the prepare edge captures. The live variant only decides the next
+  // proposal, so it must not fan out into this mux.
+  mainpipeIntent.bits := Mux(mainpipeProposedVariant === 0.U, captureTask,
+    Mux(mainpipeProposedVariant === 1.U, copyBackTask, releaseTask))
   val mainpipeInvalidate = io.alloc.valid || io.sinkC.valid || io.rxrsp.valid ||
     io.releaseDataSeen || io.victimDataCaptured || io.victimDataNeedsWriteback ||
     io.nestedReleaseWritePending ||
     io.snoopStarted || io.snoopDoneCount.orR || io.snoopMeta.valid || io.snoopToInvalDone ||
     io.copyBackDone || io.parentRelease || io.sourceBAccepted ||
     io.tasks.txreq.fire || io.tasks.txdat.fire || io.tasks.txrsp.fire
-  mainpipeIssuedVariant := MainpipeLeaseIO.freeze(io.tasks.preparedLease,
+  mainpipeProposedVariant := MainpipeLeaseIO.freeze(io.tasks.preparedLease,
     mainpipeIntent, io.tasks.mainpipe,
     Mux(captureTaskValid, 0.U(4.W), Mux(copyBackTaskValid, 1.U(4.W), 2.U(4.W))),
     Mux(captureTaskValid, 3.U(3.W), 4.U(3.W)), mainpipeInvalidate)
+  mainpipeIssuedVariant := mainpipeProposedVariant
   // Comp for WriteEvictOrEvict is the only response that owes CompAck.  The
   // flit stays valid until TXRSP accepts it; retiring earlier would drop it.
   val compAckRsp = io.tasks.txrsp.bits

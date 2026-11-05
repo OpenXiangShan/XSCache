@@ -281,6 +281,9 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   val mpDctValid = valid && !state.s_dct.getOrElse(true.B) && state.s_probeack
   val mainpipeIntent = Wire(Decoupled(new TaskBundle))
   val mainpipeIssuedOperation = Wire(UInt(4.W))
+  // Registered by the lease below. Declared here so the payload mux can use
+  // the same select the lease samples into its task register.
+  val mainpipeProposedOperation = Reg(UInt(4.W))
   mainpipeIntent.valid := (mpCopyValid || mpProbeAckValid || mpDctValid) &&
     !io.nestedReleaseWritePending && !io.pairSearchPending
 
@@ -392,8 +395,11 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   dctTask.snpHitReleaseWithData := req.snpHitReleaseWithData
   dctTask.snpHitReleaseIdx := req.snpHitReleaseIdx
   dctTask.snpHitReleaseMeta := req.snpHitReleaseMeta
-  mainpipeIntent.bits := Mux(mainpipeIssuedOperation(1, 0) === 0.U, copyTask,
-    Mux(mainpipeIssuedOperation(1, 0) === 1.U, probeAckTask, dctTask))
+  // Select with the registered operation the lease returns, which is the
+  // value the prepare edge captures. The live operation only decides the next
+  // proposal, so it must not fan out into this mux.
+  mainpipeIntent.bits := Mux(mainpipeProposedOperation(1, 0) === 0.U, copyTask,
+    Mux(mainpipeProposedOperation(1, 0) === 1.U, probeAckTask, dctTask))
   val leaseOwnerControls = Cat(io.normalRefillPayloadFromProbeAck,
     io.normalRefillPostGrantReleasePending, io.normalRefillPayloadFromPostGrantRelease,
     io.pairedNormalId.valid, Mux(io.pairedNormalId.valid, io.pairedNormalId.bits, 0.U))
@@ -407,10 +413,11 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
     io.snpRespDone || io.dctDone || leaseNestedEvent || leaseOwnerControlsChanged ||
     io.nestedReleaseWritePending || io.nestedReleaseWriteDone ||
     io.sourceBAccepted
-  mainpipeIssuedOperation := MainpipeLeaseIO.freeze(io.tasks.preparedLease,
+  mainpipeProposedOperation := MainpipeLeaseIO.freeze(io.tasks.preparedLease,
     mainpipeIntent, io.tasks.mainpipe,
     Cat(normalPostGrantReleasePayload,
       Mux(mpCopyValid, 0.U(2.W), Mux(mpProbeAckValid, 1.U(2.W), 2.U(2.W)))), 0.U(3.W), mainpipeInvalidate)
+  mainpipeIssuedOperation := mainpipeProposedOperation
   val mainpipeIssuedVariant = mainpipeIssuedOperation(1, 0)
   io.postGrantReleaseResponse := mainpipeIssuedOperation(2) && mainpipeIssuedVariant === 1.U
 
