@@ -48,13 +48,15 @@
  * global eligible-slot RR in the shared adapter (VBOP still wins admission).
  * Offered TLB payload stays locked across backpressure; every eligible slot
  * is served within the adapter's parameterized available-service-cycle bound.
+ * dfd3edcf / 300515bc: student, committed teacher phase results, split
+ * offsets, atomic training, default same-page PA bypass and PBOP skid.
  * Training: needHint/trainEnable is filtered before TSHR and slice arbitration;
  * enabled-vs-enabled simultaneous pulses retain Oceanus's lossy semantics.
  * D2: needT (:716,750,384) retained for dedup, output always Shared; counter
  * increments on req.fire for a needT=1 request. Future candidate: map needT=1
  * to StashUnique when the base supports that internal prefetch path.
- * D3: optional same-page PA bypass (fork :1138-1189); default false matches
- * reference (all predictions translate). Enabled bypass omits TLB/PMP checks.
+ * D3 superseded by upstream dfd3edcf: same-page PA bypass defaults true.
+ * It uses the training PA and intentionally omits TLB/PMP for same-page targets.
  * CCHI source identity substitutes TL sourceId, since oceanus has no TL edge.
  * Training origin is the existing global miss/prefetched-hit event; no mergeA
  * is invented (OceanusBOP ledger documents the base's queued demand behavior).
@@ -80,23 +82,29 @@ case class OceanusVBOPParameters(
   dQEntries: Int = 16,
   dQLatency: Int = 300,
   dQMaxLatency: Int = 1024,
+  crossPage: Boolean = true,
+  useDelayOut: Boolean = true,
+  enableStudentCover: Boolean = true,
+  studentPoolSize: Int = 4,
+  studentFilterTableBits: Int = 4096,
+  studentFilterEntryBits: Int = 64,
+  studentHashMode: String = "pairs_low9",
+  studentCovThreshold: Int = 0,
+  issueGateEnable: Boolean = true,
+  issueConfThreshold: Int = 14,
   offsetList: Seq[Int] = Seq(
-    -256, -250, -243, -240, -225, -216, -200,
-    -192, -180, -162, -160, -150, -144, -135, -128,
-    -125, -120, -108, -100, -96, -90, -81, -80,
-    -75, -72, -64, -60, -54, -50, -48, -45,
-    -40, -36, -32, -30, -27, -25, -24, -20,
-    -18, -16, -15, -12, -10, -9, -8, -6,
-    -5, -4, -3, -2, -1,
-    1, 2, 3, 4, 5, 6, 8,
-    9, 10, 12, 15, 16, 18, 20, 24,
-    25, 27, 30, 32, 36, 40, 45, 48,
-    50, 54, 60, 64, 72, 75, 80, 81,
-    90, 96, 100, 108, 120, 125, 128, 135,
-    144, 150, 160, 162, 180, 192, 200, 216,
-    225, 240, 243, 250/*, 256*/
-  ),
-  samePagePA: Boolean = false
+              -117, -147, -91, 117, 147, 91,
+              -256, -250, -243, -240, -225, -216, -200,
+              -192, -180, -162, -160, -150, -144, -135, -128,
+              -125, -120, -108, -100, -96, -90, -81, -80,
+              -75, -72, -64, -60, -54, -50, -48, -45,
+              -40, -36, 32, 36, 40, 45, 48,
+              50, 54, 60, 64, 72, 75, 80, 81,
+              90, 96, 100, 108, 120, 125, 128, 135,
+              144, 150, 160, 162, 180, 192, 200, 216,
+              225, 240, 243, 250 /*, 256*/
+            ),
+  samePagePA: Boolean = true
 )
 case object OceanusVBOPKey extends Field[OceanusVBOPParameters](OceanusVBOPParameters())
 trait OceanusVHasBOPParams {
@@ -104,10 +112,10 @@ trait OceanusVHasBOPParams {
   def bopParams = p(OceanusVBOPKey)
   def fullVAddrBits = 50
   def fullAddressBits = p(L2ParamsKey).physicalAddrWidth
-  def fullAddrBits = 50
+  def fullAddrBits = if (virtualTrain) fullVAddrBits else fullAddressBits
   def offsetBits = 6
   def sourceIdBits = p(CCHIParametersKey).TxnID_Width + p(CCHIParametersKey).UpstreamNodeID_Width
-  def noOffsetAddrBits = 44
+  def noOffsetAddrBits = fullAddrBits - offsetBits
   def REQ_FILTER_SIZE = 16
   def rrTableEntries = bopParams.rrTableEntries
   def rrIdxBits = log2Up(rrTableEntries)
@@ -120,12 +128,32 @@ trait OceanusVHasBOPParams {
   def dQEntries = bopParams.dQEntries
   def dQLatency = bopParams.dQLatency
   def dQMaxLatency = bopParams.dQMaxLatency
+  def crossPage = bopParams.crossPage
+  def useDelayOut = bopParams.useDelayOut
+  def enableStudentCover = bopParams.enableStudentCover
+  def studentPoolSize = bopParams.studentPoolSize
+  def studentFilterTableBits = bopParams.studentFilterTableBits
+  def studentFilterEntryBits = bopParams.studentFilterEntryBits
+  def studentFilterTableEntries = studentFilterTableBits / studentFilterEntryBits
+  def studentFilterEntryOffsetBits = log2Ceil(studentFilterEntryBits)
+  def studentFilterEntryIdxBits = log2Ceil(studentFilterTableEntries)
+  def studentHashMode = bopParams.studentHashMode
+  def studentCovThreshold = bopParams.studentCovThreshold
+  def issueGateEnable = bopParams.issueGateEnable
+  def issueConfThreshold = bopParams.issueConfThreshold
+
+  def studentPoolIdxBits = log2Up(studentPoolSize)
+  def studentFilterIdxBits = log2Up(studentFilterTableBits)
+  // Signed confidence values are -1, 0, or +1.
+  def studentConfBits = 2
+  def studentPhaseTrainBits = log2Up(scores * (roundMax + 2) + 1)
+  def studentPhaseTrainMax = scores * (roundMax + 2)
   def scores = offsetList.length
   def offsetWidth = log2Up(offsetList.max) + 2
   def roundBits = log2Up(roundMax)
   def scoreMax = (1 << scoreBits) - 1
   def scoreTableIdxBits = log2Up(scores)
-  def virtualTrain = true
+  def virtualTrain = bopParams.virtualTrain
   def get_block_addr(a: UInt) = a(a.getWidth-1, 6)
   def getPPN(a: UInt) = a(a.getWidth-1, 12)
   def parseFullAddress(a: UInt) = (a(a.getWidth-1,12), a(11,6))
@@ -138,7 +166,28 @@ trait OceanusVHasBOPParams {
   }
 }
 abstract class OceanusVBOPBundle(implicit val p: Parameters) extends Bundle with OceanusVHasBOPParams
-abstract class OceanusVBOPModule(implicit val p: Parameters) extends Module with OceanusVHasBOPParams
+abstract class OceanusVBOPModule(implicit val p: Parameters) extends Module with OceanusVHasBOPParams {
+  protected def emitOffsetDistCounters(prefix: String, offset: SInt, enable: Bool): Unit = {
+    for (off <- offsetList) {
+      val counterName =
+        if (off < 0) prefix + "_neg_" + (-off).toString
+        else prefix + "_pos_" + off.toString
+      XSPerfAccumulate(counterName, enable && offset === off.S(offsetWidth.W))
+    }
+  }
+
+  protected def issueConf(phaseEnd: Bool, teacherDisable: Bool): Bool = {
+    val conf = RegInit(0.U(4.W))
+    val confAfterDisable = Mux(conf >= 13.U, 15.U, conf + 2.U)
+    val confAfterEnable = Mux(conf === 0.U, 0.U, conf - 1.U)
+    val nextConf = Mux(teacherDisable, confAfterDisable, confAfterEnable)
+    when(phaseEnd) {
+      conf := nextConf
+    }
+    conf < issueConfThreshold.U
+  }
+}
+
 class OceanusVScoreTableEntry(implicit p: Parameters) extends OceanusVBOPBundle {
   // val offset = UInt(offsetWidth.W)
   val score = UInt(scoreBits.W)
@@ -255,6 +304,9 @@ class OceanusVOffsetScoreTable(name: String = "")(implicit p: Parameters) extend
     val req = Flipped(DecoupledIO(UInt(fullAddrBits.W)))
     val prefetchOffset = Output(UInt(offsetWidth.W))
     val prefetchDisable = Output(Bool())
+    val phaseEndPulse = Output(Bool())
+    val phaseBestOffsetCommitted = Output(UInt(offsetWidth.W))
+    val phaseIssueEnable = Output(Bool())
     val test = new OceanusVTestOffsetBundle
   })
 
@@ -271,8 +323,20 @@ class OceanusVOffsetScoreTable(name: String = "")(implicit p: Parameters) extend
   val round = RegInit(0.U(roundBits.W))
 
   val bestOffset = RegInit(2.U(offsetWidth.W)) // the entry with the highest score while traversing
-  val bestScore = RegInit(0.U)
+  val bestScore = RegInit(0.U(scoreBits.W))
   val testOffset = offList(ptr)
+  val phaseEndCommit = WireDefault(false.B)
+  val phaseBestOffset = RegInit(2.U(offsetWidth.W))
+  val phaseIssueEnable = RegInit(false.B)
+  val respHit = io.test.resp.valid && io.test.resp.bits.hit
+  val respPtr = io.test.resp.bits.ptr
+  val oldScore = st(respPtr).score
+  val newScore = Mux(oldScore === scoreMax.U, oldScore, oldScore + 1.U)
+  val respOffset = offList(respPtr)
+  val renewOffset = respHit && newScore > bestScore
+  val committedBestOffset = Mux(renewOffset, respOffset, bestOffset)
+  val committedBestScore = Mux(renewOffset, newScore, bestScore)
+  val committedIsBad = committedBestScore < badscoreConstant
   // def winner(e1: OceanusVScoreTableEntry, e2: OceanusVScoreTableEntry): OceanusVScoreTableEntry = {
   //   val w = Wire(new OceanusVScoreTableEntry)
   //   w := Mux(e1.score > e2.score, e1, e2)
@@ -314,27 +378,33 @@ class OceanusVOffsetScoreTable(name: String = "")(implicit p: Parameters) extend
     // (2) the number of rounds equals ROUNDMAX.
     when(round >= roundMaxConstant) {
       state := s_idle
+      phaseEndCommit := true.B
     }
 
-    when(io.test.resp.valid && io.test.resp.bits.hit) {
-      val oldScore = st(io.test.resp.bits.ptr).score
-      val newScore = oldScore + 1.U
-      val offset = offList(io.test.resp.bits.ptr)
-      st(io.test.resp.bits.ptr).score := newScore
+    when(respHit) {
+      st(respPtr).score := newScore
       // bestOffset := winner((new OceanusVScoreTableEntry).apply(offset, newScore), bestOffset)
-      val renewOffset = newScore > bestScore
-      bestOffset := Mux(renewOffset, offset, bestOffset)
+      bestOffset := committedBestOffset
       bestScore := Mux(renewOffset, newScore, bestScore)
       // (1) one of the score equals SCOREMAX
       when(newScore >= scoreMax.U) {
         state := s_idle
+        phaseEndCommit := true.B
       }
     }
+  }
+
+  when(phaseEndCommit) {
+    phaseBestOffset := committedBestOffset
+    phaseIssueEnable := !committedIsBad
   }
 
   io.req.ready := state === s_learn
   io.prefetchOffset := prefetchOffset
   io.prefetchDisable := prefetchDisable
+  io.phaseEndPulse := RegNext(phaseEndCommit, false.B)
+  io.phaseBestOffsetCommitted := phaseBestOffset
+  io.phaseIssueEnable := phaseIssueEnable
   io.test.req.valid := state === s_learn && io.req.valid
   io.test.req.bits.addr := io.req.bits
   io.test.req.bits.testOffset := testOffset
@@ -343,16 +413,7 @@ class OceanusVOffsetScoreTable(name: String = "")(implicit p: Parameters) extend
   XSPerfAccumulate("total_learn_phase", state === s_idle)
   XSPerfAccumulate("total_bop_disable", state === s_idle && isBad)
   XSPerfAccumulate("total_bop_high_confidence", state === s_idle && bestScore === scoreMax.U)
-
-  for (off <- offsetList) {
-    if (off < 0) {
-      XSPerfAccumulate("best_offset_neg_" + (-off).toString + "_learning_phases",
-        Mux(state === s_idle, (bestOffset === off.S(offsetWidth.W).asUInt).asUInt, 0.U))
-    } else {
-      XSPerfAccumulate("best_offset_pos_" + off.toString + "_learning_phases",
-        Mux(state === s_idle, (bestOffset === off.U).asUInt, 0.U))
-    }
-  }
+  emitOffsetDistCounters("teacher_best_offset", io.phaseBestOffsetCommitted.asSInt, io.phaseEndPulse)
 
   // FIXME lyq: set basicDB false
   // TODO lyq: How to record the offset to the variable name so that the offset is not recorded separately
@@ -372,7 +433,363 @@ class OceanusVOffsetScoreTable(name: String = "")(implicit p: Parameters) extend
   }
   // l2BopTrainTable.log(data = data, en = (state === s_idle) && !isBad, site = name+"OceanusVOffsetScoreTable", clock, reset)
   l2BopTrainTable.log(data = data, en = (state === s_idle) && !isBad, site = name+"OceanusVOffsetScoreTable", clock, reset)
+}
 
+class OceanusVStudentPoolEntry(implicit p: Parameters) extends OceanusVBOPBundle {
+  val valid = Bool()
+  val offset = SInt(offsetWidth.W)
+  val absOffset = UInt(offsetWidth.W)
+  val conf = SInt(studentConfBits.W)
+  val lastPhaseCov = UInt(studentPhaseTrainBits.W)
+  val curPhaseCov = UInt(studentPhaseTrainBits.W)
+}
+
+class OceanusVStudentFilterUpdateReq(implicit p: Parameters) extends OceanusVBOPBundle {
+  val baseAddr = UInt(fullAddrBits.W)
+  val offsets = Vec(studentPoolSize, SInt(offsetWidth.W))
+  val valids = Vec(studentPoolSize, Bool())
+}
+
+class OceanusVStudentFilterWriteCmd(implicit p: Parameters) extends OceanusVBOPBundle {
+  val setIdxs = Vec(studentPoolSize, UInt(studentFilterEntryIdxBits.W))
+  val data = Vec(studentPoolSize, UInt(studentFilterEntryBits.W))
+  val valids = Vec(studentPoolSize, Bool())
+}
+
+class OceanusVStudentFilterTable(name: String = "")(implicit p: Parameters) extends OceanusVBOPModule {
+  require(studentHashMode == "bop_rr" ||
+    (studentHashMode == "pairs_low9" && studentFilterTableBits >= 1024),
+    s"$name studentHashMode must be bop_rr, or pairs_low9 with at least 1024 table bits")
+
+  private def hashBitPairs(addr: UInt, hi: Int, lo: Int, step: Int = 2): UInt = {
+    require(hi >= lo)
+    require(step > 0)
+    if (hi - lo + 1 <= step) {
+      addr(hi, lo)
+    } else {
+      val remain = (hi - lo + 1) % step
+      val xortmp = (lo to (hi - remain) by step).map(i => addr(i + step - 1, i)).reduce(_ ^ _)
+      if (remain == 0) {
+        xortmp
+      } else {
+        Cat(xortmp(step - 1, remain), xortmp(remain - 1, 0) ^ addr(hi, hi - remain + 1))
+      }
+    }
+  }
+
+  private def filterIndex(addr: UInt): UInt = {
+    val lineAddr = addr(fullAddrBits - 1, offsetBits)
+    studentHashMode match {
+      case "bop_rr" => (lineAddr ^ (lineAddr >> studentFilterIdxBits))(studentFilterIdxBits - 1, 0)
+      case "pairs_low9" =>
+        val rawLowBits = 9
+        val hashBits = studentFilterIdxBits - rawLowBits
+        val hashStartBit = 6
+        val foldedHigh = hashBitPairs(lineAddr, lineAddr.getWidth - 1, hashStartBit, hashBits)
+        Cat(foldedHigh, lineAddr(rawLowBits - 1, 0))
+    }
+  }
+
+  private def addOffset(addr: UInt, offset: SInt): UInt = {
+    val offsetBytes = signedExtend(offset.asUInt << offsetBits, fullAddrBits)
+    (addr + offsetBytes)(fullAddrBits - 1, 0)
+  }
+
+  val io = IO(new Bundle {
+    val queryReq = Flipped(DecoupledIO(UInt(fullAddrBits.W)))
+    val queryResp = ValidIO(Vec(studentPoolSize, Bool()))
+    val updateReq = Flipped(ValidIO(new OceanusVStudentFilterUpdateReq))
+    val clear = Input(Bool())
+  })
+
+  val tables = Seq.tabulate(studentPoolSize) { i =>
+    Module(new SRAMTemplate(
+      UInt(studentFilterEntryBits.W),
+      set = studentFilterTableEntries,
+      way = 1,
+      singlePort = true,
+      useBitmask = true,
+      hasMbist = cacheParams.hasMbist,
+      hasSramCtl = cacheParams.hasSramCtl
+    )).suggestName(s"table_$i")
+  }
+  tables.foreach(_.io.broadcast.foreach(_ := 0.U.asTypeOf(new SramBroadcastBundle)))
+  val entryValids = RegInit(VecInit(Seq.fill(studentPoolSize)(0.U(studentFilterTableEntries.W))))
+
+  val s0_queryIdx = filterIndex(io.queryReq.bits)
+  val s0_queryEntryIdx = s0_queryIdx(studentFilterIdxBits - 1, studentFilterEntryOffsetBits)
+  val s0_queryBitIdx = s0_queryIdx(studentFilterEntryOffsetBits - 1, 0)
+  val s0_queryEntryValids = Wire(Vec(studentPoolSize, Bool()))
+  val s0_queryFire = io.queryReq.fire
+  for (i <- 0 until studentPoolSize) {
+    s0_queryEntryValids(i) := entryValids(i)(s0_queryEntryIdx)
+    tables(i).io.r.req.valid := s0_queryFire
+    tables(i).io.r.req.bits.apply(setIdx = s0_queryEntryIdx)
+  }
+
+  val s1_queryValid = RegNext(s0_queryFire, false.B)
+  val s1_queryBitIdx = RegEnable(s0_queryBitIdx, s0_queryFire)
+  val s1_queryEntryValids = RegEnable(s0_queryEntryValids, s0_queryFire)
+  io.queryResp.valid := s1_queryValid
+  for (i <- 0 until studentPoolSize) {
+    io.queryResp.bits(i) := s1_queryEntryValids(i) && tables(i).io.r.resp.data(0)(s1_queryBitIdx)
+  }
+
+  val s0_updateEnable = io.updateReq.valid && !io.clear
+  val s0_predictedAddrs = Wire(Vec(studentPoolSize, UInt(fullAddrBits.W)))
+  for (i <- 0 until studentPoolSize) {
+    s0_predictedAddrs(i) := addOffset(io.updateReq.bits.baseAddr, io.updateReq.bits.offsets(i))
+  }
+
+  val s1_updateEnable = RegNext(s0_updateEnable, false.B)
+  val s1_basePPN = RegEnable(getPPN(io.updateReq.bits.baseAddr), s0_updateEnable)
+  val s1_predictedAddrs = RegEnable(s0_predictedAddrs, s0_updateEnable)
+  val s1_poolValids = RegEnable(io.updateReq.bits.valids, s0_updateEnable)
+  val s1_writeCmd = Wire(new OceanusVStudentFilterWriteCmd)
+  for (i <- 0 until studentPoolSize) {
+    val predictedAddr = s1_predictedAddrs(i)
+    val samePage = getPPN(predictedAddr) === s1_basePPN
+    val writeIdx = filterIndex(predictedAddr)
+    val writeBitIdx = writeIdx(studentFilterEntryOffsetBits - 1, 0)
+    s1_writeCmd.setIdxs(i) := writeIdx(studentFilterIdxBits - 1, studentFilterEntryOffsetBits)
+    s1_writeCmd.data(i) := UIntToOH(writeBitIdx, studentFilterEntryBits)
+    s1_writeCmd.valids(i) := s1_poolValids(i) && (crossPage.B || samePage)
+  }
+
+  val s1_writeEnable = s1_updateEnable && !io.clear
+  val s2_writeEnable = RegNext(s1_writeEnable, false.B)
+  val s2_writeCmd = RegEnable(s1_writeCmd, s1_writeEnable)
+  for (i <- 0 until studentPoolSize) {
+    val entryValid = entryValids(i)(s2_writeCmd.setIdxs(i))
+    val bitMask = Mux(entryValid, s2_writeCmd.data(i), Fill(studentFilterEntryBits, true.B))
+    tables(i).io.w.req.valid := !io.clear && s2_writeEnable && s2_writeCmd.valids(i)
+    tables(i).io.w.req.bits.apply(
+      data = s2_writeCmd.data(i),
+      setIdx = s2_writeCmd.setIdxs(i),
+      waymask = 1.U,
+      bitmask = bitMask
+    )
+    when(tables(i).io.w.req.fire) {
+      entryValids(i) := entryValids(i).bitSet(s2_writeCmd.setIdxs(i), true.B)
+    }
+    assert(!(tables(i).io.r.req.valid && tables(i).io.w.req.valid),
+      s"$name table $i cannot read and write in the same cycle")
+  }
+
+  io.queryReq.ready := !io.clear && !s2_writeEnable
+
+  when(io.clear) {
+    entryValids.foreach(_ := 0.U)
+  }
+}
+
+class OceanusVStudentCoverageLearner(name: String = "")(implicit p: Parameters) extends OceanusVBOPModule {
+  require(studentCovThreshold >= 0 && studentCovThreshold <= 5, s"$name studentCovThreshold must be in [0, 5]")
+
+  val io = IO(new Bundle {
+    val train = Flipped(DecoupledIO(UInt(fullAddrBits.W)))
+    val delayOut = Flipped(ValidIO(UInt(fullAddrBits.W)))
+    val teacherPhaseEnd = Input(Bool())
+    val teacherBestOffset = Input(UInt(offsetWidth.W))
+    val teacherIssueEnable = Input(Bool())
+    val selectedOffset = Output(UInt(offsetWidth.W))
+    val selectedValid = Output(Bool())
+    val selectedEnable = Output(Bool())
+  })
+
+  private def absOffset(offset: SInt): UInt = {
+    Mux(offset < 0.S, (-offset).asUInt, offset.asUInt)
+  }
+
+  private def isBetter(lhs: OceanusVStudentPoolEntry, rhs: OceanusVStudentPoolEntry): Bool = {
+    (lhs.curPhaseCov > rhs.curPhaseCov) ||
+      (lhs.curPhaseCov === rhs.curPhaseCov && (
+        (lhs.conf > rhs.conf) ||
+          (lhs.conf === rhs.conf && (
+            (lhs.absOffset < rhs.absOffset) ||
+              (lhs.absOffset === rhs.absOffset && lhs.offset < rhs.offset)
+          ))
+      ))
+  }
+
+  private def isWorse(lhs: OceanusVStudentPoolEntry, rhs: OceanusVStudentPoolEntry): Bool = {
+    (lhs.curPhaseCov < rhs.curPhaseCov) ||
+      (lhs.curPhaseCov === rhs.curPhaseCov && (
+        (lhs.conf < rhs.conf) ||
+          (lhs.conf === rhs.conf && (
+            (lhs.absOffset < rhs.absOffset) ||
+              (lhs.absOffset === rhs.absOffset && lhs.offset < rhs.offset)
+          ))
+      ))
+  }
+
+  // Replacement is confidence-first; it is independent of phase winner/loser ranking.
+  private def isVictim(lhs: OceanusVStudentPoolEntry, rhs: OceanusVStudentPoolEntry): Bool = {
+    (lhs.conf < rhs.conf) ||
+      (lhs.conf === rhs.conf && (
+        (lhs.lastPhaseCov < rhs.lastPhaseCov) ||
+          (lhs.lastPhaseCov === rhs.lastPhaseCov && (
+            (lhs.absOffset > rhs.absOffset) ||
+              (lhs.absOffset === rhs.absOffset && lhs.offset < rhs.offset)
+          ))
+      ))
+  }
+
+  private def covThresholdMet(selectedCov: UInt, trainCount: UInt): Bool = {
+    if (studentCovThreshold == 0) {
+      true.B
+    } else {
+      selectedCov >= (trainCount >> studentCovThreshold)
+    }
+  }
+
+  val pool = RegInit(VecInit(Seq.fill(studentPoolSize)(0.U.asTypeOf(new OceanusVStudentPoolEntry))))
+  val filterTable = Module(new OceanusVStudentFilterTable(name))
+  val selectedOffset = RegInit(1.S(offsetWidth.W))
+  val selectedValid = RegInit(false.B)
+  val selectedEnable = RegInit(false.B)
+  val phaseTrainCount = RegInit(0.U(studentPhaseTrainBits.W))
+  val endHasMatch = RegInit(false.B)
+  val endIssueEn = RegInit(false.B)
+  val endHasFree = RegInit(false.B)
+  val endFreeIdx = RegInit(0.U(studentPoolIdxBits.W))
+  val endVictimIdx = RegInit(0.U(studentPoolIdxBits.W))
+  val endWorstIdx = RegInit(0.U(studentPoolIdxBits.W))
+  val endBestIdx = RegInit(0.U(studentPoolIdxBits.W))
+  val endTrainCount = RegInit(0.U(studentPhaseTrainBits.W))
+  val endTeacherOffset = RegInit(0.U(offsetWidth.W))
+
+  val s_training :: s_phaseEnd :: Nil = Enum(2)
+  val state = RegInit(s_training)
+  filterTable.io.clear := io.teacherPhaseEnd || state === s_phaseEnd
+
+  // Query one 64-bit entry from every per-offset filter table.
+  val s0_queryEnable = state === s_training && !io.teacherPhaseEnd
+  filterTable.io.queryReq.valid := io.train.valid && s0_queryEnable
+  filterTable.io.queryReq.bits := io.train.bits
+  val s0_queryReady = s0_queryEnable && filterTable.io.queryReq.ready
+  val s0_queryFire = filterTable.io.queryReq.fire
+  val s1_queryValid = filterTable.io.queryResp.valid
+  val s1_hitMask = filterTable.io.queryResp.bits
+
+  // Generate filter-table writes for pool offsets
+  val s0_writeAddr = if (useDelayOut) io.delayOut.bits else io.train.bits
+  val s0_writeSourceValid = if (useDelayOut) io.delayOut.valid else s0_queryFire
+  val s0_writeEnable = s0_writeSourceValid && state === s_training && !io.teacherPhaseEnd
+  filterTable.io.updateReq.valid := s0_writeEnable
+  filterTable.io.updateReq.bits.baseAddr := s0_writeAddr
+  for (i <- 0 until studentPoolSize) {
+    filterTable.io.updateReq.bits.offsets(i) := pool(i).offset
+    filterTable.io.updateReq.bits.valids(i) := pool(i).valid
+  }
+
+  val selectInputs = (0 until studentPoolSize).map { i =>
+    val in = Wire(Valid(UInt(studentPoolIdxBits.W)))
+    in.valid := pool(i).valid
+    in.bits := i.U
+    in
+  }
+  val bestIdx = SelectByFn(selectInputs, pool.toSeq, isBetter, Some("bestSelect"), pipe = true)
+  val worstIdx = SelectByFn(selectInputs, pool.toSeq, isWorse, Some("worstSelect"), pipe = true)
+
+  // Compute teacher match and phase-end injection inputs
+  val victimIdx = SelectByFn(selectInputs, pool.toSeq, isVictim, Some("victimSelect"), pipe = true)
+  val matchVec = VecInit(pool.map { t =>
+    t.valid && io.teacherIssueEnable && (io.teacherBestOffset.asSInt === t.offset)
+  }).asUInt
+  val freeVec = VecInit(pool.map(t => !t.valid)).asUInt
+  val hasMatch = matchVec.orR
+  val hasFree = freeVec.orR
+  val freeIdx = PriorityEncoder(freeVec)
+  val endInjectIdx = Mux(endHasFree, endFreeIdx, endVictimIdx)
+
+  val endSelectedValid = pool(endBestIdx).valid
+  val endSelectedCov = MuxLookup(endBestIdx, 0.U(studentPhaseTrainBits.W))(
+    pool.indices.map(i => i.U -> pool(i).curPhaseCov)
+  )
+  val endSelectedEnable = endSelectedValid && covThresholdMet(endSelectedCov, endTrainCount)
+  val endSelectedOffset = pool(endBestIdx).offset
+  val endWorstCov = MuxLookup(endWorstIdx, 0.U(studentPhaseTrainBits.W))(
+    pool.indices.map(i => i.U -> pool(i).curPhaseCov)
+  )
+
+  when(state === s_training) {
+    when(io.teacherPhaseEnd) {
+      endHasMatch := hasMatch
+      endIssueEn := io.teacherIssueEnable
+      endHasFree := hasFree
+      endFreeIdx := freeIdx
+      endVictimIdx := victimIdx.bits
+      endWorstIdx := worstIdx.bits
+      endBestIdx := bestIdx.bits
+      endTrainCount := phaseTrainCount
+      endTeacherOffset := io.teacherBestOffset
+      state := s_phaseEnd
+    }.otherwise {
+      when(s1_queryValid) {
+        phaseTrainCount := phaseTrainCount + 1.U
+        for (i <- 0 until studentPoolSize) {
+          // Accumulate coverage after selecting the requested bit from the SRAM entry.
+          when(pool(i).valid && s1_hitMask(i)) {
+            pool(i).curPhaseCov := pool(i).curPhaseCov + 1.U
+          }
+        }
+      }
+    }
+  }.otherwise {
+    // Select the best entry for next phase
+    selectedValid := endSelectedValid
+    selectedOffset := endSelectedOffset
+    selectedEnable := endSelectedEnable
+
+    // Update PhaseCov counters
+    pool.foreach { entry =>
+      entry.lastPhaseCov := entry.curPhaseCov
+      entry.curPhaseCov := 0.U
+    }
+    phaseTrainCount := 0.U
+
+    // Confidence update: winner +1, loser -1, all others 0.
+    // If winner and loser are the same entry, no confidence is updated.
+    when (endBestIdx =/= endWorstIdx) {
+      for (i <- 0 until studentPoolSize) {
+        when (pool(i).valid) {
+          val update = Mux(
+            endBestIdx === i.U,
+            1.S(studentConfBits.W),
+            Mux(endWorstIdx === i.U, (-1).S(studentConfBits.W), 0.S(studentConfBits.W))
+          )
+          pool(i).conf := update
+        }
+      }
+    }
+
+    // Inject teacher offset
+    when (endIssueEn && !endHasMatch) {
+      pool(endInjectIdx).valid := true.B
+      pool(endInjectIdx).offset := endTeacherOffset.asSInt
+      pool(endInjectIdx).absOffset := absOffset(endTeacherOffset.asSInt)
+      pool(endInjectIdx).conf := 0.S
+      pool(endInjectIdx).curPhaseCov := 0.U
+      pool(endInjectIdx).lastPhaseCov := 0.U
+    }
+
+    state := s_training
+  }
+
+  io.train.ready := s0_queryReady
+  io.selectedOffset := selectedOffset.asUInt
+  io.selectedValid := selectedValid
+  io.selectedEnable := selectedEnable
+
+  XSPerfAccumulate("student_phase_end", state === s_phaseEnd)
+  XSPerfAccumulate("student_fallback", state === s_phaseEnd && !endSelectedEnable)
+  val studentMetricEnable = state === s_phaseEnd && endSelectedValid
+  emitOffsetDistCounters("student_best_offset", endSelectedOffset, studentMetricEnable)
+  XSPerfHistogram("student_best_cov", endSelectedCov, studentMetricEnable, 0, 3072, 128)
+  XSPerfHistogram("student_worst_cov", endWorstCov, studentMetricEnable, 0, 3072, 128)
+  XSPerfHistogram("student_train_count", endTrainCount, state === s_phaseEnd, 1024, 4096, 256)
+  XSPerfHistogram("student_best_worst_gap", endSelectedCov - endWorstCov, studentMetricEnable, 0, 768, 64)
 }
 
 class OceanusVDelayQueue(name: String = "")(implicit p: Parameters) extends  OceanusVBOPModule{
@@ -457,6 +874,7 @@ class OceanusVBOPBuffer(implicit p: Parameters) extends OceanusVBOPModule {
     val source = UInt(sourceIdBits.W)
     val translated = Bool()
     val waiting = Bool()
+    val issueOffset = SInt(offsetWidth.W)
   }
   val io = IO(new Bundle {
     val in = Flipped(Valid(new Entry))
@@ -558,28 +976,54 @@ class OceanusVBOP(val params: OceanusVBOPParameters = OceanusVBOPParameters())(i
   rrTable.io.r <> scoreTable.io.test
   rrTable.io.w <> delayQueue.io.out
   delayQueue.io.pfCtrlOfDelayLatency := io.delayLatency
-  // Reference :710-713 deliberately drive valid rather than train.fire.
-  // Preserve it, including the startup/phase-end behavior, for exact learning.
-  delayQueue.io.in.valid := input.io.deq.valid
+  // Upstream dfd3edcf: all three learners consume the same accepted event.
+  val student = if (enableStudentCover) Some(Module(new OceanusVStudentCoverageLearner("oceanus_vbop"))) else None
+  val studentTrainReady = student.map(_.io.train.ready).getOrElse(true.B)
+  val phaseEnd = scoreTable.io.phaseEndPulse
+  val teacherOffset = scoreTable.io.prefetchOffset
+  val teacherDisable = scoreTable.io.prefetchDisable
+  val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
+  val issueOffset = Mux(studentSelectedEnable, student.map(_.io.selectedOffset).getOrElse(teacherOffset), teacherOffset)
+  val issueGate = if (issueGateEnable) issueConf(phaseEnd, teacherDisable) else true.B
+  val issueEnable = (studentSelectedEnable || !teacherDisable) && issueGate
+  delayQueue.io.in.valid := input.io.deq.valid && studentTrainReady && scoreTable.io.req.ready
   delayQueue.io.in.bits := input.io.deq.bits.vaddr.get
-  scoreTable.io.req.valid := input.io.deq.valid
+  scoreTable.io.req.valid := input.io.deq.valid && delayQueue.io.in.ready && studentTrainReady
   scoreTable.io.req.bits := Cat(input.io.deq.bits.vaddr.get, 0.U(6.W))
-  input.io.deq.ready := delayQueue.io.in.ready && scoreTable.io.req.ready
-  val cstEnable = Constantin.createRecord("vbop_enable0", initValue = 1)
+  input.io.deq.ready := delayQueue.io.in.ready && scoreTable.io.req.ready && studentTrainReady
   val va = Cat(input.io.deq.bits.vaddr.get, 0.U(6.W))
-  val delta = signedExtend(scoreTable.io.prefetchOffset << 6, 50)
+  student.foreach { learner =>
+    learner.io.train.valid := input.io.deq.valid && delayQueue.io.in.ready && scoreTable.io.req.ready
+    learner.io.train.bits := va
+    learner.io.delayOut.valid := delayQueue.io.out.fire
+    learner.io.delayOut.bits := delayQueue.io.out.bits
+    learner.io.teacherPhaseEnd := phaseEnd
+    learner.io.teacherBestOffset := scoreTable.io.phaseBestOffsetCommitted
+    learner.io.teacherIssueEnable := scoreTable.io.phaseIssueEnable
+  }
+  val cstEnable = Constantin.createRecord("vbop_enable0", initValue = 1)
+  val enable = io.enable && cstEnable.orR
+  val delta = signedExtend(issueOffset << 6, 50)
   val predicted = (va + delta)(49, 0)
   val samePage = predicted(49,12) === va(49,12)
   val offer = Wire(new reqFilter.Entry)
   offer.va := predicted
-  offer.pa := (input.io.deq.bits.paddr + signedExtend(scoreTable.io.prefetchOffset << 6, fullAddressBits))(fullAddressBits-1,0)
+  offer.pa := (input.io.deq.bits.paddr + signedExtend(issueOffset << 6, fullAddressBits))(fullAddressBits-1,0)
   offer.needT := input.io.deq.bits.needT.get
   offer.source := input.io.deq.bits.sourceId.get
   offer.translated := params.samePagePA.B && samePage
   offer.waiting := false.B
-  val generate = input.io.deq.fire && io.enable && cstEnable.orR && !scoreTable.io.prefetchDisable
-  reqFilter.io.in.valid := RegNext(generate, false.B)
+  offer.issueOffset := issueOffset.asSInt
+  val generate = input.io.deq.fire && enable && issueEnable
+  val s1Valid = RegNext(generate, false.B)
+  reqFilter.io.in.valid := enable && s1Valid
   reqFilter.io.in.bits := RegEnable(offer, input.io.deq.fire)
+  XSPerfAccumulate("bop_train", input.io.deq.fire)
+  XSPerfAccumulate("bop_req", io.req.fire)
+  XSPerfAccumulate("bop_student_takeover", input.io.deq.fire && studentSelectedEnable)
+  XSPerfAccumulate("bop_drop_for_external_disable", input.io.deq.fire && !enable)
+  XSPerfAccumulate("bop_drop_for_auto_disable", input.io.deq.fire && enable && !issueEnable)
+  emitOffsetDistCounters("prefetch_sent_issue_offset", reqFilter.io.out.bits.issueOffset, io.req.fire)
   io.tlb <> reqFilter.io.tlb
   io.req.valid := reqFilter.io.out.valid
   io.req.bits.paddr := Cat(reqFilter.io.out.bits.pa(fullAddressBits-1,6), 0.U(6.W))

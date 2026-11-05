@@ -177,7 +177,7 @@ package oceanus.l2
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
-import utility.{ChiselDB, XSPerfAccumulate}
+import utility.{ChiselDB, Constantin, XSPerfAccumulate}
 import utility.sram.{SRAMTemplate, SramBroadcastBundle}
 
 case class OceanusBOPParameters(
@@ -189,6 +189,14 @@ case class OceanusBOPParameters(
   delayQueueEntries: Int = 16,
   delayQueueLatency: Int = 300,
   delayQueueMaxLatency: Int = 1024,
+  enableStudentCover: Boolean = true,
+  studentPoolSize: Int = 8,
+  studentFilterTableBits: Int = 2048,
+  studentFilterEntryBits: Int = 64,
+  studentHashMode: String = "bop_rr",
+  studentCovThreshold: Int = 5,
+  issueGateEnable: Boolean = true,
+  issueConfThreshold: Int = 14,
   offsetList: Seq[Int] = Seq(
     -32, -30, -27, -25, -24, -20, -18, -16, -15,
     -12, -10, -9, -8, -6, -5, -4, -3, -2, -1,
@@ -197,373 +205,100 @@ case class OceanusBOPParameters(
   )
 )
 
-private abstract class OceanusBOPModule(val bopParams: OceanusBOPParameters)(implicit val p: Parameters)
-  extends Module with HasL2Params {
-  protected val addressWidth = paramL2.physicalAddrWidth
-  protected val noOffsetAddressWidth = addressWidth - offsetBits
-  protected val rrIndexBits = log2Ceil(bopParams.rrTableEntries)
-  protected val offsetWidth = log2Ceil(bopParams.offsetList.max) + 2
-  protected val scoreTableIndexBits = log2Ceil(bopParams.offsetList.size)
-  protected val roundBits = log2Ceil(bopParams.roundMax + 1)
-  protected val scoreMax = (1 << bopParams.scoreBits) - 1
+object OceanusBOPParameters {
+  private[l2] def geometry(b: OceanusBOPParameters): OceanusVBOPParameters = OceanusVBOPParameters(
+    virtualTrain=false, rrTableEntries=b.rrTableEntries, rrTagBits=b.rrTagBits,
+    scoreBits=b.scoreBits, roundMax=b.roundMax, badScore=b.badScore,
+    dQEntries=b.delayQueueEntries, dQLatency=b.delayQueueLatency, dQMaxLatency=b.delayQueueMaxLatency,
+    crossPage=false, useDelayOut=false, enableStudentCover=b.enableStudentCover,
+    studentPoolSize=b.studentPoolSize, studentFilterTableBits=b.studentFilterTableBits,
+    studentFilterEntryBits=b.studentFilterEntryBits, studentHashMode=b.studentHashMode,
+    studentCovThreshold=b.studentCovThreshold, issueGateEnable=b.issueGateEnable,
+    issueConfThreshold=b.issueConfThreshold, offsetList=b.offsetList)
 }
 
-private class OceanusBOPTestOffsetReq(
-  addressWidth: Int,
-  offsetWidth: Int,
-  scoreTableIndexBits: Int
-) extends Bundle {
-  val addr = UInt(addressWidth.W)
-  val testOffset = UInt(offsetWidth.W)
-  val ptr = UInt(scoreTableIndexBits.W)
-}
-
-private class OceanusBOPTestOffsetResp(scoreTableIndexBits: Int) extends Bundle {
-  val ptr = UInt(scoreTableIndexBits.W)
-  val hit = Bool()
-}
-
-private class OceanusBOPTestOffsetBundle(
-  addressWidth: Int,
-  offsetWidth: Int,
-  scoreTableIndexBits: Int
-) extends Bundle {
-  val req = DecoupledIO(new OceanusBOPTestOffsetReq(addressWidth, offsetWidth, scoreTableIndexBits))
-  val resp = Flipped(ValidIO(new OceanusBOPTestOffsetResp(scoreTableIndexBits)))
-}
-
-private class OceanusBOPRecentRequestTable(name: String, params: OceanusBOPParameters)(implicit p: Parameters)
-  extends OceanusBOPModule(params) {
-  require(isPow2(bopParams.rrTableEntries) && bopParams.rrTableEntries >= 2)
-
-  val io = IO(new Bundle {
-    val w = Flipped(DecoupledIO(UInt(addressWidth.W)))
-    val r = Flipped(new OceanusBOPTestOffsetBundle(addressWidth, offsetWidth, scoreTableIndexBits))
-  })
-
-  private def lineAddress(address: UInt): UInt = address(addressWidth - 1, offsetBits)
-  private def hash1(address: UInt): UInt = lineAddress(address)(rrIndexBits - 1, 0)
-  private def hash2(address: UInt): UInt = lineAddress(address)(2 * rrIndexBits - 1, rrIndexBits)
-  private def index(address: UInt): UInt = hash1(address) ^ hash2(address)
-  private def tag(address: UInt): UInt = lineAddress(address)(bopParams.rrTagBits + rrIndexBits - 1, rrIndexBits)
-  private def signedExtend(value: UInt): UInt =
-    Cat(Fill(addressWidth - value.getWidth, value(value.getWidth - 1)), value)
-
-  private class RecentRequestEntry extends Bundle {
-    val valid = Bool()
-    val tag = UInt(bopParams.rrTagBits.W)
-  }
-
-  private val rrTable = Module(new SRAMTemplate(
-    gen = new RecentRequestEntry,
-    set = bopParams.rrTableEntries,
-    way = 1,
-    shouldReset = true,
-    singlePort = true,
-    hasMbist = paramL2.hasMbist,
-    hasSramCtl = paramL2.hasSramCtl
-  ))
-
-  // [Implementation detail R06] Define the optional SRAM-template DFT inputs.
-  // Original: utility exposes broadcast inputs when the RR SRAM has MBIST.
-  // This implementation: use Directory's inactive local broadcast defaults.
-  // Reason: standalone/target construction otherwise leaves those inputs uninitialized.
-  // Status: verification results are recorded in the migration ledger.
-  rrTable.io.broadcast.foreach(_ := 0.U.asTypeOf(new SramBroadcastBundle))
-
-  private val writeAddress = io.w.bits
-  rrTable.io.w.req.valid := io.w.valid && !io.r.req.valid
-  rrTable.io.w.req.bits.setIdx := index(writeAddress)
-  rrTable.io.w.req.bits.data(0).valid := true.B
-  rrTable.io.w.req.bits.data(0).tag := tag(writeAddress)
-
-  private val readAddress = io.r.req.bits.addr - signedExtend(io.r.req.bits.testOffset << offsetBits)
-  private val readData = Wire(new RecentRequestEntry)
-  rrTable.io.r.req.valid := io.r.req.fire
-  rrTable.io.r.req.bits.setIdx := index(readAddress)
-  readData := rrTable.io.r.resp.data(0)
-
-  assert(!RegNext(io.w.fire && io.r.req.fire), "single port SRAM should not read and write at the same time")
-
-  private val stage0Valid = rrTable.io.r.req.fire
-  private val stage1Valid = RegNext(stage0Valid, false.B)
-  private val stage1Pointer = RegNext(io.r.req.bits.ptr)
-  private val stage1Hit = readData.valid && readData.tag === RegNext(tag(readAddress))
-  private val stage2Valid = RegNext(stage1Valid, false.B)
-
-  io.w.ready := rrTable.io.w.req.ready && !io.r.req.valid
-  io.r.req.ready := rrTable.io.r.req.ready
-  io.r.resp.valid := stage2Valid
-  io.r.resp.bits.ptr := RegEnable(stage1Pointer, stage1Valid)
-  io.r.resp.bits.hit := RegEnable(stage1Hit, stage1Valid)
-
-  private class WriteRecentRequestEntry extends Bundle {
-    val addr = UInt(addressWidth.W)
-  }
-  private val writeRecentRequestTable = ChiselDB.createTable(
-    name + "WriteRecentRequestTable",
-    new WriteRecentRequestEntry,
-    basicDB = false
-  )
-  private val writeLogEntry = Wire(new WriteRecentRequestEntry)
-  writeLogEntry.addr := writeAddress
-  writeRecentRequestTable.log(
-    writeLogEntry,
-    io.w.valid && !io.r.req.valid,
-    site = "RecentRequestTable",
-    clock,
-    reset
-  )
-}
-
-private class OceanusBOPOffsetScoreTable(name: String, params: OceanusBOPParameters)(implicit p: Parameters)
-  extends OceanusBOPModule(params) {
-  val io = IO(new Bundle {
-    val req = Flipped(DecoupledIO(UInt(addressWidth.W)))
-    val requestAvailable = Input(Bool())
-    val prefetchOffset = Output(UInt(offsetWidth.W))
-    val prefetchDisable = Output(Bool())
-    val test = new OceanusBOPTestOffsetBundle(addressWidth, offsetWidth, scoreTableIndexBits)
-  })
-
-  private class ScoreTableEntry extends Bundle {
-    val score = UInt(bopParams.scoreBits.W)
-  }
-
-  private val prefetchOffset = RegInit(2.U(offsetWidth.W))
-  private val prefetchDisable = RegInit(false.B)
-  private val scoreTable = RegInit(VecInit(Seq.fill(bopParams.offsetList.size)(0.U.asTypeOf(new ScoreTableEntry))))
-  private val offsetList = WireInit(VecInit(bopParams.offsetList.map(_.S(offsetWidth.W).asUInt)))
-  private val pointer = RegInit(0.U(scoreTableIndexBits.W))
-  private val round = RegInit(0.U(roundBits.W))
-  private val bestOffset = RegInit(2.U(offsetWidth.W))
-  private val bestScore = RegInit(0.U(bopParams.scoreBits.W))
-  private val testOffset = offsetList(pointer)
-
-  private val idle :: learn :: Nil = Enum(2)
-  private val state = RegInit(idle)
-  private val isBad = bestScore < bopParams.badScore.U
-
-  // Startup is identical to coupledL2 PBOP: BestOffsetPrefetch.scala:238,
-  // 247,256,261-269 resets disable=false, bestScore=0, state=idle, then
-  // assigns disable=(bestScore < badScore) at the first non-reset edge.
-  // Its production PBOP overrides badScore=1 (Prefetcher.scala:274), as we
-  // do by default: 0<1 disables issue during the first learning phase.
-  // Reset disable=false does NOT mean every initial train issues a prefetch.
-  // A test-only badScore=0 keeps startup enabled because 0<0 is false;
-  // the comparison is strict <, not <=. No production startup exception.
-  when(state === idle) {
-    scoreTable.foreach(_.score := 0.U)
-    pointer := 0.U
-    round := 0.U
-    bestScore := 0.U
-    prefetchOffset := bestOffset
-    prefetchDisable := isBad
-    state := learn
-  }
-
-  when(state === learn) {
-    when(io.test.req.fire) {
-      val roundFinished = pointer === (bopParams.offsetList.size - 1).U
-      pointer := Mux(roundFinished, 0.U, pointer + 1.U)
-      round := Mux(roundFinished, round + 1.U, round)
-    }
-
-    when(round >= bopParams.roundMax.U) {
-      state := idle
-    }
-
-    when(io.test.resp.valid && io.test.resp.bits.hit) {
-      val oldScore = scoreTable(io.test.resp.bits.ptr).score
-      val newScore = oldScore + 1.U
-      val offset = offsetList(io.test.resp.bits.ptr)
-      val renewOffset = newScore > bestScore
-      scoreTable(io.test.resp.bits.ptr).score := newScore
-      bestOffset := Mux(renewOffset, offset, bestOffset)
-      bestScore := Mux(renewOffset, newScore, bestScore)
-      when(newScore >= scoreMax.U) {
-        state := idle
-      }
-    }
-  }
-
-  io.req.ready := state === learn && io.test.req.ready
-  io.prefetchOffset := prefetchOffset
-  io.prefetchDisable := prefetchDisable
-  io.test.req.valid := state === learn && io.req.valid && io.requestAvailable
-  io.test.req.bits.addr := io.req.bits
-  io.test.req.bits.testOffset := testOffset
-  io.test.req.bits.ptr := pointer
-
-  XSPerfAccumulate("total_learn_phase", state === idle)
-  XSPerfAccumulate("total_bop_disable", state === idle && isBad)
-  XSPerfAccumulate("total_bop_high_confidence", state === idle && bestScore === scoreMax.U)
-
-  for (offset <- bopParams.offsetList) {
-    if (offset < 0) {
-      XSPerfAccumulate(
-        "best_offset_neg_" + (-offset).toString + "_learning_phases",
-        Mux(state === idle, (bestOffset === offset.S(offsetWidth.W).asUInt).asUInt, 0.U)
-      )
-    } else {
-      XSPerfAccumulate(
-        "best_offset_pos_" + offset.toString + "_learning_phases",
-        Mux(state === idle, (bestOffset === offset.U).asUInt, 0.U)
-      )
-    }
-  }
-
-  private class BopTrainEntry extends Bundle {
-    val bestOffset = UInt(offsetWidth.W)
-    val bestScore = UInt(bopParams.scoreBits.W)
-    val offsets = Vec(bopParams.offsetList.size, UInt(offsetWidth.W))
-    val scores = Vec(bopParams.offsetList.size, UInt(bopParams.scoreBits.W))
-  }
-  private val bopTrainTable = ChiselDB.createTable(name + "OffsetScoreTable", new BopTrainEntry, basicDB = false)
-  private val trainLogEntry = Wire(new BopTrainEntry)
-  trainLogEntry.bestOffset := bestOffset
-  trainLogEntry.bestScore := bestScore
-  for (index <- bopParams.offsetList.indices) {
-    trainLogEntry.offsets(index) := offsetList(index)
-    trainLogEntry.scores(index) := scoreTable(index).score
-  }
-  bopTrainTable.log(
-    data = trainLogEntry,
-    en = state === idle && !isBad,
-    site = name + "OffsetScoreTable",
-    clock,
-    reset
-  )
-}
-
-private class OceanusBOPDelayQueue(name: String, params: OceanusBOPParameters)(implicit p: Parameters)
-  extends OceanusBOPModule(params) {
-  require(isPow2(bopParams.delayQueueEntries) && bopParams.delayQueueEntries >= 2)
-  require(bopParams.delayQueueLatency >= 0 && bopParams.delayQueueLatency < bopParams.delayQueueMaxLatency)
-
+// Upstream dfd3edcf: PA learner and one-entry flow-through output skid.
+// Shared learner implementation is parameterized by PA rather than VA geometry.
+class OceanusBOP(val params: OceanusBOPParameters = OceanusBOPParameters())(implicit outer: Parameters)
+  extends OceanusVBOPModule()(OceanusVBOP.configured(outer, OceanusBOPParameters.geometry(params))) {
   val io = IO(new Bundle {
     val delayLatency = Input(UInt(10.W))
-    val in = Flipped(DecoupledIO(UInt(noOffsetAddressWidth.W)))
-    val out = DecoupledIO(UInt(addressWidth.W))
-    val fullDrop = Output(Bool())
-  })
-
-  private val indexWidth = log2Ceil(bopParams.delayQueueEntries)
-  private val latencyWidth = log2Ceil(bopParams.delayQueueMaxLatency)
-  private class Entry extends Bundle {
-    val addressNoOffset = UInt(noOffsetAddressWidth.W)
-    val count = UInt(latencyWidth.W)
-  }
-
-  private val queue = RegInit(VecInit(Seq.fill(bopParams.delayQueueEntries)(0.U.asTypeOf(new Entry))))
-  private val valid = RegInit(VecInit(Seq.fill(bopParams.delayQueueEntries)(false.B)))
-  private val head = RegInit(0.U(indexWidth.W))
-  private val tail = RegInit(0.U(indexWidth.W))
-  private val empty = head === tail && !valid.last
-  private val full = head === tail && valid.last
-  private val outValid = !empty && !queue(head).count.orR && valid(head)
-
-  when(io.in.valid && !full) {
-    queue(tail).addressNoOffset := io.in.bits
-    queue(tail).count := Mux(io.delayLatency.orR, io.delayLatency, bopParams.delayQueueLatency.U)
-    valid(tail) := true.B
-    tail := tail + 1.U
-  }
-  when(outValid && io.out.ready) {
-    valid(head) := false.B
-    head := head + 1.U
-  }
-
-  io.in.ready := true.B
-  io.out.valid := outValid
-  io.out.bits := Cat(queue(head).addressNoOffset, 0.U(offsetBits.W))
-  io.fullDrop := io.in.valid && full
-
-  for (index <- 0 until bopParams.delayQueueEntries) {
-    when(queue(index).count.orR) {
-      queue(index).count := queue(index).count - 1.U
-    }
-  }
-
-  XSPerfAccumulate("full", full)
-  XSPerfAccumulate("empty", empty)
-  XSPerfAccumulate("entryNumber", PopCount(valid.asUInt))
-  XSPerfAccumulate("inNumber", io.in.valid)
-  XSPerfAccumulate("outNumber", io.out.valid)
-}
-
-class OceanusBOP(val bopParams: OceanusBOPParameters = OceanusBOPParameters())(implicit val p: Parameters)
-  extends Module with HasL2Params {
-  require(bopParams.roundMax >= 1)
-  require(bopParams.badScore >= 0 && bopParams.badScore < (1 << bopParams.scoreBits))
-  require(bopParams.offsetList.nonEmpty)
-
-  private val addressWidth = paramL2.physicalAddrWidth
-  private val offsetWidth = log2Ceil(bopParams.offsetList.max) + 2
-  private val pageOffsetBits = 12
-
-  val io = IO(new Bundle {
-    val delayLatency = Input(UInt(10.W))
-    val train = Flipped(Decoupled(UInt(addressWidth.W)))
-    val req = Decoupled(UInt(addressWidth.W))
+    val train = Flipped(Decoupled(UInt(fullAddressBits.W)))
+    val req = Decoupled(UInt(fullAddressBits.W))
     val crossPageDrop = Output(Bool())
     val disabledDrop = Output(Bool())
     val delayQueueFullDrop = Output(Bool())
   })
-
-  private def signedExtend(value: UInt): UInt =
-    Cat(Fill(addressWidth - value.getWidth, value(value.getWidth - 1)), value)
-
-  private val request = Reg(UInt(addressWidth.W))
-  private val requestValid = RegInit(false.B)
-
-  private val delayQueue = Module(new OceanusBOPDelayQueue("pbop", bopParams))
-  delayQueue.io.delayLatency := io.delayLatency
-  private val recentRequestTable = Module(new OceanusBOPRecentRequestTable("pbop", bopParams))
-  private val scoreTable = Module(new OceanusBOPOffsetScoreTable("pbop", bopParams))
-
-  private val prefetchOffset = scoreTable.io.prefetchOffset
-  private val prefetchDisable = scoreTable.io.prefetchDisable
-  private val oldAddress = io.train.bits
-  private val oldAddressNoOffset = oldAddress(addressWidth - 1, offsetBits)
-  private val newAddress = oldAddress + signedExtend(prefetchOffset << offsetBits)
-
+  val delayQueue = Module(new OceanusVDelayQueue("oceanus_pbop"))
+  val recentRequestTable = Module(new OceanusVRecentRequestTable("oceanus_pbop"))
+  val scoreTable = Module(new OceanusVOffsetScoreTable("oceanus_pbop"))
+  val student = if (enableStudentCover) Some(Module(new OceanusVStudentCoverageLearner("oceanus_pbop"))) else None
+  val studentTrainReady = student.map(_.io.train.ready).getOrElse(true.B)
+  val teacherOffset = scoreTable.io.prefetchOffset
+  val teacherDisable = scoreTable.io.prefetchDisable
+  val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
+  val issueOffset = Mux(studentSelectedEnable, student.map(_.io.selectedOffset).getOrElse(teacherOffset), teacherOffset)
+  val issueGate = if (issueGateEnable) issueConf(scoreTable.io.phaseEndPulse, teacherDisable) else true.B
+  val issueEnable = (studentSelectedEnable || !teacherDisable) && issueGate
+  val cstEnable = Constantin.createRecord("pbop_enable0", initValue=1)
+  val enable = cstEnable.orR
+  val newAddress = io.train.bits + signedExtend(issueOffset << offsetBits, fullAddressBits)
+  val crossPageNow = getPPN(newAddress) =/= getPPN(io.train.bits)
+  class Request extends Bundle {
+    val address = UInt(fullAddressBits.W)
+    val issueOffset = SInt(offsetWidth.W)
+  }
+  val request = Reg(new Request)
+  val requestValid = RegInit(false.B)
+  val skid = Module(new Queue(new Request, 1, pipe=false, flow=true))
+  val s1Ready = skid.io.enq.ready || !requestValid
+  io.train.ready := delayQueue.io.in.ready && scoreTable.io.req.ready && studentTrainReady && s1Ready
   recentRequestTable.io.r <> scoreTable.io.test
   recentRequestTable.io.w <> delayQueue.io.out
-  delayQueue.io.in.valid := io.train.valid
-  delayQueue.io.in.bits := oldAddressNoOffset
-  scoreTable.io.req.valid := io.train.valid
-  scoreTable.io.req.bits := oldAddress
-  scoreTable.io.requestAvailable := !requestValid || io.req.ready
-
-  private val crossPage = newAddress(addressWidth - 1, pageOffsetBits) =/=
-    oldAddress(addressWidth - 1, pageOffsetBits)
-
-  when(io.req.fire) {
-    requestValid := false.B
+  delayQueue.io.pfCtrlOfDelayLatency := io.delayLatency
+  delayQueue.io.in.valid := io.train.valid && scoreTable.io.req.ready && studentTrainReady && s1Ready
+  delayQueue.io.in.bits := get_block_addr(io.train.bits)
+  scoreTable.io.req.valid := io.train.valid && delayQueue.io.in.ready && studentTrainReady && s1Ready
+  scoreTable.io.req.bits := io.train.bits
+  student.foreach { learner =>
+    learner.io.train.valid := io.train.valid && delayQueue.io.in.ready && scoreTable.io.req.ready && s1Ready
+    learner.io.train.bits := io.train.bits
+    learner.io.delayOut.valid := delayQueue.io.out.fire
+    learner.io.delayOut.bits := delayQueue.io.out.bits
+    learner.io.teacherPhaseEnd := scoreTable.io.phaseEndPulse
+    learner.io.teacherBestOffset := scoreTable.io.phaseBestOffsetCommitted
+    learner.io.teacherIssueEnable := scoreTable.io.phaseIssueEnable
   }
-  when(scoreTable.io.req.fire) {
-    request := newAddress
-    requestValid := !crossPage && !prefetchDisable
-  }
-
-  io.req.valid := requestValid
-  io.req.bits := request
-  io.train.ready := delayQueue.io.in.ready && scoreTable.io.req.ready && (!requestValid || io.req.ready)
-  io.crossPageDrop := scoreTable.io.req.fire && crossPage
-  io.disabledDrop := scoreTable.io.req.fire && !crossPage && prefetchDisable
-  io.delayQueueFullDrop := delayQueue.io.fullDrop
-
-  for (offset <- bopParams.offsetList) {
-    if (offset < 0) {
-      XSPerfAccumulate("best_offset_neg_" + (-offset).toString, prefetchOffset === offset.S(offsetWidth.W).asUInt)
-    } else {
-      XSPerfAccumulate("best_offset_pos_" + offset.toString, prefetchOffset === offset.U)
-    }
-  }
-  XSPerfAccumulate("bop_req", io.req.fire)
+  when(io.train.fire) {
+    request.address := newAddress
+    request.issueOffset := issueOffset.asSInt
+    requestValid := enable && !crossPageNow && issueEnable
+  }.elsewhen(s1Ready && requestValid) { requestValid := false.B }
+  skid.io.enq.valid := requestValid
+  skid.io.enq.bits := request
+  io.req.valid := enable && skid.io.deq.valid
+  io.req.bits := skid.io.deq.bits.address
+  skid.io.deq.ready := io.req.ready
+  io.crossPageDrop := io.train.fire && crossPageNow
+  io.disabledDrop := io.train.fire && !crossPageNow && !issueEnable
+  io.delayQueueFullDrop := delayQueue.io.in.valid && delayQueue.full
   XSPerfAccumulate("bop_train", io.train.fire)
-  XSPerfAccumulate("bop_train_stall_for_st_not_ready", io.train.valid && !scoreTable.io.req.ready)
-  XSPerfAccumulate("bop_drop_for_cross_page", scoreTable.io.req.fire && crossPage)
-  XSPerfAccumulate("bop_drop_for_auto_disable", scoreTable.io.req.fire && prefetchDisable)
+  XSPerfAccumulate("bop_req", io.req.fire)
+  XSPerfAccumulate("bop_student_takeover", io.train.fire && studentSelectedEnable)
+  emitOffsetDistCounters("prefetch_sent_issue_offset", skid.io.deq.bits.issueOffset, io.req.fire)
+}
+
+private[l2] class OceanusBOPDelayQueue(name: String, params: OceanusBOPParameters)(implicit outer: Parameters)
+  extends OceanusVBOPModule()(OceanusVBOP.configured(outer, OceanusBOPParameters.geometry(params))) {
+  val io = IO(new Bundle {
+    val delayLatency = Input(UInt(10.W))
+    val in = Flipped(Decoupled(UInt(noOffsetAddrBits.W)))
+    val out = Decoupled(UInt(fullAddrBits.W))
+    val fullDrop = Output(Bool())
+  })
+  val queue = Module(new OceanusVDelayQueue(name))
+  queue.io.pfCtrlOfDelayLatency := io.delayLatency
+  queue.io.in <> io.in
+  io.out <> queue.io.out
+  io.fullDrop := queue.io.in.valid && queue.full
 }
