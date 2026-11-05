@@ -62,6 +62,7 @@ object L2Directory {
     val valid = Bool()
     val set = UInt(setBits.W)
     val way = UInt(wayBits.W)
+    val hitHold = Bool()
   }
 
   object MetaState {
@@ -166,6 +167,7 @@ object L2Directory {
     val DirWb = Bool()
     val ReplRd = Bool()
     val DirRel = Bool() // DRRIP release-type update (commit path)
+    val ReplLock = Bool()
   }
 
   class PathToDirectory(implicit val p: Parameters) extends PathToDirectoryUOPs with HasL2Params {
@@ -179,6 +181,8 @@ object L2Directory {
     val RRIP_PREFETCH = Bool()
     val RRIP_REFILL_PREFETCH = Bool()
     val RRIP_LOCAL_VALID = Bool()
+    val REPL_LOCK_WAY = UInt(wayBits.W)
+    val REPL_LOCK_RELEASE = Bool()
   }
 
   class PathFromDirectoryUOPs extends Bundle {
@@ -189,6 +193,7 @@ object L2Directory {
     val ReplRdResp = Bool()
     val ReplRdRetryAck = Bool()
     val DirRelArbComp = Bool()
+    val ReplLockConflict = Bool()
   }
 
   class PathFromDirectory(implicit val p: Parameters) extends PathFromDirectoryUOPs with HasL2Params {
@@ -650,7 +655,29 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val currentFreeWayMask_s3 = ~VecInit((0 until ways).map { w =>
     VecInit(lockTable.map(e => e.valid && e.set === s3_set && e.way === w.U)).asUInt.orR
   }).asUInt
-  val victimMask_s3 = freeWayMask_s3 & currentFreeWayMask_s3
+  def requestSet(req: L2Directory.PathToDirectory): UInt = req.PADDR(offsetBits + setBits - 1, offsetBits)
+  val replLockConflictVec = VecInit(io.toDir.zipWithIndex.map { case (req, i) =>
+    val lockSet = requestSet(req)
+    val lockWay = req.REPL_LOCK_WAY
+    val otherOwnerLock = VecInit(lockTable.zipWithIndex.filter { case (_, j) => j != i }.map {
+      case (entry, _) => entry.valid && entry.set === lockSet && entry.way === lockWay
+    }).asUInt.orR
+    val earlierReplLock = if (i == 0) false.B else VecInit((0 until i).map { j =>
+      val earlier = io.toDir(j)
+      earlier.ReplLock && requestSet(earlier) === lockSet && earlier.REPL_LOCK_WAY === lockWay
+    }).asUInt.orR
+    otherOwnerLock || earlierReplLock
+  })
+
+  // A simultaneous ReplLock always wins its way against ReplRd. Other existing
+  // owners keep their earlier reservation and divert a later ReplLock to prefill.
+  val replLockMask_s3 = VecInit((0 until ways).map { w =>
+    VecInit(io.toDir.map { req =>
+      req.ReplLock && requestSet(req) === s3_set && req.REPL_LOCK_WAY === w.U
+    }).asUInt.orR
+  }).asUInt
+
+  val victimMask_s3 = freeWayMask_s3 & currentFreeWayMask_s3 & ~replLockMask_s3
 
   val victimWay  = Mux(victimMask_s3(chosenWay), chosenWay, PriorityEncoder(victimMask_s3))
   val replRetry  = s3_valid && s3_isRepl && !victimMask_s3.orR
@@ -740,10 +767,8 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     originBits(relSet) := originBits(relSet) | UIntToOH(relWay, ways)
   }
 
-  // Pending-clear application (one cycle after the release grant): the ONLY
-  // per-cycle lock-table maintenance. Listed first so that a same-cycle lock
-  // set wins over the clear on the vacated slot, and a same-cycle release
-  // grant re-registers pendClearValid below (Chisel last-wins).
+  // Compatibility state for fault probes; normal commits now release at the
+  // DirWb edge. A same-edge hit-hold handoff overrides the old refill clear.
   when(pendClearValid) {
     when(blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U) {
       lockTable(pendClearIdx).valid := false.B
@@ -764,19 +789,63 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     lockTable(s3_tshr).valid := true.B
     lockTable(s3_tshr).set := s3_set
     lockTable(s3_tshr).way := way_s3
+    lockTable(s3_tshr).hitHold := false.B
   }
 
-  // Release mark at the owner's fill-commit DirWb grant: the TSHR ID indexes
-  // the locker's slot directly, so ownership is structural — a non-owner's
-  // DirWb indexes its own slot and is rejected by the valid+set+way gate; an
-  // eviction invalidate (meta-only, TAG_WEN=0) never releases. The clear lands
-  // one cycle later via pendClear, so the way stays unpickable through the
-  // grant cycle + 1.
   val relEntry = lockTable(winReq.TSHRID(idxW - 1, 0))
-  when(grantDirWb && winReq.TAG_WEN && relEntry.valid &&
-       relEntry.set === reqSet && relEntry.way === winReq.WAY(wayBits - 1, 0)) {
-    pendClearValid := true.B
-    pendClearIdx := winReq.TSHRID(idxW - 1, 0)
+  val dirWbUnlock = grantDirWb && winReq.TAG_WEN && relEntry.valid &&
+    relEntry.set === reqSet && relEntry.way === winReq.WAY &&
+    blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U
+  val pendClearApply = pendClearValid && blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U
+  // Release at the owner's fill-commit DirWb grant: ownership is structural
+  // per TSHR and exact set/way. The tag/meta commit is visible from the next
+  // cycle, so the way can be released at this same edge without a clear/idle
+  // race. A non-owner or meta-only write never releases. An older refill may
+  // still retire replCAM ownership after a same-slot hit-hold handoff, but
+  // must not clear the new hold.
+  when(dirWbUnlock && !lockTable(winDirWb).hitHold) {
+    lockTable(winDirWb).valid := false.B
+  }
+
+  val dirWbHitLockRelease = grantDirWb && winReq.REPL_LOCK_RELEASE &&
+                            lockTable(winDirWb).valid && lockTable(winDirWb).hitHold &&
+                            lockTable(winDirWb).set === reqSet &&
+                            lockTable(winDirWb).way === winReq.REPL_LOCK_WAY
+
+  when (grantDirWb && winReq.REPL_LOCK_RELEASE) {
+    assert(dirWbHitLockRelease, "Directory: ReplLock release without matching hit-hold ownership")
+    assert(!winReq.TAG_WEN, "Directory: ReplLock release must be meta-only")
+    assert(winReq.WAY === winReq.REPL_LOCK_WAY, "Directory: ReplLock release way mismatch")
+  }
+
+  when (dirWbHitLockRelease) {
+    // The final meta write lands at this edge, so a later request can observe
+    // the released way immediately; no delayed clear is needed for hit holds.
+    lockTable(winDirWb).valid := false.B
+  }
+
+  io.toDir.zipWithIndex.foreach { case (req, i) =>
+    val lockSet = requestSet(req)
+    val lockWay = req.REPL_LOCK_WAY
+    val selfClearing = pendClearApply && pendClearIdx === i.U
+    val selfCompatible = !lockTable(i).valid || selfClearing ||
+                         !lockTable(i).hitHold &&
+                         lockTable(i).set === lockSet && lockTable(i).way === lockWay
+
+    when (req.ReplLock) {
+      assert(!replLockConflictVec(i), "Directory: ReplLock conflict was not diverted to prefill")
+      assert(selfCompatible, "Directory: ReplLock overwrote incompatible TSHR ownership")
+      lockTable(i).valid := true.B
+      lockTable(i).set := lockSet
+      lockTable(i).way := lockWay
+      lockTable(i).hitHold := true.B
+      // Cancel both an older pending clear and a clear scheduled by this
+      // cycle's old refill release, so handoff has no unlocked interval.
+      when ((pendClearValid && pendClearIdx === i.U) ||
+            ((dirWbUnlock || dirWbHitLockRelease) && winDirWb === i.U)) {
+        pendClearValid := false.B
+      }
+    }
   }
 
   lockTable.zipWithIndex.foreach { case (e, i) =>
@@ -846,6 +915,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     o.ReplRdResp     := false.B
     o.ReplRdRetryAck := false.B
     o.DirRelArbComp  := false.B
+    o.ReplLockConflict := replLockConflictVec(i)
   }
 
   // ArbComp — combinational at grant cycle (N) for all three operations.

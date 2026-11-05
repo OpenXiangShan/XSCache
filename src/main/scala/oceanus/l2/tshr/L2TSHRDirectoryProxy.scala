@@ -114,6 +114,11 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
     val repl_done = Output(Bool())
     val repl_retry = Output(Bool())
 
+    val repl_lock_req = Input(Bool())
+    val repl_lock_way = Input(UInt(wayBits.W))
+    val repl_lock_conflict = Output(Bool())
+    val repl_lock_release = Input(Bool())
+
     val wb_locked = Input(Bool())
     val wb_cancel = Input(Bool())
     val wb_aux = Input(Bool())
@@ -505,9 +510,18 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   io.toDir.RRIP_UPDATE := io.rrip_update
   io.toDir.RRIP_PREFETCH := io.rrip_prefetch
   io.toDir.RRIP_REFILL_PREFETCH := io.rrip_refill_prefetch
+  io.toDir.ReplLock := io.repl_lock_req
+  io.toDir.REPL_LOCK_WAY := io.repl_lock_way
+  io.toDir.REPL_LOCK_RELEASE := io.repl_lock_release
+  io.repl_lock_conflict := fromDir_en && io.fromDir.ReplLockConflict
   io.toDir.DirRd := state_dirRead.PreArb
   io.toDir.DirWb := state_dirWrite.PreArb && !io.wb_locked
   io.toDir.ReplRd := state_dirRead.ReplPreArb
+
+  when (io.repl_lock_release && io.toDir.DirWb) {
+    assert(!io.toDir.TAG_WEN, "ReplLock release must use a meta-only DirWb")
+    assert(io.toDir.WAY === io.toDir.REPL_LOCK_WAY, "ReplLock release way mismatch")
+  }
 
   assert(PopCount(Seq(io.toDir.DirRd, io.toDir.DirWb, io.toDir.ReplRd, io.toDir.DirRel)) <= 1.U,
     "DirRd, DirWb, ReplRd and DirRel operations to Directory overlapped")
