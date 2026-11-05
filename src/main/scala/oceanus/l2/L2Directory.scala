@@ -729,19 +729,6 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     }
   }
   val rrip_policy = rrip_policy_for_set(s3_set)
-  def releaseNextState(base: UInt, set: UInt, way: UInt, origin: Bool, prefetch: Bool): UInt = {
-    if (enableRRIPReleaseUpdate) {
-      val reqType = Cat(origin, true.B, prefetch, false.B)
-      val wayOH = UIntToOH(way, ways)
-      if (useDRRIP) {
-        rrip.get.get_next_state(base, wayOH, true.B, false.B, rrip_policy_for_set(set), reqType)
-      } else {
-        0.U(replBits.W)
-      }
-    } else {
-      0.U(replBits.W)
-    }
-  }
   val replNextState = Wire(UInt(replBits.W))
   if (useDRRIP) {
     replNextState := rrip.get.get_next_state(s3_repl, rrip_way_oh, s3_isDirRd, hasInvalid, rrip_policy, rrip_req_type)
@@ -767,10 +754,19 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val dirRelFire = dirRelGrant && useDRRIP.B
   val relSource = Mux(dirRelReq.RRIP_LOCAL_VALID, dirRelReq.META.pfSource,
     dirReadData_s2(relWay).meta.pfSource)
-  when (dirRelFire) {
-    replRegs(relSet) := releaseNextState(replRegs(relSet), relSet, relWay,
-      originBits(relSet)(relWay), relSource =/= 0.U)
-    originBits(relSet) := originBits(relSet) | UIntToOH(relWay, ways)
+  // Decode the row write statically. Re-reading an entire dynamic FF row
+  // while dynamically writing it back creates a large self-select expression
+  // during gsim optimization. Only the selected release lane changes.
+  val relRrpv = Mux(originBits(relSet)(relWay) && relSource === 0.U,
+    0.U(2.W), Mux(rrip_policy_for_set(relSet), 3.U(2.W), 2.U(2.W)))
+  for (set <- 0 until sets) {
+    when (dirRelFire && relSet === set.U) {
+      val next = VecInit((0 until ways).map { way =>
+        Mux(relWay === way.U, relRrpv, replRegs(set)(2 * way + 1, 2 * way))
+      })
+      replRegs(set) := next.asUInt
+      originBits(set) := originBits(set) | UIntToOH(relWay, ways)
+    }
   }
 
   // Compatibility state for fault probes; normal commits now release at the
