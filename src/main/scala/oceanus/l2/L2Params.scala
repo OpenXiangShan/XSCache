@@ -39,6 +39,8 @@ case object L2SliceDirPlruProbeEnableKey extends Field[Boolean](false)
 case object L2SliceDisableReplRetryReplayKey extends Field[Boolean](false)
 
 trait HasL2Params extends HasCHIParameters {
+  def enableRRIPReleaseUpdate: Boolean = paramL2.enableDRRIPReleaseUpdate && paramL2.replacement == "drrip"
+
 
     implicit val p: Parameters
 

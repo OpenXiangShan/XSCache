@@ -1479,7 +1479,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // --------------------------------
   val repl_tshr_meta_wr = p_prefill && io.repl_done
-
   val tshr_meta_wr_state_UU = meta_wr_state_UU && !p_prefill
   val tshr_meta_wr_state_US = meta_wr_state_US && !p_prefill
   val tshr_meta_wr_state_S = meta_wr_state_S && !p_prefill

@@ -48,19 +48,6 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
     val toDir = Output(new L2Directory.PathToDirectory)
     val fromDir = Input(new L2Directory.PathFromDirectory)
 
-    // DRRIP release-type update, entrance path: pulses at a WayValid EVT
-    // entrance (Evict / WriteBackFull) carrying the flit's (set, way). The
-    // allocator guarantees at most one EVT entrance per cycle per slice.
-    // Elaborated only when the entrance path is enabled.
-    val replTrain = if (paramL2.enableDRRIPEntranceReleaseUpdate) {
-      Some(Output(Valid(new Bundle {
-        val set = UInt(setBits.W)
-        val way = UInt(wayBits.W)
-      })))
-    } else {
-      None
-    }
-
     val toDS = Output(new L2DataStorage.PathTSHRToDataStorage)
     val fromDS = Input(new L2DataStorage.PathDataStorageToTSHR)
 
@@ -137,17 +124,27 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
                            !tshr_enter_EVT_WayValid_Evict &&
                            !tshr_enter_EVT_WayValid_WriteBackFull
 
-  // DRRIP release train, entrance path: a WayValid EVT entrance trains the
-  // flit-carried (set, way) immediately, trusted exactly as the existing
-  // directoryReadNeed skip trusts it. WayValid-entered episodes never issue a
-  // DirRel (suppression in L2VPipeEVT); when the entrance update is disabled
-  // their release simply goes untrained (and this port is not elaborated).
-  val useDRRIP = paramL2.replacement == "drrip"
-  io.replTrain.foreach { t =>
-    t.valid := tshr_enter_EVT && io.UpRXEVT.WayValid &&
-      (io.UpRXEVT.Opcode === Evict.U || io.UpRXEVT.Opcode === WriteBackFull.U) && useDRRIP.B
-    t.bits.set := io.UpRXEVT.Addr(offsetBits + setBits - 1, offsetBits)
-    t.bits.way := io.UpRXEVT.Way(wayBits - 1, 0)
+  val rrip_acquire = tshr_enter_REQ && (io.UpRXREQ.Opcode === ReadShared.U ||
+                                        io.UpRXREQ.Opcode === ReadUnique.U ||
+                                        io.UpRXREQ.Opcode === MakeUnique.U)
+
+  val rrip_hint = tshr_enter_REQ && (io.UpRXREQ.Opcode === StashShared.U ||
+                                     io.UpRXREQ.Opcode === StashUnique.U)
+
+  val rrip_update_next = paramL2.replacement match {
+    case "plru" => true.B
+    case "brrip" => rrip_acquire
+    case _ => rrip_acquire || rrip_hint
+  }
+  val rrip_update = RegInit(false.B)
+  val rrip_prefetch = RegInit(false.B)
+  val rrip_refill_prefetch = RegInit(false.B)
+  when (tshr_enter) {
+    rrip_update := rrip_update_next
+    rrip_prefetch := rrip_hint
+  }
+  when (tshr_alloc) {
+    rrip_refill_prefetch := rrip_hint
   }
 
   // TSHR payloads
@@ -798,11 +795,22 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
   proxyDir.io.meta_modified := meta_modified
   proxyDir.io.tag_modify := tag_modify
   proxyDir.io.tag_modified := tag_modified
+  proxyDir.io.rrip_update := rrip_update
+  proxyDir.io.rrip_prefetch := rrip_prefetch
+  proxyDir.io.rrip_refill_prefetch := rrip_refill_prefetch
 
-  // DRRIP release train, DirRel path: validated commit pulse from the EVT
-  // vPipe into the proxy's dedicated DirRel FSM (both ports elaborated only
-  // when the DirRel path is enabled).
   proxyDir.io.repl_release.zip(vPipeEVT.io.tshr_repl_release).foreach { case (in, out) => in := out }
+  proxyDir.io.repl_way.zip(vPipeEVT.io.tshr_repl_way).foreach { case (in, out) => in := out }
+
+  // Local meta is the latest copy for this address. Capture release provenance
+  // in the proxy, then mark it consumed locally without forcing a DirWb. The
+  // validity indicator is the live proxy output, never a TSHR-side register.
+  vPipeEVT.io.tshr_repl_release.foreach { release =>
+    when (release && (proxyDir.io.rd_done || meta_modified.pfSource)) {
+      meta.pfSource := 0.U
+      meta.cdpPfDepth := 0.U
+    }
+  }
 
   rbeEVT.io.directoryReadDone := proxyDir.io.rd_done
   rbeSNP.io.directoryReadDone := proxyDir.io.rd_done
@@ -819,7 +827,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
   meta_commit_valid := proxyDir.io.wb_accept
 
   meta_valid := proxyDir.io.rd_done
-  tshr_wb_done_dir := proxyDir.io.wb_done
+  tshr_wb_done_dir := proxyDir.io.wb_done && proxyDir.io.rel_idle
 
   // Data Storage Proxy
   val proxyDS = Module(new L2TSHRDataStorageProxy(tshrId))

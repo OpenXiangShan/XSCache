@@ -175,6 +175,10 @@ object L2Directory {
     val META = new L2Directory.Meta // only applicable for DirWb
     val META_WEN = new L2Directory.MetaWriteMask // only applicable for DirWb
     val TAG_WEN = Bool()
+    val RRIP_UPDATE = Bool()
+    val RRIP_PREFETCH = Bool()
+    val RRIP_REFILL_PREFETCH = Bool()
+    val RRIP_LOCAL_VALID = Bool()
   }
 
   class PathFromDirectoryUOPs extends Bundle {
@@ -299,18 +303,6 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     val toDir   = Input(Vec(nMSHR, new L2Directory.PathToDirectory))
     val fromDir = Output(Vec(nMSHR, new L2Directory.PathFromDirectory))
     val tshrIdle = Input(Vec(nMSHR, Bool()))
-    // DRRIP release-type update, entrance path: WayValid EVT entrance train,
-    // reduced one-hot from the TSHRs (at most one EVT entrance per cycle per
-    // slice by allocator construction; see L2TSHRAlloc assertions).
-    // Elaborated only when the entrance path is enabled.
-    val evtRelTrain = if (paramL2.enableDRRIPEntranceReleaseUpdate) {
-      Some(Input(Valid(new Bundle {
-        val set = UInt(setBits.W)
-        val way = UInt(wayBits.W)
-      })))
-    } else {
-      None
-    }
     val debugStateWrite = if (enableDirStateProbe) {
       Some(Output(new Bundle {
         val valid = Bool()
@@ -379,6 +371,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val sets = paramL2.sets
   val ways = paramL2.ways
   val useDRRIP = paramL2.replacement == "drrip"
+  val rrip = if (useDRRIP) Some(new OceanusDRRIP(ways)) else None
   require(paramL2.replacement == "plru" || useDRRIP,
     s"Directory: unknown replacement policy '${paramL2.replacement}'")
   require(isPow2(ways) && ways >= 2,
@@ -453,6 +446,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
 
   // replStall (declared as wire; driven after S2/S3 regs exist)
   val replStall = Wire(Bool())
+  val releasePortBusy = Wire(Bool())
 
   // starvation counters for Level-2 groups
   val ageWb = RegInit(0.U(4.W))
@@ -467,7 +461,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     wbWinsAge)
 
   // ReplRd preempts Level-2 unless a Level-2 group is starved or replStall
-  val replRdWins = anyReplRd && !anyStarved && !replStall
+  val replRdWins = anyReplRd && !anyStarved && !replStall && !releasePortBusy
 
   // round-robin pointers
   val rrReplRd = RegInit(0.U(idxW.W))
@@ -490,8 +484,8 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val winDirRd  = roundRobinNext(rrDirRd,  dirRdVec.asUInt,  nMSHR)
 
   val grantReplRd = replRdWins  && anyReplRd
-  val grantDirWb  = !replRdWins && anyLevel2 &&  level2WinIsWb && anyDirWb
-  val grantDirRd  = !replRdWins && anyLevel2 && !level2WinIsWb && anyDirRd
+  val grantDirWb  = !releasePortBusy && !replRdWins && anyLevel2 &&  level2WinIsWb && anyDirWb
+  val grantDirRd  = !releasePortBusy && !replStall && !replRdWins && anyLevel2 && !level2WinIsWb && anyDirRd
 
   val winIdx   = Mux(grantReplRd, winReplRd, Mux(grantDirWb, winDirWb, winDirRd))
   val anyGrant = grantReplRd || grantDirWb || grantDirRd
@@ -505,22 +499,29 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   ageWb := Mux(grantDirWb, 0.U, incrCapped(ageWb, anyDirWb))
   ageRd := Mux(grantDirRd, 0.U, incrCapped(ageRd, anyDirRd))
 
-  // ══════════════════════════════════════════════════════════════════
-  // DirRel arbiter — FULLY SEPARATE from the DirRd/DirWb/ReplRd arbiter
-  // ══════════════════════════════════════════════════════════════════
-  val dirRelPath = if (paramL2.enableDRRIPReleaseUpdate) {
-    val relVec = VecInit(io.toDir.map(_.DirRel))
-    val anyRel = relVec.asUInt.orR && !initActive
-    val rrRel  = RegInit(0.U(idxW.W))
-    val winRel = roundRobinNext(rrRel, relVec.asUInt, nMSHR)
-    when(anyRel) { rrRel := winRel }
-    Some((anyRel, io.toDir(winRel), winRel))
-  } else {
-    None
+  // A release reads the persistent source for WayValid entrants that have no
+  // local Meta. Hold the single array port through atomic source/depth clear.
+  val relVec = VecInit(io.toDir.map(x => x.DirRel && enableRRIPReleaseUpdate.B))
+  val rrRel = RegInit(0.U(idxW.W))
+  val preferRel = RegInit(true.B)
+  val relPending = RegInit(false.B)
+  val relReq = Reg(new L2Directory.PathToDirectory)
+  val relWin = roundRobinNext(rrRel, relVec.asUInt, nMSHR)
+  val dirRelRead = relVec.asUInt.orR && !initActive && !relPending && !replStall &&
+    (preferRel || !(anyReplRd || anyLevel2))
+  val dirRelGrant = relPending
+  val dirRelReq = relReq
+  val dirRelWin = relReq.TSHRID
+  val relBusy = dirRelRead || relPending
+  releasePortBusy := relBusy
+  when (dirRelRead) {
+    relReq := io.toDir(relWin)
+    relPending := true.B
+    rrRel := relWin
+    preferRel := false.B
   }
-  val dirRelGrant = dirRelPath.map(_._1).getOrElse(false.B)
-  val dirRelReq   = dirRelPath.map(_._2).getOrElse(0.U.asTypeOf(new L2Directory.PathToDirectory))
-  val dirRelWin   = dirRelPath.map(_._3).getOrElse(0.U(idxW.W))
+  when (relPending) { relPending := false.B }
+  when (anyGrant) { preferRel := true.B }
 
   // ══════════════════════════════════════════════════════════════════
   // S1: decode the arbitration winner
@@ -533,7 +534,8 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val reqSet = winReq.PADDR(offsetBits + setBits - 1, offsetBits)
   val reqTag = winReq.PADDR(paramL2.physicalAddrWidth - 1, offsetBits + setBits)
 
-  val dirReadData_s2 = dirArray.io.r(isRead, reqSet).resp.data
+  val relReadSet = io.toDir(relWin).PADDR(offsetBits + setBits - 1, offsetBits)
+  val dirReadData_s2 = dirArray.io.r(isRead || dirRelRead, Mux(dirRelRead, relReadSet, reqSet)).resp.data
   val replState_s1   = replRegs(reqSet)
 
   // ── S1 → S2 ───────────────────────────────────────────────────────
@@ -545,6 +547,10 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val s2_tag     = RegNext(reqTag,        0.U)
   val s2_repl    = RegNext(replState_s1,  0.U)
 
+  val s2_rrip_update = RegNext(winReq.RRIP_UPDATE, false.B)
+  val s2_rrip_prefetch = RegNext(winReq.RRIP_PREFETCH, false.B)
+  val s2_rrip_refill_prefetch = RegNext(winReq.RRIP_REFILL_PREFETCH, false.B)
+
   // ── S2 → S3 ───────────────────────────────────────────────────────
   val s3_valid   = RegNext(s2_valid,   false.B)
   val s3_isRepl  = RegNext(s2_isRepl,  false.B)
@@ -553,6 +559,10 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val s3_set     = RegNext(s2_set,     0.U)
   val s3_tag     = RegNext(s2_tag,     0.U)
   val s3_repl    = RegNext(s2_repl,    0.U)
+
+  val s3_rrip_update = RegNext(s2_rrip_update, false.B)
+  val s3_rrip_prefetch = RegNext(s2_rrip_prefetch, false.B)
+  val s3_rrip_refill_prefetch = RegNext(s2_rrip_refill_prefetch, false.B)
 
   // ══════════════════════════════════════════════════════════════════
   // DirWb: bitmask partial write at S1
@@ -570,11 +580,16 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   wbMask.meta.cdpPfDepth := Fill(2, winReq.META_WEN.pfSource)
   wbMask.meta.clients.zip(winReq.META_WEN.clients).foreach { case (m, w) => m := w }
 
-  val dirWriteValid = initActive || isDirWb
-  val dirWriteEntry = Mux(initActive, initEntry, wbEntry)
-  val dirWriteSet = Mux(initActive, initSet, reqSet)
-  val dirWriteWayMask = Mux(initActive, initWayMask, UIntToOH(winReq.WAY(wayBits - 1, 0), ways))
-  val dirWriteBitMask = Mux(initActive, initMask.asUInt, wbMask.asUInt)
+  val relClearMask = WireDefault(0.U.asTypeOf(new L2Directory.DirEntry))
+  relClearMask.meta.pfSource := Fill(L2PfSource.Width, true.B)
+  relClearMask.meta.cdpPfDepth := Fill(2, true.B)
+  val relSet = dirRelReq.PADDR(offsetBits + setBits - 1, offsetBits)
+  val relWay = dirRelReq.WAY
+  val dirWriteValid = initActive || isDirWb || dirRelGrant
+  val dirWriteEntry = Mux(initActive, initEntry, Mux(dirRelGrant, 0.U.asTypeOf(wbEntry), wbEntry))
+  val dirWriteSet = Mux(initActive, initSet, Mux(dirRelGrant, relSet, reqSet))
+  val dirWriteWayMask = Mux(initActive, initWayMask, UIntToOH(Mux(dirRelGrant, relWay, winReq.WAY), ways))
+  val dirWriteBitMask = Mux(initActive, initMask.asUInt, Mux(dirRelGrant, relClearMask.asUInt, wbMask.asUInt))
 
   dirArray.io.w(
     valid   = dirWriteValid,
@@ -632,7 +647,10 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
                    else          PLRU4.getReplaceWay(s3_repl(PLRU4.nBits - 1, 0))
   val chosenWay  = Mux(hasInvalid, invalidWay, replWay)
 
-  val victimMask_s3 = freeWayMask_s3
+  val currentFreeWayMask_s3 = ~VecInit((0 until ways).map { w =>
+    VecInit(lockTable.map(e => e.valid && e.set === s3_set && e.way === w.U)).asUInt.orR
+  }).asUInt
+  val victimMask_s3 = freeWayMask_s3 & currentFreeWayMask_s3
 
   val victimWay  = Mux(victimMask_s3(chosenWay), chosenWay, PriorityEncoder(victimMask_s3))
   val replRetry  = s3_valid && s3_isRepl && !victimMask_s3.orR
@@ -649,22 +667,51 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
       "Directory: read response entry is Invalid but carries client presence")
   }
 
-  val replWen = (s3_valid && s3_isDirRd && hit_s3) ||
-                (s3_valid && s3_isRepl && !replRetry)
-  // Next replacement state, policy-selected at elaboration: DRRIP promotes
-  // on hit and inserts-at-0 with aging on valid eviction; PLRU marks the
-  // touched way MRU. A DirRd miss and a retried ReplRd never update.
+  val updateRefill = s3_valid && s3_isRepl && !replRetry
+  val replWen = (s3_valid && s3_isDirRd && hit_s3 && s3_rrip_update) || updateRefill
+  val rrip_way_oh = UIntToOH(way_s3, ways)
+  val rrip_prefetch = Mux(s3_isRepl, s3_rrip_refill_prefetch, s3_rrip_prefetch)
+  val rrip_req_type = Cat(originBits(s3_set)(way_s3), false.B, rrip_prefetch, s3_isRepl)
+  val psel = if (useDRRIP) Some(RegInit(512.U(10.W))) else None
+  def rrip_match_a(set: UInt): Bool = {
+    val halfSetBits = setBits >> 1
+    set(setBits - 1, halfSetBits) === set(setBits - halfSetBits - 1, 0)
+  }
+  def rrip_match_b(set: UInt): Bool = {
+    val halfSetBits = setBits >> 1
+    set(setBits - 1, halfSetBits) === (~set(setBits - halfSetBits - 1, 0))
+  }
+  def rrip_policy_for_set(set: UInt): Bool = {
+    if (useDRRIP) {
+      Mux(rrip_match_a(set), false.B, Mux(rrip_match_b(set), true.B, psel.get(9)))
+    } else {
+      false.B
+    }
+  }
+  if (useDRRIP) {
+    when(updateRefill && rrip_match_a(s3_set) && !hit_s3 && (psel.get =/= 1023.U)) {
+      psel.get := psel.get + 1.U
+    }.elsewhen(updateRefill && rrip_match_b(s3_set) && !hit_s3 && (psel.get =/= 0.U)) {
+      psel.get := psel.get - 1.U
+    }
+  }
+  val rrip_policy = rrip_policy_for_set(s3_set)
+  def releaseNextState(base: UInt, set: UInt, way: UInt, origin: Bool, prefetch: Bool): UInt = {
+    if (enableRRIPReleaseUpdate) {
+      val reqType = Cat(origin, true.B, prefetch, false.B)
+      val wayOH = UIntToOH(way, ways)
+      if (useDRRIP) {
+        rrip.get.get_next_state(base, wayOH, true.B, false.B, rrip_policy_for_set(set), reqType)
+      } else {
+        0.U(replBits.W)
+      }
+    } else {
+      0.U(replBits.W)
+    }
+  }
   val replNextState = Wire(UInt(replBits.W))
   if (useDRRIP) {
-    // Aging applies only when the actually-selected victim held a valid
-    // line (a real eviction); filling an Invalid slot does not age. The
-    // actual victim entry is used (not hasInvalid): the lock-mask fallback
-    // in victimWay can divert the pick from an Invalid candidate to a
-    // valid way.
-    val victimHoldsValid = entry_s3.meta.state =/= L2Directory.MetaState.I
-    replNextState := Mux(s3_isDirRd,
-      DRRIP.getNextStateHit(s3_repl, way_s3, ways),
-      DRRIP.getNextStateRefill(s3_repl, way_s3, victimHoldsValid, ways))
+    replNextState := rrip.get.get_next_state(s3_repl, rrip_way_oh, s3_isDirRd, hasInvalid, rrip_policy, rrip_req_type)
   } else {
     replNextState := PLRU4.getNextState(s3_repl(PLRU4.nBits - 1, 0), way_s3).pad(replBits)
   }
@@ -681,35 +728,15 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     }
   }
 
-  // ── DRRIP release-type updates via the EVT channel ─────────────────────
-  // Two fully separate, individually switched delivery paths (L2Params),
-  // each elaborated only when its switch is on:
-  //   entrance: a WayValid EVT entrance trains immediately (evtRelTrain input,
-  //             reduced one-hot from the TSHRs — at most one EVT entrance per
-  //             cycle per slice by allocator construction). WayValid-entered
-  //             episodes ONLY ever use this path (or none when disabled).
-  //   DirRel:   an arbitrated op issued by the proxy's dedicated DirRel FSM
-  //             at the EVT vPipe's validated commit, granted by the SEPARATE
-  //             DirRel arbiter above and applied at its grant cycle. It never
-  //             rides, shares, or disturbs the DirRd/DirWb/ReplRd paths.
-  // Both blocks sit after the S3 replWen block so they win same-edge ties
-  // (DirRel last of all); an in-flight S2 pipeline writer landing a cycle
-  // later can still clobber a train — the same race class this design already
-  // tolerates between concurrent DirRd-hit updates (best-effort heuristic
-  // state, not architectural), accepted deliberately.
-  io.evtRelTrain.foreach { t =>
-    val entRelFire = t.valid && useDRRIP.B && !initActive
-    when(entRelFire) {
-      replRegs(t.bits.set) := DRRIP.getNextStateRelease(replRegs(t.bits.set), t.bits.way, originBits(t.bits.set)(t.bits.way), ways)
-      originBits(t.bits.set) := originBits(t.bits.set) | UIntToOH(t.bits.way, ways)
-    }
-    XSPerfAccumulate("repl_rel_upd_ent", entRelFire)
-  }
+  // A drained R/W pair preserves FF RAW ordering and clears provenance at W.
+  // When a TSHR has newer local Meta use its captured source; otherwise use
+  // persistent Directory Meta (WayValid entrance can skip the initial DirRd).
   val dirRelFire = dirRelGrant && useDRRIP.B
-  when(dirRelFire) {
-    val relSet = dirRelReq.PADDR(offsetBits + setBits - 1, offsetBits)
-    val relWay = dirRelReq.WAY(wayBits - 1, 0)
-    replRegs(relSet) := DRRIP.getNextStateRelease(replRegs(relSet), relWay, originBits(relSet)(relWay), ways)
+  val relSource = Mux(dirRelReq.RRIP_LOCAL_VALID, dirRelReq.META.pfSource,
+    dirReadData_s2(relWay).meta.pfSource)
+  when (dirRelFire) {
+    replRegs(relSet) := releaseNextState(replRegs(relSet), relSet, relWay,
+      originBits(relSet)(relWay), relSource =/= 0.U)
     originBits(relSet) := originBits(relSet) | UIntToOH(relWay, ways)
   }
 
