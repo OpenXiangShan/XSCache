@@ -244,15 +244,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val p_hit_lock_way = Reg(UInt(wayBits.W))
 
-  io.repl_lock_req := rxreq_fire && rxreq_hit_lock_accept
-  io.repl_lock_way := Mux(rxreq_fire, dirResult.way, p_hit_lock_way)
-
-  when (rxreq_fire) {
-    when (rxreq_hit_lock_accept) {
-      p_hit_lock_way := dirResult.way
-    }
-  }
-
   val p_prefill_miss = RegInit(false.B)
   val p_prefill_hit = RegInit(false.B)
   val p_prefill_any = p_prefill_miss || p_prefill_hit
@@ -402,16 +393,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val w_hit_lock_release = RegInit(false.B) // Waiting for allocating response and final meta-only Directory Write-Back to release hit-way reservation
   val s_hit_lock_release = RegInit(false.B) // Scheduling hit-way reservation release with final meta-only Directory Write-Back
-
-  io.repl_lock_release := w_hit_lock_release && s_hit_lock_release
-
-  when (rxreq_fire) {
-    w_hit_lock_release := rxreq_hit_lock_accept
-    s_hit_lock_release := false.B
-  }
-
-  assert(!(p_prefill_hit && w_hit_lock_release),
-    "REQ vPipe conflict-hit prefill unexpectedly owns a hit-lock")
 
   val w_s_evict_up_evict = RegInit(false.B) // Waiting to schedule local eviction RXREQ EvictBack
   val s_evict_up_evict = RegInit(false.B) // Scheduling local eviction RXREQ EvictBack
@@ -1883,6 +1864,25 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   io.repl_en := s_repl
   io.repl_reset := rxreq_fire
+
+  io.repl_lock_req := rxreq_fire && rxreq_hit_lock_accept
+  io.repl_lock_way := Mux(rxreq_fire, dirResult.way, p_hit_lock_way)
+
+  io.repl_lock_release := w_hit_lock_release && s_hit_lock_release
+
+  when (rxreq_fire) {
+    when (rxreq_hit_lock_accept) {
+      p_hit_lock_way := dirResult.way
+    }
+  }
+
+  when (rxreq_fire) {
+    w_hit_lock_release := rxreq_hit_lock_accept
+    s_hit_lock_release := false.B
+  }
+
+  assert(!(p_prefill_hit && w_hit_lock_release),
+    "REQ vPipe conflict-hit prefill unexpectedly owns a hit-lock")
 
   io.dir_wb_locked := w_unlock_dir
   io.ds_wb_locked := w_unlock_ds
