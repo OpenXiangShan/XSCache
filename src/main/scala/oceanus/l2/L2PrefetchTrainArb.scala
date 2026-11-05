@@ -4,7 +4,7 @@ package oceanus.l2
 
 import chisel3._
 import chisel3.util._
-import utility.FastArbiter
+import utility.{FastArbiter, XSPerfAccumulate, XSPerfReference}
 import org.chipsalliance.cde.config.Parameters
 
 object L2PrefetchTrainSelect {
@@ -33,10 +33,18 @@ class L2PrefetchTrainArb(inputs: Int, sideband: Boolean, buffered: Boolean = fal
       queues(i).io.enq.valid := L2PrefetchTrainSelect.enabled(source)
       queues(i).io.enq.bits := source.bits
       sink <> queues(i).io.deq
+      XSPerfAccumulate(s"slice${i}_train_queue_enq", queues(i).io.enq.fire)
+      XSPerfAccumulate(s"slice${i}_train_queue_drop", queues(i).io.enq.valid && !queues(i).io.enq.ready)
+      XSPerfAccumulate(s"slice${i}_train_arb_unselected", sink.valid && !sink.ready)
+      XSPerfReference(s"slice${i}_train_pending", queues(i).io.count)
+
     } else {
       sink.valid := L2PrefetchTrainSelect.enabled(source)
       sink.bits := source.bits
     }
   }
   io.out <> arb.io.out
+  // In buffered mode these are waiting service opportunities, not losses.
+  XSPerfAccumulate("slice_train_arb_unselected", PopCount(arb.io.in.map(_.valid)) - arb.io.out.valid.asUInt)
+  XSPerfAccumulate("slice_train_arb_fire", arb.io.out.fire)
 }

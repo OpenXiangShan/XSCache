@@ -380,6 +380,10 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     learner.io.train.valid := input.io.deq.valid
     learner.io.train.bits := input.io.deq.bits.paddr
     input.io.deq.ready := learner.io.train.ready
+    XSPerfAccumulate("pbop_train_raw", input.io.enq.valid)
+    XSPerfAccumulate("pbop_train_accept", input.io.enq.fire)
+    XSPerfAccumulate("pbop_train_drop", input.io.enq.valid && !input.io.enq.ready)
+    XSPerfReference("pbop_train_pending", input.io.count)
     input
   }
   bopTrainArb.io.out.ready := true.B
@@ -412,6 +416,33 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       vbopStub.foreach { learner =>
         counts.io.accepted(1)(source) := learner.io.trainAccepted && selectedOrigin === entry.nid.U
       }
+      // Snapshot original R10 registers; per-cycle deltas respect perf.clean.
+      for ((name, row) <- Seq("pbop" -> 0, "vbop" -> 1, "cdp_vpn" -> 2, "cdp_filter" -> 3)) {
+        val raw = counts.io.total(row)(source)
+        val accepted = counts.io.accepted(row)(source).asUInt
+        XSPerfAccumulate(s"r10_${name}_src${entry.nid}_raw", raw)
+        XSPerfAccumulate(s"r10_${name}_src${entry.nid}_accepted", accepted)
+        XSPerfAccumulate(s"r10_${name}_src${entry.nid}_gap", raw.pad(64) - accepted.pad(64))
+        XSPerfReference(s"r10_${name}_src${entry.nid}_raw_lifetime", counts.io.totals(row)(source))
+        XSPerfReference(s"r10_${name}_src${entry.nid}_accepted_lifetime", counts.io.accepts(row)(source))
+        XSPerfReference(s"r10_${name}_src${entry.nid}_dropped_lifetime", counts.io.drops(row)(source))
+      }
+      val localSelected = PopCount(slices.map(s => s.io.bopTrain.valid &&
+        (s.io.bopTrain.bits.sourceId.get >> p(xscache.oceanus.compactchi.CCHIParametersKey).TxnID_Width) === entry.nid.U))
+      val sliceAdmissions = PopCount(bopTrainArb.queues.map(q => q.io.enq.fire &&
+        (q.io.enq.bits.sourceId.get >> p(xscache.oceanus.compactchi.CCHIParametersKey).TxnID_Width) === entry.nid.U))
+      val pending = PopCount(bopTrainArb.queues.map(q => q.io.deq.valid &&
+        (q.io.deq.bits.sourceId.get >> p(xscache.oceanus.compactchi.CCHIParametersKey).TxnID_Width) === entry.nid.U))
+      val broadcast = bopTrainArb.io.out.fire && selectedOrigin === entry.nid.U
+      XSPerfAccumulate(s"r10_bop_src${entry.nid}_disabled_or_local_drop", rawBop - localSelected)
+      XSPerfAccumulate(s"r10_bop_src${entry.nid}_slice_queue_drop", localSelected - sliceAdmissions)
+      XSPerfReference(s"r10_bop_src${entry.nid}_slice_pending", pending)
+      for ((name, row, exists) <- Seq(("pbop", 0, bop.nonEmpty), ("vbop", 1, vbopStub.nonEmpty))) {
+        val inputDrop = broadcast && !counts.io.accepted(row)(source)
+        XSPerfAccumulate(s"r10_${name}_src${entry.nid}_input_drop", inputDrop)
+        XSPerfAccumulate(s"r10_${name}_src${entry.nid}_physical_drop",
+          rawBop - sliceAdmissions + inputDrop.asUInt)
+      }
       cdp.foreach { learner =>
         val events = cdpEvents.get
         counts.io.accepted(2)(source) := learner.io.vpnTrainAccepted && origins(events.io.vpnChoice) === entry.nid.U
@@ -421,6 +452,10 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     }
     val victimBucket = config.upstream.entries.size
     counts.io.total(3)(victimBucket) := PopCount(evictRaw.map(_.valid))
+    XSPerfAccumulate("r10_cdp_filter_victim_raw", counts.io.total(3)(victimBucket))
+    XSPerfAccumulate("r10_cdp_filter_victim_accepted", counts.io.accepted(3)(victimBucket))
+    XSPerfAccumulate("r10_cdp_filter_victim_dropped", counts.io.total(3)(victimBucket) - counts.io.accepted(3)(victimBucket).asUInt)
+    XSPerfReference("r10_cdp_filter_victim_dropped_lifetime", counts.io.drops(3)(victimBucket))
     cdp.foreach { learner =>
       counts.io.accepted(3)(victimBucket) := learner.io.filterTrainAccepted &&
         cdpEvents.get.io.filterChoice >= cdpRaw.size.U
