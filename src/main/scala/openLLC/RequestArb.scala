@@ -116,7 +116,11 @@ class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo wi
     Cat(respInfo.map(e => e.valid && e.bits.reqID === reqID_s1)).orR ||
     (inflight_response +& potential_response) >= mshrs.response.U
   )
+  val snoopAddrConflict = Cat(snpInfo.map(e =>
+    e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag_s1, set_s1)
+  )).orR
   val blockBySnp = !task_s1.bits.refillTask && (
+    snoopAddrConflict ||
     Cat(snpInfo.map(e => e.valid && e.bits.reqID === reqID_s1)).orR ||
     (inflight_snoop +& potential_snoop) >= mshrs.snoop.U
   )
@@ -128,10 +132,14 @@ class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo wi
     Cat(memInfo.map(e => e.valid && e.bits.reqID === reqID_s1 && !task_s1.bits.refillTask)).orR ||
     (inflight_memAccess +& potential_memAccess) >= mshrs.memory.U
 
-  val blockEntrance = blockByMainPipe || blockByRefill || blockByResp || blockByMem
+  val blockEntrance = blockByMainPipe || blockByRefill || blockByResp || blockBySnp || blockByMem
 
   task_s1.valid := io.dirRead_s1.ready && (io.busTask_s1.valid || io.refillTask_s1.valid) && !blockEntrance
   task_s1.bits := Mux(io.refillTask_s1.valid, io.refillTask_s1.bits, io.busTask_s1.bits)
+  when(task_s1.valid && !task_s1.bits.refillTask) {
+    assert(!snoopAddrConflict,
+      "a request must not enter Directory while a same-address snoop is in flight")
+  }
 
   io.busTask_s1.ready := io.dirRead_s1.ready && !io.refillTask_s1.valid && !blockEntrance
   io.refillTask_s1.ready := io.dirRead_s1.ready && !blockEntrance

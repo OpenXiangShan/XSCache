@@ -1540,7 +1540,11 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
       buf.io.enq(j).bits := req.bits
 
       if (j > 0) {
-        buf.io.enq(j).bits.pfVAddr := req.bits.pfVAddr + (j * blockBytes).U
+        // Keep the byte offset and address-width wrap semantics, but compute
+        // carries between small address chunks with a parallel prefix. A
+        // full-width constant add otherwise becomes a long increment chain.
+        buf.io.enq(j).bits.pfVAddr :=
+          BOPAddressAdd(req.bits.pfVAddr, j.S, log2Ceil(blockBytes))
       }
     }
 

@@ -42,7 +42,9 @@ class RXREQ (implicit p: Parameters) extends LLCModule {
     * +----------------+---------------------------+  
     *
     */
-  val id_pool = RegInit(0.U((TXNID_WIDTH - bankBits - 1).W))
+  // Reserve the bit below SliceID for SnoopUnit's independent writebacks.
+  // Normal requests must never enter that namespace when id_pool advances.
+  val id_pool = RegInit(0.U((TXNID_WIDTH - bankBits - 2).W))
   when(io.task.fire) {
     id_pool := id_pool + 1.U // maybe fail if in-flight transactions exceed (256/banks) ?
   }
@@ -60,7 +62,7 @@ class RXREQ (implicit p: Parameters) extends LLCModule {
     task.off := off
     task.size := r.size
     task.refillTask := false.B
-    task.reqID := Cat(0.U(1.W), bank, id_pool)
+    task.reqID := Cat(0.U(1.W), bank, 0.U(1.W), id_pool)
     // this follows TaskBundle.toCHIReqBundle
     task.tgtID := r.tgtID
     task.srcID := r.srcID

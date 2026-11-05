@@ -176,7 +176,7 @@ class LCredit2Decoupled[T <: Bundle](
   XSPerfAccumulate("accept", accept)
 
   if (blocking) {
-    val queue = Module(new Queue(gen.cloneType, entries = lcreditNum, pipe = true, flow = false))
+    val queue = Module(new Queue(gen.cloneType, entries = lcreditNum, pipe = false, flow = false))
 
     lcreditOut := (lcreditPool > queue.io.count) && enableLCredit
 

@@ -33,6 +33,10 @@ class GrantStatus(implicit p: Parameters) extends L2Bundle {
 
 class ProbeEntry(implicit p: Parameters) extends L2Bundle {
   val valid = Bool()
+  // Queue enqueue is only a registered transport handoff; keep the probe
+  // entry owned until the external B channel accepts the packet.
+  val sent = Bool()
+  val checked = Bool()
   val rdy   = Bool()
   val waitG = UInt(sourceIdBits.W) // grantEntry probe is waiting for, sourceId as Idx
   val task  = new SourceBReq()
@@ -74,12 +78,9 @@ class SourceB(implicit p: Parameters) extends L2Module {
 
   // comparing with #sourceIdAll entries might have timing issues
   // but worry not, we can delay cycles cuz not critical
-  val conflictMask = io.grantStatus.map(s =>
-    s.valid && s.set === io.task.bits.set && s.tag === io.task.bits.tag
-  )
-  val conflict     = Cat(conflictMask).orR
-
   val noReadyEntry = Wire(Bool())
+  val queuedOwner = RegInit(0.U(log2Ceil(entries).W))
+  val queuedValid = RegInit(false.B)
 
   /* ======== Alloc ======== */
   io.task.ready   := !full
@@ -89,10 +90,11 @@ class SourceB(implicit p: Parameters) extends L2Module {
   when(alloc) {
     val p = probes(insertIdx)
     p.valid := true.B
-    p.rdy   := !conflict
-    p.waitG := OHToUInt(conflictMask)
+    p.sent := false.B
+    p.checked := false.B
+    p.rdy   := false.B
+    p.waitG := 0.U
     p.task  := io.task.bits
-    assert(PopCount(conflictMask) <= 1.U)
   }
 
   /* ======== Issue ======== */
@@ -100,25 +102,50 @@ class SourceB(implicit p: Parameters) extends L2Module {
   ArbPerf(issueArb, "issueArb")
   issueArb.io.in zip probes foreach{
     case (i, p) =>
-      i.valid := p.valid && p.rdy
+      i.valid := p.valid && !p.sent && p.checked && p.rdy
       i.bits  := p.task
       when(i.fire) {
-        p.valid := false.B
+        // Keep the owner occupied while the registered output slot waits
+        // for an external B handshake.
+        p.sent := true.B
       }
   }
-  issueArb.io.out.ready := io.sourceB.ready
+  val sourceBQueue = Module(new Queue(new TLBundleB(edgeIn.bundle), entries = 1,
+    pipe = false, flow = false))
+  sourceBQueue.io.enq.valid := issueArb.io.out.valid
+  sourceBQueue.io.enq.bits := toTLBundleB(issueArb.io.out.bits)
+  issueArb.io.out.ready := sourceBQueue.io.enq.ready
+  when(issueArb.io.out.fire) {
+    queuedOwner := PriorityEncoder(VecInit(issueArb.io.in.map(_.fire)))
+    queuedValid := true.B
+  }
+  when(io.sourceB.fire && queuedValid) {
+    probes(queuedOwner).valid := false.B
+    probes(queuedOwner).sent := false.B
+    queuedValid := false.B
+  }
   noReadyEntry := !issueArb.io.out.valid
 
   /* ======== Update rdy ======== */
   probes foreach { p =>
-    when(p.valid && !io.grantStatus(p.waitG).valid) {
+    // SourceB already owns the full task after io.task.fire. Check the
+    // registered address on the following cycle so source arbitration and
+    // the Grant CAM are separated without advancing the source's fire.
+    val conflictMask = io.grantStatus.map(s =>
+      s.valid && s.set === p.task.set && s.tag === p.task.tag
+    )
+    when(p.valid && !p.sent && !p.checked) {
+      p.checked := true.B
+      p.rdy := !Cat(conflictMask).orR
+      p.waitG := OHToUInt(conflictMask)
+      assert(PopCount(conflictMask) <= 1.U)
+    }.elsewhen(p.valid && !p.sent && p.checked && !io.grantStatus(p.waitG).valid) {
       p.rdy := RegNext(true.B) // cuz GrantData has 2 beats, can move RegNext elsewhere
     }
   }
 
   /* ======== Output ======== */
-  io.sourceB.valid := issueArb.io.out.valid
-  io.sourceB.bits  := toTLBundleB(issueArb.io.out.bits)
+  io.sourceB <> sourceBQueue.io.deq
 
   /* ======== Perf ======== */
   for(i <- 0 until entries){

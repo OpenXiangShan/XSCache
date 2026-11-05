@@ -34,12 +34,14 @@ class ReqEntry(entries: Int = 4)(implicit p: Parameters) extends L2Bundle() {
   val timer    = UInt(timestampBits.W) // for prefetch controller analysis
 
   /* blocked by MainPipe
-  * [3] by stage1, a same-set entry just fired
-  * [2] by stage2
-  * [1] by stage3
+  * [5] by stage1 at entry allocation
+  * [4] by stage2 / a same-set entry just fired
+  * [3] by result capture
+  * [2] by decision
+  * [1] by stage3 apply
   * [0] block release flag
   */
-  val waitMP  = UInt(4.W)
+  val waitMP  = UInt(6.W)
 
   /* which MSHR the entry is waiting for
   * We need to compare req.tag AND dirResult.tag (if replacement)
@@ -50,6 +52,17 @@ class ReqEntry(entries: Int = 4)(implicit p: Parameters) extends L2Bundle() {
   * (3) when MSHR is free
   * */
   val waitMS  = UInt(mshrsAll.W)
+
+  /* Split of waitMS by conflict kind (assigned at alloc alongside waitMS):
+  * waitMSReq: conflict via the MSHR's own request line (reqTag). Clears when
+  *   the MSHR's deferred refill commit has landed (refillCommitPending=0) --
+  *   the Directory/DS state of that line is then final, so a follow-up no
+  *   longer needs to wait for the MSHR to fully retire.
+  * waitMSVic: conflict via the MSHR's chosen victim (metaTag && needRelease).
+  *   Clears only at willFree, as before.
+  * */
+  val waitMSReq = UInt(mshrsAll.W)
+  val waitMSVic = UInt(mshrsAll.W)
 
   /* buffer_dep_mask[i][j] => entry i should wait entry j
   *   this is used to make sure that same set requests will be sent
@@ -75,13 +88,17 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     val in          = Flipped(DecoupledIO(new TaskBundle))
     val out         = DecoupledIO(new TaskBundle)
     val mshrInfo  = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo)))
+    // A live snoop owns its address independently of the paired normal MSHR.
+    // Keep it visible here so queued A requests do not pass a toN snoop while
+    // its Directory update or response is still in flight.
+    val snoopInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo)))
     val aMergeTask = ValidIO(new AMergeTask)
-    val mainPipeBlock = Input(Vec(2, Bool()))
+    val mainPipeBlock = Input(Vec(4, Bool()))
     /* Snoop task from arbiter at stage 2 */
     val taskFromArb_s2 = Flipped(ValidIO(new TaskBundle()))
 
     /* status of s2 and s3 */
-    val pipeStatusVec = Flipped(Vec(2, ValidIO(new PipeStatus)))
+    val pipeStatusVec = Flipped(Vec(3, ValidIO(new PipeStatus)))
 
     val ATag        = Output(UInt(tagBits.W))
     val ASet        = Output(UInt(setBits.W))
@@ -95,15 +112,22 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     val hasMergeA = Output(Bool())
   })
 
+  // A real input FIFO promises storage from local registered occupancy.
+  // Owner conflict/merge/prefetch searches operate on its retained head and
+  // cannot propagate through SinkA.ready to the upstream TileLink channel.
+  val ingress = Module(new Queue(new TaskBundle, entries = 2, pipe = false, flow = false))
+  ingress.io.enq <> io.in
+  val admitted = ingress.io.deq
+
   /* ======== Data Structure ======== */
 
-  io.ATag := io.in.bits.tag
-  io.ASet := io.in.bits.set
+  io.ATag := admitted.bits.tag
+  io.ASet := admitted.bits.set
 
   val buffer = RegInit(VecInit(Seq.fill(entries)(0.U.asTypeOf(new ReqEntry))))
   val issueArb = Module(new TwoLevelRRArbiter(new ReqEntry, entries))
   ArbPerf(issueArb, "issueArb")
-  val chosenQ = Module(new Queue(new ChosenQBundle(entries), entries = 1, pipe = true, flow = false))
+  val chosenQ = Module(new Queue(new ChosenQBundle(entries), entries = 1, pipe = false, flow = false))
   val chosenQValid = chosenQ.io.deq.valid
 
   /* ======== Enchantment ======== */
@@ -116,16 +140,49 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   def addrConflict(a: TaskBundle, s: MSHRInfo): Bool = {
     a.set === s.set && (a.tag === s.reqTag || a.tag === s.metaTag && s.needRelease)
   }
-  def conflictMask(a: TaskBundle): UInt = VecInit(io.mshrInfo.map(s =>
-    s.valid && addrConflict(a, s.bits) && !s.bits.willFree)).asUInt
-  def conflict(a: TaskBundle): Bool = conflictMask(a).orR
+  // A reqTag conflict against a live normal context blocks a follow-up until
+  // that context fully retires.  Early release at refillCommitLanded is NOT
+  // safe: the landed-but-not-retired context still owns the address for
+  // nested ReleaseData routing (single-owner invariant).  Victim conflicts
+  // likewise wait until the registered owner becomes invalid.
+  def conflictMaskReq(a: TaskBundle): UInt = VecInit(io.mshrInfo.map(s =>
+    // A live context keeps blocking its reqTag until full retirement, even
+    // after its refill commit has landed: a follow-up may allocate a second
+    // live context on the same address in the landed-but-not-retired window
+    // (observed: 11 cycles), and a nested ReleaseData then matches both --
+    // violating single-owner routing (tl-test assert "ReleaseData matches
+    // multiple normal refill contexts").  SPEC shows the early release is
+    // perf-free (<=0.1% of instructions).
+    s.valid && sameAddr(a, s.bits))).asUInt
+  // A context that has selected this line as its replacement victim keeps
+  // holding it for its whole pre-commit window, not just when a lower-level
+  // release is owed: Directory suppresses A-channel hits on the victim way
+  // from victim selection until the install lands (victimPendingWayMask_s3,
+  // `!dirHit && w_replResp && !refillCommitLanded`).  Releasing a follow-up in
+  // that window drops it to the miss path (the suppressed hit is invisible),
+  // and it then installs a SECOND copy of the same line into another way --
+  // leaving the tag in two ways (observed: "Set should not have more than one
+  // hit").  Hold it until the context retires instead; `willFree` is reached
+  // only after refillCommitLanded, so the whole suppression window is covered.
+  def conflictMaskVic(a: TaskBundle): UInt = VecInit(io.mshrInfo.map(s =>
+    s.valid && a.set === s.bits.set && a.tag === s.bits.metaTag &&
+      // An INVALID replacement way retains an arbitrary old tag, but owns
+      // no victim line. CMO misses also set w_replResp without replacing a
+      // way. Neither may turn that stale tag into an address dependency.
+      (s.bits.needRelease || (!s.bits.isCmo && s.bits.w_replResp &&
+        !s.bits.dirHit && s.bits.meta.state =/= MetaData.INVALID)))).asUInt
+  def conflictMask(a: TaskBundle): UInt = conflictMaskReq(a) | conflictMaskVic(a)
+  def snoopConflict(a: TaskBundle): Bool = VecInit(io.snoopInfo.map(s =>
+    s.valid && s.bits.blocksSnoop && sameAddr(a, s.bits)
+  )).asUInt.orR
+  def conflict(a: TaskBundle): Bool = conflictMask(a).orR || snoopConflict(a)
 
   def conflictMaskFromA(a: TaskBundle): UInt =
     conflictMask(a) & VecInit(io.mshrInfo.map(_.bits.fromA)).asUInt
 
   def latePrefetch(a: TaskBundle): (Bool, UInt, UInt) = {
     val matchVec = VecInit(io.mshrInfo.map(s =>
-    s.valid && s.bits.isPrefetch && sameAddr(a, s.bits) && !s.bits.willFree &&
+    s.valid && s.bits.isPrefetch && sameAddr(a, s.bits) &&
       a.fromA && (a.opcode === AcquireBlock || a.opcode === AcquirePerm)
     ))
     val matched = matchVec.asUInt.orR
@@ -147,7 +204,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
 //  }
 
   // other flags
-  val in      = io.in.bits
+  val in      = admitted.bits
   val full    = Cat(buffer.map(_.valid)).andR
 
   // incoming Acquire can be merged with late_pf MSHR block
@@ -158,7 +215,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   }).asUInt
   val mergeA = mergeAMask.orR
   assert(!mergeA || PopCount(mergeAMask) <= 1.U, "RequestBuffer: mergeAMask must be one-hot when mergeA is asserted")
-  io.aMergeTask.valid := io.in.valid && mergeA
+  io.aMergeTask.valid := admitted.valid && mergeA
   io.aMergeTask.bits.idOH := mergeAMask
   io.aMergeTask.bits.task := in
 
@@ -168,10 +225,18 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   def noFreeWayForSet(set: UInt): Bool = {
     val task_s2 = io.taskFromArb_s2
     val sameSet_s2 = task_s2.valid && task_s2.bits.fromA && !task_s2.bits.mshrTask && task_s2.bits.set === set
-    val sameSet_s3 = RegNext(task_s2.valid && task_s2.bits.fromA && !task_s2.bits.mshrTask) &&
-      RegEnable(task_s2.bits.set, task_s2.valid) === set
-    val sameSetCnt = PopCount(VecInit(io.mshrInfo.map(s => s.valid && s.bits.set === set && s.bits.fromA) :+
-      sameSet_s2 :+ sameSet_s3).asUInt)
+    val normalA_capture = RegNext(task_s2.valid && task_s2.bits.fromA && !task_s2.bits.mshrTask, false.B)
+    val set_capture = RegEnable(task_s2.bits.set, task_s2.valid)
+    val sameSet_s3 = normalA_capture && set_capture === set
+    val normalA_decide = RegNext(normalA_capture, false.B)
+    val set_decide = RegNext(set_capture)
+    val sameSet_decide = normalA_decide && set_decide === set
+    val sameSet_apply = RegNext(normalA_decide, false.B) && RegNext(set_decide) === set
+    // This interface carries normal contexts only. A normal MSHR with a live
+    // ReplaceMSHR child still reserves its own destination way.
+    val sameSetCnt = PopCount(VecInit(io.mshrInfo.map(s =>
+      s.valid && s.bits.set === set && s.bits.fromA) :+
+      sameSet_s2 :+ sameSet_s3 :+ sameSet_decide :+ sameSet_apply).asUInt)
     val noFreeWay = sameSetCnt >= cacheParams.ways.U
     noFreeWay
   }
@@ -195,7 +260,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   val canFlow = flow.B && !full && !conflict(in) && !chosenQValid && !Cat(io.mainPipeBlock).orR && !noFreeWay(in) && !prefetchBlocked(in)
   val doFlow  = canFlow && io.out.ready
 
-  //  val depMask    = buffer.map(e => e.valid && sameAddr(io.in.bits, e.task))
+  //  val depMask    = buffer.map(e => e.valid && sameAddr(admitted.bits, e.task))
   // remove duplicate prefetch if same-addr A req in MSHR or ReqBuf
   val isPrefetch = in.fromA && in.opcode === Hint
   val dupMask    = VecInit(
@@ -212,21 +277,21 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
 
   // statistics io
   val latePrefetchRes = latePrefetch(in) // demand request hit entry of pf
-  io.pfStatInMSHR.hitPf := latePrefetchRes._1 && io.in.valid && !sameAddr(in, RegNext(in))
+  io.pfStatInMSHR.hitPf := latePrefetchRes._1 && admitted.valid && !sameAddr(in, RegNext(in))
   io.pfStatInMSHR.hitPfReqSrc := latePrefetchRes._2
   io.pfStatInMSHR.hitPfLatency := latePrefetchRes._3
-  io.pfStatInMSHR.pfLate := io.in.valid && dup
-  io.pfStatInMSHR.pfLateReqSrc := io.in.bits.reqSource
+  io.pfStatInMSHR.pfLate := admitted.valid && dup
+  io.pfStatInMSHR.pfLateReqSrc := admitted.bits.reqSource
   io.pfStatInMSHR.pfLateHitReqSrc := dupHitSrc
-  io.hasMergeA := mergeA && io.in.valid && !sameAddr(in, RegNext(in))
+  io.hasMergeA := mergeA && admitted.valid && !sameAddr(in, RegNext(in))
 
   //!! TODO: we can also remove those that duplicate with mainPipe
 
   /* ======== Alloc ======== */
-  io.in.ready   := !prefetchBlocked(in) && (!full || doFlow) || mergeA || dup
+  admitted.ready   := !prefetchBlocked(in) && (!full || doFlow) || mergeA || dup
 
   val insertOH = MaskToOH(buffer.map(!_.valid))
-  val alloc = !full && io.in.valid && !prefetchBlocked(in) && !doFlow && !dup && !mergeA
+  val alloc = !full && admitted.valid && !prefetchBlocked(in) && !doFlow && !dup && !mergeA
   buffer.zip(insertOH.asBools).foreach { case (entry, sel) =>
     when(alloc && sel){
       val mpBlock = Cat(io.mainPipeBlock).orR
@@ -237,14 +302,18 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
       entry.valid   := true.B
       // when Addr-Conflict / Same-Addr-Dependent / MainPipe-Block / noFreeWay-in-Set, entry not ready
       entry.rdy     := !conflict(in) && !mpBlock && !s1Block && !noFreeWay(in)// && !Cat(depMask).orR
-      entry.task    := io.in.bits
+      entry.task    := admitted.bits
       entry.waitMP  := Cat(
         s1Block,
         io.mainPipeBlock(0),
         io.mainPipeBlock(1),
+        io.mainPipeBlock(2),
+        io.mainPipeBlock(3),
         0.U(1.W))
       entry.waitMS  := conflictMask(in)
       entry.timer   := 1.U
+      entry.waitMSReq := conflictMaskReq(in)
+      entry.waitMSVic := conflictMaskVic(in)
       assert(PopCount(conflictMaskFromA(in)) <= 2.U)
     }
   }
@@ -271,22 +340,26 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
       e.timer := e.timer + 1.U
 
       val waitMSUpdate  = WireInit(e.waitMS)
+      val waitMSReqUpdate = WireInit(e.waitMSReq)
+      val waitMSVicUpdate = WireInit(e.waitMSVic)
 //      val depMaskUpdate = WireInit(e.depMask)
 
-      // when mshr will_free, clear it in other reqs' waitMS
-      val willFreeMask = VecInit(io.mshrInfo.map(s => s.valid && s.bits.willFree)).asUInt
-      waitMSUpdate  := e.waitMS  & (~willFreeMask).asUInt
+      // Wait for the registered owner-valid to clear before releasing waiters.
+      val retiredMask = VecInit(io.mshrInfo.map(s => !s.valid)).asUInt
+      // reqTag conflicts release only at full retirement: a commit-landed
+      // context still owns its address until then (see conflictMaskReq).
+      waitMSUpdate  := e.waitMS  & (~retiredMask).asUInt
+      waitMSReqUpdate := e.waitMSReq & (~retiredMask).asUInt
+      waitMSVicUpdate := e.waitMSVic & (~retiredMask).asUInt
 
-      // Initially,
-      //    waitMP(2) = s2 blocking, wait 2 cycles
-      //    waitMP(1) = s3 blocking, wait 1 cycle
-      // Now that we shift right waitMP every cycle
-      //    so when waitMP(1) is 0 and waitMP(0) is 1, desired cycleCnt reached
-      //    we recalculate waitMS and occWays, overriding old mask
-      //    to take new allocated MSHR into account
+      // Recalculate only after the apply edge has made the allocated owner's
+      // registered valid visible. Capture and decision are distinct cycles;
+      // merging them releases this mask one edge before the new MSHR exists.
       e.waitMP := e.waitMP >> 1
       when(e.waitMP(1) === 0.U && e.waitMP(0) === 1.U) {
         waitMSUpdate  := conflictMask(e.task)
+        waitMSReqUpdate := conflictMaskReq(e.task)
+        waitMSVicUpdate := conflictMaskVic(e.task)
       }
 
       // when request is sent, clear it in other reqs' depMask
@@ -299,27 +372,29 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
       val s1B_Block = io.s1Entrance.valid && io.s1Entrance.bits.set === e.task.set
       val s1_Block  = s1A_Block || s1B_Block
       when(s1_Block) {
-        e.waitMP := (e.waitMP >> 1) | "b0100".U // fired-req at s2 next cycle
+        e.waitMP := (e.waitMP >> 1) | "b010000".U
       }
 
       // update info
       e.waitMS  := waitMSUpdate
+      e.waitMSReq := waitMSReqUpdate
+      e.waitMSVic := waitMSVicUpdate
 //      e.depMask := depMaskUpdate
-      e.rdy     := !waitMSUpdate.orR && !e.waitMP && !s1_Block && !noFreeWay(e.task)
+      e.rdy     := !waitMSReqUpdate.orR && !waitMSVicUpdate.orR && !snoopConflict(e.task) && !e.waitMP && !s1_Block && !noFreeWay(e.task)
     }
   }
 
   /* ======== Output ======== */
   // when entry.rdy is no longer true,
   // we cancel req in chosenQ, with the entry still held in buffer to issue later
-//  val cancel = (canFlow && sameSet(chosenQ.io.deq.bits.bits.task, io.in.bits)) || !buffer(chosenQ.io.deq.bits.id).rdy
+//  val cancel = (canFlow && sameSet(chosenQ.io.deq.bits.bits.task, admitted.bits)) || !buffer(chosenQ.io.deq.bits.id).rdy
   val cancel = !Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.rdy && !prefetchBlockedByMSHR(e.task)))
 
   chosenQ.io.deq.ready := io.out.ready || cancel
-  io.out.valid := chosenQValid && !cancel || io.in.valid && canFlow
+  io.out.valid := chosenQValid && !cancel || admitted.valid && canFlow
   io.out.bits := {
     if (!flow) chosenQ.io.deq.bits.bits.task
-    else Mux(chosenQValid, chosenQ.io.deq.bits.bits.task, io.in.bits)
+    else Mux(chosenQValid, chosenQ.io.deq.bits.bits.task, admitted.bits)
   }
 
   buffer.zip(chosenQ.io.deq.bits.idOH.asBools).foreach {
@@ -339,17 +414,26 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
 
   // add XSPerf to see how many cycles the req is held in Buffer
   if(cacheParams.enablePerf) {
-    XSPerfAccumulate("drop_prefetch", io.in.valid && dup)
+    XSPerfAccumulate("drop_prefetch", admitted.valid && dup)
     if(flow){
-      XSPerfAccumulate("req_buffer_flow", io.in.valid && doFlow)
+      XSPerfAccumulate("req_buffer_flow", admitted.valid && doFlow)
     }
     XSPerfAccumulate("req_buffer_alloc", alloc)
     XSPerfAccumulate("req_buffer_full", full)
-    XSPerfAccumulate("recv_prefetch", io.in.fire && isPrefetch)
-    XSPerfAccumulate("recv_normal", io.in.fire && !isPrefetch)
+    // Early release observability: waitMSReq bits cleared while the target
+    // context is still live (valid && !willFree) but its commit has landed --
+    // i.e. releases that would previously have waited for full retirement.
+    val waitMSReqVec = buffer.map(_.waitMSReq).reduce(_ | _)
+    val commitLiveMask = VecInit(io.mshrInfo.map(s =>
+      s.valid && s.bits.refillCommitLanded)).asUInt
+    val commitReleasePrev = RegEnable(commitLiveMask & waitMSReqVec, 0.U(mshrsAll.W), true.B)
+    val commitReleaseBits = commitReleasePrev & ~waitMSReqVec
+    XSPerfAccumulate("reqbuf_commitlanded_release", PopCount(commitReleaseBits))
+    XSPerfAccumulate("recv_prefetch", admitted.fire && isPrefetch)
+    XSPerfAccumulate("recv_normal", admitted.fire && !isPrefetch)
     XSPerfAccumulate("chosenQ_cancel", chosenQValid && cancel)
     XSPerfAccumulate("req_buffer_mergeA", io.hasMergeA)
-    XSPerfAccumulate("req_buffer_pf_block_occ", io.in.valid && isPrefetchTask(in) && pfThrottleByOcc)
+    XSPerfAccumulate("req_buffer_pf_block_occ", admitted.valid && isPrefetchTask(in) && pfThrottleByOcc)
     // TODO: count conflict
     for(i <- 0 until entries){
       val cntEnable = PopCount(buffer.map(_.valid)) === i.U

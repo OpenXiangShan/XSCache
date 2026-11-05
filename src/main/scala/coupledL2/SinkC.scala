@@ -21,6 +21,7 @@ import chisel3._
 import chisel3.util._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tilelink.TLMessages._
+import freechips.rocketchip.tilelink.TLPermissions._
 import org.chipsalliance.cde.config.Parameters
 import utility.{MemReqSource, XSPerfAccumulate, TwoLevelRRArbiter, ArbPerf}
 import xscache.coupledL2.utils._
@@ -38,9 +39,24 @@ class SinkC(implicit p: Parameters) extends L2Module {
     val c = Flipped(DecoupledIO(new TLBundleC(edgeIn.bundle)))
     val task = DecoupledIO(new TaskBundle) // Release/ReleaseData
     val resp = Output(new RespBundle)
+    // Reserve the unique outstanding Probe owner before accepting beat zero.
+    // The controller retains the route until the accepted terminal beat.
+    val probeRouteRequest = Output(ValidIO(new TaskBundle))
+    val probeRouteReady = Input(Bool())
+    val probeRouteDone = Output(Bool())
+    // ReleaseData follows the task path rather than resp. Expose its address
+    // at SinkC acceptance so a ReplaceMSHR can wait for its newer payload.
+    val releaseData = Output(ValidIO(new TaskBundle))
     val releaseBufWrite = ValidIO(new MSHRBufWrite)
     val bufResp = Output(new PipeBufferResp)
     val refillBufWrite = ValidIO(new MSHRBufWrite)
+    // ProbeAckData targeted at a normal context is captured into that slot's
+    // RefillBuf (Get-on-TRUNK / cache-alias); MSHRCtl routes the entry id.
+    val refillBufWriteId = Flipped(ValidIO(UInt(mshrBits.W)))
+    // A same-line normal context can coexist with the snoop which received
+    // ProbeAckData.  In that case the payload is mirrored to RefillBuf while
+    // ReleaseBuf remains the snoop response source.
+    val snoopRefillBufWriteId = Flipped(ValidIO(UInt(mshrBits.W)))
     val msInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo)))
   })
 
@@ -106,6 +122,13 @@ class SinkC(implicit p: Parameters) extends L2Module {
     task
   }
 
+  io.probeRouteRequest.valid := io.c.valid && !isRelease && first
+  io.probeRouteRequest.bits := toTaskBundle(io.c.bits)
+  io.probeRouteDone := io.c.fire && !isRelease && last
+
+  io.releaseData.valid := io.c.fire && io.c.bits.opcode === ReleaseData && io.c.bits.param === TtoN
+  io.releaseData.bits := toTaskBundle(io.c.bits)
+
   when (io.c.fire && isRelease) {
     when (hasData) {
       when (first) {
@@ -146,8 +169,9 @@ class SinkC(implicit p: Parameters) extends L2Module {
   io.task.bits := taskArb.io.out.bits
   io.task.bits.bufIdx := taskArb.io.out.bits.bufIdx
 
-  io.resp.valid := io.c.valid && (first || last) && !isRelease
+  io.resp.valid := io.c.fire && (first || last) && !isRelease
   io.resp.mshrId := 0.U // DontCare
+  io.resp.txnID := 0.U
   io.resp.tag := parseAddress(io.c.bits.address)._1
   io.resp.set := parseAddress(io.c.bits.address)._2
   io.resp.respInfo := 0.U.asTypeOf(io.resp.respInfo.cloneType)
@@ -161,17 +185,33 @@ class SinkC(implicit p: Parameters) extends L2Module {
 
   // keep the first beat of ProbeAckData
   val probeAckDataBuf = RegEnable(io.c.bits.data, 0.U((beatBytes * 8).W),
-    io.c.valid && io.c.bits.opcode === ProbeAckData && first)
+    io.c.fire && io.c.bits.opcode === ProbeAckData && first)
 
-  io.releaseBufWrite.valid := io.c.valid && io.c.bits.opcode === ProbeAckData && last
+  // A ProbeAckData for a direct normal response goes to RefillBuf only.  A
+  // same-line snoop/normal overlap mirrors it to RefillBuf and ReleaseBuf so
+  // the later normal Grant cannot observe the stale pre-probe snapshot.
+  val probeAckDataForRefill = io.c.fire && io.c.bits.opcode === ProbeAckData && last &&
+    (io.refillBufWriteId.valid || io.snoopRefillBufWriteId.valid)
+  io.releaseBufWrite.valid := io.c.fire && io.c.bits.opcode === ProbeAckData && last && !io.refillBufWriteId.valid
   io.releaseBufWrite.bits.id := 0.U(mshrBits.W) // id is given by MSHRCtl by comparing address to the MSHRs
   io.releaseBufWrite.bits.data.data := Cat(io.c.bits.data, probeAckDataBuf)
   io.releaseBufWrite.bits.beatMask := Fill(beatSize, true.B)
 
-  // C-Release, with new data, comes before repl-Release writes old refill data back to DS
+  // A same-line ReleaseData must also replace data buffered by an MSHR that
+  // has already produced its first grant.  At that point blockRefill is low,
+  // but a later merged grant would otherwise refill DS with the stale buffer.
   val newdataMask = VecInit(io.msInfo.map(s =>
-    s.valid && s.bits.set === io.task.bits.set && s.bits.reqTag === io.task.bits.tag && s.bits.blockRefill
+    s.valid && s.bits.set === io.task.bits.set && s.bits.reqTag === io.task.bits.tag &&
+      (s.bits.blockRefill || (s.bits.s_refill && s.bits.w_grantlast))
   )).asUInt
+  // Freeze the C ReleaseData owner mask at the task handshake.  The write is
+  // intentionally one cycle later (after the buffered payload is complete),
+  // so the output must use this registered identity rather than re-reading
+  // the moving MSHR status vector at the write edge.
+  val releaseDataWriteFire = io.task.fire && io.task.bits.opcode === ReleaseData && newdataMask.orR
+  val releaseDataWritePending = RegNext(releaseDataWriteFire, false.B)
+  val releaseDataWriteMask = RegEnable(newdataMask, releaseDataWriteFire)
+  val releaseDataWriteBufIdx = RegEnable(io.task.bits.bufIdx, releaseDataWriteFire)
 
   // we must wait until 2nd beat written into databuf(idx) before we can read it
   // So we use RegNext
@@ -180,16 +220,25 @@ class SinkC(implicit p: Parameters) extends L2Module {
   // since what we are trying to prevent is that C-Release comes first and MSHR-Release comes later
   // we can make sure this refillBufWrite can be read by MSHR-Release
   // TODO: this is rarely triggered, consider just blocking? but blocking may affect timing of SinkC-Directory
-  io.refillBufWrite.valid := RegNext(io.task.fire && io.task.bits.opcode === ReleaseData && newdataMask.orR, false.B)
-  io.refillBufWrite.bits.id := RegNext(OHToUInt(newdataMask))
-  io.refillBufWrite.bits.data.data := dataBuf(RegNext(io.task.bits.bufIdx)).asUInt
+  io.refillBufWrite.valid := probeAckDataForRefill || releaseDataWritePending
+  io.refillBufWrite.bits.id := Mux(probeAckDataForRefill,
+    Mux(io.refillBufWriteId.valid, io.refillBufWriteId.bits, io.snoopRefillBufWriteId.bits),
+    OHToUInt(releaseDataWriteMask))
+  io.refillBufWrite.bits.data.data := Mux(probeAckDataForRefill,
+    Cat(io.c.bits.data, probeAckDataBuf),
+    dataBuf(releaseDataWriteBufIdx).asUInt)
   io.refillBufWrite.bits.beatMask := Fill(beatSize, true.B)
 
-  io.c.ready := !isRelease || !first || !full
+  io.c.ready := Mux(isRelease, !first || !full, io.probeRouteReady)
 
+  // The buffered task data is captured at task.fire and consumed one cycle
+  // later.  Keep the completion index on that same registered boundary;
+  // re-reading task.bits here can clear a different buffer after arbitration
+  // advances to the next task.
+  val taskBufIdxAtFire = RegEnable(io.task.bits.bufIdx, io.task.fire)
   io.bufResp.data := RegNext(RegEnable(dataBuf(io.task.bits.bufIdx), io.task.fire))
   when(RegNext(io.task.fire)) {
-    beatValids(RegNext(io.task.bits.bufIdx)).foreach(_ := false.B)
+    beatValids(taskBufIdxAtFire).foreach(_ := false.B)
   }
 
   // Performance counters
