@@ -396,6 +396,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val payloadReady = Bool()
     val probePayload = Bool()
   }
+  // Snapshots of the generations each registered pair was built from. An
+  // allocation advances the live generation, so a pair goes stale by mismatch
+  // with this register instead of a per-cycle Mux1H over live owner state.
+  val snoopPairSnoopGenerationSeen = RegInit(VecInit(Seq.fill(mshrsAll)(0.U(8.W))))
+  val snoopPairNormalGenerationSeen = RegInit(VecInit(Seq.fill(mshrsAll)(0.U(8.W))))
   val snoopPairs = snoopMshrs.zipWithIndex.map { case (snoop, i) =>
     val pair = RegInit(0.U.asTypeOf(Valid(new SnoopPair)))
     val normalMatches = VecInit(refillMshrs.map { normal =>
@@ -422,22 +427,23 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         (releaseStarts && Mux1H(normalMatches, refillMshrs.map(_.io.postGrantReleaseWindow)))
       pair.bits.payloadReady := Mux1H(normalMatches, refillMshrs.map(_.io.postGrantReleasePayloadReady))
       pair.bits.probePayload := normalMatches(i) && refillMshrs(i).io.refillPayloadFromProbeAck
+      // Snapshot the generations this pair was built from. A later allocation
+      // advances the live generation, and the pair becomes stale by mismatch
+      // without re-reading the owner's status, set, or tag.
+      snoopPairSnoopGenerationSeen(i) := mshrTaskGenerations(1)(i)
+      when(normalMatches.orR) {
+        snoopPairNormalGenerationSeen(OHToUInt(normalMatches)) :=
+          Mux1H(normalMatches, mshrTaskGenerations(0))
+      }
     }
     pair
   }
   val snoopPairKnown = snoopPairs.zipWithIndex.map { case (pair, i) =>
-    pair.valid && snoopMshrs(i).io.status.valid &&
-      pair.bits.snoopGeneration === mshrTaskGenerations(1)(i) &&
-      pair.bits.set === snoopMshrs(i).io.status.bits.set &&
-      pair.bits.tag === snoopMshrs(i).io.status.bits.reqTag
+    pair.valid && pair.bits.snoopGeneration === snoopPairSnoopGenerationSeen(i)
   }
   val snoopPairNormalValid = snoopPairs.zipWithIndex.map { case (pair, i) =>
-    val normalOH = UIntToOH(pair.bits.normal.bits.id, mshrsAll)
     snoopPairKnown(i) && pair.bits.normal.valid &&
-      Mux1H(normalOH, refillMshrs.map(_.io.status.valid)) &&
-      Mux1H(normalOH, mshrTaskGenerations(0)) === pair.bits.normal.bits.generation &&
-      Mux1H(normalOH, refillMshrs.map(_.io.status.bits.set)) === pair.bits.normal.bits.set &&
-      Mux1H(normalOH, refillMshrs.map(_.io.status.bits.reqTag)) === pair.bits.normal.bits.tag
+      pair.bits.normal.bits.generation === snoopPairNormalGenerationSeen(pair.bits.normal.bits.id)
   }
   val sinkCRefillRecord = RegInit(0.U.asTypeOf(Valid(new MSHRBufWrite)))
   val sinkCRefillGeneration = RegInit(0.U(8.W))
@@ -2428,20 +2434,23 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val sourceOH = UIntToOH(mshrTaskWinners(g).source, mshrTaskGroupSize)
     Mux1H(sourceOH, mshrTaskLeasePorts(g).map(_.cancel))
   }
-  def completionCurrent(completion: ValidIO[PairedCompletion]): Bool = {
-    val targetOH = UIntToOH(completion.bits.target, mshrsAll)
-    !completion.valid || (Mux1H(targetOH, refillMshrs.map(_.io.status.valid)) &&
-      Mux1H(targetOH, mshrTaskGenerations(0)) === completion.bits.targetGeneration &&
-      Mux1H(targetOH, refillMshrs.map(_.io.status.bits.set)) === completion.bits.targetSet &&
-      Mux1H(targetOH, refillMshrs.map(_.io.status.bits.reqTag)) === completion.bits.targetTag)
-  }
-  val mshrTaskWinnerCurrent = (0 until nMshrTaskGroups).map { g =>
-    mshrTaskLeaseValid(g) && !mshrTaskLeaseReturning(g) && !mshrTaskGroupCancel(g).valid &&
-      VecInit(mshrTaskGenerations(g))(mshrTaskWinners(g).source) === mshrTaskWinners(g).token.generation &&
-      completionCurrent(mshrTaskWinners(g).completion)
+  // A winner is correct at the edge it is chosen. Staleness is a clock-edge
+  // event, not a per-cycle re-read of the 16-wide status/generation/set/tag:
+  // reallocation advances the source generation, and the paired normal owner
+  // is tracked by the generation snapshot taken when the pair was registered.
+  val mshrTaskWinnerStale = (0 until nMshrTaskGroups).map { g =>
+    val winner = mshrTaskWinners(g)
+    val sourceReallocated =
+      VecInit(mshrTaskGenerations(g))(winner.source) =/= winner.token.generation
+    val pairedOwnerReallocated = if (g == 1) {
+      winner.completion.valid &&
+        winner.completion.bits.targetGeneration =/=
+          snoopPairNormalGenerationSeen(winner.completion.bits.target)
+    } else false.B
+    sourceReallocated || pairedOwnerReallocated
   }
   val mshrTaskGroupReady = (0 until nMshrTaskGroups).map { g =>
-    mshrTaskPreparedValid(g) && mshrTaskWinnerCurrent(g)
+    mshrTaskPreparedValid(g) && mshrTaskLeaseValid(g) && !mshrTaskLeaseReturning(g)
   }
 
   // The cross-group arbiter transports only a narrow ticket.  Register that
@@ -2463,7 +2472,13 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }).asUInt)
   val mshrTaskTicketInputs = (0 until nMshrTaskGroups).map { g =>
     val ticket = Wire(Decoupled(new MSHRTaskTicket))
-    ticket.valid := mshrTaskGroupReady(g) && mshrTaskGroupClassEff(g) === mshrTaskFinalBestClass
+    // A source cancellation is an edge-visible revocation of the prepared
+    // winner. Do not capture a new cross-group ticket on the same cycle as
+    // that revocation; otherwise the canceled source can reach the permit
+    // stage before its lease-return handshake is observed.
+    ticket.valid := mshrTaskGroupReady(g) &&
+      !mshrTaskGroupCancel(g).valid &&
+      mshrTaskGroupClassEff(g) === mshrTaskFinalBestClass
     ticket.bits.group := g.U
     ticket.bits.source := mshrTaskPrepared(g).source
     ticket.bits.qosClass := mshrTaskGroupClassEff(g)
@@ -2474,7 +2489,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   mshrTaskTicketOut.ready := !mshrTaskTicketValid && !mshrTaskIssuePermitValid
   val mshrTaskTicketGroupOH = UIntToOH(mshrTaskTicket.group, nMshrTaskGroups)
   val mshrTaskTicketReady = Mux1H(mshrTaskTicketGroupOH, (0 until nMshrTaskGroups).map { g =>
-    mshrTaskGroupReady(g) && mshrTaskPrepared(g).source === mshrTaskTicket.source
+    mshrTaskGroupReady(g) && mshrTaskPrepared(g).source === mshrTaskTicket.source &&
+      !mshrTaskGroupCancel(g).valid
   })
   val mshrTaskIssuePermitGroupOH = UIntToOH(mshrTaskIssuePermit.group, nMshrTaskGroups)
   val mshrTaskIssuePermitReady = mshrTaskIssuePermitValid && Mux1H(
@@ -2482,7 +2498,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     (0 until nMshrTaskGroups).map { g =>
       mshrTaskGroupReady(g) &&
         mshrTaskPrepared(g).source === mshrTaskIssuePermit.source &&
-        mshrTaskPrepared(g).token.asUInt === mshrTaskIssuePermit.token.asUInt
+        mshrTaskPrepared(g).token.asUInt === mshrTaskIssuePermit.token.asUInt &&
+        !mshrTaskGroupCancel(g).valid
     }
   )
   val mshrTaskIssuePermitTake = mshrTaskTicketValid && mshrTaskTicketReady &&
@@ -2560,8 +2577,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val payload = Mux1H(sourceOH, groupOf(g).map(_.bits))
     val payloadValid = Mux1H(sourceOH, groupOf(g).map(_.valid))
     val payloadOperation = Mux1H(sourceOH, mshrTaskLeasePorts(g).map(_.candidate.bits.operation))
-    val preparePayload = mshrTaskWinnerCurrent(g) && !mshrTaskPreparedValid(g) && payloadValid &&
-      payloadOperation === winner.operation
+    // The source payload is itself a register captured at the prepare edge, so
+    // gating on the registered lease (and not a live status recheck) keeps the
+    // 16:1 TaskBundle mux off the FSM state cone.
+    val preparePayload = mshrTaskLeaseValid(g) && !mshrTaskLeaseReturning(g) &&
+      !mshrTaskPreparedValid(g) && payloadValid && payloadOperation === winner.operation
     val granted = mshrTask.fire && mshrTaskIssuePermitGroupOH(g)
     val returnRequest = mshrTaskLeaseValid(g) && mshrTaskLeaseReturning(g) &&
       !mshrTaskLeaseAwaitPipe(g) && !mshrTaskLeaseReturnSent(g)
@@ -2592,7 +2612,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         mshrTaskPrepared(g).completion.bits.outcome := outcome
         when(winner.completion.valid) {
           assert(payload.set === winner.completion.bits.targetSet &&
-            payload.tag === winner.completion.bits.targetTag && completionCurrent(winner.completion),
+            payload.tag === winner.completion.bits.targetTag &&
+            winner.completion.bits.targetGeneration ===
+              snoopPairNormalGenerationSeen(winner.completion.bits.target),
             "paired payload must retain the winner's normal owner and line")
         }
       }
@@ -2622,9 +2644,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       mshrTaskLeaseReturnSent(g) := false.B
       mshrTaskGroupWait(g) := 0.U
     }.elsewhen(mshrTaskLeaseValid(g) && !mshrTaskLeaseReturning(g) &&
-      (granted || !mshrTaskWinnerCurrent(g))) {
-      // Cancellation works before payload exists as well as after prepared.
-      // Both cases return/ack the winning token before another can be chosen.
+      (granted || mshrTaskGroupCancel(g).valid || mshrTaskWinnerStale(g))) {
+      // A winner is correct at the edge it is chosen. Revocation is itself a
+      // clock-edge event: the source cancel, a reallocation of the source or
+      // its paired normal owner, or the issue that starts the lease return.
+      // None of these re-reads the 16-wide live status to revalidate the winner.
       mshrTaskLeaseReturning(g) := true.B
       mshrTaskLeaseAwaitPipe(g) := granted
       mshrTaskGroupWait(g) := 0.U
