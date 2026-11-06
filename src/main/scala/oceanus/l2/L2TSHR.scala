@@ -99,6 +99,8 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
     val self_unlock_dir_ack = Input(Bool())
 
     val valid = Output(Bool())
+    val hintLock = Input(Bool())
+    val hitHintSafe = Output(Bool())
 
     val bopPerf = Output(Vec(L2BOPPerf.names.size, Bool()))
     val bopPerfSource = Output(Vec(L2BOPPerf.names.size, UInt(L2PfSource.Width.W)))
@@ -167,7 +169,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
   val tshr_wb_done_dir = Wire(Bool())
   val tshr_wb_done_ds = Wire(Bool())
 
-  val tshr_dealloc = tshr_inactive && tshr_wb_done_dir && tshr_wb_done_ds && !tshr_enter
+  val tshr_dealloc = tshr_inactive && tshr_wb_done_dir && tshr_wb_done_ds && !tshr_enter && !io.hintLock
 
   val tshr_valid = RegInit(false.B)
 
@@ -437,17 +439,17 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
   val rbeEVB = Module(new L2RBE(new L2VPipeREQ.FlitEVB))
   val rbeREQ = Module(new L2RBE(new L2BufferedREQ(pfTrainEnable)))
 
-  io.toAlloc.busy.EVT := !rbeEVT.io.in.ready
-  io.toAlloc.busy.SNP := !rbeSNP.io.in.ready
-  io.toAlloc.busy.EVB := !rbeEVB.io.in.ready
-  io.toAlloc.busy.REQ := !rbeREQ.io.in.ready
+  io.toAlloc.busy.EVT := !rbeEVT.io.in.ready || io.hintLock
+  io.toAlloc.busy.SNP := !rbeSNP.io.in.ready || io.hintLock
+  io.toAlloc.busy.EVB := !rbeEVB.io.in.ready || io.hintLock
+  io.toAlloc.busy.REQ := !rbeREQ.io.in.ready || io.hintLock
 
   // RBE drain priority chain: EVT > SNP > EVB > REQ.
   // NOTE: keyed on io.valid (queue occupancy, registered) rather than io.out.valid
   // (drain fire) — the latter closes a combinational cycle through vPipeSNP.blockRBE.EVT
-  rbeSNP.io.blockFromTSHR := rbeEVT.io.valid
-  rbeEVB.io.blockFromTSHR := rbeEVT.io.valid || rbeSNP.io.valid
-  rbeREQ.io.blockFromTSHR := rbeEVT.io.valid || rbeSNP.io.valid || rbeEVB.io.valid
+  rbeSNP.io.blockFromTSHR := io.hintLock || (rbeEVT.io.valid)
+  rbeEVB.io.blockFromTSHR := io.hintLock || (rbeEVT.io.valid || rbeSNP.io.valid)
+  rbeREQ.io.blockFromTSHR := io.hintLock || (rbeEVT.io.valid || rbeSNP.io.valid || rbeEVB.io.valid)
 
   // PathVPipeBlock.EVB is only meaningful on the vPipe (blockRBE) side;
   // there is no EVB vPipe to block an RBE, so tie it off here
@@ -760,6 +762,18 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
 
   fastArb(Seq(vPipeEVT.io.UpTXRSP, vPipeREQ.io.UpTXRSP), io.UpTXRSP, Some("UpTXRSP"))
 
+  // D = DS grant + 1. The same edge writes both original TSHR halves
+  // and acquires ownership. The registered lock starts AFTER this valid write.
+  io.hitHintSafe := tshr_valid && io.fromDS.DSBufRdResp &&
+    vPipeREQ.io.hitHintReady && vPipeEVT.io.free && vPipeSNP.io.free &&
+    !tshr_enter && !rbeEVT.io.out.valid && !rbeSNP.io.out.valid &&
+    !rbeEVB.io.out.valid && !rbeREQ.io.out.valid &&
+    !tshr_buffer_wen_RXDAT_0 && !tshr_buffer_wen_RXDAT_2
+  when(io.hintLock) {
+    assert(tshr_valid && !tshr_enter, "hint owner released or reused")
+    assert(!tshr_buffer_wen_DS && !tshr_buffer_wen_RXDAT_0 && !tshr_buffer_wen_RXDAT_2,
+      "unexpected write after final DS response reservation")
+  }
   io.UpTXDAT <> vPipeREQ.io.UpTXDAT
   io.UpTXDAT.bits.Data := Mux(io.UpTXDAT.bits.DataID === 0.U, tshr_buffer_0, tshr_buffer_2)
 
@@ -838,7 +852,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
 
   meta_valid := proxyDir.io.rd_done
   tshr_wb_done_dir := proxyDir.io.wb_done && proxyDir.io.rel_idle
-  rbeEVT.io.blockFromTSHR := !proxyDir.io.rel_idle
+  rbeEVT.io.blockFromTSHR := io.hintLock || (!proxyDir.io.rel_idle)
 
   // Data Storage Proxy
   val proxyDS = Module(new L2TSHRDataStorageProxy(tshrId))

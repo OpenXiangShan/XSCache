@@ -39,7 +39,7 @@ trait L2SliceLocatable {
   def getTxnIDFromTSHRId(tshrId: Int) = (tshrId.U << log2Ceil(sliceNum)) | sliceIdx.U(log2Ceil(sliceNum).W)
 }
 
-class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val nodeId: Int, val pfTrainEnable: Boolean = false)(implicit val p: Parameters) extends Module
+class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val nodeId: Int, val pfTrainEnable: Boolean = false, val hintTargets: Seq[Int] = Nil, val hintMissEntries: Int = 16)(implicit val p: Parameters) extends Module
     with HasL2Params 
     with L2SliceLocatable
     with HasCCHIParameters {
@@ -62,6 +62,9 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
     val UpRXDAT = Flipped(Valid(new FlitUpDAT))
     val UpTXRSP = Decoupled(new FlitDnRSP)
     val UpTXDAT = Decoupled(new FlitDnDAT)
+    val refillHint = Decoupled(new L2RefillHint(paramCCHI.TxnID_Width, paramCCHI.UpstreamNodeID_Width))
+    val hintQuiescent = Output(Bool())
+    val hintQueueFull = Input(Bool())
 
     val DnRXRSP = Flipped(Valid(new CHIBundleRSP))
     val DnRXDAT = Flipped(Valid(new CHIBundleDAT))
@@ -79,8 +82,8 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
 
     val bopTrain = Valid(new L2PrefetchTrain(pfTrainEnable))
     // R10: raw pulses and physical source identities before local selection.
-    val bopTrainRaw = if (pfTrainEnable) Some(Output(Vec(nMSHR, Bool()))) else None
-    val trainSourceNID = if (pfTrainEnable) Some(Output(Vec(nMSHR, UInt(paramCCHI.UpstreamNodeID_Width.W)))) else None
+    val bopTrainRaw = if (pfTrainEnable) Some(Output(Vec(paramL2.mshrSize, Bool()))) else None
+    val trainSourceNID = if (pfTrainEnable) Some(Output(Vec(paramL2.mshrSize, UInt(paramCCHI.UpstreamNodeID_Width.W)))) else None
     val cdpData = Decoupled(new L2CDPHalf)
     val cdpTrain = Output(Vec(paramL2.mshrSize, Valid(new L2CDPTrain)))
     val cdpEvict = Output(Vec(paramL2.mshrSize, Valid(new L2CDPEvict)))
@@ -234,6 +237,61 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
 
   fastArb(tshrs.map(_.io.UpTXRSP), io.UpTXRSP, Some("TSHRsToUpTXRSP"))
   fastArb(tshrs.map(_.io.UpTXDAT), io.UpTXDAT, Some("TSHRsToUpTXDAT"))
+
+  // Non-preempting reservation: the ORIGINAL arbiter above remains the only
+  // DAT selector. A hint is admitted only with no other live owner locally
+  // and, at the top, no live owner in any other slice. A fresh allocation
+  // cannot traverse directory/RBE/DS and become DAT within the four-cycle
+  // reservation horizon. Uncertain or competing transactions simply skip hint.
+  io.hintQuiescent := !tshrs.map(_.io.valid).reduce(_ || _)
+  io.refillHint.valid := false.B
+  io.refillHint.bits := 0.U.asTypeOf(io.refillHint.bits)
+  tshrs.foreach(_.io.hintLock := false.B)
+  if (hintTargets.nonEmpty) {
+    val width = math.max(1, log2Ceil(paramL2.mshrSize))
+    val pointers = Module(new L2HintPointerQueue(width))
+    val reserved = RegInit(VecInit(Seq.fill(paramL2.mshrSize)(false.B)))
+    val candidates = VecInit(tshrs.map(t => t.io.hitHintSafe &&
+      hintTargets.map(n => t.io.UpTXDAT.bits.TgtID === n.U).reduce(_ || _) &&
+      t.io.UpTXDAT.bits.TxnID < hintMissEntries.U))
+    val soleOwner = PopCount(VecInit(tshrs.map(_.io.valid))) === 1.U
+    val chosen = OHToUInt(candidates)
+    val dat = VecInit(tshrs.map(_.io.UpTXDAT.bits))(chosen)
+    val eligible = candidates.asUInt.orR && soleOwner && !reserved.asUInt.orR
+    io.refillHint.valid := eligible && pointers.io.enq.ready
+    io.refillHint.bits.sourceId := dat.TxnID
+    io.refillHint.bits.targetId := dat.TgtID
+    io.refillHint.bits.isKeyword := false.B
+    pointers.io.enq.valid := io.refillHint.fire
+    pointers.io.enq.bits := chosen
+    when(io.refillHint.fire) {
+      assert(PopCount(candidates) === 1.U)
+      assert(pointers.io.enq.fire, "local reservation must be atomic with external hint")
+      reserved(chosen) := true.B
+    }
+    tshrs.zipWithIndex.foreach { case (t, i) => t.io.hintLock := reserved(i) }
+    val head = pointers.io.out.bits
+    val fires = VecInit(tshrs.map(_.io.UpTXDAT.fire))
+    pointers.io.out.ready := io.UpTXDAT.fire && fires(head)
+    when(pointers.io.out.valid) {
+      assert(reserved(head) && pointers.io.out.fire, "non-preempting local reservation missed")
+      assert(io.UpTXDAT.bits.DataID === pointers.io.second.asUInt, "hint beat phase")
+    }
+    when(pointers.io.out.fire && pointers.io.second) { reserved(head) := false.B }
+    val otherBlocked = tshrs.zipWithIndex.map { case (t, i) =>
+      !reserved(i) && t.io.UpTXDAT.valid && !t.io.UpTXDAT.ready
+    }.reduce(_ || _)
+    XSPerfAccumulate("hint_hit_sent", io.refillHint.fire)
+    XSPerfAccumulate("hint_skip_fifo_full", candidates.asUInt.orR &&
+      (pointers.io.full || io.hintQueueFull))
+    XSPerfAccumulate("hint_skip_unsafe", candidates.asUInt.orR && !io.refillHint.fire &&
+      !pointers.io.full && !io.hintQueueFull)
+    // Conservative upper bound: even ordinary blocked competition is counted.
+    // DAT valid/ready has no reservation mux or mask, so hint cannot steal it.
+    XSPerfAccumulate("hint_reservation_delayed_other", pointers.io.out.valid && otherBlocked)
+    assert(!(pointers.io.out.valid && otherBlocked), "unexpected competing DAT inside quiet reservation")
+  }
+
 
   fastArb(tshrs.map(_.io.DnTXREQ), io.DnTXREQ, Some("TSHRsToDnTXREQ"))
 
