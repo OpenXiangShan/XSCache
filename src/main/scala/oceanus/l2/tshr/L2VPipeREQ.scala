@@ -314,9 +314,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   }
 
   val p_rxevb = Reg(new L2VPipeREQ.FlitEVB)
+  val p_rxevb_unsatisfied = RegInit(false.B)
 
   when (rxevb_evictback) {
     p_rxevb := io.UpRXEVB.bits
+    p_rxevb_unsatisfied := rxevb_unsatisfied_evictback
   }
 
   val p_txreq_reissue = RegInit(false.B)
@@ -815,7 +817,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.DnTXREQ.bits.QoS.get := 14.U // Default at 14, (**DOT NOT use 15**, maybe better policy in future)
   io.DnTXREQ.bits.TgtID.get := 0.U // Support E-SAM only currently
   io.DnTXREQ.bits.SrcID.get := io.consts.nodeId
-  io.DnTXREQ.bits.TxnID.get := dnTxnID
+  io.DnTXREQ.bits.TxnID.get := Mux(txreq_pcrdreturn, 0.U, dnTxnID)
   io.DnTXREQ.bits.ReturnNID_StashNID_SLCRepHint.get := 0.U // Not providing SLCRepHint/StashNID, default to 0
   io.DnTXREQ.bits.StashNIDValid_Endian_Deep.get := 0.U
   io.DnTXREQ.bits.ReturnTxnID_StashLPIDValid_StashLPID.get := 0.U
@@ -1842,9 +1844,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val unlock_self_evictback = RegNext(meta_wr_state_evictback_I) && !meta_wr_state_evictback_I
   val unlock_self_noevict = RegNext(io.repl_done && w_s_evict_up_evict && evict_not_needed)
+  val unlock_evictback_cancel = fire_txreq_pcrdreturn && p_rxevb_unsatisfied
 
-  val unlock_dir = io.self_unlock_dir || unlock_self_evictback || unlock_self_noevict
-  val unlock_ds = io.self_unlock_ds || unlock_self_evictback || unlock_self_noevict
+  val unlock_dir = io.self_unlock_dir || unlock_self_evictback || unlock_self_noevict ||
+                   unlock_evictback_cancel
+  val unlock_ds = io.self_unlock_ds || unlock_self_evictback || unlock_self_noevict ||
+                  unlock_evictback_cancel
 
   when (lock_dir) {
     w_unlock_dir := true.B
@@ -1894,7 +1899,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // 3. Cancel at snoop-response completion of an unsatisfied EvictBack.
   //    This drops the Snoop Agent's clients-clear the same cycle it rises
   //    (L2SnoopAgent.scala clear_client_en) and the pending first-beat PASSDIRTY dirty-set.
+  // 4. Cancel a retry-canceled unsatisfied EvictBack's pending directory write so it cannot
+  //    invalidate the replacement already committed to the same way.
   io.dir_wb_cancel := meta_wr_state_evictback_I ||
+                      unlock_evictback_cancel ||
                       rxevb_satisfied_evictback && dirResult.way === rxevb.Way ||
                       p_rxreq_evictback && sa_resp_last
 
@@ -1956,16 +1964,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val sched_evictback_peer_unlock_dir = rxevb_evictback &&
                                         !evictback_peer_unlock_dir_immediate
 
-  // Satisfied/unsatisfied qualification of the accepted EvictBack, registered for the
-  // scheduled (late) peer Directory unlock path.
-  val p_rxevb_unsatisfied = RegInit(false.B)
-  when (rxevb_evictback) {
-    p_rxevb_unsatisfied := rxevb_unsatisfied_evictback
-  }
-
   val allow_evictback_peer_unlock_dir = w_s_evict_peer_unlock_dir &&
                                         Mux(p_rxevb_unsatisfied,
-                                            io.ds_rd_done || ds_cancel_evictback || fire_txreq_evict,
+                                            io.ds_rd_done || ds_cancel_evictback || fire_txreq_evict ||
+                                            unlock_evictback_cancel,
                                             Mux(p_prefill_hit,
                                                 prefill_hit_data_ready,
                                                 io.dir_wb_done))
@@ -1993,7 +1995,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val allow_evictback_peer_unlock_ds = w_s_evict_peer_unlock_ds &&
                                        Mux(p_prefill_hit,
                                            prefill_hit_data_ready,
-                                           io.ds_rd_done || ds_cancel_evictback || fire_txreq_evict)
+                                           io.ds_rd_done || ds_cancel_evictback || fire_txreq_evict ||
+                                           unlock_evictback_cancel)
 
   val evictback_peer_unlock_ds_late = allow_evictback_peer_unlock_ds
 
