@@ -97,6 +97,10 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
 
     val rd_idle = Output(Bool())
     val rd_done = Output(Bool())
+    // rd_done, or the combinational DSBufRdResp pulse one cycle earlier. The data
+    // is captured into the TSHR buffer at the pulse's edge (see L2TSHR), so
+    // consumers may safely act on it from the following cycle.
+    val rd_done_flow = Output(Bool())
 
     val wb_locked = Input(Bool())
     val wb_cancel = Input(Bool())
@@ -368,6 +372,7 @@ class L2TSHRDataStorageProxy(val id: Int)(implicit val p: Parameters) extends Mo
 
   io.rd_idle := state_dsRead.NotYet
   io.rd_done := state_dsRead.Done
+  io.rd_done_flow := state_dsRead.Done || fromDS_DSBufRdResp
 
   assert(PopCount(state_dsRead.asUInt) <= 1.U, "multiple active state in DSReadFSM")
 

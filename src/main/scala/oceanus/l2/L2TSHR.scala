@@ -146,7 +146,10 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   val tshr_inactive_vpipe = Wire(Bool())
   val tshr_inactive = tshr_inactive_rbe && tshr_inactive_vpipe
 
-  val tshr_inactivate = WireInit(false.B) // fastest combinational path of vPipe free, might be implemented in future
+  // T1-d (hitFastPathEarlyInactive): combinational one-cycle-early prediction of
+  // the REQ vPipe going free, resolving one cycle ahead of tshr_inactive.
+  // Driven after the vPipe instantiation below.
+  val tshr_inactivate = Wire(Bool())
 
   val tshr_wb_done_dir = Wire(Bool())
   val tshr_wb_done_ds = Wire(Bool())
@@ -477,6 +480,14 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   tshr_inactive_vpipe := vPipeEVT.io.free && vPipeSNP.io.free && vPipeREQ.io.free
 
+  // T1-d: exact prediction — the REQ vPipe is provably free at this cycle's
+  // edge (only w_rd_up_compack may remain, clearing on this cycle's CompAck)
+  // and nothing else is active. The proxies use this to resolve their write
+  // FSMs one cycle early; tshr_dealloc still keys on the real tshr_inactive.
+  tshr_inactivate := (if (paramL2.hitFastPathEarlyInactive)
+                        vPipeREQ.io.free_next && vPipeEVT.io.free && vPipeSNP.io.free && tshr_inactive_rbe
+                      else false.B)
+
   // connections between SNP vPipe and Snoop Agent
   snoopAgent.io.uopFromSNP.valid := vPipeSNP.io.toSA.SnpMakeInvalid ||
                                     vPipeSNP.io.toSA.SnpToInvalid ||
@@ -745,7 +756,10 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   proxyDS.io.ds_read_REQ_cancel := vPipeREQ.io.ds_rd_cancel
 
   vPipeSNP.io.ds_read_done := proxyDS.io.rd_done
-  vPipeREQ.io.ds_rd_done := proxyDS.io.rd_done
+  // T1-a (hitFastPathDsRespFlow): the REQ vPipe ends its DS wait on the
+  // combinational DSBufRdResp pulse instead of the registered Done state.
+  vPipeREQ.io.ds_rd_done := (if (paramL2.hitFastPathDsRespFlow) proxyDS.io.rd_done_flow
+                             else                           proxyDS.io.rd_done)
 
   tshr_buffer_commit := proxyDS.io.wb_accept
 

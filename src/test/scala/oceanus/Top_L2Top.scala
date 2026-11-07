@@ -116,6 +116,11 @@ Usage: Top_L2Top [<--option> <values>]
   var enableDRRIPReleaseUpdate = true
   var dirRelArbitration = "rr"
   var dirRelSingleCycle = true
+  var hitfpAll = false
+  var hitfpDsRespFlow = false
+  var hitfpSnoopWaitElision = false
+  var hitfpEarlyClientDirWb = false
+  var hitfpEarlyInactive = false
 
   def parseBoolean(option: String, value: String): Boolean = {
     require(value == "0" || value == "1", s"$option expects 0 or 1, got $value")
@@ -134,6 +139,16 @@ Usage: Top_L2Top [<--option> <values>]
       (originUseSRAM = parseBoolean("--l2-origin-use-sram", value), i)
     case (Array("--l2-dirrel-single-cycle", value), i) =>
       (dirRelSingleCycle = parseBoolean("--l2-dirrel-single-cycle", value), i)
+    case (Array("--l2-hitfp-all", value), i) =>
+      (hitfpAll = parseBoolean("--l2-hitfp-all", value), i)
+    case (Array("--l2-hitfp-ds-flow", value), i) =>
+      (hitfpDsRespFlow = parseBoolean("--l2-hitfp-ds-flow", value), i)
+    case (Array("--l2-hitfp-snoop-elision", value), i) =>
+      (hitfpSnoopWaitElision = parseBoolean("--l2-hitfp-snoop-elision", value), i)
+    case (Array("--l2-hitfp-early-dirwb", value), i) =>
+      (hitfpEarlyClientDirWb = parseBoolean("--l2-hitfp-early-dirwb", value), i)
+    case (Array("--l2-hitfp-early-inactive", value), i) =>
+      (hitfpEarlyInactive = parseBoolean("--l2-hitfp-early-inactive", value), i)
   }
 
   varArgsToDrop.map(_._2).foreach(i => {
@@ -169,7 +184,11 @@ Usage: Top_L2Top [<--option> <values>]
       originUseSRAM = originUseSRAM,
       enableDRRIPReleaseUpdate = enableDRRIPReleaseUpdate,
       dirRelArbitration = dirRelArbitration,
-      dirRelSingleCycle = dirRelSingleCycle
+      dirRelSingleCycle = dirRelSingleCycle,
+      hitFastPathDsRespFlow = hitfpAll || hitfpDsRespFlow,
+      hitFastPathSnoopWaitElision = hitfpAll || hitfpSnoopWaitElision,
+      hitFastPathEarlyClientDirWb = hitfpAll || hitfpEarlyClientDirWb,
+      hitFastPathEarlyInactive = hitfpAll || hitfpEarlyInactive
     )
     case CHIParametersKey => CHIParameters (
       issue = EnumCHIIssue.E,
