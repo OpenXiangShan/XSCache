@@ -1938,20 +1938,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // 3. Trigger Directory write-back immediately on EvictBack to commit the un-commited meta.
   // 4. Commit modified meta before an ordinary miss replacement read can wait
   //    on it. Conflict-hit prefill must not write the surrendered old line.
-  // 5. T1-c (hitFastPathEarlyClientDirWb): commit the ReadShared client-bit meta
-  //    write at CompData issue time instead of waiting for post-CompAck teardown.
-  //    The trigger pulse IS the meta write, so the DirWb always carries a
-  //    non-empty intended mask (no phantom write; cf. the seed-3019 note above).
-  //    Scoped to non-replacing lives (!p_prefill_any): on a miss the same pulse
-  //    fires at the fill issue while the replacement read may still be pending,
-  //    and an early PreArb entry there can overlap ReplRd with DirWb (the
-  //    miss-path commit is already handled by the dir_meta_stale term above).
   val dir_meta_stale = (io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept
   io.dir_wb_aux := hit_lock_response ||
                    io.self_unlock_dir || unlock_self_noevict ||
                    (dir_meta_stale && expect_miss_replace) ||
-                   (dir_meta_stale && rxevb_satisfied_evictback) ||
-                   (meta_wr_client_readshared_set && !p_prefill_any && paramL2.hitFastPathEarlyClientDirWb.B)
+                   (dir_meta_stale && rxevb_satisfied_evictback)
 
   assert(!(unlock_self_evictback && (io.tshr_meta_modified || io.tshr_tag_modified)),
     "EvictBack self-unlock with un-committed meta/tag: aux drop would strand a commit")

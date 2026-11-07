@@ -94,13 +94,12 @@ L2_DRRIP_USE_SRAM ?= 1
 L2_DIRREL_ARBITRATION ?= rr
 L2_ORIGIN_USE_SRAM ?= 0
 L2_DIRREL_SINGLE_CYCLE ?= 1
-# Tier-1 hit fast path (all default ON): L2_HITFP_ALL=0 disables all three;
+# Tier-1 hit fast path (all default ON): L2_HITFP_ALL=0 disables both;
 # the individual knobs default to L2_HITFP_ALL and override it selectively.
 L2_HITFP_ALL ?= 1
 L2_HITFP_DS_FLOW ?= $(L2_HITFP_ALL)
-L2_HITFP_EARLY_DIRWB ?= $(L2_HITFP_ALL)
 L2_HITFP_EARLY_INACTIVE ?= $(L2_HITFP_ALL)
-HITFP_ARGS = --l2-hitfp-all $(L2_HITFP_ALL) --l2-hitfp-ds-flow $(L2_HITFP_DS_FLOW) --l2-hitfp-early-dirwb $(L2_HITFP_EARLY_DIRWB) --l2-hitfp-early-inactive $(L2_HITFP_EARLY_INACTIVE)
+HITFP_ARGS = --l2-hitfp-all $(L2_HITFP_ALL) --l2-hitfp-ds-flow $(L2_HITFP_DS_FLOW) --l2-hitfp-early-inactive $(L2_HITFP_EARLY_INACTIVE)
 # set TOP_L2TOP_PERF=1 to elaborate all XSPerf performance counters (release
 # default is off); exposes the log dump/clean pins on the generated top
 TOP_L2TOP_PERF ?= 0

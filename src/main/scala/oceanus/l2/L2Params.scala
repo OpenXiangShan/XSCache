@@ -37,8 +37,6 @@ import utility.Code
   * elaborates zero extra hardware (gates constant-fold, dead ports prune):
   *   - hitFastPathDsRespFlow: clear the DS wait on the combinational
   *     DSBufRdResp pulse instead of the registered DSReadFSM Done.
-  *   - hitFastPathEarlyClientDirWb: commit the ReadShared client-bit meta
-  *     write at CompData issue time instead of post-CompAck teardown.
   *   - hitFastPathEarlyInactive: resolve the proxies' write FSMs one cycle
   *     early via an exact free-at-edge prediction of the REQ vPipe.
   *
@@ -66,7 +64,6 @@ case class L2Params(
     dirRelSingleCycle: Boolean = true,
     enableDRRIPEntranceReleaseUpdate: Boolean = true,
     hitFastPathDsRespFlow: Boolean = true,
-    hitFastPathEarlyClientDirWb: Boolean = true,
     hitFastPathEarlyInactive: Boolean = true,
 ) {
     require(Seq("dirrel-high", "rr", "dirrel-low").contains(dirRelArbitration),

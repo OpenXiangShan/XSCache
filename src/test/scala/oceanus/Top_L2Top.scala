@@ -118,7 +118,6 @@ Usage: Top_L2Top [<--option> <values>]
   var dirRelSingleCycle = true
   var hitfpAll = true
   var hitfpDsRespFlow = true
-  var hitfpEarlyClientDirWb = true
   var hitfpEarlyInactive = true
 
   def parseBoolean(option: String, value: String): Boolean = {
@@ -138,18 +137,15 @@ Usage: Top_L2Top [<--option> <values>]
       (originUseSRAM = parseBoolean("--l2-origin-use-sram", value), i)
     case (Array("--l2-dirrel-single-cycle", value), i) =>
       (dirRelSingleCycle = parseBoolean("--l2-dirrel-single-cycle", value), i)
-    // hit fast paths default on; --l2-hitfp-all sets all three, the
+    // hit fast paths default on; --l2-hitfp-all sets both, the
     // individual options after it override selectively
     case (Array("--l2-hitfp-all", value), i) =>
       hitfpAll = parseBoolean("--l2-hitfp-all", value)
       hitfpDsRespFlow = hitfpAll
-      hitfpEarlyClientDirWb = hitfpAll
       hitfpEarlyInactive = hitfpAll
       ((), i)
     case (Array("--l2-hitfp-ds-flow", value), i) =>
       (hitfpDsRespFlow = parseBoolean("--l2-hitfp-ds-flow", value), i)
-    case (Array("--l2-hitfp-early-dirwb", value), i) =>
-      (hitfpEarlyClientDirWb = parseBoolean("--l2-hitfp-early-dirwb", value), i)
     case (Array("--l2-hitfp-early-inactive", value), i) =>
       (hitfpEarlyInactive = parseBoolean("--l2-hitfp-early-inactive", value), i)
   }
@@ -189,7 +185,6 @@ Usage: Top_L2Top [<--option> <values>]
       dirRelArbitration = dirRelArbitration,
       dirRelSingleCycle = dirRelSingleCycle,
       hitFastPathDsRespFlow = hitfpDsRespFlow,
-      hitFastPathEarlyClientDirWb = hitfpEarlyClientDirWb,
       hitFastPathEarlyInactive = hitfpEarlyInactive
     )
     case CHIParametersKey => CHIParameters (
