@@ -620,7 +620,15 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   fastArb(Seq(vPipeSNP.io.DnTXRSP, vPipeREQ.io.DnTXRSP), io.DnTXRSP, Some("DnTXRSP"))
 
   fastArb(Seq(vPipeSNP.io.DnTXDAT, vPipeREQ.io.DnTXDAT), io.DnTXDAT, Some("DnTXDAT"))
-  io.DnTXDAT.bits.Data.get := Mux(io.DnTXDAT.bits.DataID.get === 0.U, tshr_buffer_0, tshr_buffer_2)
+  val dataBeat = Mux(io.DnTXDAT.bits.DataID.get === 0.U, tshr_buffer_0, tshr_buffer_2)
+  io.DnTXDAT.bits.Data.get := VecInit(
+    (0 until paramCHI.datBEWidth).map { byteIndex =>
+      Mux(
+        io.DnTXDAT.bits.BE.get(byteIndex),
+        dataBeat(byteIndex * 8 + 7, byteIndex * 8),
+        0.U(8.W))
+    }
+  ).asUInt
 
   io.UpTXEVB <> vPipeREQ.io.UpTXEVB
 
