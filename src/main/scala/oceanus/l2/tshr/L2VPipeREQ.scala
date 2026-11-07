@@ -80,6 +80,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
     val blockRBE = Output(new L2RBE.PathVPipeBlock)
     val free = Output(Bool())
+    // The vPipe is free, or provably becomes free at this cycle's edge.
+    val free_next = Output(Bool())
 
     // The latched opcode never triggers the Snoop Agent (no toSA.SnpTo*), so
     // its meta writes may legitimately coincide with an EVT vPipe commit on
@@ -424,23 +426,26 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // ----------------------------------------------------------------
 
   // -- State enchantment signals
-  val active = w_snpresp0 || w_snpresp2 || s_snpcompack ||
-               s_dn_txreq || w_dn_pcrdgrant ||
-               w_ds_resp ||
-               w_s_rd_dn_compack || s_rd_dn_compack || w_rd_dn_data0 || w_rd_dn_data2 || w_rd_dn_comp ||
-               w_rd_up_compack ||
-               w_s_rd_up_compdata0 || s_rd_up_compdata0 || w_s_rd_up_compdata2 || s_rd_up_compdata2 ||
-               w_s_rd_up_comp || s_rd_up_comp ||
-               w_unlock_dir || w_unlock_ds || w_s_unlock_ack ||
-               w_s_repl || s_repl || w_s_evict_up_evict || s_evict_up_evict ||
-               w_evict_s_dn_txreq ||
-               w_evict_dn_comp || w_evict_dn_compdbid ||
-               w_s_evict_dn_cbwrdata0 || w_s_evict_dn_cbwrdata2 ||
-               s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2 ||
-               s_evict_dn_compack ||
-               w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds ||
-               w_evict_peer_commit_dir ||
-               w_hit_lock_release || s_hit_lock_release
+  // active_tailless: all activity bits except the upstream CompAck tail
+  // (w_rd_up_compack); 'active' adds the tail back.
+  val active_tailless = w_snpresp0 || w_snpresp2 || s_snpcompack ||
+                        s_dn_txreq || w_dn_pcrdgrant ||
+                        w_ds_resp ||
+                        w_s_rd_dn_compack || s_rd_dn_compack || w_rd_dn_data0 || w_rd_dn_data2 || w_rd_dn_comp ||
+                        w_s_rd_up_compdata0 || s_rd_up_compdata0 || w_s_rd_up_compdata2 || s_rd_up_compdata2 ||
+                        w_s_rd_up_comp || s_rd_up_comp ||
+                        w_unlock_dir || w_unlock_ds || w_s_unlock_ack ||
+                        w_s_repl || s_repl || w_s_evict_up_evict || s_evict_up_evict ||
+                        w_evict_s_dn_txreq ||
+                        w_evict_dn_comp || w_evict_dn_compdbid ||
+                        w_s_evict_dn_cbwrdata0 || w_s_evict_dn_cbwrdata2 ||
+                        s_evict_dn_cbwrdata0 || s_evict_dn_cbwrdata2 ||
+                        s_evict_dn_compack ||
+                        w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds ||
+                        w_evict_peer_commit_dir ||
+                        w_hit_lock_release || s_hit_lock_release
+
+  val active = active_tailless || w_rd_up_compack
 
   io.free := !active
 
@@ -1086,6 +1091,13 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   }
 
   assert(!(up_rxrsp_compack && !w_rd_up_compack), "Receiving upstream RXRSP CompAck on non-valid 'w_rd_up_compack' in TSHR @ %m REQ vPipe")
+
+  // T1-d (hitFastPathEarlyInactive): exact one-cycle-ahead free prediction: if
+  // no bit is set the vPipe is free already; if the sole remaining bit is
+  // w_rd_up_compack and the CompAck arrives combinationally this cycle, every
+  // bit is clear at the edge. Any other last-bit case conservatively keeps the
+  // unpredicted timing.
+  io.free_next := !active || (!active_tailless && w_rd_up_compack && up_rxrsp_compack)
   assert(!(dn_rxrsp_comp && !(w_rd_dn_comp || w_evict_dn_comp || w_evict_dn_compdbid)),
     "TSHR @ %m REQ vPipe received downstream Comp on non-valid expectation")
   assert(!(dn_rxdat_compdata && !(w_rd_dn_data0 || w_rd_dn_data2)),
@@ -1921,16 +1933,25 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   //    re-arming on it manufactured a phantom (empty) DirWb that collided with a nested refill's
   //    ReplRd (seed 3019). 'unlock_self_noevict' is kept: its pulse always has the refill's locked
   //    commit pending, and it is the only prompt trigger once 'expect_replace' has cleared.
-  // 2. Trigger Directory write-back immediately on refill transactions to commit the un-committed 
+  // 2. Trigger Directory write-back immediately on refill transactions to commit the un-committed
   //    I state into Directory on reuse.
   // 3. Trigger Directory write-back immediately on EvictBack to commit the un-commited meta.
   // 4. Commit modified meta before an ordinary miss replacement read can wait
   //    on it. Conflict-hit prefill must not write the surrendered old line.
+  // 5. T1-c (hitFastPathEarlyClientDirWb): commit the ReadShared client-bit meta
+  //    write at CompData issue time instead of waiting for post-CompAck teardown.
+  //    The trigger pulse IS the meta write, so the DirWb always carries a
+  //    non-empty intended mask (no phantom write; cf. the seed-3019 note above).
+  //    Scoped to non-replacing lives (!p_prefill_any): on a miss the same pulse
+  //    fires at the fill issue while the replacement read may still be pending,
+  //    and an early PreArb entry there can overlap ReplRd with DirWb (the
+  //    miss-path commit is already handled by the dir_meta_stale term above).
   val dir_meta_stale = (io.tshr_meta_modified || io.tshr_tag_modified) && !io.dir_wb_accept
   io.dir_wb_aux := hit_lock_response ||
                    io.self_unlock_dir || unlock_self_noevict ||
                    (dir_meta_stale && expect_miss_replace) ||
-                   (dir_meta_stale && rxevb_satisfied_evictback)
+                   (dir_meta_stale && rxevb_satisfied_evictback) ||
+                   (meta_wr_client_readshared_set && !p_prefill_any && paramL2.hitFastPathEarlyClientDirWb.B)
 
   assert(!(unlock_self_evictback && (io.tshr_meta_modified || io.tshr_tag_modified)),
     "EvictBack self-unlock with un-committed meta/tag: aux drop would strand a commit")

@@ -94,12 +94,19 @@ L2_DRRIP_USE_SRAM ?= 1
 L2_DIRREL_ARBITRATION ?= rr
 L2_ORIGIN_USE_SRAM ?= 0
 L2_DIRREL_SINGLE_CYCLE ?= 1
+# Tier-1 hit fast path (all default ON): L2_HITFP_ALL=0 disables all three;
+# the individual knobs default to L2_HITFP_ALL and override it selectively.
+L2_HITFP_ALL ?= 1
+L2_HITFP_DS_FLOW ?= $(L2_HITFP_ALL)
+L2_HITFP_EARLY_DIRWB ?= $(L2_HITFP_ALL)
+L2_HITFP_EARLY_INACTIVE ?= $(L2_HITFP_ALL)
+HITFP_ARGS = --l2-hitfp-all $(L2_HITFP_ALL) --l2-hitfp-ds-flow $(L2_HITFP_DS_FLOW) --l2-hitfp-early-dirwb $(L2_HITFP_EARLY_DIRWB) --l2-hitfp-early-inactive $(L2_HITFP_EARLY_INACTIVE)
 # set TOP_L2TOP_PERF=1 to elaborate all XSPerf performance counters (release
 # default is off); exposes the log dump/clean pins on the generated top
 TOP_L2TOP_PERF ?= 0
 
 gen-top-l2top:
-	mill -i XSCache.testtop.oceanus.runMain oceanus.Top_L2Top -td $(BUILD_DIR_TOP_L2TOP) --slices $(L2_SLICES) --tshr $(TSHR) --l2-drrip-release-update $(L2_DRRIP_RELEASE_UPDATE) --l2-drrip-use-sram $(L2_DRRIP_USE_SRAM) --l2-origin-use-sram $(L2_ORIGIN_USE_SRAM) --l2-dirrel-arbitration $(L2_DIRREL_ARBITRATION) --l2-dirrel-single-cycle $(L2_DIRREL_SINGLE_CYCLE) $(if $(filter 1,$(TOP_L2TOP_PERF)),--perf,) --target systemverilog --split-verilog
+	mill -i XSCache.testtop.oceanus.runMain oceanus.Top_L2Top -td $(BUILD_DIR_TOP_L2TOP) --slices $(L2_SLICES) --tshr $(TSHR) --l2-drrip-release-update $(L2_DRRIP_RELEASE_UPDATE) --l2-drrip-use-sram $(L2_DRRIP_USE_SRAM) --l2-origin-use-sram $(L2_ORIGIN_USE_SRAM) --l2-dirrel-arbitration $(L2_DIRREL_ARBITRATION) --l2-dirrel-single-cycle $(L2_DIRREL_SINGLE_CYCLE) $(HITFP_ARGS) $(if $(filter 1,$(TOP_L2TOP_PERF)),--perf,) --target systemverilog --split-verilog
 
 BUILD_DIR_L2TOP = ./build/l2top
 
@@ -137,7 +144,7 @@ LLC_MSHR_MEMORY ?= 16
 LLC_MSHR_REFILL ?= 16
 test-top-l2openllc: NUM_SLICE = 2
 test-top-l2openllc:
-	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2OpenLLC -td $(BUILD_DIR_L2OPENLLC) --l2 $(NUM_L2) --slices $(NUM_SLICE) --tshrs $(NUM_TSHR) --l2-sets $(L2_SETS) --l2-ways $(L2_WAYS) --l2-replacement $(L2_REPLACEMENT) --l2-drrip-release-update $(L2_DRRIP_RELEASE_UPDATE) --l2-drrip-use-sram $(L2_DRRIP_USE_SRAM) --l2-origin-use-sram $(L2_ORIGIN_USE_SRAM) --l2-dirrel-single-cycle $(L2_DIRREL_SINGLE_CYCLE) --l2-dirrel-arbitration $(L2_DIRREL_ARBITRATION) --llc-sets $(LLC_SETS) --llc-ways $(LLC_WAYS) --llc-banks $(LLC_BANKS) --llc-mshr-memory $(LLC_MSHR_MEMORY) --llc-mshr-refill $(LLC_MSHR_REFILL) $(PERF_ARGS) --target systemverilog --split-verilog
+	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2OpenLLC -td $(BUILD_DIR_L2OPENLLC) --l2 $(NUM_L2) --slices $(NUM_SLICE) --tshrs $(NUM_TSHR) --l2-sets $(L2_SETS) --l2-ways $(L2_WAYS) --l2-replacement $(L2_REPLACEMENT) --l2-drrip-release-update $(L2_DRRIP_RELEASE_UPDATE) --l2-drrip-use-sram $(L2_DRRIP_USE_SRAM) --l2-origin-use-sram $(L2_ORIGIN_USE_SRAM) --l2-dirrel-single-cycle $(L2_DIRREL_SINGLE_CYCLE) --l2-dirrel-arbitration $(L2_DIRREL_ARBITRATION) --llc-sets $(LLC_SETS) --llc-ways $(LLC_WAYS) --llc-banks $(LLC_BANKS) --llc-mshr-memory $(LLC_MSHR_MEMORY) --llc-mshr-refill $(LLC_MSHR_REFILL) $(PERF_ARGS) $(HITFP_ARGS) --target systemverilog --split-verilog
 	if [ -f "$(BUILD_DIR_L2OPENLLC)/TestTop.sv.conf" ]; then $(MEM_GEN_SEP) "$(MEM_GEN)" "$(BUILD_DIR_L2OPENLLC)/TestTop.sv.conf" "$(BUILD_DIR_L2OPENLLC)"; fi
 
 # CHIRRTL (.fir) emission for the gsim backend (same knobs as above).
@@ -146,7 +153,7 @@ BUILD_DIR_L2OPENLLC_FIR = ./build/l2openllc$(if $(TAG),_$(TAG),)_fir
 
 test-top-l2openllc-fir: NUM_SLICE = 2
 test-top-l2openllc-fir:
-	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2OpenLLC -td $(BUILD_DIR_L2OPENLLC_FIR) --l2 $(NUM_L2) --slices $(NUM_SLICE) --tshrs $(NUM_TSHR) --l2-sets $(L2_SETS) --l2-ways $(L2_WAYS) --l2-replacement $(L2_REPLACEMENT) --l2-drrip-release-update $(L2_DRRIP_RELEASE_UPDATE) --l2-drrip-use-sram $(L2_DRRIP_USE_SRAM) --l2-origin-use-sram $(L2_ORIGIN_USE_SRAM) --l2-dirrel-single-cycle $(L2_DIRREL_SINGLE_CYCLE) --l2-dirrel-arbitration $(L2_DIRREL_ARBITRATION) --llc-sets $(LLC_SETS) --llc-ways $(LLC_WAYS) --llc-banks $(LLC_BANKS) --llc-mshr-memory $(LLC_MSHR_MEMORY) --llc-mshr-refill $(LLC_MSHR_REFILL) $(PERF_ARGS) --target chirrtl
+	mill -i XSCache.testtop.oceanus.runMain oceanus.TestTop_L2OpenLLC -td $(BUILD_DIR_L2OPENLLC_FIR) --l2 $(NUM_L2) --slices $(NUM_SLICE) --tshrs $(NUM_TSHR) --l2-sets $(L2_SETS) --l2-ways $(L2_WAYS) --l2-replacement $(L2_REPLACEMENT) --l2-drrip-release-update $(L2_DRRIP_RELEASE_UPDATE) --l2-drrip-use-sram $(L2_DRRIP_USE_SRAM) --l2-origin-use-sram $(L2_ORIGIN_USE_SRAM) --l2-dirrel-single-cycle $(L2_DIRREL_SINGLE_CYCLE) --l2-dirrel-arbitration $(L2_DIRREL_ARBITRATION) --llc-sets $(LLC_SETS) --llc-ways $(LLC_WAYS) --llc-banks $(LLC_BANKS) --llc-mshr-memory $(LLC_MSHR_MEMORY) --llc-mshr-refill $(LLC_MSHR_REFILL) $(PERF_ARGS) $(HITFP_ARGS) --target chirrtl
 
 # per-L2 node IDs; CHI_NIDS is a comma list with one value per L2 (default
 # 0,1,2,...); CCHI_UPSTREAM is the per-L2 upstream CCHI port table spec

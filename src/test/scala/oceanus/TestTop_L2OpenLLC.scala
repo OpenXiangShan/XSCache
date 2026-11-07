@@ -306,6 +306,10 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
   var l2OriginUseSRAM = false
   var l2DirRelArbitration = "rr"
   var l2DirRelSingleCycle = true
+  var l2HitfpAll = true
+  var l2HitfpDsRespFlow = true
+  var l2HitfpEarlyClientDirWb = true
+  var l2HitfpEarlyInactive = true
   var llcSets = 64
   var llcWays = 4
   var llcBanks = 1
@@ -328,6 +332,16 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       case "--l2-origin-use-sram" => l2OriginUseSRAM = args(i + 1) == "1"; i += 2
       case "--l2-dirrel-arbitration" => l2DirRelArbitration = args(i + 1); i += 2
       case "--l2-dirrel-single-cycle" => l2DirRelSingleCycle = args(i + 1) == "1"; i += 2
+      // hit fast paths default on; --l2-hitfp-all sets all three, the
+      // individual options after it override selectively
+      case "--l2-hitfp-all" =>
+        l2HitfpAll = args(i + 1) == "1"
+        l2HitfpDsRespFlow = l2HitfpAll
+        l2HitfpEarlyClientDirWb = l2HitfpAll
+        l2HitfpEarlyInactive = l2HitfpAll; i += 2
+      case "--l2-hitfp-ds-flow" => l2HitfpDsRespFlow = args(i + 1) == "1"; i += 2
+      case "--l2-hitfp-early-dirwb" => l2HitfpEarlyClientDirWb = args(i + 1) == "1"; i += 2
+      case "--l2-hitfp-early-inactive" => l2HitfpEarlyInactive = args(i + 1) == "1"; i += 2
       case "--llc-sets" => llcSets = args(i + 1).toInt; i += 2
       case "--llc-ways" => llcWays = args(i + 1).toInt; i += 2
       case "--llc-banks" => llcBanks = args(i + 1).toInt; i += 2
@@ -360,7 +374,10 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       originUseSRAM = l2OriginUseSRAM,
       enableDRRIPReleaseUpdate = l2DRRIPReleaseUpdate,
       dirRelArbitration = l2DirRelArbitration,
-      dirRelSingleCycle = l2DirRelSingleCycle
+      dirRelSingleCycle = l2DirRelSingleCycle,
+      hitFastPathDsRespFlow = l2HitfpDsRespFlow,
+      hitFastPathEarlyClientDirWb = l2HitfpEarlyClientDirWb,
+      hitFastPathEarlyInactive = l2HitfpEarlyInactive
     )
     case CHIParametersKey => CHIParameters (
       issue = EnumCHIIssue.E,
