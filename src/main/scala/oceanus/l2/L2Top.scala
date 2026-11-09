@@ -133,7 +133,9 @@ class L2Configuration(
   val vbopStubEnable: Boolean = false,
   val cdpStubEnable: Boolean = false,
   val vbopParams: OceanusVBOPParameters = OceanusVBOPParameters(),
-  val cdpParams: OceanusCDPParameters = OceanusCDPParameters()
+  val cdpParams: OceanusCDPParameters = OceanusCDPParameters(),
+  val hintEnable: Boolean = false,
+  val hintMissEntries: Int = 16
 ) {
   def sliceNum = slices.size
   // Training enables cache event observation even without an algorithm sink.
@@ -168,6 +170,9 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     val pfTlb = if (config.pfTlbEnable) Some(new L2PrefetchTlbIO) else None
     val pfTrain = if (config.pfTrainEnable) Some(Input(Vec(t1NIDs.size, new L2PrefetchTrainSideband))) else None
 
+    val refillHint = Vec(t1NIDs.size, Valid(new L2RefillHint(
+      p(xscache.oceanus.compactchi.CCHIParametersKey).TxnID_Width,
+      p(xscache.oceanus.compactchi.CCHIParametersKey).UpstreamNodeID_Width)))
     val chi = new CHIRNFInterface
   })
 
@@ -236,7 +241,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   // ----------------------------------------------------------------
 
   //
-  val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId, config.pfTrainEnable)(
+  val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId, config.pfTrainEnable, if (config.hintEnable) t1NIDs else Nil, config.hintMissEntries)(
     p.alterPartial { case L2CDPObserveEnableKey => config.cdpObserveEnable })))
 
   // Source controls gate issue. delay_latency drives both BOP delay queues;
@@ -824,6 +829,56 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
     }}
     fastArb(preArb_DnDATs(i), port._1, Some(s"DnDAT_$i"))
   }}
+
+  slices.foreach { s =>
+    s.io.refillHint.ready := false.B
+    s.io.hintQueueFull := false.B
+  }
+  io.refillHint.foreach { h =>
+    h.valid := false.B
+    h.bits := 0.U.asTypeOf(h.bits)
+  }
+  if (config.hintEnable) {
+    val queues = t1NIDs.map(_ => Module(new L2HintPointerQueue(math.max(1, log2Ceil(config.sliceNum)))))
+    val arbs = t1NIDs.map(_ => Module(new Arbiter(chiselTypeOf(io.refillHint.head.bits), config.sliceNum)))
+    for (ch <- t1NIDs.indices) {
+      val arb = arbs(ch)
+      val q = queues(ch)
+      slices.zipWithIndex.foreach { case (s, i) =>
+        val othersQuiet = slices.zipWithIndex.filter(_._2 != i).map(_._1.io.hintQuiescent)
+          .foldLeft(true.B)(_ && _)
+        arb.io.in(i).valid := s.io.refillHint.valid && othersQuiet &&
+          s.io.refillHint.bits.targetId === t1NIDs(ch).U
+        arb.io.in(i).bits := s.io.refillHint.bits
+      }
+      arb.io.out.ready := q.io.enq.ready
+      q.io.enq.valid := arb.io.out.valid
+      q.io.enq.bits := arb.io.chosen
+      io.refillHint(ch).valid := arb.io.out.fire
+      io.refillHint(ch).bits := arb.io.out.bits
+      val dat = port_DnDATs(ch)._1
+      val head = q.io.out.bits
+      q.io.out.ready := dat.fire && VecInit(slices.map(_.io.UpTXDAT.fire))(head) &&
+        VecInit(slices.map(_.io.UpTXDAT.bits.TgtID))(head) === t1NIDs(ch).U
+      when(q.io.out.valid) {
+        assert(q.io.out.fire, "non-preempting cross-slice reservation missed")
+        assert(dat.bits.DataID === q.io.second.asUInt, "cross-slice hint beat phase")
+      }
+      val otherBlocked = preArb_DnDATs(ch).zipWithIndex.map { case (d, i) =>
+        head =/= i.U && d.valid && !d.ready
+      }.reduce(_ || _)
+      XSPerfAccumulate(s"hint_reservation_delayed_other_$ch", q.io.out.valid && otherBlocked)
+      assert(!(q.io.out.valid && otherBlocked), "unexpected cross-slice DAT competitor")
+      XSPerfAccumulate(s"hint_hit_sent_$ch", io.refillHint(ch).valid)
+      XSPerfAccumulate(s"hint_skip_fifo_full_$ch", arb.io.out.valid && q.io.full)
+    }
+    slices.zipWithIndex.foreach { case (s, i) =>
+      s.io.refillHint.ready := t1NIDs.indices.map(ch =>
+        arbs(ch).io.in(i).valid && arbs(ch).io.in(i).ready).reduce(_ || _)
+      s.io.hintQueueFull := t1NIDs.indices.map(ch =>
+        s.io.refillHint.bits.targetId === t1NIDs(ch).U && queues(ch).io.full).reduce(_ || _)
+    }
+  }
 
   // Assert: a slice-emitted UpTXDAT flit must target a configured upstream port
   // NID (Type-1 or Type-4). Same stall-forever failure mode as UpTXRSP above.
