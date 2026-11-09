@@ -50,7 +50,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val mshrTask = DecoupledIO(new TaskBundle())
 
     /* status of s2 and s3 */
-    val pipeStatusVec = Flipped(Vec(2, ValidIO(new PipeStatus)))
+    val pipeStatusVec = Flipped(Vec(2, ValidIO(new PipeStatusWithCHI)))
 
     /* send reqs */
     val toTXREQ = DecoupledIO(new CHIREQ())
@@ -107,7 +107,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
 
   val mshrs = Seq.fill(mshrsAll) { Module(new MSHR()) }
   val mshrValids = VecInit(mshrs.map(m => m.io.status.valid))
-  val pipeReqCount = PopCount(Cat(io.pipeStatusVec.map(_.valid))) // TODO: consider add !mshrTask to optimize
+  // MSHR tasks already own an entry and cannot allocate again in MainPipe.
+  val pipeReqCount = PopCount(Cat(io.pipeStatusVec.map(s => s.valid && !s.bits.mshrTask)))
   val mshrCount = PopCount(Cat(mshrs.map(_.io.status.valid)))
   val mshrFull = pipeReqCount + mshrCount >= mshrsAll.U
   val a_mshrFull = pipeReqCount + mshrCount >= (mshrsAll-1).U // the last idle mshr should not be allocated for channel A req

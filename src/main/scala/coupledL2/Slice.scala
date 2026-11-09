@@ -150,8 +150,8 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   mshrCtl.io.replResp := directory.io.replResp
   mshrCtl.io.aMergeTask := reqBuf.io.aMergeTask
   // TODO: This is ugly
-  mshrCtl.io.pipeStatusVec(0) := (reqArb.io.status_vec)(1) // s2 status
-  mshrCtl.io.pipeStatusVec(1) := mainPipe.io.status_vec_toD(0) // s3 status
+  mshrCtl.io.pipeStatusVec(0) := reqArb.io.status_vec_toTX(1) // s2 status
+  mshrCtl.io.pipeStatusVec(1) := mainPipe.io.status_vec_toTX(0) // s3 status
 
   /* Read and write release buffer */
   releaseBuf.io.r := reqArb.io.releaseBufRead_s2
