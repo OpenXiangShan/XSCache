@@ -171,7 +171,6 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   // meta
   val dirResult = Reg(new L2Directory.MetaReadResult)
   val replResult = Reg(new L2Directory.ReplReadResult)
-  val replResultMeta = Reg(new L2Directory.Meta)   // victim entry meta latched at ReplRdResp
 
   /* NOTICE: For current design, any partial write to meta would never assert 'meta_valid'.
              Any later read request on full meta line would result in a Directory Read if no any read done yet.
@@ -216,7 +215,6 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   
   when (io.fromDir.ReplRdResp && io.fromDir.TSHRID === io.consts.tshrId) {
     replResult := io.fromDir.REPL
-    replResultMeta := io.fromDir.META   // victim's committed state at pick time
     meta.way := io.fromDir.REPL.way
   }
 
@@ -456,7 +454,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   val dirResult_with_fastpath = if (paramL2.hitFastPathDirRespFlow) {
     val dirRdResp_for_me = io.fromDir.DirRdResp && io.fromDir.TSHRID === io.consts.tshrId
     val dirReq_fire_fastpath = dirRdResp_for_me && rbeREQ.io.out.fire
-    Mux(dirReq_fire_fastpath, io.fromDir.DIRRD_META.get, dirResult)
+    Mux(dirReq_fire_fastpath, io.fromDir.META, dirResult)
   } else {
     dirResult
   }
@@ -703,7 +701,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   vPipeREQ.io.repl_retry := proxyDir.io.repl_retry
   vPipeREQ.io.repl_done := proxyDir.io.repl_done
   vPipeREQ.io.repl_resp := replResult
-  vPipeREQ.io.repl_meta := replResultMeta
+  vPipeREQ.io.repl_meta := replResult.meta
 
   proxyDir.io.repl_lock_req := vPipeREQ.io.repl_lock_req
   proxyDir.io.repl_lock_way := vPipeREQ.io.repl_lock_way

@@ -76,7 +76,7 @@ object L2Directory {
 
   class MetaReadResult(implicit override val p: Parameters) extends Meta with HasL2Params {
     val way = UInt(wayBits.W)
-    val hit = Bool() // DirRd: tag hit. ReplRd: unused.
+    val hit = Bool() // DirRd tag hit
   }
 
   class MetaWriteMask(implicit val p: Parameters) extends Bundle with HasL2Params {
@@ -119,8 +119,9 @@ object L2Directory {
   }
 
   class ReplReadResult(implicit override val p: Parameters) extends Bundle with HasL2Params {
-    val paddr = UInt(paramL2.physicalAddrWidth.W) // victim PA; valid when META.state =/= I
+    val paddr = UInt(paramL2.physicalAddrWidth.W) // victim PA; valid when meta.state =/= I
     val way = UInt(wayBits.W)
+    val meta = new L2Directory.Meta
   }
 
   // A valid entry represents one active set and caches its complete replacement
@@ -172,8 +173,7 @@ object L2Directory {
 
   class PathFromDirectory(implicit val p: Parameters) extends PathFromDirectoryUOPs with HasL2Params {
     val TSHRID = UInt(mshrIndexWidth.W)
-    val META = new L2Directory.MetaReadResult
-    val DIRRD_META = if (paramL2.hitFastPathDirRespFlow) Some(new L2Directory.MetaReadResult) else None
+    val META = new L2Directory.MetaReadResult // only applicable for DirRd
     val REPL = new L2Directory.ReplReadResult // only applicable for ReplRd
   }
 
@@ -1430,7 +1430,6 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   io.fromDir.zipWithIndex.foreach { case (o, i) =>
     o.TSHRID         := i.U
     o.META           := 0.U.asTypeOf(new L2Directory.MetaReadResult)
-    o.DIRRD_META.foreach(_ := 0.U.asTypeOf(new L2Directory.MetaReadResult))
     o.REPL           := 0.U.asTypeOf(new L2Directory.ReplReadResult)
     o.DirRdArbComp   := false.B
     o.DirRdResp      := false.B
@@ -1454,26 +1453,15 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   // Resp at S3 — routed one-to-one to the originating TSHR
   when(s3_valid) {
     val o = io.fromDir(s3_tshr)
-    if (paramL2.hitFastPathDirRespFlow) {
-      val dirRdEntry_s3 = dirData_s3(Mux(hit_s3, hitWay, 0.U))
-      when (s3_isDirRd && hit_s3) {
-        o.DIRRD_META.get.state := dirRdEntry_s3.meta.state
-        o.DIRRD_META.get.dirty := dirRdEntry_s3.meta.dirty
-        o.DIRRD_META.get.clients := dirRdEntry_s3.meta.clients
-        o.DIRRD_META.get.alias := dirRdEntry_s3.meta.alias
-        o.DIRRD_META.get.prefetch := dirRdEntry_s3.meta.prefetch
-        o.DIRRD_META.get.way := hitWay
-        o.DIRRD_META.get.hit := true.B
-      }
-    }
-    when(metaValid) {
-      o.META.state   := entry_s3.meta.state
-      o.META.dirty   := entry_s3.meta.dirty
-      o.META.clients := entry_s3.meta.clients
-      o.META.alias   := entry_s3.meta.alias
-      o.META.prefetch := entry_s3.meta.prefetch
-      o.META.way     := way_s3
-      o.META.hit     := Mux(s3_isRepl, false.B, hit_s3)
+    val dirRdEntry_s3 = dirData_s3(Mux(hit_s3, hitWay, 0.U))
+    when (s3_isDirRd && hit_s3) {
+      o.META.state := dirRdEntry_s3.meta.state
+      o.META.dirty := dirRdEntry_s3.meta.dirty
+      o.META.clients := dirRdEntry_s3.meta.clients
+      o.META.alias := dirRdEntry_s3.meta.alias
+      o.META.prefetch := dirRdEntry_s3.meta.prefetch
+      o.META.way := hitWay
+      o.META.hit := true.B
     }
     when(s3_isRepl) {
       o.ReplRdResp := !replRetry
@@ -1481,6 +1469,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
       when(!replRetry) {
         o.REPL.paddr := Cat(entry_s3.tag, s3_set, 0.U(offsetBits.W))
         o.REPL.way := way_s3
+        o.REPL.meta := entry_s3.meta
       }
     }.otherwise {
       o.DirRdResp := true.B

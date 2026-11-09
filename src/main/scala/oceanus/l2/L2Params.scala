@@ -33,8 +33,8 @@ import utility.Code
   *
   * The hitFastPath* fields gate the hit-latency/occupancy optimizations
   * (documented in the L2 proxy-FSM optimization series). Each is independent,
-  * elaboration-time only, and defaults on; a disabled fix elaborates zero
-  * extra hardware (gates constant-fold, dead ports prune):
+  * elaboration-time only, and defaults on; disabling a fix removes its bypass
+  * logic. The DirRd/ReplRd response interfaces remain split in either mode:
   *   - hitFastPathDsRespFlow: clear the DS wait on the combinational
   *     DSBufRdResp pulse instead of the registered DSReadFSM Done.
   *   - hitFastPathDirRespFlow: fire the REQ vPipe on the combinational
