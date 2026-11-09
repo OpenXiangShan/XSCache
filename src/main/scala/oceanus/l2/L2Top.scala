@@ -241,7 +241,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   // ----------------------------------------------------------------
 
   //
-  val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId, config.pfTrainEnable, if (config.hintEnable) t1NIDs else Nil, config.hintMissEntries)(
+  val slices = Seq.tabulate(config.sliceNum)(i => Module(new L2TSHRCtrl(config.sliceNum, i, config.slices(i), config.nodeId, config.pfTrainEnable, if (config.hintEnable) t1NIDs else Nil, config.hintMissEntries, t1NIDs)(
     p.alterPartial { case L2CDPObserveEnableKey => config.cdpObserveEnable })))
 
   // Source controls gate issue. delay_latency drives both BOP delay queues;
@@ -833,6 +833,9 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   slices.foreach { s =>
     s.io.refillHint.ready := false.B
     s.io.hintQueueFull := false.B
+    s.io.hintOtherSlicesBusy := false.B
+    s.io.hintChannelCooldown := false.B
+    s.io.hintArbLost := false.B
   }
   io.refillHint.foreach { h =>
     h.valid := false.B
@@ -877,6 +880,13 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
         arbs(ch).io.in(i).valid && arbs(ch).io.in(i).ready).reduce(_ || _)
       s.io.hintQueueFull := t1NIDs.indices.map(ch =>
         s.io.refillHint.bits.targetId === t1NIDs(ch).U && queues(ch).io.full).reduce(_ || _)
+      s.io.hintOtherSlicesBusy := slices.zipWithIndex.filter(_._2 != i)
+        .map { case (other, _) => !other.io.hintQuiescent }.foldLeft(false.B)(_ || _)
+      s.io.hintChannelCooldown := t1NIDs.indices.map(ch =>
+        s.io.refillHint.bits.targetId === t1NIDs(ch).U &&
+          !queues(ch).io.full && !queues(ch).io.enq.ready).reduce(_ || _)
+      s.io.hintArbLost := t1NIDs.indices.map(ch =>
+        arbs(ch).io.in(i).valid && arbs(ch).io.chosen =/= i.U).reduce(_ || _)
     }
   }
 

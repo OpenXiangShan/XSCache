@@ -61,6 +61,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     val UpTXRSP = Decoupled(new FlitDnRSP)
     val UpTXDAT = Decoupled(new FlitDnDAT)
     val hitHintReady = Output(Bool())
+    val hitHintObserve = Output(new L2HitHintObservation)
 
     val UpTXEVB = Decoupled(new L2VPipeREQ.FlitEVB)
 
@@ -1770,6 +1771,19 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     !s_rd_up_compdata0 && !s_rd_up_compdata2 && w_ds_resp &&
     !w_snpresp0 && !w_snpresp2 && !w_rd_dn_data0 && !w_rd_dn_data2 &&
     !io.L1EVT_active && !io.ds_rd_cancel
+
+  // Snapshot the OLD directory result at request execution, before metadata
+  // updates. Only transactions that later send L1D data enter the denominator.
+  io.hitHintObserve.request := rxreq_fire
+  io.hitHintObserve.hit := dirResult.hit
+  io.hitHintObserve.dsResponse := false.B // supplied by the owning TSHR
+  io.hitHintObserve.failures := VecInit(Seq(
+    !dirResult.hit, !(p_rxreq_readshared || p_rxreq_readunique),
+    !w_s_rd_up_compdata0, !w_s_rd_up_compdata2,
+    s_rd_up_compdata0, s_rd_up_compdata2, !w_ds_resp,
+    w_snpresp0, w_snpresp2, w_rd_dn_data0, w_rd_dn_data2,
+    io.L1EVT_active, io.ds_rd_cancel
+  ) ++ Seq.fill(L2HintCoverage.tshrReasons.size)(false.B))
 
   val up_txdat_dataid = Mux(s_rd_up_compdata0, 0.U, 1.U) // TODO: cirtical word first maybe
 

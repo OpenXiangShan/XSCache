@@ -112,6 +112,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
     val valid = Output(Bool())
     val hintLock = Input(Bool())
     val hitHintSafe = Output(Bool())
+    val hitHintObserve = Output(new L2HitHintObservation)
 
     val bopPerf = Output(Vec(L2BOPPerf.names.size, Bool()))
     val bopPerfSource = Output(Vec(L2BOPPerf.names.size, UInt(L2PfSource.Width.W)))
@@ -767,6 +768,13 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int, val pfTrainEnable: Boolean = fa
     !tshr_enter && !rbeEVT.io.out.valid && !rbeSNP.io.out.valid &&
     !rbeEVB.io.out.valid && !rbeREQ.io.out.valid &&
     !tshr_buffer_wen_RXDAT_0 && !tshr_buffer_wen_RXDAT_2
+  io.hitHintObserve := vPipeREQ.io.hitHintObserve
+  io.hitHintObserve.dsResponse := io.fromDS.DSBufRdResp
+  Seq(!tshr_valid, !vPipeEVT.io.free, !vPipeSNP.io.free, tshr_enter,
+    rbeEVT.io.out.valid, rbeSNP.io.out.valid, rbeEVB.io.out.valid, rbeREQ.io.out.valid,
+    tshr_buffer_wen_RXDAT_0, tshr_buffer_wen_RXDAT_2).zipWithIndex.foreach { case (v, i) =>
+    io.hitHintObserve.failures(L2HintCoverage.pipeReasons.size + i) := v
+  }
   when(io.hintLock) {
     assert(tshr_valid && !tshr_enter, "hint owner released or reused")
     assert(!tshr_buffer_wen_DS && !tshr_buffer_wen_RXDAT_0 && !tshr_buffer_wen_RXDAT_2,

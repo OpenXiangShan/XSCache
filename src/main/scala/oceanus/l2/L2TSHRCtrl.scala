@@ -39,7 +39,7 @@ trait L2SliceLocatable {
   def getTxnIDFromTSHRId(tshrId: Int) = (tshrId.U << log2Ceil(sliceNum)) | sliceIdx.U(log2Ceil(sliceNum).W)
 }
 
-class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val nodeId: Int, val pfTrainEnable: Boolean = false, val hintTargets: Seq[Int] = Nil, val hintMissEntries: Int = 16)(implicit val p: Parameters) extends Module
+class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val nodeId: Int, val pfTrainEnable: Boolean = false, val hintTargets: Seq[Int] = Nil, val hintMissEntries: Int = 16, val hintObserveTargets: Seq[Int] = Nil)(implicit val p: Parameters) extends Module
     with HasL2Params 
     with L2SliceLocatable
     with HasCCHIParameters {
@@ -65,6 +65,9 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
     val refillHint = Decoupled(new L2RefillHint(paramCCHI.TxnID_Width, paramCCHI.UpstreamNodeID_Width))
     val hintQuiescent = Output(Bool())
     val hintQueueFull = Input(Bool())
+    val hintOtherSlicesBusy = Input(Bool())
+    val hintChannelCooldown = Input(Bool())
+    val hintArbLost = Input(Bool())
 
     val DnRXRSP = Flipped(Valid(new CHIBundleRSP))
     val DnRXDAT = Flipped(Valid(new CHIBundleDAT))
@@ -247,6 +250,14 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
   io.refillHint.valid := false.B
   io.refillHint.bits := 0.U.asTypeOf(io.refillHint.bits)
   tshrs.foreach(_.io.hintLock := false.B)
+  // Per-entry observation state is independent of functional scheduling.
+  val hintAdmissionFailures = Wire(Vec(paramL2.mshrSize,
+    Vec(L2HintCoverage.admissionReasons.size, Bool())))
+  hintAdmissionFailures.foreach(_ := VecInit(Seq.fill(L2HintCoverage.admissionReasons.size)(false.B)))
+  val hintAccepted = Wire(Vec(paramL2.mshrSize, Bool()))
+  hintAccepted.foreach(_ := false.B)
+  val hintCovEvents = Wire(Vec(paramL2.mshrSize, UInt(4.W)))
+  val hintCovReasons = Wire(Vec(paramL2.mshrSize, UInt(L2HintCoverage.reasons.size.W)))
   if (hintTargets.nonEmpty) {
     val width = math.max(1, log2Ceil(paramL2.mshrSize))
     val pointers = Module(new L2HintPointerQueue(width))
@@ -270,6 +281,28 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
       reserved(chosen) := true.B
     }
     tshrs.zipWithIndex.foreach { case (t, i) => t.io.hintLock := reserved(i) }
+    tshrs.zipWithIndex.foreach { case (t, i) =>
+      hintAccepted(i) := io.refillHint.fire && chosen === i.U
+      val safe = t.io.hitHintSafe
+      val sourceOK = t.io.UpTXDAT.bits.TxnID < hintMissEntries.U
+      val localEligible = safe && sourceOK && soleOwner && !reserved.asUInt.orR
+      val offered = localEligible && pointers.io.enq.ready
+      val topEligible = offered && !io.hintOtherSlicesBusy
+      val topReady = topEligible && !io.hintQueueFull && !io.hintChannelCooldown
+      val checks = Seq(
+        safe && !sourceOK,
+        safe && sourceOK && !soleOwner,
+        safe && sourceOK && reserved.asUInt.orR,
+        localEligible && pointers.io.full,
+        localEligible && !pointers.io.full && !pointers.io.enq.ready,
+        offered && io.hintOtherSlicesBusy,
+        topEligible && io.hintQueueFull,
+        topEligible && !io.hintQueueFull && io.hintChannelCooldown,
+        topReady && io.hintArbLost,
+        topReady && !io.hintArbLost && !io.refillHint.fire,
+        false.B, false.B, false.B)
+      hintAdmissionFailures(i) := VecInit(checks)
+    }
     val head = pointers.io.out.bits
     val fires = VecInit(tshrs.map(_.io.UpTXDAT.fire))
     pointers.io.out.ready := io.UpTXDAT.fire && fires(head)
@@ -290,6 +323,59 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
     // DAT valid/ready has no reservation mux or mask, so hint cannot steal it.
     XSPerfAccumulate("hint_reservation_delayed_other", pointers.io.out.valid && otherBlocked)
     assert(!(pointers.io.out.valid && otherBlocked), "unexpected competing DAT inside quiet reservation")
+  }
+
+  tshrs.zipWithIndex.foreach { case (t, i) =>
+    val o = t.io.hitHintObserve
+    val live = RegInit(false.B)
+    val hit = RegInit(false.B)
+    val firstSent = RegInit(false.B)
+    val decided = RegInit(false.B)
+    val hinted = RegInit(false.B)
+    val failures = RegInit(0.U(L2HintCoverage.reasons.size.W))
+    val decision = Cat(hintAdmissionFailures(i).asUInt, o.failures.asUInt)
+    when(!t.io.valid) { live := false.B }
+    when(o.request) {
+      live := true.B
+      hit := o.hit
+      firstSent := false.B
+      decided := false.B
+      hinted := false.B
+      failures := 0.U
+    }
+    when(live && !firstSent && o.dsResponse && !decided) {
+      decided := true.B
+      failures := decision
+    }
+    when(hintAccepted(i)) { hinted := true.B }
+    val toL1D = hintObserveTargets.map(n => t.io.UpTXDAT.bits.TgtID === n.U)
+      .foldLeft(false.B)(_ || _)
+    val first = live && !firstSent && t.io.UpTXDAT.fire && toL1D
+    when(first) { firstSent := true.B }
+    val hitSent = first && hit
+    val skipped = hitSent && !hinted
+    val disabled = (hintTargets.isEmpty).B
+    val noDS = !decided
+    val fallback = Mux(disabled,
+      (BigInt(1) << L2HintCoverage.reasons.indexOf("hint_disabled")).U,
+      Mux(noDS, (BigInt(1) << L2HintCoverage.reasons.indexOf("no_ds_response")).U,
+        Mux(failures.orR, failures,
+          (BigInt(1) << L2HintCoverage.reasons.indexOf("no_recorded_reason")).U)))
+    hintCovReasons(i) := Mux(skipped, fallback, 0.U)
+    hintCovEvents(i) := Cat(skipped, hitSent && hinted, first && !hit, hitSent)
+    when(first && !hit) { assert(!hinted, "directory miss must not issue a hit hint") }
+  }
+  // L1D transactions are counted exactly once at their first actual DAT fire.
+  // Consequently warmup/window boundaries use the same event for both ratio terms.
+  val hintCovCounts = Wire(Vec(4, UInt(log2Ceil(paramL2.mshrSize + 1).W)))
+  Seq("hit_txn", "miss_txn", "hit_hinted", "hit_skipped").zipWithIndex.foreach { case (name, bit) =>
+    hintCovCounts(bit) := PopCount(VecInit(hintCovEvents.map(_(bit))))
+    XSPerfAccumulate(s"hint_cov_$name", hintCovCounts(bit))
+  }
+  val hintCovPrimary = VecInit(hintCovReasons.map(x => PriorityEncoderOH(x)))
+  L2HintCoverage.reasons.zipWithIndex.foreach { case (name, bit) =>
+    XSPerfAccumulate(s"hint_cov_skip_$name", PopCount(VecInit(hintCovPrimary.map(_(bit)))))
+    XSPerfAccumulate(s"hint_cov_condition_$name", PopCount(VecInit(hintCovReasons.map(_(bit)))))
   }
 
 

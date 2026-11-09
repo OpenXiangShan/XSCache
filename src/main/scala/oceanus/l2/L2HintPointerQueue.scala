@@ -40,3 +40,36 @@ class L2HintPointerQueue(pointerBits: Int, entries: Int = 4, ahead: Int = 3) ext
   pointers.io.deq.ready := io.out.fire && second
   when(io.out.fire) { second := !second }
 }
+
+// Observation only: none of these signals feed hint admission or DAT scheduling.
+// skip_* is a disjoint first-failure histogram in this order; condition_* may
+// overlap. Both are charged once, at the first actual L1D DAT handshake.
+object L2HintCoverage {
+  val pipeReasons = Seq(
+    "directory_not_hit", "opcode_not_read_shared_unique", "waiting_data0_missing",
+    "waiting_data2_missing", "data0_already_scheduled", "data2_already_scheduled",
+    "not_waiting_ds", "waiting_snoop0", "waiting_snoop2",
+    "waiting_downstream0", "waiting_downstream2", "l1evt_active",
+    "ds_read_cancelled"
+  )
+  val tshrReasons = Seq(
+    "tshr_invalid", "evt_pipe_busy", "snp_pipe_busy",
+    "nested_enter", "evt_rbe_valid", "snp_rbe_valid",
+    "evb_rbe_valid", "req_rbe_valid", "rxdat_write0",
+    "rxdat_write2"
+  )
+  val admissionReasons = Seq(
+    "source_out_of_range", "local_other_owner", "local_reservation_active",
+    "local_fifo_full", "local_fifo_cooldown", "other_slice_active",
+    "channel_fifo_full", "channel_fifo_cooldown", "same_cycle_arb_lost",
+    "downstream_not_ready", "hint_disabled", "no_ds_response",
+    "no_recorded_reason"
+  )
+  val reasons = pipeReasons ++ tshrReasons ++ admissionReasons
+}
+class L2HitHintObservation extends Bundle {
+  val request = Bool()
+  val hit = Bool()
+  val dsResponse = Bool()
+  val failures = Vec(L2HintCoverage.pipeReasons.size + L2HintCoverage.tshrReasons.size, Bool())
+}
