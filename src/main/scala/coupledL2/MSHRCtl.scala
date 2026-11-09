@@ -576,13 +576,28 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   val replaceReservedSlotOH = replaceReserveSlotOHByParent.reduce(_ | _)
   // A captured B owns a concrete S/R slot before its Directory execution.
-  // It transfers to SnoopMSHR at result apply, or is returned on the direct
-  // response path. No slot can be lent to replacement in the meantime.
-  val snoopServiceValid = RegInit(false.B)
-  val snoopServiceSlot = Reg(UInt(mshrBits.W))
+  // Keep the request identity with that slot so the transient pipeline can
+  // release exactly the reservation it consumed.  The owner is the physical
+  // S/R index and generation is a controller-local epoch; neither is inferred
+  // again from the live MSHR vectors in blockB_s1.
+  class SnoopReservationToken extends Bundle {
+    val valid = Bool()
+    val slot = UInt(mshrBits.W)
+    val set = UInt(setBits.W)
+    val tag = UInt(tagBits.W)
+    val txnID = UInt(TXNID_WIDTH.W)
+    val source = UInt(sourceIdBits.W)
+    val owner = UInt(mshrBits.W)
+    val generation = UInt(8.W)
+  }
+  val snoopReservationSequence = RegInit(0.U(8.W))
+  val snoopServiceToken = RegInit(0.U.asTypeOf(new SnoopReservationToken))
+  val snoopPendingToken = RegInit(0.U.asTypeOf(new SnoopReservationToken))
+  val snoopServiceValid = snoopServiceToken.valid
+  val snoopServiceSlot = snoopServiceToken.slot
   val snoopServiceTask = Reg(new TaskBundle)
-  val snoopServiceSlotOH = Mux(snoopServiceValid,
-    UIntToOH(snoopServiceSlot, mshrsAll), 0.U(mshrsAll.W))
+  val snoopServiceSlotOH = Mux(snoopServiceToken.valid,
+    UIntToOH(snoopServiceToken.slot, mshrsAll), 0.U(mshrsAll.W))
   assert(
     PopCount(replaceReservedSlotOH) === PopCount(replaceReserveValid.asUInt),
     "each pending replacer lookup must own one unique S/R reservation"
@@ -632,17 +647,42 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val snoopEntering_s3 = RegNext(snoopEntering_s2, false.B)
   val snoopEnteringDecision = RegNext(snoopEntering_s3, false.B)
   val snoopEnteringApply = RegNext(snoopEnteringDecision, false.B)
-  val snoopEnteringCount = PopCount(Seq(
-    snoopEntering_s2, snoopEntering_s3, snoopEnteringDecision, snoopEnteringApply))
+  // bFire transfers the already-registered service token into a one-entry
+  // pending record. This is the only extra occupancy that can exist between
+  // service registration and apply; it is intentionally narrow and carries
+  // identity rather than a global count of pipeline stages.
+  when(io.fromReqArb.status_s1.bFire) {
+    assert(snoopServiceToken.valid, "B entered the pipeline without a service token")
+    assert(!snoopPendingToken.valid, "multiple B tokens entered the single service window")
+    snoopPendingToken := snoopServiceToken
+  }
   when(snoopEnteringApply) {
-    assert(snoopServiceValid, "B result applied without its reserved service slot")
-    snoopServiceValid := false.B
+    assert(snoopServiceToken.valid, "B result applied without its reserved service slot")
+    assert(snoopPendingToken.valid, "B result applied without its pending token")
+    assert(snoopPendingToken.slot === snoopServiceToken.slot &&
+      snoopPendingToken.set === snoopServiceToken.set &&
+      snoopPendingToken.tag === snoopServiceToken.tag &&
+      snoopPendingToken.generation === snoopServiceToken.generation &&
+      snoopPendingToken.txnID === snoopServiceToken.txnID &&
+      snoopPendingToken.source === snoopServiceToken.source &&
+      snoopPendingToken.owner === snoopServiceToken.owner,
+      "B apply consumed a different reservation token")
+    snoopPendingToken.valid := false.B
+    snoopServiceToken.valid := false.B
   }
   when(io.bServiceStart.valid) {
     assert(!snoopServiceValid && snoopBaseEligibleOH.orR,
       "B service requires a unique available physical slot")
-    snoopServiceValid := true.B
-    snoopServiceSlot := OHToUInt(PriorityEncoderOH(snoopBaseEligibleOH))
+    val serviceSlot = OHToUInt(PriorityEncoderOH(snoopBaseEligibleOH))
+    snoopServiceToken.valid := true.B
+    snoopServiceToken.slot := serviceSlot
+    snoopServiceToken.set := io.bServiceStart.bits.set
+    snoopServiceToken.tag := io.bServiceStart.bits.tag
+    snoopServiceToken.txnID := io.bServiceStart.bits.txnID.get
+    snoopServiceToken.source := io.bServiceStart.bits.sourceId
+    snoopServiceToken.owner := serviceSlot
+    snoopServiceToken.generation := snoopReservationSequence + 1.U
+    snoopReservationSequence := snoopReservationSequence + 1.U
     snoopServiceTask := io.bServiceStart.bits
     when(io.bServiceStart.bits.snpHitRelease) {
       val owner = Mux1H(UIntToOH(io.bServiceStart.bits.snpHitReleaseIdx, mshrsAll),
@@ -652,6 +692,22 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         "captured B lost its sidecar owner before service reservation")
     }
   }
+  val snoopPendingMatchesService = snoopPendingToken.valid && snoopServiceToken.valid &&
+    snoopPendingToken.slot === snoopServiceToken.slot &&
+    snoopPendingToken.set === snoopServiceToken.set &&
+    snoopPendingToken.tag === snoopServiceToken.tag &&
+    snoopPendingToken.generation === snoopServiceToken.generation &&
+    snoopPendingToken.txnID === snoopServiceToken.txnID &&
+    snoopPendingToken.source === snoopServiceToken.source &&
+    snoopPendingToken.owner === snoopServiceToken.owner
+  // A pending token normally aliases the service token and must not consume
+  // the same physical slot a second time. If service is canceled/invalidated
+  // first, retain the pending token's concrete slot as the sole extra fence.
+  val snoopPendingExtra = snoopPendingToken.valid && !snoopPendingMatchesService
+  val snoopPendingExtraSlotOH = Mux(snoopPendingExtra,
+    UIntToOH(snoopPendingToken.slot, mshrsAll), 0.U(mshrsAll.W))
+  val snoopTokenEligibleOH = snoopBaseEligibleOH & ~snoopPendingExtraSlotOH
+  val snoopPendingCapacityBlock = snoopPendingExtra && !snoopTokenEligibleOH.orR
   val snoopReservationFence = snoopCandidateSeen ||
     snoopEntering_s2 || snoopEntering_s3 || snoopEnteringDecision || snoopEnteringApply
   val replaceReserveNeedParentOH = VecInit(refillMshrs.zipWithIndex.map {
@@ -1980,7 +2036,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   io.toReqArb.blockB_s1 := mshrFull ||
     (io.fromReqArb.status_s1.bToN && pendingToNFull) ||
     (io.fromReqArb.status_s1.bCandidateValid &&
-      (!snoopCandidateSeen || PopCount(snoopBaseEligibleOH) <= snoopEnteringCount))
+      (!snoopCandidateSeen || snoopPendingCapacityBlock))
   // Normal capacity is consumed only by the pre-Directory claim/ack.
   // Its registered ack gates A execution; do not reinsert free-slot reduction
   // into the actual Directory read after a concrete slot has been promised.
