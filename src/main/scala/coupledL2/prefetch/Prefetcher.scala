@@ -250,11 +250,12 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   l2ToL1PfCtrl.bertiDegree := bertiDegree
   l2ToL1PfCtrl.smsDegree := smsDegree
 
-  val pfRcv_en = RegNextN(pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pf_recv_en, 2, Some(true.B))
+  // Isolated BOP experiments: only the selected BOP engines may issue data prefetches.
+  val pfRcv_en = false.B
   val pbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pbop_en
   val vbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_vbop_en
-  val tp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_tp_en
-  val cdp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_cdp_en
+  val tp_en = false.B
+  val cdp_en = false.B
   val delay_latency = pfCtrlFromCore.l2_pf_delay_latency
 
   /**
@@ -286,6 +287,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   val stashPrefetcher = Module(new StashPrefetcher)
   stashPrefetcher.io.recv := io.l3_recv
+  // Disable core-to-L3 data prefetch forwarding in every isolated variant.
+  stashPrefetcher.io.recv.pf_en := false.B
   io.stash_txreq <> stashPrefetcher.io.txreq
   stashPrefetcher.io.rxrsp <> io.stash_rxrsp
 
@@ -416,7 +419,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     XSPerfAccumulate("nl_train_drop", nl_train_buf.io.enq.valid && !nl_train_buf.io.enq.ready)
     XSPerfAccumulate("nl_train_accept", nl_train_buf.io.enq.fire)
 
-    nl.get.io.enable := true.B
+    nl.get.io.enable := false.B
     nl.get.io.train <> nl_train_buf.io.deq
     nl.get.io.resp <> resp
   }
