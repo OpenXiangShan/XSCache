@@ -453,6 +453,13 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   tshr_inactive_rbe := !rbeEVT.io.valid && !rbeSNP.io.valid && !rbeEVB.io.valid && !rbeREQ.io.valid &&
                        !rbeEVT.io.in.valid && !rbeSNP.io.in.valid && !rbeEVB.io.in.valid && !rbeREQ.io.in.valid
 
+  val dirResult_with_fastpath = if (paramL2.hitFastPathDirRespFlow) {
+    val dirRdResp_for_me = io.fromDir.DirRdResp && io.fromDir.TSHRID === io.consts.tshrId
+    val dirReq_fire_fastpath = dirRdResp_for_me && rbeREQ.io.out.fire
+    Mux(dirReq_fire_fastpath, io.fromDir.DIRRD_META.get, dirResult)
+  } else {
+    dirResult
+  }
 
   // Post RBE Data Storage Read Decision
   val ds_read_rbeEVT_en = Wire(Bool())
@@ -504,7 +511,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   // connections between TSHR local / RX and Snoop Agent
   snoopAgent.io.tshr_paddr := tshr_paddr
-  snoopAgent.io.tshr_dirResult := meta
+  snoopAgent.io.tshr_dirResult := dirResult_with_fastpath
   snoopAgent.io.UpRXRSP := io.UpRXRSP
   snoopAgent.io.UpRXDAT := io.UpRXDAT
 
@@ -579,7 +586,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   // connections between TSHR local and REQ vPipe
   vPipeREQ.io.tshr_paddr := tshr_paddr
-  vPipeREQ.io.tshr_dirResult := dirResult
+  vPipeREQ.io.tshr_dirResult := dirResult_with_fastpath
   vPipeREQ.io.tshr_dealloc := tshr_dealloc
   vPipeREQ.io.tshr_meta_modified := meta_modified.asUInt.orR
   vPipeREQ.io.tshr_tag_modified := tag_modified
@@ -690,7 +697,8 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   rbeEVT.io.directoryReadDone := proxyDir.io.rd_done
   rbeSNP.io.directoryReadDone := proxyDir.io.rd_done
   rbeEVB.io.directoryReadDone := proxyDir.io.rd_done
-  rbeREQ.io.directoryReadDone := proxyDir.io.rd_done
+  rbeREQ.io.directoryReadDone := (if (paramL2.hitFastPathDirRespFlow) proxyDir.io.rd_done_flow
+                                  else                               proxyDir.io.rd_done)
 
   vPipeREQ.io.repl_retry := proxyDir.io.repl_retry
   vPipeREQ.io.repl_done := proxyDir.io.repl_done

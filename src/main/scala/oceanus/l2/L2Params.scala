@@ -31,12 +31,14 @@ import utility.Code
   * enableDRRIPEntranceReleaseUpdate is a deprecated no-op retained only for
   * source compatibility; entrance release training has been removed.
   *
-  * The hitFastPath* fields gate the Tier-1 hit-latency/occupancy
-  * optimizations (documented in the L2 proxy-FSM optimization series). Each
-  * is independent, elaboration-time only, and defaults on; a disabled fix
-  * elaborates zero extra hardware (gates constant-fold, dead ports prune):
+  * The hitFastPath* fields gate the hit-latency/occupancy optimizations
+  * (documented in the L2 proxy-FSM optimization series). Each is independent,
+  * elaboration-time only, and defaults on; a disabled fix elaborates zero
+  * extra hardware (gates constant-fold, dead ports prune):
   *   - hitFastPathDsRespFlow: clear the DS wait on the combinational
   *     DSBufRdResp pulse instead of the registered DSReadFSM Done.
+  *   - hitFastPathDirRespFlow: fire the REQ vPipe on the combinational
+  *     DirRdResp pulse instead of the registered DirReadFSM Done.
   *   - hitFastPathEarlyInactive: resolve the proxies' write FSMs one cycle
   *     early via an exact free-at-edge prediction of the REQ vPipe.
   *
@@ -64,6 +66,7 @@ case class L2Params(
     dirRelSingleCycle: Boolean = true,
     enableDRRIPEntranceReleaseUpdate: Boolean = true,
     hitFastPathDsRespFlow: Boolean = true,
+    hitFastPathDirRespFlow: Boolean = true,
     hitFastPathEarlyInactive: Boolean = true,
 ) {
     require(Seq("dirrel-high", "rr", "dirrel-low").contains(dirRelArbitration),

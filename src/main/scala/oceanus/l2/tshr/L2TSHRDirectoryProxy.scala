@@ -107,6 +107,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
     val rd_idle = Output(Bool())
     val rd_accept = Output(Bool())
     val rd_done = Output(Bool())
+    val rd_done_flow = Output(Bool())
 
     val repl_idle = Output(Bool())
     val repl_ready = Output(Bool())
@@ -285,6 +286,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   io.rd_idle := state_dirRead.NotYet
   io.rd_accept := io.toDir.DirRd && fromDir_DirRdArbComp
   io.rd_done := state_dirRead.Done || state_dirRead.Repl
+  io.rd_done_flow := state_dirRead.Done || state_dirRead.Repl || fromDir_DirRdResp
 
   io.repl_idle := !state_dirRead.ReplPreArb && !state_dirRead.ReplPostArb
   io.repl_ready := state_dirRead.Done || state_dirRead.ReplRetry
@@ -302,7 +304,9 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
 
   assert(PopCount(state_dirRead.asUInt) <= 1.U, "multiple active states in DirReadFSM")
 
-  assert (!(io.repl_reset && !state_dirRead.Done && !state_dirRead.ReplDone), "replace read state reset on inter-states")
+  val repl_reset_at_dir_resp = paramL2.hitFastPathDirRespFlow.B && fromDir_DirRdResp
+  assert(!(io.repl_reset && !state_dirRead.Done && !state_dirRead.ReplDone && !repl_reset_at_dir_resp),
+    "replace read state reset on inter-states")
 
   FSMPerfHistogram(s"L2TSHR_${id}_DirReadFSM_PreArb", state_dirRead.PreArb, state_dirRead_next.PreArb)
   FSMPerfHistogram(s"L2TSHR_${id}_DirReadFSM_PostArb", state_dirRead.PostArb, state_dirRead_next.PostArb)

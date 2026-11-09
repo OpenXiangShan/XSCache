@@ -173,6 +173,7 @@ object L2Directory {
   class PathFromDirectory(implicit val p: Parameters) extends PathFromDirectoryUOPs with HasL2Params {
     val TSHRID = UInt(mshrIndexWidth.W)
     val META = new L2Directory.MetaReadResult
+    val DIRRD_META = if (paramL2.hitFastPathDirRespFlow) Some(new L2Directory.MetaReadResult) else None
     val REPL = new L2Directory.ReplReadResult // only applicable for ReplRd
   }
 
@@ -1429,6 +1430,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   io.fromDir.zipWithIndex.foreach { case (o, i) =>
     o.TSHRID         := i.U
     o.META           := 0.U.asTypeOf(new L2Directory.MetaReadResult)
+    o.DIRRD_META.foreach(_ := 0.U.asTypeOf(new L2Directory.MetaReadResult))
     o.REPL           := 0.U.asTypeOf(new L2Directory.ReplReadResult)
     o.DirRdArbComp   := false.B
     o.DirRdResp      := false.B
@@ -1452,6 +1454,18 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   // Resp at S3 — routed one-to-one to the originating TSHR
   when(s3_valid) {
     val o = io.fromDir(s3_tshr)
+    if (paramL2.hitFastPathDirRespFlow) {
+      val dirRdEntry_s3 = dirData_s3(Mux(hit_s3, hitWay, 0.U))
+      when (s3_isDirRd && hit_s3) {
+        o.DIRRD_META.get.state := dirRdEntry_s3.meta.state
+        o.DIRRD_META.get.dirty := dirRdEntry_s3.meta.dirty
+        o.DIRRD_META.get.clients := dirRdEntry_s3.meta.clients
+        o.DIRRD_META.get.alias := dirRdEntry_s3.meta.alias
+        o.DIRRD_META.get.prefetch := dirRdEntry_s3.meta.prefetch
+        o.DIRRD_META.get.way := hitWay
+        o.DIRRD_META.get.hit := true.B
+      }
+    }
     when(metaValid) {
       o.META.state   := entry_s3.meta.state
       o.META.dirty   := entry_s3.meta.dirty
