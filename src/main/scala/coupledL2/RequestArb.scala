@@ -108,6 +108,15 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val s2_ready = Wire(Bool())
   val mshr_task_s1 = RegInit(0.U.asTypeOf(Valid(new TaskBundle())))
   val mshrLeaseToken_s1 = Reg(new MainpipeLeaseToken)
+  // Directory read admission is owned locally after capture.  The hold keeps
+  // the complete request and its lease provenance stable while the Directory
+  // port is blocked by a same-bank write; upstream valid/ready signals only
+  // observe the one-entry occupancy and never the Directory ready directly.
+  val dirReadAdmissionValid = RegInit(false.B)
+  val dirReadAdmissionBits = RegInit(0.U.asTypeOf(new DirRead()))
+  val dirReadAdmissionTask = RegInit(0.U.asTypeOf(new TaskBundle()))
+  val dirReadAdmissionToken = RegInit(0.U.asTypeOf(new MainpipeLeaseToken))
+  val dirReadAdmissionFire = Wire(Bool())
   // Reserve the fixed-latency Directory result/apply slot before S1. This
   // short local execution slot ends after S3 applies; response collection,
   // ProbeAck/GrantAck and outgoing queues remain independent of it.
@@ -184,7 +193,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   /* ======== Stage 1 ======== */
   /* latch mshr_task from s0 to s1 */
   val mshr_replRead_stall =
-    mshr_task_s1.valid && s1_needs_replRead && (!io.dirRead_s1.ready || io.fromMainPipe.blockG_s1)
+    mshr_task_s1.valid && s1_needs_replRead && (!dirReadAdmissionFire || io.fromMainPipe.blockG_s1)
   mshr_task_s1.valid := mshr_task_s1.valid && !s1_fire || s0_fire
 
   when(s0_fire) {
@@ -317,29 +326,69 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   io.sinkCHintQInfo.bits := io.sinkC.bits
 
   /* Meta read request */
-  // ^ only sinkA/B/C tasks need to read directory
-  io.dirRead_s1.valid := s2_ready && (chnl_task_s1.valid && !mshr_task_s1.valid || s1_needs_replRead && !io.fromMainPipe.blockG_s1)
-  // Directory ready depends on the candidate's bank. Use candidate presence,
-  // which is independent of ready, to keep idle addresses known without a loop.
-  val haveDirCandidate = mshr_task_s1.valid || sinkValids.orR
-  io.dirRead_s1.bits.set := Mux(haveDirCandidate, task_s1.bits.set, 0.U)
-  io.dirRead_s1.bits.tag := task_s1.bits.tag
+  // Build the request from the task being captured, then register the whole
+  // request before exposing it to Directory.  The hold is the sole owner of
+  // this read until Directory.fire.
+  val dirReadCapture = !dirReadAdmissionValid && mshr_task_s1.valid && s1_needs_replRead &&
+    s2_ready && !io.fromMainPipe.blockG_s1
+  val dirReadCaptureTask = mshr_task_s1.bits
+  val dirReadCaptureIsRepl = mshr_task_s1.valid && s1_needs_replRead
+  val dirReadCaptureBits = Wire(new DirRead())
+  dirReadCaptureBits.set := dirReadCaptureTask.set
+  dirReadCaptureBits.tag := dirReadCaptureTask.tag
   // invalid way which causes mshr_retry
   // TODO: random waymask can be used to avoid multi-way conflict
-  io.dirRead_s1.bits.wayMask := Mux(
+  dirReadCaptureBits.wayMask := Mux(
     mshr_task_s1.valid && mshr_task_s1.bits.mshrRetry,
     (~(1.U(cacheParams.ways.W) << mshr_task_s1.bits.way)),
     Fill(cacheParams.ways, "b1".U)
   )
-  io.dirRead_s1.bits.replacerInfo.opcode := task_s1.bits.opcode
-  io.dirRead_s1.bits.replacerInfo.channel := task_s1.bits.channel
-  io.dirRead_s1.bits.replacerInfo.reqSource := task_s1.bits.reqSource
-  io.dirRead_s1.bits.replacerInfo.refill_prefetch := s1_needs_replRead && (mshr_task_s1.bits.opcode === HintAck && mshr_task_s1.bits.dsWen)
-  io.dirRead_s1.bits.refill := s1_needs_replRead
-  io.dirRead_s1.bits.normalRefillRevalidate := mshr_task_s1.valid && task_s1.bits.normalRefillRevalidate
-  io.dirRead_s1.bits.mshrId := task_s1.bits.mshrId
-  io.dirRead_s1.bits.cmoAll := A_task.cmoAll
-  io.dirRead_s1.bits.cmoWay := A_task.way
+  dirReadCaptureBits.replacerInfo.opcode := dirReadCaptureTask.opcode
+  dirReadCaptureBits.replacerInfo.channel := dirReadCaptureTask.channel
+  dirReadCaptureBits.replacerInfo.reqSource := dirReadCaptureTask.reqSource
+  dirReadCaptureBits.replacerInfo.refill_prefetch := dirReadCaptureIsRepl &&
+    (mshr_task_s1.bits.opcode === HintAck && mshr_task_s1.bits.dsWen)
+  dirReadCaptureBits.refill := dirReadCaptureIsRepl
+  dirReadCaptureBits.normalRefillRevalidate := mshr_task_s1.valid && dirReadCaptureTask.normalRefillRevalidate
+  dirReadCaptureBits.mshrId := dirReadCaptureTask.mshrId
+  dirReadCaptureBits.cmoAll := dirReadCaptureTask.cmoAll
+  dirReadCaptureBits.cmoWay := dirReadCaptureTask.way
+
+  // Replacement reads use the registered admission hold. Channel A/B/C keeps
+  // the original same-cycle Directory handshake and reservation timing.
+  val channelDirReadBits = Wire(new DirRead())
+  val haveDirCandidate = mshr_task_s1.valid || sinkValids.orR
+  channelDirReadBits.set := Mux(haveDirCandidate, task_s1.bits.set, 0.U)
+  channelDirReadBits.tag := task_s1.bits.tag
+  channelDirReadBits.wayMask := Mux(
+    mshr_task_s1.valid && mshr_task_s1.bits.mshrRetry,
+    (~(1.U(cacheParams.ways.W) << mshr_task_s1.bits.way)),
+    Fill(cacheParams.ways, "b1".U)
+  )
+  channelDirReadBits.replacerInfo.opcode := task_s1.bits.opcode
+  channelDirReadBits.replacerInfo.channel := task_s1.bits.channel
+  channelDirReadBits.replacerInfo.reqSource := task_s1.bits.reqSource
+  channelDirReadBits.replacerInfo.refill_prefetch := s1_needs_replRead &&
+    (mshr_task_s1.bits.opcode === HintAck && mshr_task_s1.bits.dsWen)
+  channelDirReadBits.refill := s1_needs_replRead
+  channelDirReadBits.normalRefillRevalidate := mshr_task_s1.valid && task_s1.bits.normalRefillRevalidate
+  channelDirReadBits.mshrId := task_s1.bits.mshrId
+  channelDirReadBits.cmoAll := A_task.cmoAll
+  channelDirReadBits.cmoWay := A_task.way
+  val mshrReplReadActive = mshr_task_s1.valid && s1_needs_replRead
+  io.dirRead_s1.valid := Mux(
+    mshrReplReadActive,
+    dirReadAdmissionValid && (!dirReadAdmissionBits.refill || !io.fromMainPipe.blockG_s1),
+    s2_ready && chnl_task_s1.valid
+  )
+  io.dirRead_s1.bits := Mux(mshrReplReadActive, dirReadAdmissionBits, channelDirReadBits)
+  dirReadAdmissionFire := io.dirRead_s1.valid && io.dirRead_s1.ready
+  dirReadAdmissionValid := dirReadAdmissionValid && !dirReadAdmissionFire || dirReadCapture
+  when(dirReadCapture) {
+    dirReadAdmissionBits := dirReadCaptureBits
+    dirReadAdmissionTask := dirReadCaptureTask
+    dirReadAdmissionToken := mshrLeaseToken_s1
+  }
 
   // block same-set A req
   io.s1Entrance.valid := mshr_task_s1.valid && s2_ready && mshr_task_s1.bits.metaWen || io.sinkC.fire || bExecute
@@ -549,9 +598,9 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   XSPerfAccumulate("sinkB_stall_by_dir", io.sinkB.valid && !block_B && !io.dirRead_s1.ready)
   XSPerfAccumulate("sinkC_stall_by_dir", io.sinkC.valid && !block_C && !io.dirRead_s1.ready)
 
-  XSPerfAccumulate("sinkA_stall_by_mshrTask", io.sinkA.valid && !block_A && io.dirRead_s1.ready && mshr_task_s1.valid)
-  XSPerfAccumulate("sinkB_stall_by_mshrTask", io.sinkB.valid && !block_B && io.dirRead_s1.ready && mshr_task_s1.valid)
-  XSPerfAccumulate("sinkC_stall_by_mshrTask", io.sinkC.valid && !block_C && io.dirRead_s1.ready && mshr_task_s1.valid)
+  XSPerfAccumulate("sinkA_stall_by_mshrTask", io.sinkA.valid && !block_A && dirReadAdmissionFire && mshr_task_s1.valid)
+  XSPerfAccumulate("sinkB_stall_by_mshrTask", io.sinkB.valid && !block_B && dirReadAdmissionFire && mshr_task_s1.valid)
+  XSPerfAccumulate("sinkC_stall_by_mshrTask", io.sinkC.valid && !block_C && dirReadAdmissionFire && mshr_task_s1.valid)
 
   XSPerfAccumulate(
     "sinkA_stall_by_mcp2",
