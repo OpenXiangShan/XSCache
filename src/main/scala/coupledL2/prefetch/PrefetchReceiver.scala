@@ -44,7 +44,7 @@ class PrefetchReceiver()(implicit p: Parameters) extends PrefetchModule {
    })
 
   // 0 / 1: whether to enable
-  private val cstEnable = Constantin.createRecord("pfRcv_enable"+cacheParams.hartId.toString, initValue = 1)
+  private val cstEnable = Constantin.createRecord("pfRcv_enable"+cacheParams.hartId.toString, initValue = 0)
   val enable = io.enable && cstEnable.orR
 
   io.req.valid := enable && io.recv_addr.valid

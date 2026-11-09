@@ -1348,7 +1348,7 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
   println(s"============================================")
 
 
-  private val cstEnable = Constantin.createRecord("cdp_enable"+cacheParams.hartId.toString, initValue = 1)
+  private val cstEnable = Constantin.createRecord("cdp_enable"+cacheParams.hartId.toString, initValue = 0)
   require(degree > 0, "CDP degree must be positive")
 
   /**

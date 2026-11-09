@@ -20,7 +20,7 @@ package xscache.coupledL2.prefetch
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
-import utility.{MemReqSource, TwoLevelRRArbiter, XSPerfAccumulate}
+import utility.{Constantin, MemReqSource, TwoLevelRRArbiter, XSPerfAccumulate}
 import xscache.chi.{CHIREQ, CHIRSP, HasCHIOpcodes, MPAM, MemAttr, OrderEncodings, SAM}
 import xscache.coupledL2.PrefetchRecv
 import xscache.coupledL2.utils.OverwriteQueue
@@ -109,12 +109,17 @@ class StashPrefetcher(implicit p: Parameters) extends PrefetchModule with HasCHI
     val rxrsp = Flipped(DecoupledIO(new CHIRSP))
   })
 
+  private val cstEnable = Constantin.createRecord(
+    "stashPrefetch_enable" + cacheParams.hartId.toString,
+    initValue = false
+  )
+
   val l3PftQueue = Module(new OverwriteQueue(
     gen = new StashPrefetchReq,
     entries = stashPrefetchEntryCount,
     hasFlow = true
   ))
-  l3PftQueue.io.enq.valid := io.recv.addr_valid && io.recv.pf_en
+  l3PftQueue.io.enq.valid := io.recv.addr_valid && io.recv.pf_en && cstEnable
   l3PftQueue.io.enq.bits.addr := io.recv.addr(fullAddressBits - 1, 0)
   l3PftQueue.io.enq.bits.pfSource := io.recv.pf_source
 
