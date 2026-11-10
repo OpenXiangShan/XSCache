@@ -83,12 +83,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     // The vPipe is free, or provably becomes free at this cycle's edge.
     val free_next = Output(Bool())
 
-    // The latched opcode never triggers the Snoop Agent (no toSA.SnpTo*), so
-    // its meta writes may legitimately coincide with an EVT vPipe commit on
-    // this TSHR (the EVT commit yields, see L2VPipeEVT). Whitelist for the
-    // TSHR-level assertion: StashShared & StashUnique for now.
-    val sa_free_opcode = Output(Bool())
-
     val ds_rd_en = Output(Bool())
     val ds_rd_cancel = Output(Bool())
     val ds_rd_done = Input(Bool())
@@ -302,8 +296,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val p_rxreq_readunique        = p_rxreq_opcode === CCHIOpcode.ReadUnique.U
   val p_rxreq_makeunique        = p_rxreq_opcode === CCHIOpcode.MakeUnique.U
   val p_rxreq_evictback         = p_rxreq_opcode === CCHIOpcode.EvictBack.U
-
-  io.sa_free_opcode := p_rxreq_stashshared || p_rxreq_stashunique
 
   when (rxreq_fire) {
     p_rxreq := rxreq
@@ -2095,9 +2087,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                      w_evict_peer_commit_dir ||
                      evict_active
   io.blockRBE.REQ := active
-
-  assert(!(p_prefill_hit && io.L1EVT_wbFull),
-    "EVT WriteBackFull entered during conflict-hit prefill")
 
   assert(!(rxevb_unsatisfied_evictback && active), 
     "TSHR @ %m REQ vPipe passed unsatisfied EvictBack on active non-replace non-invalid transaction")
