@@ -146,6 +146,18 @@ trait HasBOPParams extends HasPrefetcherHelper {
 }
 
 abstract class BOPBundle(implicit val p: Parameters) extends Bundle with HasBOPParams
+class BopIssueGateSnapshot(implicit p: Parameters) extends BOPBundle {
+  val confBefore              = UInt(4.W)
+  val confAfter               = UInt(4.W)
+  val threshold               = UInt(4.W)
+  val teacherDisabled         = Bool()
+  val committedTeacherEnabled = Bool()
+  val studentSelected         = Bool()
+  val externallyEnabled       = Bool()
+  val gateBefore              = Bool()
+  val gateAfter               = Bool()
+}
+
 abstract class BOPModule(implicit val p: Parameters) extends Module with HasBOPParams {
   protected def emitOffsetDistCounters(prefix: String, offset: SInt, enable: Bool): Unit = {
     for (off <- offsetList) {
@@ -156,14 +168,35 @@ abstract class BOPModule(implicit val p: Parameters) extends Module with HasBOPP
     }
   }
 
-  protected def issueConf(phaseEnd: Bool, teacherDisable: Bool): Bool = {
-    val conf = RegInit(0.U(4.W))
+  protected def issueConf(
+      name:                   String,
+      phaseEnd:               Bool,
+      teacherDisable:         Bool,
+      committedTeacherEnable: Bool,
+      studentSelected:        Bool,
+      externalEnable:         Bool
+  ): Bool = {
+    val conf             = RegInit(0.U(4.W))
     val confAfterDisable = Mux(conf >= 13.U, 15.U, conf + 2.U)
-    val confAfterEnable = Mux(conf === 0.U, 0.U, conf - 1.U)
-    val nextConf = Mux(teacherDisable, confAfterDisable, confAfterEnable)
+    val confAfterEnable  = Mux(conf === 0.U, 0.U, conf - 1.U)
+    val nextConf         = Mux(teacherDisable, confAfterDisable, confAfterEnable)
     when(phaseEnd) {
       conf := nextConf
     }
+    // One observation per actual confidence update. ChiselDB owns the diagnostic timestamp;
+    // it is not the ROB TEA cycle or the score-table idle counter.
+    val gateSnapshot = Wire(new BopIssueGateSnapshot)
+    gateSnapshot.confBefore              := conf
+    gateSnapshot.confAfter               := nextConf
+    gateSnapshot.threshold               := issueConfThreshold.U
+    gateSnapshot.teacherDisabled         := teacherDisable
+    gateSnapshot.committedTeacherEnabled := committedTeacherEnable
+    gateSnapshot.studentSelected         := studentSelected
+    gateSnapshot.externallyEnabled       := externalEnable
+    gateSnapshot.gateBefore              := conf < issueConfThreshold.U
+    gateSnapshot.gateAfter               := nextConf < issueConfThreshold.U
+    val gateTrace = ChiselDB.createTable(name + "IssueGate", new BopIssueGateSnapshot, basicDB = true)
+    gateTrace.log(gateSnapshot, phaseEnd, site = name + "IssueGate", clock, reset)
     conf < issueConfThreshold.U
   }
 }
@@ -1132,7 +1165,9 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val studentSelectedOffset = student.map(_.io.selectedOffset).getOrElse(teacherOffset)
   val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
   val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, teacherOffset)
-  val issueGate = if (issueGateEnable) issueConf(phaseEnd, teacherDisable) else true.B
+  val issueGate = if (issueGateEnable) {
+    issueConf("vbop", phaseEnd, teacherDisable, scoreTable.io.phaseIssueEnable, studentSelectedEnable, enable)
+  } else true.B
   val issueEnable = (studentSelectedEnable || !teacherDisable) && issueGate
   // NOTE: vaddr from l1 to l2 has no offset bits
   val s0_oldFullAddr = Cat(io.train.bits.vaddr.getOrElse(0.U), 0.U(offsetBits.W))
@@ -1238,7 +1273,9 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val studentSelectedOffset = student.map(_.io.selectedOffset).getOrElse(teacherOffset)
   val studentSelectedEnable = student.map(_.io.selectedEnable).getOrElse(false.B)
   val issueOffset = Mux(studentSelectedEnable, studentSelectedOffset, teacherOffset)
-  val issueGate = if (issueGateEnable) issueConf(phaseEnd, teacherDisable) else true.B
+  val issueGate = if (issueGateEnable) {
+    issueConf("pbop", phaseEnd, teacherDisable, scoreTable.io.phaseIssueEnable, studentSelectedEnable, enable)
+  } else true.B
   val issueEnable = (studentSelectedEnable || !teacherDisable) && issueGate
   val s0_oldAddr = io.train.bits.addr
   val s0_oldAddrNoOff = s0_oldAddr(s0_oldAddr.getWidth-1, offsetBits)
