@@ -1681,8 +1681,16 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                      dirResult.state === MetaState.I &&
                                      up_txdat_compdata_last
 
-  val allow_up_rd_compdata0 = !w_ds_resp && !w_snpresp0 && !w_rd_dn_data0 && !io.L1EVT_active && io.tbuf_data0_valid
-  val allow_up_rd_compdata2 = !w_ds_resp && !w_snpresp2 && !w_rd_dn_data2 && !io.L1EVT_active && io.tbuf_data2_valid
+  val allow_up_rd_compdata0 = (if (paramL2.hitFastPathDsRespIssue) {
+    !w_ds_resp || io.ds_rd_done
+  } else {
+    !w_ds_resp
+  }) && !w_snpresp0 && !w_rd_dn_data0 && !io.L1EVT_active && io.tbuf_data0_valid
+  val allow_up_rd_compdata2 = (if (paramL2.hitFastPathDsRespIssue) {
+    !w_ds_resp || io.ds_rd_done
+  } else {
+    !w_ds_resp
+  }) && !w_snpresp2 && !w_rd_dn_data2 && !io.L1EVT_active && io.tbuf_data2_valid
 
   val sched_up_rd_compdata_sat_readunique = rxreq_satisfied_readunique && 
                                             (!rxreq_client_present || rxreq.ExpCompData)

@@ -37,6 +37,8 @@ import utility.Code
   * logic. The DirRd/ReplRd response interfaces remain split in either mode:
   *   - hitFastPathDsRespFlow: clear the DS wait on the combinational
   *     DSBufRdResp pulse instead of the registered DSReadFSM Done.
+  *   - hitFastPathDsRespIssue: issue CompData on the selected DS response
+  *     completion instead of waiting for the registered DS wait to clear.
   *   - hitFastPathDirRespFlow: fire the REQ vPipe on the combinational
   *     DirRdResp pulse instead of the registered DirReadFSM Done.
   *   - hitFastPathEarlyInactive: resolve the proxies' write FSMs one cycle
@@ -68,6 +70,7 @@ case class L2Params(
     hitFastPathDsRespFlow: Boolean = true,
     hitFastPathDirRespFlow: Boolean = true,
     hitFastPathEarlyInactive: Boolean = true,
+    hitFastPathDsRespIssue: Boolean = true,
 ) {
     require(Seq("dirrel-high", "rr", "dirrel-low").contains(dirRelArbitration),
       s"DirRel arbitration must be dirrel-high, rr, or dirrel-low: $dirRelArbitration")

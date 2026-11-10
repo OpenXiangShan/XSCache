@@ -278,8 +278,9 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
                                 dirrel-high, rr (default), or dirrel-low
       --l2-dirrel-single-cycle <0|1>
                                 single-cycle DirRel in the origin-FF backend
-      --l2-hitfp-all <0|1>      set all three hit fast paths (1, default)
+      --l2-hitfp-all <0|1>      set all four hit fast paths (1, default)
       --l2-hitfp-ds-flow <0|1>  flow the DS response into the REQ wait (1, default)
+      --l2-hitfp-ds-issue <0|1> issue CompData on the DS response (1, default)
       --l2-hitfp-dir-flow <0|1> fire REQ on the directory response (1, default)
       --l2-hitfp-early-inactive <0|1>
                                 predict proxy write-FSM inactivation (1, default)
@@ -313,6 +314,7 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
   var l2DirRelSingleCycle = true
   var l2HitfpAll = true
   var l2HitfpDsRespFlow = true
+  var l2HitfpDsRespIssue = true
   var l2HitfpDirRespFlow = true
   var l2HitfpEarlyInactive = true
   var llcSets = 64
@@ -337,14 +339,16 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       case "--l2-origin-use-sram" => l2OriginUseSRAM = args(i + 1) == "1"; i += 2
       case "--l2-dirrel-arbitration" => l2DirRelArbitration = args(i + 1); i += 2
       case "--l2-dirrel-single-cycle" => l2DirRelSingleCycle = args(i + 1) == "1"; i += 2
-      // hit fast paths default on; --l2-hitfp-all sets all three, the
+      // hit fast paths default on; --l2-hitfp-all sets all four, the
       // individual options after it override selectively
       case "--l2-hitfp-all" =>
         l2HitfpAll = args(i + 1) == "1"
         l2HitfpDsRespFlow = l2HitfpAll
+        l2HitfpDsRespIssue = l2HitfpAll
         l2HitfpDirRespFlow = l2HitfpAll
         l2HitfpEarlyInactive = l2HitfpAll; i += 2
       case "--l2-hitfp-ds-flow" => l2HitfpDsRespFlow = args(i + 1) == "1"; i += 2
+      case "--l2-hitfp-ds-issue" => l2HitfpDsRespIssue = args(i + 1) == "1"; i += 2
       case "--l2-hitfp-dir-flow" => l2HitfpDirRespFlow = args(i + 1) == "1"; i += 2
       case "--l2-hitfp-early-inactive" => l2HitfpEarlyInactive = args(i + 1) == "1"; i += 2
       case "--llc-sets" => llcSets = args(i + 1).toInt; i += 2
@@ -381,6 +385,7 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       dirRelArbitration = l2DirRelArbitration,
       dirRelSingleCycle = l2DirRelSingleCycle,
       hitFastPathDsRespFlow = l2HitfpDsRespFlow,
+      hitFastPathDsRespIssue = l2HitfpDsRespIssue,
       hitFastPathDirRespFlow = l2HitfpDirRespFlow,
       hitFastPathEarlyInactive = l2HitfpEarlyInactive
     )

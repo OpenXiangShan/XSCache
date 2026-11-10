@@ -92,8 +92,9 @@ Usage: Top_L2Top [<--option> <values>]
       --l2-dirrel-single-cycle <0|1>
                                 enable single-cycle DirRel (0, default); requires
                                 RRIP SRAM with origin FF
-      --l2-hitfp-all <0|1>      set all three hit fast paths (1, default)
+      --l2-hitfp-all <0|1>      set all four hit fast paths (1, default)
       --l2-hitfp-ds-flow <0|1>  flow the DS response into the REQ wait (1, default)
+      --l2-hitfp-ds-issue <0|1> issue CompData on the DS response (1, default)
       --l2-hitfp-dir-flow <0|1> fire REQ on the directory response (1, default)
       --l2-hitfp-early-inactive <0|1>
                                 predict proxy write-FSM inactivation (1, default)
@@ -123,6 +124,7 @@ Usage: Top_L2Top [<--option> <values>]
   var dirRelSingleCycle = true
   var hitfpAll = true
   var hitfpDsRespFlow = true
+  var hitfpDsRespIssue = true
   var hitfpDirRespFlow = true
   var hitfpEarlyInactive = true
 
@@ -143,16 +145,19 @@ Usage: Top_L2Top [<--option> <values>]
       (originUseSRAM = parseBoolean("--l2-origin-use-sram", value), i)
     case (Array("--l2-dirrel-single-cycle", value), i) =>
       (dirRelSingleCycle = parseBoolean("--l2-dirrel-single-cycle", value), i)
-    // hit fast paths default on; --l2-hitfp-all sets all three, the
+    // hit fast paths default on; --l2-hitfp-all sets all four, the
     // individual options after it override selectively
     case (Array("--l2-hitfp-all", value), i) =>
       hitfpAll = parseBoolean("--l2-hitfp-all", value)
       hitfpDsRespFlow = hitfpAll
+      hitfpDsRespIssue = hitfpAll
       hitfpDirRespFlow = hitfpAll
       hitfpEarlyInactive = hitfpAll
       ((), i)
     case (Array("--l2-hitfp-ds-flow", value), i) =>
       (hitfpDsRespFlow = parseBoolean("--l2-hitfp-ds-flow", value), i)
+    case (Array("--l2-hitfp-ds-issue", value), i) =>
+      (hitfpDsRespIssue = parseBoolean("--l2-hitfp-ds-issue", value), i)
     case (Array("--l2-hitfp-dir-flow", value), i) =>
       (hitfpDirRespFlow = parseBoolean("--l2-hitfp-dir-flow", value), i)
     case (Array("--l2-hitfp-early-inactive", value), i) =>
@@ -194,6 +199,7 @@ Usage: Top_L2Top [<--option> <values>]
       dirRelArbitration = dirRelArbitration,
       dirRelSingleCycle = dirRelSingleCycle,
       hitFastPathDsRespFlow = hitfpDsRespFlow,
+      hitFastPathDsRespIssue = hitfpDsRespIssue,
       hitFastPathDirRespFlow = hitfpDirRespFlow,
       hitFastPathEarlyInactive = hitfpEarlyInactive
     )
