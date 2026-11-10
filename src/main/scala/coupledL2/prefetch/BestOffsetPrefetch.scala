@@ -1123,6 +1123,7 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val s1_req_valid = RegInit(false.B)
   val s0_ready, s1_ready = WireInit(false.B)
   val s0_fire = s0_ready && io.train.valid
+  val s0_isDemandStore = io.train.bits.reqsource === MemReqSource.CPUStoreData.id.U
   val s1_fire = s1_ready && s1_req_valid
 
   /* s0 train */
@@ -1170,7 +1171,8 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   s1_ready := reqFilter.io.in_req.ready || !s1_req_valid
 
   when(s0_fire) {
-    s1_req_valid := enable && issueEnable
+    // Demand stores still train the learners but do not create prefetch requests.
+    s1_req_valid := enable && issueEnable && !s0_isDemandStore
   }.elsewhen(s1_fire){
     s1_req_valid := false.B
   }
@@ -1229,6 +1231,7 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val s1_req_valid = RegInit(false.B)
   val s0_ready, s1_ready = WireInit(false.B)
   val s0_fire = s0_ready && io.train.valid
+  val s0_isDemandStore = io.train.bits.reqsource === MemReqSource.CPUStoreData.id.U
   val s1_fire = s1_ready && s1_req_valid
 
   /* s0 train */
@@ -1281,7 +1284,8 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     s1_req.needT := io.train.bits.needT
     s1_req.source := io.train.bits.source
     s1_issueOffset := issueOffset.asSInt
-    s1_req_valid := enable && !s0_crossPage && issueEnable // stop prefetch when prefetch req crosses pages
+    // Demand stores still train; cross-page prefetch targets remain disabled.
+    s1_req_valid := enable && !s0_crossPage && issueEnable && !s0_isDemandStore
   }.elsewhen(s1_fire) {
     s1_req_valid := false.B
   }
