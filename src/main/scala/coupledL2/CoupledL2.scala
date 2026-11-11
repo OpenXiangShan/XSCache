@@ -745,14 +745,19 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     val txreq_arb = Module(new TwoLevelRRArbiter(new CHIREQ, txreqArbInputs.size))
     ArbPerf(txreq_arb, "txreq_arb")
     val txreq = Wire(DecoupledIO(new CHIREQ))
-    txreqArbInputs.zip(txreq_arb.io.in).foreach { case (req, in) => in <> req }
+    // Balance bank ports across groups and retain canonical transaction origins.
+    val halfSlices = slices.size / 2
+    val txreqArbOrder = (0 until halfSlices) ++ Seq(mmioTxReqIndex) ++
+      (halfSlices until slices.size) ++ stashTxReqOpt.toSeq.map(_ => stashTxReqIndex)
+    txreqArbOrder.zip(txreq_arb.io.in).foreach { case (origin, in) => in <> txreqArbInputs(origin) }
+    val txreqOrigin = VecInit(txreqArbOrder.map(_.U))(txreq_arb.io.chosen)
     txreq <> txreq_arb.io.out
-    val txreqFromMMIO = txreq_arb.io.chosen === mmioTxReqIndex.U
-    val txreqFromStashPrefetch = prefetchOpt.map(_ => txreq_arb.io.chosen === stashTxReqIndex.U).getOrElse(false.B)
+    val txreqFromMMIO = txreqOrigin === mmioTxReqIndex.U
+    val txreqFromStashPrefetch = prefetchOpt.map(_ => txreqOrigin === stashTxReqIndex.U).getOrElse(false.B)
     txreq.bits.txnID := Mux(
       txreqFromStashPrefetch,
       txreq_arb.io.out.bits.txnID,
-      setSliceID(txreq_arb.io.out.bits.txnID, txreq_arb.io.chosen, txreqFromMMIO)
+      setSliceID(txreq_arb.io.out.bits.txnID, txreqOrigin, txreqFromMMIO)
     )
     when(txreq.valid && !txreqFromStashPrefetch && !txreqFromMMIO) {
       assert(
