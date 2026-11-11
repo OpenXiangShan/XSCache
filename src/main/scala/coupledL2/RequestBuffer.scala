@@ -31,6 +31,10 @@ class ReqEntry(entries: Int = 4)(implicit p: Parameters) extends L2Bundle() {
   val valid    = Bool()
   val rdy      = Bool()
   val task     = new TaskBundle()
+  // Entry epoch distinguishes a held issue from a later reuse of the same
+  // physical buffer slot.  It is advanced only when a fresh request is
+  // allocated into the slot and is carried by the local issue token.
+  val generation = UInt(8.W)
   val timer    = UInt(timestampBits.W) // for prefetch controller analysis
 
   /* blocked by MainPipe
@@ -87,6 +91,9 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   val io = IO(new Bundle() {
     val in          = Flipped(DecoupledIO(new TaskBundle))
     val out         = DecoupledIO(new TaskBundle)
+    // RequestArb has captured the Directory command and now owns this held
+    // source. Eligibility cannot revoke it before the real output handshake.
+    val issueCommit = Input(Bool())
     val mshrInfo  = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo)))
     // A live snoop owns its address independently of the paired normal MSHR.
     // Keep it visible here so queued A requests do not pass a toN snoop while
@@ -129,6 +136,14 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   ArbPerf(issueArb, "issueArb")
   val chosenQ = Module(new Queue(new ChosenQBundle(entries), entries = 1, pipe = false, flow = false))
   val chosenQValid = chosenQ.io.deq.valid
+  // A selected entry is held locally before it is exposed to RequestArb.
+  // This cuts the chosenQ/output ready feedback while retaining the complete
+  // task and a narrow owner/generation identity.  The buffer entry remains
+  // valid until the real output fire, so cancellation can safely return it to
+  // issueArb without losing work.
+  val issueHold = RegInit(0.U.asTypeOf(new ChosenQBundle(entries)))
+  val issueHoldValid = RegInit(false.B)
+  val issueHoldCommitted = RegInit(false.B)
 
   /* ======== Enchantment ======== */
   val NWay = cacheParams.ways
@@ -256,9 +271,8 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   def prefetchBlocked(task: TaskBundle): Bool = isPrefetchTask(task) && (pfThrottleByMSHR || pfThrottleByOcc)
   def prefetchBlockedByMSHR(task: TaskBundle): Bool = isPrefetchTask(task) && pfThrottleByMSHR
 
-  // flow not allowed when full, or entries might starve
-  val canFlow = flow.B && !full && !conflict(in) && !chosenQValid && !Cat(io.mainPipeBlock).orR && !noFreeWay(in) && !prefetchBlocked(in)
-  val doFlow  = canFlow && io.out.ready
+  // Every request is owned by a buffer entry before it reaches issueHold.
+  // Ingress and chosenQ never bypass the registered output owner.
 
   //  val depMask    = buffer.map(e => e.valid && sameAddr(admitted.bits, e.task))
   // remove duplicate prefetch if same-addr A req in MSHR or ReqBuf
@@ -288,10 +302,10 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   //!! TODO: we can also remove those that duplicate with mainPipe
 
   /* ======== Alloc ======== */
-  admitted.ready   := !prefetchBlocked(in) && (!full || doFlow) || mergeA || dup
+  admitted.ready   := !prefetchBlocked(in) && !full || mergeA || dup
 
   val insertOH = MaskToOH(buffer.map(!_.valid))
-  val alloc = !full && admitted.valid && !prefetchBlocked(in) && !doFlow && !dup && !mergeA
+  val alloc = !full && admitted.valid && !prefetchBlocked(in) && !dup && !mergeA
   buffer.zip(insertOH.asBools).foreach { case (entry, sel) =>
     when(alloc && sel){
       val mpBlock = Cat(io.mainPipeBlock).orR
@@ -300,6 +314,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
       val s1Block      = pipeBlockOut || probeBlock
 
       entry.valid   := true.B
+      entry.generation := entry.generation + 1.U
       // when Addr-Conflict / Same-Addr-Dependent / MainPipe-Block / noFreeWay-in-Set, entry not ready
       entry.rdy     := !conflict(in) && !mpBlock && !s1Block && !noFreeWay(in)// && !Cat(depMask).orR
       entry.task    := admitted.bits
@@ -319,9 +334,12 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   }
 
   /* ======== Issue ======== */
-  issueArb.io.in zip buffer foreach {
-    case(in, e) =>
-      in.valid := e.valid && e.rdy && !prefetchBlockedByMSHR(e.task)
+  issueArb.io.in.zip(buffer).zipWithIndex.foreach {
+    case ((in, e), i) =>
+    // A held entry is already reserved for the downstream handshake; do not
+    // let the arbiter enqueue a second copy of the same owner into chosenQ.
+    in.valid := e.valid && e.rdy &&
+      !(issueHoldValid && issueHold.idOH(i))
       in.bits  := e
   }
 
@@ -380,7 +398,8 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
       e.waitMSReq := waitMSReqUpdate
       e.waitMSVic := waitMSVicUpdate
 //      e.depMask := depMaskUpdate
-      e.rdy     := !waitMSReqUpdate.orR && !waitMSVicUpdate.orR && !snoopConflict(e.task) && !e.waitMP && !s1_Block && !noFreeWay(e.task)
+      e.rdy     := !waitMSReqUpdate.orR && !waitMSVicUpdate.orR && !snoopConflict(e.task) && !e.waitMP && !s1_Block && !noFreeWay(e.task) &&
+        !prefetchBlockedByMSHR(e.task)
     }
   }
 
@@ -388,26 +407,70 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   // when entry.rdy is no longer true,
   // we cancel req in chosenQ, with the entry still held in buffer to issue later
 //  val cancel = (canFlow && sameSet(chosenQ.io.deq.bits.bits.task, admitted.bits)) || !buffer(chosenQ.io.deq.bits.id).rdy
-  val cancel = !Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.rdy && !prefetchBlockedByMSHR(e.task)))
+  val cancel = !Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.valid && e.rdy))
 
-  chosenQ.io.deq.ready := io.out.ready || cancel
-  io.out.valid := chosenQValid && !cancel || admitted.valid && canFlow
-  io.out.bits := {
-    if (!flow) chosenQ.io.deq.bits.bits.task
-    else Mux(chosenQValid, chosenQ.io.deq.bits.bits.task, admitted.bits)
+  val issueHoldOwnerValid = Mux1H(issueHold.idOH, buffer.map(_.valid))
+  val issueHoldGeneration = Mux1H(issueHold.idOH, buffer.map(_.generation))
+  val issueHoldSet = Mux1H(issueHold.idOH, buffer.map(_.task.set))
+  val issueHoldTag = Mux1H(issueHold.idOH, buffer.map(_.task.tag))
+  val issueHoldSource = Mux1H(issueHold.idOH, buffer.map(_.task.sourceId))
+  val issueHoldOpcode = Mux1H(issueHold.idOH, buffer.map(_.task.opcode))
+  val issueHoldEntryWaitMSReq = Mux1H(issueHold.idOH, buffer.map(_.waitMSReq.orR))
+  val issueHoldEntryWaitMSVic = Mux1H(issueHold.idOH, buffer.map(_.waitMSVic.orR))
+  val issueHoldEntryWaitMP = Mux1H(issueHold.idOH, buffer.map(_.waitMP.orR))
+  val issueHoldEntryReady = Mux1H(issueHold.idOH, buffer.map(_.rdy))
+  val issueHoldTask = issueHold.bits.task
+  // Eligibility is maintained in the owner's local registers above. Cross-
+  // module conflict/way searches only write rdy's D; they never bypass it to
+  // revoke a presented task in the same cycle. A canceled hold leaves its
+  // buffer owner intact for a later arbitration attempt.
+  val issueHoldCurrent = issueHoldValid && issueHoldOwnerValid &&
+    issueHoldGeneration === issueHold.bits.generation &&
+    issueHoldSet === issueHoldTask.set && issueHoldTag === issueHoldTask.tag &&
+    issueHoldSource === issueHoldTask.sourceId &&
+    issueHoldOpcode === issueHoldTask.opcode &&
+    issueHoldEntryReady &&
+    !issueHoldEntryWaitMSReq && !issueHoldEntryWaitMSVic && !issueHoldEntryWaitMP
+  // Capture is mandatory, including when RequestArb is already ready. The
+  // complete payload and selected owner both come from issueHold's Q.
+  val issueHoldCapture = !issueHoldValid && chosenQValid && !cancel
+  val issueHoldCancel = issueHoldValid && !issueHoldCommitted && !issueHoldCurrent
+  val issueHoldFire = io.out.fire
+
+  chosenQ.io.deq.ready := issueHoldCapture || cancel
+  io.out.valid := issueHoldValid && (issueHoldCommitted || issueHoldCurrent)
+  io.out.bits := issueHoldTask
+
+  when (issueHoldCapture) {
+    issueHold := chosenQ.io.deq.bits
+    issueHoldValid := true.B
+    issueHoldCommitted := false.B
+  }.elsewhen (issueHoldFire || issueHoldCancel) {
+    issueHoldValid := false.B
+    issueHoldCommitted := false.B
+  }.elsewhen(io.issueCommit) {
+    issueHoldCommitted := true.B
+  }
+  when(io.issueCommit) {
+    assert(issueHoldCurrent && !issueHoldCommitted && !io.out.fire,
+      "RequestArb must commit one eligible retained RequestBuffer owner")
   }
 
-  buffer.zip(chosenQ.io.deq.bits.idOH.asBools).foreach {
+  buffer.zip(issueHold.idOH.asBools).foreach {
     case (e, y) =>
-      when(chosenQ.io.deq.fire && y && !cancel) {
+      when (issueHoldFire && y) {
         e.valid := false.B
       }
   }
+  when(issueHoldFire) {
+    assert(PopCount(issueHold.idOH) === 1.U && issueHoldOwnerValid &&
+      (issueHoldCommitted || issueHoldEntryReady),
+      "a RequestBuffer issue must consume its registered or committed owner")
+  }
 
-  io.pfStatInMSHR.pfReleaseFromReqBuffer := chosenQ.io.deq.fire && !cancel &&
-    Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.task.fromA && e.task.opcode === Hint))
-  io.pfStatInMSHR.reqBufferPfReqSrc := Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.task.reqSource))
-  io.pfStatInMSHR.reqBufferHoldLatency := Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.timer))
+  io.pfStatInMSHR.pfReleaseFromReqBuffer := issueHoldFire && isPrefetchTask(issueHoldTask)
+  io.pfStatInMSHR.reqBufferPfReqSrc := issueHoldTask.reqSource
+  io.pfStatInMSHR.reqBufferHoldLatency := Mux1H(issueHold.idOH, buffer.map(_.timer))
 
   // for Dir to choose a free way
   io.out.bits.wayMask := Fill(cacheParams.ways, 1.U(1.W))
@@ -415,9 +478,6 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   // add XSPerf to see how many cycles the req is held in Buffer
   if(cacheParams.enablePerf) {
     XSPerfAccumulate("drop_prefetch", admitted.valid && dup)
-    if(flow){
-      XSPerfAccumulate("req_buffer_flow", admitted.valid && doFlow)
-    }
     XSPerfAccumulate("req_buffer_alloc", alloc)
     XSPerfAccumulate("req_buffer_full", full)
     // Early release observability: waitMSReq bits cleared while the target

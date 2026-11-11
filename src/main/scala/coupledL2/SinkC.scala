@@ -23,7 +23,7 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLPermissions._
 import org.chipsalliance.cde.config.Parameters
-import utility.{MemReqSource, XSPerfAccumulate, TwoLevelRRArbiter, ArbPerf}
+import utility.{MemReqSource, XSPerfAccumulate, LatchFastArbiter, ArbPerf}
 import xscache.coupledL2.utils._
 
 class PipeBufferResp(implicit p: Parameters) extends L2Bundle {
@@ -71,7 +71,10 @@ class SinkC(implicit p: Parameters) extends L2Module {
   val dataValids = VecInit(beatValids.map(_.asUInt.orR)).asUInt
   val taskBuf = RegInit(VecInit(Seq.fill(bufBlocks)(0.U.asTypeOf(new TaskBundle))))
   val taskValids = RegInit(VecInit(Seq.fill(bufBlocks)(false.B)))
-  val taskArb = Module(new TwoLevelRRArbiter(new TaskBundle, bufBlocks))
+  // Retain the selected source and payload before RequestArb commits its
+  // Directory token. Data is still read only at the eventual task.fire, so
+  // Directory backpressure cannot move the C payload's return phase.
+  val taskArb = Module(new LatchFastArbiter(new TaskBundle, bufBlocks))
   val bufValids = taskValids.asUInt | dataValids
   ArbPerf(taskArb, "taskArb")
 

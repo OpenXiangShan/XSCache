@@ -31,6 +31,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val io = IO(new Bundle() {
     /* receive incoming tasks */
     val sinkA = Flipped(DecoupledIO(new TaskBundle))
+    val aCommit = Output(Bool())
     val ATag = Input(UInt(tagBits.W)) // !TODO: very dirty, consider optimize structure
     val ASet = Input(UInt(setBits.W)) // To pass A entrance status to MP for blockA-info of ReqBuf
     val s1Entrance = ValidIO(new L2Bundle {
@@ -108,6 +109,38 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val s2_ready = Wire(Bool())
   val mshr_task_s1 = RegInit(0.U.asTypeOf(Valid(new TaskBundle())))
   val mshrLeaseToken_s1 = Reg(new MainpipeLeaseToken)
+  // A channel task is first selected locally, then admitted to the Directory
+  // through this one-entry token.  The token contains the narrow read payload
+  // plus the owner/provenance identity of an immutable source. Capturing A
+  // commits RequestBuffer's hold; B is already locally retained and C uses
+  // a registered arbiter hold. The complete payload stays on those register
+  // outputs until the same source/Directory handshake consumes the command.
+  class ChannelDirReadAdmissionToken extends Bundle {
+    val valid = Bool()
+    val source = UInt(2.W) // 0=C, 1=B, 2=A (sinkValids priority order)
+    val dirRead = new DirRead
+    val owner = UInt(mshrBits.W)
+    val generation = UInt(8.W)
+    val sequence = UInt(8.W)
+    val paired = Bool()
+    // Payload provenance is not used to rebuild the Directory request, but is
+    // locked and rechecked so a held token cannot be paired with a different
+    // RefillBuf/ReleaseBuf owner after an upstream context transition.
+    val mshrContext = UInt(2.W)
+    val refillToReleaseCopy = Bool()
+    val refillBufReadId = UInt(mshrBits.W)
+    val useProbeData = Bool()
+    val readProbeDataDown = Bool()
+    val readRefillData = Bool()
+    val readDataFromDS = Bool()
+    val snpHitRelease = Bool()
+    val snpHitReleaseIdx = UInt(mshrBits.W)
+  }
+  val channelDirReadAdmissionToken = RegInit(0.U.asTypeOf(new ChannelDirReadAdmissionToken))
+  val channelDirReadAdmissionValid = channelDirReadAdmissionToken.valid
+  val channelDirReadAdmissionFire = Wire(Bool())
+  // D109's replacement-read hold keeps its own fire event; this wire remains
+  // distinct so a channel token cannot advance mshr_task_s1 by accident.
   // Directory read admission is owned locally after capture.  The hold keeps
   // the complete request and its lease provenance stable while the Directory
   // port is blocked by a same-bank write; upstream valid/ready signals only
@@ -137,7 +170,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   io.reservedB := bPending.valid
   io.sidecarReservationHold := (bPending.valid && !bServiceReserved) ||
     (localTransitionIdle && !admitMshrTurn && !mshr_task_s1.valid && !bPending.valid)
-  when(localTransitionIdle && !mshr_task_s1.valid && !bPending.valid) {
+  when(localTransitionIdle && !mshr_task_s1.valid && !bPending.valid &&
+    !channelDirReadAdmissionValid) {
     admitMshrTurn := !admitMshrTurn
   }
   when(s1_fire) {
@@ -183,6 +217,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   // if mshr_task_s1 is replRead, it might stall and wait for dirRead.ready, so we block new mshrTask from entering
   // TODO: will cause msTask path vacant for one-cycle after replRead, since not use Flow so as to avoid ready propagation
   val mshrTaskReadyBasic = localTransitionIdle && admitMshrTurn && !mshr_task_s1.valid && !bPending.valid &&
+    !channelDirReadAdmissionValid &&
     !io.fromGrantBuffer.blockMSHRReqEntrance &&
     !io.fromTXDAT.blockMSHRReqEntrance &&
     !io.fromTXRSP.blockMSHRReqEntrance &&
@@ -217,7 +252,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     (sameCmoAllLine || A_task.asUInt === normalReservedTask.asUInt)
   val normalYieldForB = RegInit(false.B)
   val normalReserved = io.normalReserveAck.valid && normalReservationMatches && !normalYieldForB
-  io.normalReserveCancel := io.normalReserveAck.valid && (!normalReservationMatches || normalYieldForB)
+  io.normalReserveCancel := io.normalReserveAck.valid && !channelDirReadAdmissionValid &&
+    (!normalReservationMatches || normalYieldForB)
   io.normalReserveConsume := io.sinkA.fire
   io.normalReserveRequest.bits := A_task
   val B_task = Mux(bPending.valid, bPending.bits, io.sinkB.bits)
@@ -230,7 +266,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   // while normalReserved forbids that B forever (and may hold its last slot).
   when(!io.normalReserveAck.valid) {
     normalYieldForB := false.B
-  }.elsewhen(normalReservationMatches && block_A && io.sinkB.valid) {
+  }.elsewhen(!channelDirReadAdmissionValid && normalReservationMatches && block_A && io.sinkB.valid) {
     normalYieldForB := true.B
   }
   val block_B =
@@ -255,6 +291,98 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     )
   ).asUInt
 
+  // Select one channel candidate without consulting the Directory ready.  A
+  // candidate can therefore be captured into the registered token even while
+  // the set bank is occupied by a write.  The source ready signals below stay
+  // low until the token's Directory handshake, so each upstream payload is
+  // stable for the whole hold interval.
+  val channelCandidateValid = localTransitionIdle &&
+    (bPending.valid || !admitMshrTurn) && !mshr_task_s1.valid &&
+    sinkValids.orR && resetFinish &&
+    !channelDirReadAdmissionValid
+  val channelCandidateSource = OHToUInt(PriorityEncoderOH(sinkValids))
+  io.aCommit := channelCandidateValid && channelCandidateSource === 2.U
+  val channelCandidateTask = Wire(new TaskBundle())
+  channelCandidateTask := ParallelPriorityMux(sinkValids, Seq(C_task, B_task, A_task))
+  when(sinkValids(2) && !sinkValids(0) && !sinkValids(1)) {
+    channelCandidateTask := normalReservedTask
+    channelCandidateTask.mshrId := io.normalReserveAck.bits.id
+  }
+
+  val channelCandidateOwner = Mux(channelCandidateSource === 2.U,
+    io.normalReserveAck.bits.id, channelCandidateTask.mshrId)
+  val channelCandidateGeneration = Mux(channelCandidateSource === 2.U,
+    io.normalReserveAck.bits.token.generation, 0.U(8.W))
+  val channelCandidateSequence = Mux(channelCandidateSource === 2.U,
+    io.normalReserveAck.bits.token.sequence, 0.U(8.W))
+  val channelCandidatePaired = channelCandidateTask.snpHitRelease ||
+    channelCandidateTask.refillToReleaseCopy || channelCandidateTask.mshrContext =/= 0.U
+
+  def channelDirReadOf(task: TaskBundle): DirRead = {
+    val bits = Wire(new DirRead())
+    bits.set := task.set
+    bits.tag := task.tag
+    bits.wayMask := Fill(cacheParams.ways, "b1".U)
+    bits.replacerInfo.opcode := task.opcode
+    bits.replacerInfo.channel := task.channel
+    bits.replacerInfo.reqSource := task.reqSource
+    bits.replacerInfo.refill_prefetch := false.B
+    bits.refill := false.B
+    bits.normalRefillRevalidate := false.B
+    bits.mshrId := task.mshrId
+    bits.cmoAll := task.cmoAll
+    bits.cmoWay := task.way
+    bits
+  }
+  val channelCandidateDirReadBits = channelDirReadOf(channelCandidateTask)
+  val channelTokenTask = Wire(new TaskBundle())
+  channelTokenTask := MuxLookup(channelDirReadAdmissionToken.source,
+    0.U.asTypeOf(new TaskBundle()))(Seq(
+      0.U -> C_task,
+      1.U -> B_task,
+      2.U -> normalReservedTask
+    ))
+  when(channelDirReadAdmissionToken.source === 2.U) {
+    channelTokenTask := normalReservedTask
+    channelTokenTask.mshrId := io.normalReserveAck.bits.id
+  }
+  val channelTokenDirReadBits = channelDirReadOf(channelTokenTask)
+  val channelTokenSourceValid = Mux(channelDirReadAdmissionToken.source === 0.U,
+    io.sinkC.valid, Mux(channelDirReadAdmissionToken.source === 1.U,
+      bPending.valid && bServiceReserved, io.sinkA.valid && io.normalReserveAck.valid))
+  val channelTokenOwnerCurrent = Mux(channelDirReadAdmissionToken.source === 2.U,
+    io.normalReserveAck.bits.id, channelTokenTask.mshrId)
+  val channelTokenGenerationCurrent = Mux(channelDirReadAdmissionToken.source === 2.U,
+    io.normalReserveAck.bits.token.generation, 0.U(8.W))
+  val channelTokenSequenceCurrent = Mux(channelDirReadAdmissionToken.source === 2.U,
+    io.normalReserveAck.bits.token.sequence, 0.U(8.W))
+  val channelTokenPairedCurrent = channelTokenTask.snpHitRelease ||
+    channelTokenTask.refillToReleaseCopy || channelTokenTask.mshrContext =/= 0.U
+  val channelTokenProvenanceCurrent =
+    channelTokenTask.mshrContext === channelDirReadAdmissionToken.mshrContext &&
+    channelTokenTask.refillToReleaseCopy === channelDirReadAdmissionToken.refillToReleaseCopy &&
+    channelTokenTask.refillBufReadId === channelDirReadAdmissionToken.refillBufReadId &&
+    channelTokenTask.useProbeData === channelDirReadAdmissionToken.useProbeData &&
+    channelTokenTask.readProbeDataDown === channelDirReadAdmissionToken.readProbeDataDown &&
+    channelTokenTask.readRefillData === channelDirReadAdmissionToken.readRefillData &&
+    channelTokenTask.readDataFromDS === channelDirReadAdmissionToken.readDataFromDS &&
+    channelTokenTask.snpHitRelease === channelDirReadAdmissionToken.snpHitRelease &&
+    channelTokenTask.snpHitReleaseIdx === channelDirReadAdmissionToken.snpHitReleaseIdx
+  // Ownership was transferred at capture. These comparisons are assertions,
+  // never functional valid/ready gates: a later candidate or block signal
+  // cannot revoke a command which already reserved its source and capacity.
+  val channelTokenIdentityMatches =
+    channelDirReadAdmissionToken.dirRead.asUInt === channelTokenDirReadBits.asUInt &&
+    channelDirReadAdmissionToken.owner === channelTokenOwnerCurrent &&
+    channelDirReadAdmissionToken.generation === channelTokenGenerationCurrent &&
+    channelDirReadAdmissionToken.sequence === channelTokenSequenceCurrent &&
+    channelDirReadAdmissionToken.paired === channelTokenPairedCurrent &&
+    channelTokenProvenanceCurrent
+  when(channelDirReadAdmissionValid) {
+    assert(channelTokenSourceValid && channelTokenIdentityMatches,
+      "a channel Directory token must retain its committed source and provenance")
+  }
+
   // Background-class MSHR tasks (sidecar release/copyback, CMO; qosClass==4)
   // must not preempt sink requests at s1: sinks are on the L1/openLLC
   // critical path while background writeback work is not. The MSHRCtl-level
@@ -266,17 +394,23 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
 
   // TODO: A Hint is allowed to enter if !s2_ready for mcp2_stall
 
-  val sink_ready_basic = localTransitionIdle && (bPending.valid || !admitMshrTurn) &&
-    io.dirRead_s1.ready && resetFinish && !mshr_task_s1.valid && s2_ready
+  // This is the post-token execution event.  Directory ready is no longer
+  // part of A/B/C admission; it is observed only after the registered token
+  // has been presented to Directory.
+  val sink_ready_basic = channelDirReadAdmissionFire
 
   io.normalReserveRequest.valid := localTransitionIdle && resetFinish &&
     !mshr_task_s1.valid && !bPending.valid && io.sinkA.valid && !block_A &&
-    !io.normalReserveAck.valid && !sinkValids(0) && !io.sinkB.valid
+    !io.normalReserveAck.valid && !sinkValids(0) && !io.sinkB.valid &&
+    !channelDirReadAdmissionValid
   // An acknowledged A claim predates a later B candidate. Let it execute
   // before capturing that B: a CMO claim can reserve the last eligible S/R
   // index, so making the A wait for that blocked B would deadlock.
-  io.sinkA.ready := sink_ready_basic && normalReserved && !block_A &&
-    !sinkValids(0) && !bPending.valid
+  // The registered token has already chosen its channel owner. A later C
+  // candidate must not veto this A's consume after the same token has fired
+  // Directory and advanced S1. Eligibility was committed at token capture;
+  // source consumption is the very same event as the retained token fire.
+  io.sinkA.ready := sink_ready_basic && channelDirReadAdmissionToken.source === 2.U
   when(io.sinkA.fire) {
     assert(io.dirRead_s1.fire && normalReserved,
       "a normal Directory read must consume its registered concrete slot")
@@ -287,9 +421,15 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   // The next stage creates service/slot ownership; actual execution is a
   // separate handshake and never has to preempt ReplaceMSHR in the same cycle.
   io.sinkB.ready := localTransitionIdle && !admitMshrTurn && resetFinish &&
-    !mshr_task_s1.valid && !bPending.valid && !normalReserved && !block_B && !sinkValids(0)
-  io.sinkC.ready := sink_ready_basic && !block_C && !bPending.valid
-  bExecute := sink_ready_basic && sinkValids(1)
+    !mshr_task_s1.valid && !bPending.valid && !normalReserved && !block_B && !sinkValids(0) &&
+    !channelDirReadAdmissionValid
+  io.sinkC.ready := sink_ready_basic && channelDirReadAdmissionToken.source === 0.U
+  bExecute := sink_ready_basic && channelDirReadAdmissionToken.source === 1.U
+  val channelConsumes = VecInit(Seq(io.sinkC.fire, bExecute, io.sinkA.fire))
+  assert(channelDirReadAdmissionFire === channelConsumes.asUInt.orR,
+    "a channel Directory token must execute and consume its owner atomically")
+  assert(PopCount(channelConsumes) <= 1.U,
+    "one channel Directory token must consume exactly one channel owner")
   when(io.sinkB.fire) {
     bPending.valid := true.B
     bPending.bits := io.sinkB.bits
@@ -303,21 +443,28 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   assert(!bExecute || bServiceReserved, "B executed before registered service reservation")
 
   val chnl_task_s1 = Wire(Valid(new TaskBundle()))
-  chnl_task_s1.valid := localTransitionIdle && (bPending.valid || !admitMshrTurn) &&
-    io.dirRead_s1.ready && sinkValids.orR && resetFinish
-  chnl_task_s1.bits := ParallelPriorityMux(sinkValids, Seq(C_task, B_task, A_task))
-  when(sinkValids(2) && !sinkValids(0) && !sinkValids(1)) {
-    chnl_task_s1.bits := normalReservedTask
-    chnl_task_s1.bits.mshrId := io.normalReserveAck.bits.id
-  }
+  // A channel task reaches S1 only when its registered Directory token is
+  // valid and the Directory accepts that token.  Until then the upstream
+  // Decoupled source sees ready low and retains the complete payload.
+  // Keep a held token visible to the local pipeline even during a data-bank
+  // bubble.  `s2_ready` gates the actual S1 fire below; including it here
+  // would feed task_s1.valid back into ds_mcp2_stall and create a FIRRTL
+  // combinational cycle.
+  chnl_task_s1.valid := channelDirReadAdmissionValid && !mshr_task_s1.valid
+  chnl_task_s1.bits := channelTokenTask
 
   // mshr_task_s1 is s1_[reg]
   // task_s1 is [wire] to s2_reg
   val task_s1 = Mux(mshr_task_s1.valid, mshr_task_s1, chnl_task_s1)
   val s1_to_s2_valid = task_s1.valid && !mshr_replRead_stall
 
-  s1_cango := task_s1.valid && !mshr_replRead_stall && !mshr_refillOnlyCommit_stall
+  s1_cango := task_s1.valid && !mshr_replRead_stall && !mshr_refillOnlyCommit_stall &&
+    Mux(mshr_task_s1.valid, true.B, io.dirRead_s1.ready)
   s1_fire := s1_cango && s2_ready
+  when(!mshr_task_s1.valid) {
+    assert(s1_fire === channelDirReadAdmissionFire,
+      "a channel S1 advance must be the retained Directory token fire")
+  }
   io.contextReservation := s1_fire
 
   io.mshrHintQInfo.valid := mshr_task_s1.valid && !mshr_replRead_stall && !mshr_refillOnlyCommit_stall && s2_ready
@@ -354,40 +501,49 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   dirReadCaptureBits.cmoAll := dirReadCaptureTask.cmoAll
   dirReadCaptureBits.cmoWay := dirReadCaptureTask.way
 
-  // Replacement reads use the registered admission hold. Channel A/B/C keeps
-  // the original same-cycle Directory handshake and reservation timing.
-  val channelDirReadBits = Wire(new DirRead())
-  val haveDirCandidate = mshr_task_s1.valid || sinkValids.orR
-  channelDirReadBits.set := Mux(haveDirCandidate, task_s1.bits.set, 0.U)
-  channelDirReadBits.tag := task_s1.bits.tag
-  channelDirReadBits.wayMask := Mux(
-    mshr_task_s1.valid && mshr_task_s1.bits.mshrRetry,
-    (~(1.U(cacheParams.ways.W) << mshr_task_s1.bits.way)),
-    Fill(cacheParams.ways, "b1".U)
-  )
-  channelDirReadBits.replacerInfo.opcode := task_s1.bits.opcode
-  channelDirReadBits.replacerInfo.channel := task_s1.bits.channel
-  channelDirReadBits.replacerInfo.reqSource := task_s1.bits.reqSource
-  channelDirReadBits.replacerInfo.refill_prefetch := s1_needs_replRead &&
-    (mshr_task_s1.bits.opcode === HintAck && mshr_task_s1.bits.dsWen)
-  channelDirReadBits.refill := s1_needs_replRead
-  channelDirReadBits.normalRefillRevalidate := mshr_task_s1.valid && task_s1.bits.normalRefillRevalidate
-  channelDirReadBits.mshrId := task_s1.bits.mshrId
-  channelDirReadBits.cmoAll := A_task.cmoAll
-  channelDirReadBits.cmoWay := A_task.way
   val mshrReplReadActive = mshr_task_s1.valid && s1_needs_replRead
   io.dirRead_s1.valid := Mux(
     mshrReplReadActive,
     dirReadAdmissionValid && (!dirReadAdmissionBits.refill || !io.fromMainPipe.blockG_s1),
-    s2_ready && chnl_task_s1.valid
+    channelDirReadAdmissionValid &&
+      !mshr_task_s1.valid && s2_ready
   )
-  io.dirRead_s1.bits := Mux(mshrReplReadActive, dirReadAdmissionBits, channelDirReadBits)
-  dirReadAdmissionFire := io.dirRead_s1.valid && io.dirRead_s1.ready
+  io.dirRead_s1.bits := Mux(mshrReplReadActive,
+    dirReadAdmissionBits, channelDirReadAdmissionToken.dirRead)
+  // D109 replacement reads and the new A/B/C token have separate ownership
+  // events.  A channel token is consumed only when the Directory really
+  // accepts its registered payload.
+  dirReadAdmissionFire := mshrReplReadActive && io.dirRead_s1.fire
+  channelDirReadAdmissionFire := !mshr_task_s1.valid &&
+    channelDirReadAdmissionValid &&
+    s2_ready && io.dirRead_s1.ready
   dirReadAdmissionValid := dirReadAdmissionValid && !dirReadAdmissionFire || dirReadCapture
   when(dirReadCapture) {
     dirReadAdmissionBits := dirReadCaptureBits
     dirReadAdmissionTask := dirReadCaptureTask
     dirReadAdmissionToken := mshrLeaseToken_s1
+  }
+
+  when(channelDirReadAdmissionFire) {
+    channelDirReadAdmissionToken.valid := false.B
+  }
+  when(channelCandidateValid) {
+    channelDirReadAdmissionToken.valid := true.B
+    channelDirReadAdmissionToken.source := channelCandidateSource
+    channelDirReadAdmissionToken.dirRead := channelCandidateDirReadBits
+    channelDirReadAdmissionToken.owner := channelCandidateOwner
+    channelDirReadAdmissionToken.generation := channelCandidateGeneration
+    channelDirReadAdmissionToken.sequence := channelCandidateSequence
+    channelDirReadAdmissionToken.paired := channelCandidatePaired
+    channelDirReadAdmissionToken.mshrContext := channelCandidateTask.mshrContext
+    channelDirReadAdmissionToken.refillToReleaseCopy := channelCandidateTask.refillToReleaseCopy
+    channelDirReadAdmissionToken.refillBufReadId := channelCandidateTask.refillBufReadId
+    channelDirReadAdmissionToken.useProbeData := channelCandidateTask.useProbeData
+    channelDirReadAdmissionToken.readProbeDataDown := channelCandidateTask.readProbeDataDown
+    channelDirReadAdmissionToken.readRefillData := channelCandidateTask.readRefillData
+    channelDirReadAdmissionToken.readDataFromDS := channelCandidateTask.readDataFromDS
+    channelDirReadAdmissionToken.snpHitRelease := channelCandidateTask.snpHitRelease
+    channelDirReadAdmissionToken.snpHitReleaseIdx := channelCandidateTask.snpHitReleaseIdx
   }
 
   // block same-set A req
@@ -422,7 +578,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
       mshr_task_s1.bits.aMergeTask.opcode === GrantData
     )
   )
-  val chnl_wouldHint_s1 = !mshr_task_s1.valid && sinkValids(0)
+  val chnl_wouldHint_s1 = !mshr_task_s1.valid && channelDirReadAdmissionValid &&
+    channelDirReadAdmissionToken.source === 0.U
   val hint_stall = (mshr_wouldHint_s1 || chnl_wouldHint_s1) && io.hint_s1QueueFull
 
   s2_ready  := !ds_mcp2_stall && !hint_stall
@@ -439,8 +596,11 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   noFreeWay := sameSetCnt >= cacheParams.ways.U
    */
   io.taskToPipe_s2 := task_s2
+  val channelLeaseToken_s1 = Wire(new MainpipeLeaseToken)
+  channelLeaseToken_s1.generation := channelDirReadAdmissionToken.generation
+  channelLeaseToken_s1.sequence := channelDirReadAdmissionToken.sequence
   io.taskLeaseToken_s2 := RegEnable(Mux(mshr_task_s1.valid,
-    mshrLeaseToken_s1, io.normalReserveAck.bits.token), s1_fire)
+    mshrLeaseToken_s1, channelLeaseToken_s1), s1_fire)
 
   // MSHR task
   val mshrTask_s2 = task_s2.valid && task_s2.bits.mshrTask
