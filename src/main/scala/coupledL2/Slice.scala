@@ -62,6 +62,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   val mainPipe = Module(new MainPipe())
   val reqBuf = Module(new RequestBuffer())
   val mshrCtl = Module(new MSHRCtl())
+  mshrCtl.io.traceSliceId.foreach(_ := io.sliceId)
   private val mbistPl = MbistPipeline.PlaceMbistPipeline(2, "L2Slice", p(L2ParamKey).hasMbist)
   sinkC.io.msInfo := mshrCtl.io.msInfo
 

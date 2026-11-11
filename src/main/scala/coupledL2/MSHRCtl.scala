@@ -68,6 +68,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     })
 
     val releaseBufWriteId = Output(UInt(mshrBits.W))
+    val traceSliceId = Option.when(cacheParams.enablePerf)(Input(UInt(bankBits.W)))
 
     /* nested writeback */
     val nestedwb = Input(new NestedWriteback)
@@ -260,6 +261,35 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     XSPerfHistogram("release_period", release_period, release_period_en, 1000, 5000, 1000, true, false)
  
     val timers = RegInit(VecInit(Seq.fill(mshrsAll)(0.U(64.W))))
+
+    val lifecycle = Wire(new MshrLifecycleEvents)
+    lifecycle.bank := io.traceSliceId.get
+    lifecycle.allocated.valid := io.fromMainPipe.mshr_alloc_s3.valid
+    lifecycle.allocated.bits.entry := io.toMainPipe.mshr_alloc_ptr
+    val allocatedTask = io.fromMainPipe.mshr_alloc_s3.bits.task
+    lifecycle.allocated.bits.line := Cat(allocatedTask.tag, allocatedTask.set)
+    lifecycle.allocated.bits.source := allocatedTask.reqSource
+    lifecycle.allocated.bits.channel := allocatedTask.channel
+    lifecycle.allocated.bits.prefetch := allocatedTask.opcode === Hint
+    lifecycle.allocated.bits.miss := !io.fromMainPipe.mshr_alloc_s3.bits.dirResult.hit
+    lifecycle.merged.valid := io.aMergeTask.valid
+    lifecycle.merged.bits.entry := OHToUInt(io.aMergeTask.bits.idOH)
+    lifecycle.merged.bits.line := Cat(io.aMergeTask.bits.task.tag, io.aMergeTask.bits.task.set)
+    lifecycle.merged.bits.source := io.aMergeTask.bits.task.reqSource
+    lifecycle.freed.zip(mshrs.zip(timers)).foreach { case (event, (mshr, timer)) =>
+      event.valid := mshr.io.status.valid && mshr.io.status.bits.will_free
+      event.bits := timer
+    }
+    XSLog.registerCallerWithClock { (control, endpointReset, endpointClock) =>
+      import chisel3.util.experimental.BoringUtils.bore
+      val events = bore(lifecycle)
+      withClockAndReset(endpointClock, endpointReset) {
+        val logger = Module(new MshrLifecycleLogger).suggestName("mshrLifecycle")
+        logger.io.events := events
+        logger.io.control := control
+      }
+    }
+
     for (((timer, m), i) <- timers.zip(mshrs).zipWithIndex) {
       when (m.io.alloc.valid) {
         timer := 1.U
