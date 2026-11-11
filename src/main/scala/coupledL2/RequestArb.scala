@@ -49,6 +49,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     val sidecarReservationHold = Output(Bool())
     val reservedB = Output(Bool())
     val contextReservation = Output(Bool())
+    val grantReservation = ValidIO(new PipeStatus)
     val normalReserveRequest = DecoupledIO(new TaskBundle)
     val normalReserveAck = Flipped(ValidIO(new NormalSlotReservation))
     val normalReserveConsume = Output(Bool())
@@ -317,6 +318,17 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     io.normalReserveAck.bits.token.sequence, 0.U(8.W))
   val channelCandidatePaired = channelCandidateTask.snpHitRelease ||
     channelCandidateTask.refillToReleaseCopy || channelCandidateTask.mshrContext =/= 0.U
+
+  // Promise downstream capacity when the local owner is captured, before
+  // Directory can execute it. Only the narrow registered event crosses to
+  // GrantBuffer; neither its ledger nor credit D reads a live S1 task.
+  val grantReservation = Wire(Valid(new PipeStatus))
+  grantReservation.valid := s0_fire || channelCandidateValid
+  grantReservation.bits.channel := Mux(s0_fire,
+    io.mshrTask.bits.channel, channelCandidateTask.channel)
+  assert(!(s0_fire && channelCandidateValid),
+    "one local execution slot cannot acquire two GrantBuffer reservations")
+  io.grantReservation := RegNext(grantReservation, 0.U.asTypeOf(grantReservation))
 
   def channelDirReadOf(task: TaskBundle): DirRead = {
     val bits = Wire(new DirRead())

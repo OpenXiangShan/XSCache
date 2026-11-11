@@ -69,7 +69,8 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
     val fromReqArb = Input(new Bundle() {
       val status_s1 = new PipeEntranceStatus
     })
-    val pipeStatusVec = Flipped(Vec(6, ValidIO(new PipeStatus)))
+    val pipelineReserve = Flipped(ValidIO(new PipeStatus))
+    val pipelineReturn = Flipped(ValidIO(new PipeStatus))
     val toReqArb = Output(new Bundle() {
       val blockSinkReqEntrance = new BlockInfo()
       val blockMSHRReqEntrance = Bool()
@@ -160,7 +161,8 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   val grantQueue_enq_isKeyword = Mux(io.d_task.bits.task.mergeA, mergeAtask.isKeyword.getOrElse(false.B), io.d_task.bits.task.isKeyword.getOrElse(false.B))
   // The following is organized in the order of data flow
   // =========== save d_task in queue[FIFO] ===========
-  grantQueue.io.enq.valid := io.d_task.valid && (dtaskOpcode =/= HintAck || io.d_task.bits.task.mergeA)
+  grantQueue.io.enq.valid := io.d_task.valid && io.d_task.ready &&
+    (dtaskOpcode =/= HintAck || io.d_task.bits.task.mergeA)
   grantQueue.io.enq.bits.task := Mux(io.d_task.bits.task.mergeA, mergeAtask, io.d_task.bits.task)
   grantQueue.io.enq.bits.task.isKeyword.foreach(_ := grantQueue_enq_isKeyword)
   //grantQueue.io.enq.bits.task.isKeyword.foreach(_ := io.d_task.bits.task.isKeyword.getOrElse(false.B))
@@ -170,7 +172,6 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   grantQueueData0.io.enq.bits.data := enqData(0)
   grantQueueData1.io.enq.valid := grantQueue.io.enq.valid
   grantQueueData1.io.enq.bits.data := enqData(1)
-  val grantQueueCnt = grantQueue.io.count
   val full = !grantQueue.io.enq.ready
 
   // =========== dequeue entry and fire ===========
@@ -240,7 +241,7 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   val pftQueueLen = 10
   val pftRespQueue = prefetchOpt.map(_ => Module(new Queue(pftRespEntry, entries = pftQueueLen, flow = false)))
   prefetchOpt.map { _ =>
-    pftRespQueue.get.io.enq.valid := io.d_task.valid && dtaskOpcode === HintAck &&
+    pftRespQueue.get.io.enq.valid := io.d_task.valid && io.d_task.ready && dtaskOpcode === HintAck &&
       io.d_task.bits.task.fromL2pft.getOrElse(false.B)
     pftRespQueue.get.io.enq.bits.tag := io.d_task.bits.task.tag
     pftRespQueue.get.io.enq.bits.set := io.d_task.bits.task.set
@@ -309,28 +310,74 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   io.e.ready := eOwnerValid
 
   // =========== handle blocking - capacity conflict ===========
-  // Credits include every admitted pipeline reservation, including S1.
-  // A registered result never lends a same-cycle dequeue/GrantAck to a new
-  // request. RequestArb's bounded local slot prevents a second admission
-  // before the first is visible in this ledger (including its S0 MSHR hold).
-  val grantReservations = PopCount(VecInit(io.pipeStatusVec.map(s =>
-    s.valid && (s.bits.fromA || s.bits.fromC))).asUInt)
-  val ackReservations = PopCount(VecInit(io.pipeStatusVec.map(s =>
-    s.valid && s.bits.fromA)).asUInt)
+  // Capacity is owned locally from the registered admission event until
+  // either SourceD transfers it to a queue/table or a no-D task terminates.
+  // Every A conservatively promises grant, GrantAck and prefetch space; C
+  // promises grant space. Thus retry/refill-only/CMO need no live decode here.
+  // The admission event, pending counter and credit register take three
+  // edges to settle. The held local token/S1 owner and the four-cycle local
+  // transition slot prevent any second admission during that interval.
+  def eventCount(add: Bool, remove: Bool, capacity: Int, name: String): UInt = {
+    val used = RegInit(0.U(log2Ceil(capacity + 1).W))
+    when(add && !remove) {
+      assert(used < capacity.U, s"$name overflow")
+      used := used + 1.U
+    }.elsewhen(remove && !add) {
+      assert(used =/= 0.U, s"$name underflow")
+      used := used - 1.U
+    }
+    used
+  }
+  val reserveGrant = io.pipelineReserve.valid &&
+    (io.pipelineReserve.bits.fromA || io.pipelineReserve.bits.fromC)
+  val returnGrant = io.pipelineReturn.valid &&
+    (io.pipelineReturn.bits.fromA || io.pipelineReturn.bits.fromC)
+  val reserveA = io.pipelineReserve.valid && io.pipelineReserve.bits.fromA
+  val returnA = io.pipelineReturn.valid && io.pipelineReturn.bits.fromA
+  val grantReservations = eventCount(reserveGrant, returnGrant, mshrsAll, "grant reservations")
+  val ackReservations = eventCount(reserveA, returnA, grantBufInflightSize, "A reservations")
+
+  // Register local occupancy events to align an actual insertion with the
+  // registered reservation return. Transfer never double-counts the task or
+  // borrows a same-cycle FIFO dequeue, E response or prefetch response.
+  val grantOccupied = eventCount(
+    RegNext(grantQueue.io.enq.fire, false.B),
+    RegNext(grantQueue.io.deq.fire, false.B), mshrsAll, "grant occupancy")
+  val ackOccupied = eventCount(
+    RegNext(io.d_task.fire && taskNeedsInflight, false.B),
+    RegNext(io.e.fire, false.B), grantBufInflightSize, "GrantAck occupancy")
+  val pftOccupied = prefetchOpt.map(_ => eventCount(
+    RegNext(pftRespQueue.get.io.enq.fire, false.B),
+    RegNext(pftRespQueue.get.io.deq.fire, false.B), pftQueueLen, "prefetch occupancy"))
+  assert(grantOccupied === RegNext(grantQueue.io.count, 0.U),
+    "grant event ledger must match delayed FIFO occupancy")
+  assert(ackOccupied === RegNext(PopCount(inflightGrant.map(_.valid)), 0.U),
+    "GrantAck event ledger must match delayed table occupancy")
+  prefetchOpt.foreach { _ =>
+    assert(pftOccupied.get === RegNext(pftRespQueue.get.io.count, 0.U),
+      "prefetch event ledger must match delayed FIFO occupancy")
+  }
+  val grantUsed = grantOccupied +& grantReservations
+  val ackUsed = ackOccupied +& ackReservations
+  assert(grantUsed <= mshrsAll.U, "grant promises exceed local capacity")
+  assert(ackUsed <= grantBufInflightSize.U, "GrantAck promises exceed local capacity")
   def registeredCredit(used: UInt, capacity: Int): UInt = {
     val credit = RegInit(0.U(log2Ceil(capacity + 1).W))
     credit := Mux(used >= capacity.U, 0.U, capacity.U - used)
     credit
   }
-  val grantCredit = registeredCredit(grantQueueCnt +& grantReservations, mshrsAll)
-  val ackCredit = registeredCredit(PopCount(inflightGrant.map(_.valid)) +& ackReservations, mshrsAll)
+  val grantCredit = registeredCredit(grantUsed, mshrsAll)
+  val ackCredit = registeredCredit(ackUsed, grantBufInflightSize)
   val noSpaceForSinkReq = grantCredit === 0.U
   val noSpaceWaitSinkEForSinkReq = ackCredit === 0.U
   // Keep the extra MSHR-ingress margin used by the original S0 path.
   val noSpaceForMSHRReq = grantCredit <= 1.U
   val noSpaceWaitSinkEForMSHRReq = ackCredit <= 1.U
-  val pftCredit = prefetchOpt.map(_ =>
-    registeredCredit(pftRespQueue.get.io.count +& ackReservations, pftQueueLen))
+  val pftCredit = pftOccupied.map { occupied =>
+    val used = occupied +& ackReservations
+    assert(used <= pftQueueLen.U, "prefetch promises exceed local capacity")
+    registeredCredit(used, pftQueueLen)
+  }
   val noSpaceForSinkPft = pftCredit.map(_ === 0.U)
   val noSpaceForMSHRPft = pftCredit.map(_ <= 1.U)
 

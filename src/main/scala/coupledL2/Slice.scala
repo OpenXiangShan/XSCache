@@ -69,7 +69,8 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
 
   grantBuf.io.d_task <> mainPipe.io.toSourceD
   grantBuf.io.fromReqArb.status_s1 := reqArb.io.status_s1
-  grantBuf.io.pipeStatusVec := reqArb.io.status_vec ++ mainPipe.io.status_vec_toD
+  grantBuf.io.pipelineReserve := reqArb.io.grantReservation
+  grantBuf.io.pipelineReturn := mainPipe.io.grantReservationReturn
 
   val status_vec_toTX = reqArb.io.status_vec_toTX ++ mainPipe.io.status_vec_toTX
   txreq.io.pipeReq <> mainPipe.io.toTXREQ

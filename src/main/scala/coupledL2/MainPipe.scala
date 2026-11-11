@@ -54,6 +54,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
     /* handle capacity conflict of GrantBuffer */
     val status_vec_toD = Vec(4, ValidIO(new PipeStatus))
+    val grantReservationReturn = ValidIO(new PipeStatus)
     /* handle capacity conflict of TX channels */
     val status_vec_toTX = Vec(4, ValidIO(new PipeStatusWithCHI))
 
@@ -1399,6 +1400,29 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
   task_s5.valid := task_s4.valid && !req_drop_s4
   val leaseToken_s5 = RegEnable(leaseToken_s4, task_s4.valid && !req_drop_s4)
+  // A SourceD handoff transfers the reservation into GrantBuffer's local
+  // queue/table. A task may still write a buffer afterwards, so remember
+  // that handoff through its tail instead of returning the same credit twice.
+  val sourceDTransferred_s4 = RegNext(d_s3.fire, false.B)
+  val sourceDTransferred_s5 = RegNext(sourceDTransferred_s4 || d_s4.fire, false.B)
+  assert(!d_s4.fire || !sourceDTransferred_s4,
+    "one task cannot transfer its SourceD reservation twice at S4")
+  assert(!d_s5.fire || !sourceDTransferred_s5,
+    "one task cannot transfer its SourceD reservation twice at S5")
+  assert(!d_s5.valid || d_s5.ready,
+    "a terminal SourceD task must own its reserved GrantBuffer capacity")
+  val grantReservationEnds = Seq(
+    (d_s3.fire || task_s3.valid && req_drop_s3, task_s3.bits),
+    (d_s4.fire || task_s4.valid && req_drop_s4 && !sourceDTransferred_s4, task_s4.bits),
+    (d_s5.fire || task_s5.valid && !d_s5.valid && !sourceDTransferred_s5, task_s5.bits)
+  ).map { case (end, task) => (end && (task.fromA || task.fromC), task.channel) }
+  val grantReservationReturn = Wire(Valid(new PipeStatus))
+  grantReservationReturn.valid := VecInit(grantReservationEnds.map(_._1)).asUInt.orR
+  grantReservationReturn.bits.channel := Mux1H(grantReservationEnds)
+  assert(PopCount(grantReservationEnds.map(_._1)) <= 1.U,
+    "one local execution slot cannot return two GrantBuffer reservations")
+  io.grantReservationReturn := RegNext(grantReservationReturn,
+    0.U.asTypeOf(grantReservationReturn))
   // Return the source lease only after its final local task/buffer reference.
   // A source accepted at S0 may stall in RequestArb S1; actual pipeline
   // terminal events, rather than a fixed countdown, determine this boundary.
