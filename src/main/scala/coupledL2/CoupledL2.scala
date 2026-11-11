@@ -762,6 +762,22 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
         stashPrefetchIdBits.U
       )
     }
+    if (cacheParams.enablePerf) {
+      val txreqEvents = Wire(new TxreqArbEvents(txreqArbInputs.size))
+      txreqEvents.validMask := VecInit(txreqArbInputs.map(_.valid)).asUInt
+      txreqEvents.readyMask := VecInit(txreqArbInputs.map(_.ready)).asUInt
+      txreqEvents.outReady := txreq_arb.io.out.ready
+      XSLog.registerCallerWithClock { (control, endpointReset, endpointClock) =>
+        import chisel3.util.experimental.BoringUtils.bore
+        val events = bore(txreqEvents)
+        withClockAndReset(endpointClock, endpointReset) {
+          val logger = Module(new TxreqArbLogger(txreqArbInputs.size)).suggestName("txreqArbTrace")
+          logger.io.events := events
+          logger.io.control := control
+        }
+      }
+    }
+
     val txrsp = Wire(DecoupledIO(new CHIRSP))
     fastArb(slices.map(_.io.out.tx.rsp), txrsp, Some("txrsp"))
 
