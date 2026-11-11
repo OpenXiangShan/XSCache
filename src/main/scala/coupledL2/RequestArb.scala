@@ -228,7 +228,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   /* ======== Stage 1 ======== */
   /* latch mshr_task from s0 to s1 */
   val mshr_replRead_stall =
-    mshr_task_s1.valid && s1_needs_replRead && (!dirReadAdmissionFire || io.fromMainPipe.blockG_s1)
+    mshr_task_s1.valid && s1_needs_replRead && !dirReadAdmissionFire
   mshr_task_s1.valid := mshr_task_s1.valid && !s1_fire || s0_fire
 
   when(s0_fire) {
@@ -504,7 +504,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val mshrReplReadActive = mshr_task_s1.valid && s1_needs_replRead
   io.dirRead_s1.valid := Mux(
     mshrReplReadActive,
-    dirReadAdmissionValid && (!dirReadAdmissionBits.refill || !io.fromMainPipe.blockG_s1),
+    dirReadAdmissionValid && s2_ready && !mshr_refillOnlyCommit_stall,
     channelDirReadAdmissionValid &&
       !mshr_task_s1.valid && s2_ready
   )
@@ -514,6 +514,19 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   // events.  A channel token is consumed only when the Directory really
   // accepts its registered payload.
   dirReadAdmissionFire := mshrReplReadActive && io.dirRead_s1.fire
+  // Same-set eligibility was reserved at capture. No new local command can
+  // enter while this owner is held, so blockG must not bypass that FF to
+  // revoke a retained read. Directory and S1 consume the token together.
+  when(mshrReplReadActive) {
+    assert(dirReadAdmissionFire === s1_fire,
+      "a replacement Directory token must execute and advance S1 atomically")
+  }
+  when(dirReadAdmissionFire) {
+    assert(!io.fromMainPipe.blockG_s1,
+      "a retained replacement read must keep its reserved same-set execution slot")
+    assert(dirReadAdmissionToken.asUInt === mshrLeaseToken_s1.asUInt,
+      "a replacement Directory read must consume its retained source lease")
+  }
   channelDirReadAdmissionFire := !mshr_task_s1.valid &&
     channelDirReadAdmissionValid &&
     s2_ready && io.dirRead_s1.ready
