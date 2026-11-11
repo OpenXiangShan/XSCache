@@ -252,7 +252,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   // Isolated BOP experiments: only the selected BOP engines may issue data prefetches.
   val pfRcv_en = false.B
-  val pbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pbop_en
+  val pbop_en = false.B
   val vbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_vbop_en
   val tp_en = false.B
   val cdp_en = false.B
@@ -346,7 +346,12 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
               50, 54, 60, 64, 72, 75, 80, 81,
               90, 96, 100, 108, 120, 125, 128, 135,
               144, 150, 160, 162, 180, 192, 200, 216,
-              225, 240, 243, 250 /*, 256*/
+              225, 240, 243, 250,
+              // Append PBOP candidates after the original VBOP scan order.
+              -32, -30, -27, -25, -24, -20, -18, -16, -15,
+              -12, -10, -9, -8, -6, -5, -4, -3, -2, -1,
+              1, 2, 3, 4, 5, 6, 8, 9, 10,
+              12, 15, 16, 18, 20, 24, 25, 27, 30
             )
           )) ++ l2Params.prefetch.filterNot(_.isInstanceOf[BOPParameters])
         )
