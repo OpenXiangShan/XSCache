@@ -48,7 +48,7 @@ class MshrLifecycleRow(implicit p: Parameters) extends L2Bundle {
   val events = new MshrLifecycleEvents
   val nativeCycle = UInt(64.W)
   val clean = Bool()
-  val dump = Bool()
+  val nativeDump = Bool()
   val logEnable = Bool()
 }
 
@@ -61,10 +61,10 @@ class MshrLifecycleLogger(implicit p: Parameters) extends CoupledL2Module {
   row.events := io.events
   row.nativeCycle := io.control.timer
   row.clean := io.control.clean
-  row.dump := io.control.dump
+  row.nativeDump := io.control.dump
   row.logEnable := io.control.logEnable
   val changed = io.events.allocated.valid || io.events.merged.valid ||
-    io.events.freed.map(_.valid).reduce(_ || _) || row.clean || row.dump
+    io.events.freed.map(_.valid).reduce(_ || _) || row.clean || row.nativeDump
   val table = ChiselDB.createTable(s"${cacheParams.name}MshrLifecycle", new MshrLifecycleRow, basicDB = true)
   table.log(row, changed, "MSHRCtl", clock, reset)
 }
