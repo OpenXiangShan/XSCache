@@ -32,6 +32,14 @@ class RXSNP(
   val io = IO(new Bundle() {
     val rxsnp = Flipped(DecoupledIO(new CHISNP()))
     val task = DecoupledIO(new TaskBundle())
+    // A snapshot acquires its concrete S/R slot before becoming visible to B.
+    val admissionEnable = Input(Bool())
+    // Queue occupancy is a register output, independent from owner/stall
+    // eligibility. It can release an older blocked A claim before snapshot.
+    val queued = Output(Bool())
+    val admission = DecoupledIO(new TaskBundle)
+    val replaceAdmissionIdle = Input(UInt(mshrsAll.W))
+    val sidecarReserve = ValidIO(UInt(mshrBits.W))
     // A normal request, a snoop context, and a replacement victim can all be
     // live concurrently. Keep their addresses independent.
     val refillInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo())))
@@ -45,6 +53,7 @@ class RXSNP(
   val queue = Module(new Queue(io.rxsnp.bits.cloneType, 2, pipe = false, flow = false))
   rxsnp <> queue.io.deq
   queue.io.enq <> io.rxsnp
+  io.queued := queue.io.deq.valid
   val task = Wire(new TaskBundle)
 
   /**
@@ -130,11 +139,19 @@ class RXSNP(
   // releaseStarted is not a blocking boundary. Only a CopyBackWrData already
   // issued to MainPipe is immutable; wait for its final data beat in that
   // narrow interval.
-  val sidecarNestReadyMask = VecInit(io.replaceInfo.map(s =>
-    s.bits.probeDone && s.bits.releaseBufReady &&
+  val sidecarNestReadyMask = VecInit(io.replaceInfo.zipWithIndex.map { case (s, i) =>
+    s.bits.probeDone && s.bits.releaseBufReady && io.replaceAdmissionIdle(i) &&
       (!s.bits.releaseStarted || !s.bits.copyBackIssued)
-  )).asUInt
+  }).asUInt
   val sidecarNestSnpMask = sidecarLineMask & sidecarNestReadyMask
+
+  // The whole command is frozen only after the local admission phase and
+  // concrete service-slot reservation agree. The queue head remains owned
+  // until the actual B capture, but no raw eligibility or payload can bypass
+  // this register. A nested snapshot also pins its physical ReleaseBuf owner.
+  val admissionValid = RegInit(false.B)
+  val admissionTask = RegInit(0.U.asTypeOf(new TaskBundle))
+  val admissionOwnerGeneration = Reg(UInt((mshrBits + 1).W))
 
   // A same-line snoop during a CMO is serviced by the CMO sidecar's ReleaseBuf
   // snapshot whenever nesting applies, so the CMO block yields to nesting.
@@ -197,9 +214,36 @@ class RXSNP(
     allocatingSidecarBlockSnp
   val stall = reqBlockSnp || replaceBlockSnp || cmoBlockSnp || sidecarBlockSnp ||
     normalVictimAwaitingOwner || snoopContextBlock
-  io.task.valid := rxsnp.valid && !stall
-  io.task.bits := task
-  rxsnp.ready := io.task.ready && !stall
+
+  io.admission.valid := rxsnp.valid && io.admissionEnable && !admissionValid && !stall
+  io.admission.bits := task
+  val admissionCapture = io.admission.fire
+  io.task.valid := admissionValid
+  io.task.bits := admissionTask
+  rxsnp.ready := io.task.fire
+
+  val admissionOwnerOH = UIntToOH(task.snpHitReleaseIdx, mshrsAll)
+  when(admissionCapture) {
+    admissionValid := true.B
+    admissionTask := task
+    admissionOwnerGeneration := Mux1H(admissionOwnerOH,
+      io.replaceInfo.map(s => Cat(s.bits.parentEpoch, s.bits.parentId)))
+  }.elsewhen(io.task.fire) {
+    admissionValid := false.B
+  }
+  // The local capture phase protects the owner across the snapshot edge.
+  // This registered one-cycle event then transfers that protection into the
+  // sidecar's existing snoopInFlight tally, exactly once per nested command.
+  io.sidecarReserve.valid := RegNext(admissionCapture && task.snpHitRelease, false.B)
+  io.sidecarReserve.bits := RegEnable(task.snpHitReleaseIdx, admissionCapture)
+
+  when(admissionValid) {
+    assert(rxsnp.valid, "a retained snoop snapshot must keep its CHI queue head")
+    assert(fromSnpToTaskBundle(rxsnp.bits).tag === admissionTask.tag &&
+      fromSnpToTaskBundle(rxsnp.bits).set === admissionTask.set &&
+      rxsnp.bits.txnID === admissionTask.txnID.get,
+      "a retained snoop snapshot must keep the same CHI request")
+  }
 
   val stallCnt = RegInit(0.U(64.W))
   when(rxsnp.fire) {
@@ -236,12 +280,14 @@ class RXSNP(
   assert(allocBlockCnt =/= ALLOC_BLOCK_CNT_MAX,
     "a snoop blocked only by an allocating sidecar must eventually be admitted")
 
-  when(io.task.fire && task.snpHitRelease) {
-    assert(sidecarNestSnpMask.orR &&
-      (UIntToOH(task.snpHitReleaseIdx, mshrsAll) & sidecarNestSnpMask).orR,
-      "captured nested snoop must reference its registered ReleaseBuf owner")
+  when(io.task.fire && admissionTask.snpHitRelease) {
+    val owner = Mux1H(UIntToOH(admissionTask.snpHitReleaseIdx, mshrsAll), io.replaceInfo)
+    assert(owner.valid && owner.bits.set === admissionTask.set &&
+      owner.bits.tag === admissionTask.tag &&
+      Cat(owner.bits.parentEpoch, owner.bits.parentId) === admissionOwnerGeneration,
+      "captured nested snoop must retain its reserved ReleaseBuf owner")
   }
-  assert(!(stall && rxsnp.fire))
+  assert(!admissionCapture || !stall)
 
   def fromSnpToTaskBundle(snp: CHISNP): TaskBundle = {
     val task = WireInit(0.U.asTypeOf(new TaskBundle))

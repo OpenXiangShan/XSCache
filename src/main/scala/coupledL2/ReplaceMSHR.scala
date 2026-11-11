@@ -55,6 +55,9 @@ class ReplaceMSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   // Registered local admission phase protects a possible B capture before
   // its exact same-line service reservation is applied on the following edge.
   val localReservationHold = Input(Bool())
+  // Snapshot one snoop at a time so an earlier response cannot change the
+  // metadata on the edge at which the next immutable command is captured.
+  val snoopAdmissionIdle = Output(Bool())
   val sinkCOwnerHold = Input(Bool())
   val sourceBHold = Input(Bool())
   val sourceBAccepted = Input(Bool())
@@ -590,6 +593,9 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     donePulse := true.B
   }
 
+  io.snoopAdmissionIdle := !snoopInFlight && !releaseDataPending &&
+    !io.releaseDataSeen && !io.sinkC.valid && !io.victimDataCaptured &&
+    !io.victimDataNeedsWriteback && !io.snoopMeta.valid && !io.snoopDoneCount.orR
   io.info.valid := valid
   io.info.bits := victim
   io.info.bits.releaseStarted := releaseSent

@@ -93,6 +93,11 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   rxsnp.io.replaceInfo := mshrCtl.io.replaceInfoForSnoop
   rxsnp.io.refillVictimDelegated := mshrCtl.io.refillVictimDelegated
   rxsnp.io.replaceAlloc := mshrCtl.io.replaceAllocForSnoop
+  rxsnp.io.admissionEnable := reqArb.io.snoopAdmissionEnable
+  reqArb.io.snoopQueued := rxsnp.io.queued
+  mshrCtl.io.snoopAdmission <> rxsnp.io.admission
+  mshrCtl.io.sidecarSnoopReserve := rxsnp.io.sidecarReserve
+  rxsnp.io.replaceAdmissionIdle := mshrCtl.io.replaceSnoopAdmissionIdle
 
   directory.io.read <> reqArb.io.dirRead_s1
   directory.io.metaWReq := mainPipe.io.metaWReq

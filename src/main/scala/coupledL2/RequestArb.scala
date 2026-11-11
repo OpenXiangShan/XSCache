@@ -47,6 +47,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     // only afterwards executes the Directory read. This event is registered.
     val bServiceStart = ValidIO(new TaskBundle)
     val sidecarReservationHold = Output(Bool())
+    val snoopAdmissionEnable = Output(Bool())
+    val snoopQueued = Input(Bool())
     val reservedB = Output(Bool())
     val contextReservation = Output(Bool())
     val grantReservation = ValidIO(new PipeStatus)
@@ -169,7 +171,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   // before looking at live B.valid. It prevents a sidecar from issuing or
   // retiring at the edge at which a B snapshot may acquire its service.
   io.reservedB := bPending.valid
-  io.sidecarReservationHold := (bPending.valid && !bServiceReserved) ||
+  io.sidecarReservationHold := io.sinkB.valid || (bPending.valid && !bServiceReserved) ||
     (localTransitionIdle && !admitMshrTurn && !mshr_task_s1.valid && !bPending.valid)
   when(localTransitionIdle && !mshr_task_s1.valid && !bPending.valid &&
     !channelDirReadAdmissionValid) {
@@ -218,6 +220,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   // if mshr_task_s1 is replRead, it might stall and wait for dirRead.ready, so we block new mshrTask from entering
   // TODO: will cause msTask path vacant for one-cycle after replRead, since not use Flow so as to avoid ready propagation
   val mshrTaskReadyBasic = localTransitionIdle && admitMshrTurn && !mshr_task_s1.valid && !bPending.valid &&
+    !io.sinkB.valid &&
     !channelDirReadAdmissionValid &&
     !io.fromGrantBuffer.blockMSHRReqEntrance &&
     !io.fromTXDAT.blockMSHRReqEntrance &&
@@ -257,7 +260,10 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     (!normalReservationMatches || normalYieldForB)
   io.normalReserveConsume := io.sinkA.fire
   io.normalReserveRequest.bits := A_task
-  val B_task = Mux(bPending.valid, bPending.bits, io.sinkB.bits)
+  // Both B sources are register outputs: RXSNP's admitted snapshot and
+  // this module's pending command. No raw sidecar eligibility reaches status.
+  val B_task = bPending.bits
+  val bCandidateStatus = Mux(bPending.valid, bPending.bits, io.sinkB.bits)
   val C_task = io.sinkC.bits
   val block_A =
     io.fromMSHRCtl.blockA_s1 || io.fromMainPipe.blockA_s1 || io.fromGrantBuffer.blockSinkReqEntrance.blockA_s1
@@ -267,7 +273,11 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   // while normalReserved forbids that B forever (and may hold its last slot).
   when(!io.normalReserveAck.valid) {
     normalYieldForB := false.B
-  }.elsewhen(!channelDirReadAdmissionValid && normalReservationMatches && block_A && io.sinkB.valid) {
+  }.elsewhen(!channelDirReadAdmissionValid && normalReservationMatches && block_A &&
+    (io.sinkB.valid || io.snoopQueued)) {
+    // The immutable B snapshot waits for this older claim to leave. Queue
+    // occupancy Q breaks that wait before snapshot admission; raw eligibility
+    // and sidecar payload never enter this yield or channel arbitration.
     normalYieldForB := true.B
   }
   val block_B =
@@ -276,6 +286,12 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
       io.fromTXRSP.blockSinkBReqEntrance
   val block_C =
     io.fromMSHRCtl.blockC_s1 || io.fromMainPipe.blockC_s1 || io.fromGrantBuffer.blockSinkReqEntrance.blockC_s1
+
+  // This phase precedes the immutable RXSNP snapshot. Do not create a new A
+  // claim at the same edge; a previously acknowledged A/C finishes first.
+  io.snoopAdmissionEnable := localTransitionIdle && !admitMshrTurn && resetFinish &&
+    !mshr_task_s1.valid && !bPending.valid && !channelDirReadAdmissionValid &&
+    !io.normalReserveAck.valid && !io.sinkC.valid && !io.sinkB.valid && !block_B
 
 //  val noFreeWay = Wire(Bool())
 
@@ -300,7 +316,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val channelCandidateValid = localTransitionIdle &&
     (bPending.valid || !admitMshrTurn) && !mshr_task_s1.valid &&
     sinkValids.orR && resetFinish &&
-    !channelDirReadAdmissionValid
+    !channelDirReadAdmissionValid && !io.sinkB.valid
   val channelCandidateSource = OHToUInt(PriorityEncoderOH(sinkValids))
   io.aCommit := channelCandidateValid && channelCandidateSource === 2.U
   val channelCandidateTask = Wire(new TaskBundle())
@@ -414,7 +430,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   io.normalReserveRequest.valid := localTransitionIdle && resetFinish &&
     !mshr_task_s1.valid && !bPending.valid && io.sinkA.valid && !block_A &&
     !io.normalReserveAck.valid && !sinkValids(0) && !io.sinkB.valid &&
-    !channelDirReadAdmissionValid
+    !channelDirReadAdmissionValid && !io.snoopAdmissionEnable
   // An acknowledged A claim predates a later B candidate. Let it execute
   // before capturing that B: a CMO claim can reserve the last eligible S/R
   // index, so making the A wait for that blocked B would deadlock.
@@ -429,13 +445,17 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     assert(sameCmoAllLine || A_task.asUInt === normalReservedTask.asUInt,
       "normal reservation must retain the complete upstream request")
   }
-  // Upstream handshake captures the complete B, without reading Directory.
-  // The next stage creates service/slot ownership; actual execution is a
-  // separate handshake and never has to preempt ReplaceMSHR in the same cycle.
-  io.sinkB.ready := localTransitionIdle && !admitMshrTurn && resetFinish &&
-    !mshr_task_s1.valid && !bPending.valid && !normalReserved && !block_B && !sinkValids(0) &&
-    !channelDirReadAdmissionValid
+  // The complete B already owns its concrete service slot in RXSNP. This
+  // handshake transfers the retained payload into bPending before execution.
+  // RXSNP already owns the service slot. Reapplying pool-full or a later C
+  // priority here would wait on the very reservation held by this command.
+  io.sinkB.ready := localTransitionIdle && resetFinish &&
+    !mshr_task_s1.valid && !bPending.valid && !channelDirReadAdmissionValid &&
+    !normalReserved && !blockReservedB &&
+    !io.fromTXDAT.blockSinkBReqEntrance && !io.fromTXRSP.blockSinkBReqEntrance
   io.sinkC.ready := sink_ready_basic && channelDirReadAdmissionToken.source === 0.U
+  // Execution follows the existing registered bPending/service confirmation
+  // phase and consumes the same service token acquired at the snapshot edge.
   bExecute := sink_ready_basic && channelDirReadAdmissionToken.source === 1.U
   val channelConsumes = VecInit(Seq(io.sinkC.fire, bExecute, io.sinkA.fire))
   assert(channelDirReadAdmissionFire === channelConsumes.asUInt.orR,
@@ -685,8 +705,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   require(beatSize == 2)
 
   /* status of each pipeline stage */
-  io.status_s1.sets := VecInit(Seq(C_task.set, B_task.set, io.ASet, mshr_task_s1.bits.set))
-  io.status_s1.tags := VecInit(Seq(C_task.tag, B_task.tag, io.ATag, mshr_task_s1.bits.tag))
+  io.status_s1.sets := VecInit(Seq(C_task.set, bCandidateStatus.set, io.ASet, mshr_task_s1.bits.set))
+  io.status_s1.tags := VecInit(Seq(C_task.tag, bCandidateStatus.tag, io.ATag, mshr_task_s1.bits.tag))
   // `sinkA` is RequestBuffer's output.  Keep this separate from `ASet/ATag`,
   // which intentionally describe RequestBuffer's input for same-set enqueue
   // backpressure in MainPipe.
@@ -698,7 +718,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   // acknowledged A claim. Its candidate remains visible for conservative
   // owner deferral, but must not create an A<->B admission wait cycle.
   io.status_s1.bValid := bPending.valid || io.sinkB.valid && !block_B && !normalReserved
-  io.status_s1.bToN := (bPending.valid || io.sinkB.valid) && isSnpToN(B_task.chiOpcode.get)
+  io.status_s1.bToN := (bPending.valid || io.sinkB.valid) && isSnpToN(bCandidateStatus.chiOpcode.get)
   io.status_s1.bFire := bExecute
   io.status_s1.cReleaseData := io.sinkC.valid && C_task.opcode === ReleaseData
   // io.status_s1.isKeyword := VecInit(Seq(C_task.isKeyword, B_task.isKeyword, io.isKeyword, mshr_task_s1.bits.isKeyword))
