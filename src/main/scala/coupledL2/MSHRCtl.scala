@@ -259,6 +259,21 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     when(allocate) { generation := generation + 1.U }
     generation
   })
+  // One entry per possible SourceB owner. Acceptance atomically claims the
+  // actual transmitted line before the registered owner notification. Keep
+  // that immutable key until the precisely routed final ProbeAck returns;
+  // neither a later Directory/victim tag nor a delayed probeIssued marker
+  // may change the identity of an already accepted Probe.
+  class SourceBProbeClaim extends Bundle {
+    val valid = Bool()
+    val set = UInt(setBits.W)
+    val tag = UInt(tagBits.W)
+    val generation = UInt(8.W)
+  }
+  val sourceBProbeClaims = RegInit(VecInit(
+    Seq.fill(3 * mshrsAll)(0.U.asTypeOf(new SourceBProbeClaim))))
+  val sourceBGenerations = (0 until mshrsAll).flatMap(i =>
+    Seq(mshrTaskGenerations(0)(i), mshrTaskGenerations(1)(i))) ++ mshrTaskGenerations(2)
   // One concrete normal slot is promised before an A reads Directory.
   // It remains reserved through either allocation or the hit/noalloc result.
   val normalService = RegInit(0.U.asTypeOf(Valid(new NormalSlotReservation)))
@@ -1424,12 +1439,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   when(activeReplaceProbeAckDataCapture) {
     assert(PopCount(activeReplaceProbeAckDataOH) === 1.U, "ProbeAckData matches multiple active ReplaceMSHRs")
   }
-  val replaceDelegatedForParent = Seq.tabulate(mshrsAll) { parent =>
-    // Keep arbitration intent independent of replaceAllocValid: feeding the
-    // accepted grant back into replReadWanted creates a reservation cycle.
-    replaceActiveForParent(parent) || replaceNeedsAlloc && replaceParentOH(parent)
-  }
-
   // A retry has no committed ReplacerResult, so a ReleaseData for the stale
   // candidate may proceed. Once SinkC accepts it, hold the matching normal
   // MSHR's next replacer read until that C task reaches MainPipe S3.
@@ -1461,17 +1470,16 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val probeNormalMirror = RegInit(0.U(mshrsAll.W))
   val probeOwnerGenerations = RegInit(VecInit(Seq.fill(3)(VecInit(Seq.fill(mshrsAll)(0.U(8.W))))))
   val probeQuery = io.sinkCProbeRouteRequest.bits
-  val probeContextLookup = mshrs.zipWithIndex.map { case (mshr, contextIdx) =>
-    val status = mshr.io.status.bits
-    val tag = if (contextIdx % 2 == 0) Mux(status.needsRepl, status.metaTag, status.reqTag)
-      else status.reqTag
-    mshr.io.probeIssued && mshr.io.status.valid && status.w_c_resp &&
-      probeQuery.set === status.set && probeQuery.tag === tag &&
-      (!(contextIdx % 2 == 0).B || !replaceDelegatedForParent(contextIdx / 2))
+  val probeContextLookup = mshrs.indices.map { contextIdx =>
+    val claim = sourceBProbeClaims(contextIdx)
+    claim.valid && claim.generation === sourceBGenerations(contextIdx) &&
+      probeQuery.set === claim.set && probeQuery.tag === claim.tag
   }
-  val probeReplaceLookup = VecInit(replaceMshrs.map { m =>
-    m.io.info.valid && m.io.info.bits.awaitingProbeAck &&
-      probeQuery.set === m.io.info.bits.set && probeQuery.tag === m.io.info.bits.tag
+  val probeReplaceLookup = VecInit(replaceMshrs.indices.map { i =>
+    val source = 2 * mshrsAll + i
+    val claim = sourceBProbeClaims(source)
+    claim.valid && claim.generation === sourceBGenerations(source) &&
+      probeQuery.set === claim.set && probeQuery.tag === claim.tag
   }).asUInt
   val probeNormalLookup = VecInit((0 until mshrsAll).map(i => probeContextLookup(2 * i))).asUInt
   val probeSnoopLookup = VecInit((0 until mshrsAll).map(i => probeContextLookup(2 * i + 1))).asUInt
@@ -1530,6 +1538,19 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     resp_sinkC_match_vec(2 * i) || resp_sinkC_match_vec(2 * i + 1)
   }
   val sinkCContextMatches = resp_sinkC_match_vec ++ replaceProbeSinkCMatch.toSeq
+  sourceBProbeClaims.zipWithIndex.foreach { case (claim, source) =>
+    when(io.resps.sinkC.valid && sinkCProbeResponse &&
+        io.resps.sinkC.respInfo.last && sinkCContextMatches(source)) {
+      assert(claim.valid && claim.generation === sourceBGenerations(source) &&
+        claim.set === io.resps.sinkC.set && claim.tag === io.resps.sinkC.tag,
+        "terminal ProbeAck must release exactly its accepted source/key/generation")
+      claim.valid := false.B
+    }
+    when(claim.valid) {
+      assert(claim.generation === sourceBGenerations(source),
+        "accepted Probe claim must retain its source generation through the terminal C beat")
+    }
+  }
   when(io.resps.sinkC.valid && sinkCProbeResponse) {
     assert(
       PopCount(Cat(sinkCContextMatches)) === 1.U,
@@ -2268,45 +2289,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       task
   }
 
-  // TileLink C ProbeAck does not carry a transaction identifier: all probes
-  // from SourceB use the client source ID.  Therefore two outstanding probes
-  // for the same line cannot be distinguished when their C response returns.
-  // Once a context has handed its B request to SourceB, keep a later probe to
-  // the same line behind that response.  This applies across normal, snoop,
-  // and independent ReplaceMSHR contexts.
-  val sourceBProbeOutstanding = mshrs.zipWithIndex.map {
-    case (m, contextIdx) =>
-      val status = m.io.status.bits
-      // A normal context delegates the victim probe to ReplaceMSHR. Its
-      // source_b.valid is then intentionally low even before any Probe was
-      // issued; treating that as an in-flight Probe blocks the sidecar's only
-      // request forever. Use the context's registered probeIssued marker,
-      // rather than source_b.valid or the combinational replaceActive port.
-      // ReplaceMSHR has its own outstanding entry below.
-      val normalDelegatedToReplace = if (contextIdx % 2 == 0) {
-        m.io.sidecarDelegated
-      } else {
-        false.B
-      }
-      val probeOutstanding = m.io.status.valid && !normalDelegatedToReplace &&
-        status.w_c_resp && m.io.probeIssued
-      // During replacement handoff the status tag can switch between the
-      // request line and the victim line. SinkC matching uses either value
-      // depending on needsRepl, so protect both while the Probe is outstanding.
-      Seq(
-        (probeOutstanding, status.set, status.reqTag),
-        (probeOutstanding, status.set, status.metaTag)
-      )
-  }.flatten
-  val replaceProbeOutstanding = replaceMshrs.map { m =>
-    (m.io.info.valid && m.io.info.bits.awaitingProbeAck, m.io.info.bits.set, m.io.info.bits.tag)
-  }
-  // SinkC ProbeAck has no transaction ID. Do not issue a second Probe for a
-  // line that already has an accepted Probe waiting for its C response. The
-  // outstanding tuple intentionally excludes a context whose SourceB task is
-  // still queued, so the arbiter can accept the first Probe and establish the
-  // ownership marker without a combinational ready/valid feedback loop.
-  val sourceBOutstanding = sourceBProbeOutstanding ++ replaceProbeOutstanding
+  // SinkC ProbeAck has no transaction ID. The accepted-key claim ledger is
+  // the sole authority for outstanding lines across all three owner classes.
+  // Revocable candidates establish no claim and consume no SourceB capacity.
   // Each source publishes a full registered candidate before the 48-way RR.
   // Capturing a candidate never fires the owner or consumes SourceB capacity.
   class SourceBCandidate extends Bundle {
@@ -2317,9 +2302,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val generation = UInt(8.W)
   }
   val sourceBInputs = sourceBTasks ++ replaceSourceBTasks
-  val sourceBGenerations = (0 until mshrsAll).flatMap(i =>
-    Seq(mshrTaskGenerations(0)(i), mshrTaskGenerations(1)(i))) ++ mshrTaskGenerations(2)
   val sourceBCommit = RegInit(0.U.asTypeOf(Valid(new SourceBCandidate)))
+  val sourceBCommitChecked = RegInit(false.B)
+  val sourceBCommitConflicts = RegInit(VecInit(Seq.fill(3 * mshrsAll)(false.B)))
   // This slot is part of the accepted Probe transport, just like SourceB's
   // internal queue. Authorization transfers the packet and consumes its
   // owner once; downstream ready only drains the registered packet.
@@ -2336,8 +2321,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val candidate = RegInit(0.U.asTypeOf(Valid(new SourceBCandidate)))
     val selected = sourceBCommit.valid && sourceBCommit.bits.source === i.U
     val permitted = sourceBPermit.valid && sourceBPermit.bits.source === i.U
-    sourceBHoldPorts(i) := candidate.valid || selected || permitted || sourceBAccepted(i)
-    when(!candidate.valid && !selected && !permitted && !sourceBAccepted(i) && task.valid) {
+    sourceBHoldPorts(i) := candidate.valid || selected || permitted || sourceBAccepted(i) ||
+      sourceBProbeClaims(i).valid
+    when(!candidate.valid && !selected && !permitted && !sourceBAccepted(i) &&
+        !sourceBProbeClaims(i).valid && task.valid) {
       candidate.valid := true.B
       candidate.bits.request := task.bits
       candidate.bits.source := i.U
@@ -2356,18 +2343,27 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     "source_b_candidate_arb")
   sourceBCandidateOut.ready := !sourceBCommit.valid
   val commitOH = UIntToOH(sourceBCommit.bits.source, sourceBInputs.size)
-  val commitCurrent = Mux1H(commitOH, sourceBInputs.map(_.valid)) &&
-    Mux1H(commitOH, sourceBGenerations) === sourceBCommit.bits.generation &&
-    Mux1H(commitOH, sourceBInputs.map(_.bits)).asUInt === sourceBCommit.bits.request.asUInt
-  // Recheck at the unique commit point: several prepared same-line candidates
-  // may coexist, but only the first can establish the outstanding Probe.
-  val commitLineBusy = sourceBOutstanding.map { case (valid, set, tag) =>
-    valid && set === sourceBCommit.bits.request.set && tag === sourceBCommit.bits.request.tag
-  }.reduce(_ || _)
+  // Keep revocation local to each owner. This preserves the instantaneous
+  // intent/key check without a 48-way payload/generation mux before compare.
+  val commitCurrent = VecInit(sourceBInputs.zipWithIndex.map { case (task, i) =>
+    commitOH(i) && task.valid && sourceBGenerations(i) === sourceBCommit.bits.generation &&
+      task.bits.asUInt === sourceBCommit.bits.request.asUInt
+  }).asUInt.orR
+  sourceBProbeClaims.zipWithIndex.foreach { case (claim, i) =>
+    sourceBCommitConflicts(i) := claim.valid &&
+      claim.set === sourceBCommit.bits.request.set && claim.tag === sourceBCommit.bits.request.tag
+  }
+  // Exactly one commit packet stays fixed while the per-source comparisons
+  // are registered. No other authorization can create a new claim in that
+  // window. A returning ProbeAck may only remove a conflict, costing a cycle.
+  // A new packet always clears checked; its first possible acceptance uses
+  // a complete claim/key snapshot, including a preceding acceptance edge.
+  val commitLineBusy = sourceBCommitConflicts.asUInt.orR
   val sourceB = Module(new SourceB())
   // Validate late owner events and claim the line at the irrevocable local
   // acceptance edge. No SourceB queue-ready signal enters that decision.
-  val authorizeSourceB = sourceBCommit.valid && commitCurrent && !commitLineBusy && !sourceBPermit.valid
+  val authorizeSourceB = sourceBCommit.valid && sourceBCommitChecked &&
+    commitCurrent && !commitLineBusy && !sourceBPermit.valid
   sourceB.io.task.valid := sourceBPermit.valid
   sourceB.io.task.bits := sourceBPermit.bits.request
   sourceBInputs.zipWithIndex.foreach { case (task, i) =>
@@ -2375,6 +2371,13 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     // advances the owner, even if a later event has already changed intent.
     task.ready := false.B
     sourceBAccepted(i) := authorizeSourceB && commitOH(i)
+    when(authorizeSourceB && commitOH(i)) {
+      assert(!sourceBProbeClaims(i).valid, "a source may own only one accepted Probe")
+      sourceBProbeClaims(i).valid := true.B
+      sourceBProbeClaims(i).set := sourceBCommit.bits.request.set
+      sourceBProbeClaims(i).tag := sourceBCommit.bits.request.tag
+      sourceBProbeClaims(i).generation := sourceBCommit.bits.generation
+    }
   }
   when(authorizeSourceB) {
     sourceBPermit.valid := true.B
@@ -2390,8 +2393,14 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   when(sourceBCandidateOut.fire) {
     sourceBCommit.valid := true.B
     sourceBCommit.bits := sourceBCandidateOut.bits
+    sourceBCommitChecked := false.B
   }.elsewhen(sourceBCommit.valid && (!commitCurrent || authorizeSourceB)) {
     sourceBCommit.valid := false.B
+    sourceBCommitChecked := false.B
+  }.elsewhen(sourceBCommit.valid) {
+    sourceBCommitChecked := true.B
+  }.otherwise {
+    sourceBCommitChecked := false.B
   }
   when(authorizeSourceB) {
     assert(PopCount(commitOH) === 1.U,
