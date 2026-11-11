@@ -75,6 +75,14 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     }
     val toMainPipe = new Bundle() {
       val mshr_alloc_ptr = Output(UInt(mshrBits.W))
+      // MainPipe's normal A/CMO allocation must consume the exact registered
+      // reservation that admitted its Directory read.  This identity gate is
+      // deliberately source+owner+generation+sequence paired; a later legal
+      // A carrying the same source receives a fresh reservation token.
+      val normalAllocAdmission = Output(Bool())
+      val normalAllocToken = Output(new MainpipeLeaseToken)
+      val normalAllocOwner = Output(UInt(mshrBits.W))
+      val normalAllocSource = Output(UInt(sourceIdBits.W))
       // A replacement victim is still owned by another context. MainPipe must
       // drop this grant/replacer pass exactly as it drops Directory.retry;
       // notifying only the parent MSHR would leave an irrevocable SourceD task.
@@ -1142,11 +1150,23 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     normalService.valid := false.B
   }
   val normalReservationDone = io.fromMainPipe.normalReservationDone
-  when(normalReservationDone.valid) {
-    assert(normalService.valid && normalServiceInFlight &&
-      normalReservationDone.bits.mshrId === normalService.bits.id &&
-      normalReservationDone.bits.token.asUInt === normalService.bits.token.asUInt,
-      "normal alloc/noalloc result must return its exact reservation sequence")
+  // The S3 task is not itself a Decoupled transaction.  Export only the
+  // already-registered reservation identity; MainPipe performs the narrow
+  // token/owner/source check at S3.  This keeps the allocation admission off
+  // the wide live set/tag/TaskBundle cone while still pairing A ownership.
+  val normalAllocTask = io.fromMainPipe.mshr_alloc_s3.bits.task
+  val normalReservationIdentityMatch = normalService.valid && normalServiceInFlight &&
+    normalReservationDone.valid &&
+    normalReservationDone.bits.mshrId === normalService.bits.id &&
+    normalReservationDone.bits.token.asUInt === normalService.bits.token.asUInt &&
+    normalAllocTask.fromA && !normalAllocTask.mshrTask &&
+    normalAllocTask.sourceId === normalService.bits.task.sourceId
+
+  io.toMainPipe.normalAllocAdmission := normalService.valid && normalServiceInFlight
+  io.toMainPipe.normalAllocToken := normalService.bits.token
+  io.toMainPipe.normalAllocOwner := normalService.bits.id
+  io.toMainPipe.normalAllocSource := normalService.bits.task.sourceId
+  when(normalReservationDone.valid && normalReservationIdentityMatch) {
     normalService.valid := false.B
     normalServiceInFlight := false.B
   }

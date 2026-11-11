@@ -112,6 +112,14 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
     val fromMSHRCtl = new Bundle() {
       val mshr_alloc_ptr = Input(UInt(mshrBits.W))
+      // A normal A/CMO allocation is admitted only while the registered
+      // reservation owner/generation still matches this S3 task.  B/snoop
+      // allocations use their independent service reservation and bypass
+      // this gate.
+      val normalAllocAdmission = Input(Bool())
+      val normalAllocToken = Input(new MainpipeLeaseToken)
+      val normalAllocOwner = Input(UInt(mshrBits.W))
+      val normalAllocSource = Input(UInt(sourceIdBits.W))
       val replRespRetry = Input(Bool())
       val snoopDataHolds = Flipped(Vec(mshrsAll, ValidIO(new MSHRInfo())))
       val postGrantReleaseHolds = Flipped(Vec(mshrsAll, ValidIO(new MSHRInfo())))
@@ -771,6 +779,20 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val need_cmoresp_s3_a = normalAction.cmo
   val need_compack_s3_a = !normalAction.cmo
   val need_mshr_s3_a = normalAction.needMshr
+
+  // A task can remain in the fixed Directory/apply pipeline after its A
+  // reservation has been canceled or superseded.  Such a task must not
+  // allocate a new normal MSHR (and must not write its RefillBuf/metadata).
+  // MSHRCtl binds this bit to the concrete reservation id, source, set/tag,
+  // generation, and sequence; a later legal A with the same source obtains a
+  // fresh token and therefore passes independently.
+  val normalAllocTokenMatch_s3 = io.fromMSHRCtl.normalAllocAdmission &&
+    io.fromMSHRCtl.normalAllocToken.asUInt === leaseToken_s3.asUInt &&
+    io.fromMSHRCtl.normalAllocOwner === req_s3.mshrId &&
+    io.fromMSHRCtl.normalAllocSource === req_s3.sourceId
+  val staleNormalAllocation_s3 = sinkA_req_s3 && need_mshr_s3_a &&
+    !normalAllocTokenMatch_s3
+  val normalActionAdmitted_s3 = !staleNormalAllocation_s3
   
   /**
     * 1. For SnpOnce/SnpOnceFwd, SnpQuery, and SnpStash, only the latest copy of the cacheline is needed without changing
@@ -829,7 +851,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   /* Signals to MSHR Ctl */
   val alloc_state = WireInit(0.U.asTypeOf(new FSMState()))
   alloc_state.elements.foreach(_._2 := true.B)
-  io.toMSHRCtl.mshr_alloc_s3.valid := task_s3.valid && !mshr_req_s3 && need_mshr_s3
+  io.toMSHRCtl.mshr_alloc_s3.valid := task_s3.valid && !mshr_req_s3 && need_mshr_s3 &&
+    normalActionAdmitted_s3
   assert(
     !io.toMSHRCtl.mshr_alloc_s3.valid || !sinkC_req_s3,
     "a SinkC Release( Data ) must not allocate a normal or snoop MSHR"
@@ -850,6 +873,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   }
   // Both the allocation and direct hit/noalloc path return the same claim.
   // Sequence distinguishes canceled offers; generation advances only on alloc.
+  // Report the S3 A completion independently of the allocation gate.  The
+  // controller uses the same owner/token identity to retire a matching claim;
+  // a stale task is ignored without feeding the admission bit back into this
+  // completion pulse.
   io.toMSHRCtl.normalReservationDone.valid := task_s3.valid && sinkA_req_s3
   io.toMSHRCtl.normalReservationDone.bits.mshrId := req_s3.mshrId
   io.toMSHRCtl.normalReservationDone.bits.mshrContext := 0.U
@@ -1021,7 +1048,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // DataStorage latches the target bank's req/wdata internally (and asserts
   // they stay stable for the MCP2 cycle), so the old two-cycle replay of
   // ren/wen/way -- including the merged-grant victim hold -- is obsolete.
-  io.toDS.en_s3 := task_s3.valid && (ren || wen)
+  io.toDS.en_s3 := task_s3.valid && normalActionAdmitted_s3 && (ren || wen)
   io.toDS.req_s3.valid := io.toDS.en_s3
   io.toDS.req_s3.bits.way := Mux(
     commitReplWay,
@@ -1055,12 +1082,12 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // sidecar, so it cannot retain this snapshot in ReleaseBuf. RefillBuf is
   // private to the normal context and is later overwritten by ProbeAckData or
   // CompData when either supplies newer data.
-  val need_write_refillBuf = normalAction.captureRefill
+  val need_write_refillBuf = normalActionAdmitted_s3 && normalAction.captureRefill
 
   /* ======== Write Directory ======== */
   // B, C: Requests from Channel B (RXSNP) and Channel C would only downgrade permission,
   //       so there is no need to use 'nestable_*'.
-  val metaW_valid_s3_a = normalAction.metaWrite
+  val metaW_valid_s3_a = normalActionAdmitted_s3 && normalAction.metaWrite
   // Also write directory on:
   //  1. SnpOnce nesting WriteCleanFull under UD (SnpOnceFwd always needs MSHR) for UD -> SC
   // no-client fwd snoops (direct path): toN-fwd -> INVALID, toB-fwd -> BRANCH,
@@ -1081,7 +1108,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     req_s3.metaWen && !(mshr_refill_s3 && (retry || mshr_defer_refill_write_s3)) ||
       grantMergeInstall_s3
   )
-  val metaW_valid_s3_cmo = normalAction.cmoInvalidate
+  val metaW_valid_s3_cmo = normalActionAdmitted_s3 && normalAction.cmoInvalidate
   require(clientBits == 1)
 
   val metaW_s3_a = normalAction.meta
@@ -1100,7 +1127,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     Mux(mshr_req_s3, reqWayOH_s3, s3Decision.bits.wayOH)
   )
 
-  io.metaWReq.valid := !resetFinish || task_s3.valid && (
+  io.metaWReq.valid := !resetFinish || task_s3.valid && normalActionAdmitted_s3 && (
     metaW_valid_s3_a || metaW_valid_s3_b || metaW_valid_s3_c || metaW_valid_s3_mshr || metaW_valid_s3_cmo
   )
   io.metaWReq.bits.set := Mux(resetFinish, req_s3.set, resetIdx)
