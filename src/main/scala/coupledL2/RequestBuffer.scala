@@ -82,6 +82,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
 
     /* status of s2 and s3 */
     val pipeStatusVec = Flipped(Vec(2, ValidIO(new PipeStatus)))
+    val diagPipeMshrTask = Option.when(cacheParams.enablePerf)(Input(Vec(2, Bool())))
 
     val ATag        = Output(UInt(tagBits.W))
     val ASet        = Output(UInt(setBits.W))
@@ -339,6 +340,21 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
 
   // add XSPerf to see how many cycles the req is held in Buffer
   if(cacheParams.enablePerf) {
+    // Observe the existing gate without changing admission, issue or chosenQ.
+    val diagPipeNewEntries = io.pipeStatusVec.zip(io.diagPipeMshrTask.get).map {
+      case (status, owner) => status.valid && !owner
+    }
+    val diagPfThrottleWithoutOwners = RegNext(
+      PopCount(diagPipeNewEntries ++ io.mshrInfo.map(_.valid)) >= (mshrsAll - 3).U)
+    val diagOwnerOnlyPressure = pfThrottleByMSHR && !diagPfThrottleWithoutOwners
+    val diagBlockedPrefetch = io.in.valid && isPrefetchTask(in) && !io.in.ready
+    XSPerfAccumulate("diag_reqbuf_pf_mshr_blocked_input_cycles",
+      diagBlockedPrefetch && pfThrottleByMSHR)
+    XSPerfAccumulate("diag_reqbuf_pf_owner_only_input_cycles",
+      diagBlockedPrefetch && !pfThrottleByOcc && diagOwnerOnlyPressure)
+    XSPerfAccumulate("diag_reqbuf_pf_owner_only_ready_entry_cycles",
+      Mux(diagOwnerOnlyPressure,
+        PopCount(buffer.map(e => e.valid && e.rdy && isPrefetchTask(e.task))), 0.U))
     XSPerfAccumulate("drop_prefetch", io.in.valid && dup)
     if(flow){
       XSPerfAccumulate("req_buffer_flow", io.in.valid && doFlow)

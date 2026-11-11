@@ -112,6 +112,10 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   reqBuf.io.mainPipeBlock := mainPipe.io.toReqBuf
   reqBuf.io.pipeStatusVec(0) := reqArb.io.status_vec(1) // s2 status
   reqBuf.io.pipeStatusVec(1) := mainPipe.io.status_vec_toD(0) // s3 status
+  reqBuf.io.diagPipeMshrTask.foreach { owners =>
+    owners(0) := reqArb.io.status_vec_toTX(1).bits.mshrTask
+    owners(1) := mainPipe.io.status_vec_toTX(0).bits.mshrTask
+  }
   reqBuf.io.s1Entrance := reqArb.io.s1Entrance
   reqBuf.io.taskFromArb_s2 := reqArb.io.taskToPipe_s2
 
