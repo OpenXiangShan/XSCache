@@ -182,7 +182,11 @@ class RequestArb(implicit p: Parameters) extends L2Module
   io.dirRead_s1.bits.replacerInfo.opcode := task_s1.bits.opcode
   io.dirRead_s1.bits.replacerInfo.channel := task_s1.bits.channel
   io.dirRead_s1.bits.replacerInfo.reqSource := task_s1.bits.reqSource
-  io.dirRead_s1.bits.replacerInfo.refill_prefetch := s1_needs_replRead && (mshr_task_s1.bits.opcode === HintAck && mshr_task_s1.bits.dsWen)
+  io.dirRead_s1.bits.replacerInfo.pcValid := task_s1.bits.pcValid
+  io.dirRead_s1.bits.replacerInfo.signature := task_s1.bits.signature
+  io.dirRead_s1.bits.replacerInfo.sdbpPrefetch := task_s1.bits.sdbpPrefetch
+  io.dirRead_s1.bits.replacerInfo.indices := task_s1.bits.indices
+  io.dirRead_s1.bits.replacerInfo.refill_prefetch := s1_needs_replRead && (mshr_task_s1.bits.opcode === HintAck && mshr_task_s1.bits.dsWen && !mshr_task_s1.bits.mergeA)
   io.dirRead_s1.bits.refill := s1_needs_replRead
   io.dirRead_s1.bits.mshrId := task_s1.bits.mshrId
   io.dirRead_s1.bits.cmoAll := A_task.cmoAll
@@ -199,7 +203,9 @@ class RequestArb(implicit p: Parameters) extends L2Module
   /* ========  Stage 2 ======== */
   val s1_AHint_fire = io.sinkA.fire && io.sinkA.bits.opcode === Hint
   // any req except AHint might access DS, and continuous DS accesses are prohibited
-  val ds_mcp2_stall = RegNext(s1_fire && !s1_AHint_fire)
+  val sampledHint = if (cacheParams.replacement == "sdbp")
+    SDBPHash.sampled(io.sinkA.bits.set, cacheParams.sets, cacheParams.sdbp.samplerSets) else false.B
+  val ds_mcp2_stall = RegNext(s1_fire && (!s1_AHint_fire || sampledHint), false.B)
 
   s2_ready  := !ds_mcp2_stall
 

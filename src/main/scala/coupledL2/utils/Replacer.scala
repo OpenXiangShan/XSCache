@@ -64,6 +64,7 @@ object ReplacementPolicy {
   def fromString(s: String, n_ways: Int): ReplacementPolicy = s.toLowerCase match {
     case "random" => new RandomReplacement(n_ways)
     case "lru"    => new TrueLRU(n_ways)
+    case "sdbp"   => new TrueLRU(n_ways)
     case "plru"   => new PseudoLRU(n_ways)
     case "srrip"   => new StaticRRIP(n_ways)
     case "brrip"   => new BRRIP(n_ways)
@@ -150,6 +151,17 @@ class TrueLRU(n_ways: Int) extends ReplacementPolicy {
       upperMoreRecent && lowerMoreRecent
     }
     VecInit(mruWayDec).asUInt
+  }
+
+  /** Select the oldest eligible way directly, including when global LRU is busy. */
+  def get_replace_OH(state: UInt, eligible: UInt): UInt = {
+    val moreRecent = extractMRUVec(state)
+    VecInit((0 until n_ways).map { way =>
+      eligible(way) && (0 until n_ways).filter(_ != way).map { other =>
+        val otherIsNewer = if (other > way) moreRecent(way)(other) else !moreRecent(other)(way)
+        !eligible(other) || otherIsNewer
+      }.reduceOption(_ && _).getOrElse(true.B)
+    }).asUInt
   }
 
   def get_replace_way(state: UInt): UInt = OHToUInt(get_replace_OH(state))
@@ -296,6 +308,7 @@ class SetAssocReplacer(n_sets: Int, n_ways: Int, policy: String) extends SetAsso
     case "random" => new RandomReplacement(n_ways)
     case "plru"   => new PseudoLRU(n_ways)
     case "lru"    => new TrueLRU(n_ways)
+    case "sdbp"   => new TrueLRU(n_ways)
     case t => throw new IllegalArgumentException(s"unknown Replacement Policy type $t")
   }
   val state_vec =

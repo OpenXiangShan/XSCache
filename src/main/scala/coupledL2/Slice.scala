@@ -86,6 +86,11 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   directory.io.metaWReq := mainPipe.io.metaWReq
   directory.io.tagWReq := mainPipe.io.tagWReq
   directory.io.msInfo := mshrCtl.io.msInfo
+  directory.io.sdbpCommit := mainPipe.io.sdbpCommit
+  directory.io.l1ICopy := io.l1ICopy.getOrElse(0.U)
+  io.candidateBlocks.foreach { blocks =>
+    blocks := VecInit(directory.io.candidateTags.map(tag => Cat(tag, directory.io.candidateSet)))
+  }
 
   dataStorage.io.en := mainPipe.io.toDS.en_s3
   dataStorage.io.req := mainPipe.io.toDS.req_s3

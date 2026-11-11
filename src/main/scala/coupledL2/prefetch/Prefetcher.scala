@@ -202,11 +202,13 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val hartId = IO(Input(UInt(hartIdLen.W)))
   val pfCtrlFromCore = IO(Input(new PrefetchCtrlFromCore))
 
+  private val cachePrefetchEnable = CachePrefetchControl.enabled(cacheParams.hartId, cacheParams.enablePrefetch)
+
   // l2 receive need 2 cycles to transmit from core
-  val pfRcv_en = RegNextN(pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pf_recv_en, 2, Some(true.B))
-  val pbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pbop_en
-  val vbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_vbop_en
-  val tp_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_tp_en
+  val pfRcv_en = cachePrefetchEnable && RegNextN(pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pf_recv_en, 2, Some(true.B))
+  val pbop_en = cachePrefetchEnable && pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pbop_en
+  val vbop_en = cachePrefetchEnable && pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_vbop_en
+  val tp_en = cachePrefetchEnable && pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_tp_en
   val delay_latency = pfCtrlFromCore.l2_pf_delay_latency
   val banks = 1 << bankBits
 
@@ -260,7 +262,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   val train = Wire(DecoupledIO(new PrefetchTrain))
   val resp = Wire(DecoupledIO(new PrefetchResp))
-  fastArb(io.train, train, Some("prefetch_train"))
+  fastArb(io.train.map(request => CachePrefetchControl.gate(request, cachePrefetchEnable)),
+    train, Some("prefetch_train"))
   fastArb(io.resp, resp, Some("prefetch_resp"))
 
   // =================== Connection for each Prefetcher =====================
@@ -272,6 +275,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     vbop.get.io.resp <> resp
     vbop.get.io.resp.valid := resp.valid && resp.bits.isBOP
     vbop.get.io.tlb_req <> io.tlb_req
+    io.tlb_req.req.valid := cachePrefetchEnable && vbop.get.io.tlb_req.req.valid
+    vbop.get.io.tlb_req.req.ready := cachePrefetchEnable && io.tlb_req.req.ready
     vbop.get.io.pbopCrossPage := true.B // pbop.io.pbopCrossPage // let vbop have noting to do with pbop
 
     pbop.get.io.enable := pbop_en
@@ -300,7 +305,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   }
 
   if (hasNLPrefetcher) {
-    nl.get.io.enable := true.B
+    nl.get.io.enable := cachePrefetchEnable
     nl.get.io.train <> train
     nl.get.io.resp <> resp
   }
@@ -348,7 +353,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     pftQueue(i).io.enq.valid := select(i).asUInt.orR
     pftQueue(i).io.enq.bits := ParallelPriorityMux(select(i).asUInt, reqsBits)
     pipe(i).io.in <> pftQueue(i).io.deq
-    io.req(i) <> pipe(i).io.out
+    io.req(i) <> CachePrefetchControl.gate(pipe(i).io.out, cachePrefetchEnable)
   }
 
   for ((reqOpt, j) <- reqs.zipWithIndex) {

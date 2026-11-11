@@ -803,7 +803,12 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     mp_grant.cmoTask := cmo_cbo
     mp_grant.wayMask := 0.U(cacheParams.ways.W)
     mp_grant.mshrRetry := !state.s_retry
-    mp_grant.reqSource := 0.U(MemReqSource.reqSourceBits.W)
+    mp_grant.reqSource := req.reqSource
+    mp_grant.pc.foreach(_ := req.pc.getOrElse(0.U))
+    mp_grant.pcValid := req.pcValid
+    mp_grant.signature := req.signature
+    mp_grant.indices := req.indices
+    mp_grant.sdbpPrefetch := req.sdbpPrefetch
 
     // Add merge grant task for Acquire and late Prefetch
     mp_grant.mergeA := mergeA
@@ -838,6 +843,18 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
       accessed = true.B
     )
     mp_grant.aMergeTask.pc.foreach(_ := merge_task.pc.getOrElse(0.U))
+    mp_grant.aMergeTask.pcValid := merge_task.pcValid
+    mp_grant.aMergeTask.signature := merge_task.signature
+    mp_grant.aMergeTask.indices := merge_task.indices
+    mp_grant.aMergeTask.sdbpPrefetch := merge_task.sdbpPrefetch
+    when(mergeA) {
+      mp_grant.reqSource := merge_task.reqSource
+      mp_grant.pc.foreach(_ := merge_task.pc.getOrElse(0.U))
+      mp_grant.pcValid := merge_task.pcValid
+      mp_grant.signature := merge_task.signature
+      mp_grant.indices := merge_task.indices
+      mp_grant.sdbpPrefetch := merge_task.sdbpPrefetch
+    }
 
     mp_grant
   }
@@ -979,7 +996,7 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
       mp_cmometaw_valid      -> mp_cmometaw
     )
   )
-  io.tasks.mainpipe.bits.reqSource := req.reqSource
+  io.tasks.mainpipe.bits.reqSource := Mux(mp_grant_valid, mp_grant.reqSource, req.reqSource)
   io.tasks.mainpipe.bits.isKeyword.foreach(_:= req.isKeyword.getOrElse(false.B))
 
   val mp_valid = io.tasks.mainpipe.valid

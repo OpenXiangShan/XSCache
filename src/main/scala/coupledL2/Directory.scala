@@ -142,6 +142,10 @@ class Directory(implicit p: Parameters) extends L2Module {
     val replWayOH = Output(UInt(cacheParams.ways.W))
     val cmoHitInvalid = Output(Bool())
     val retryFastFwd = Output(Bool())
+    val sdbpCommit = Flipped(Valid(new SDBPCommit(cacheParams.sets, cacheParams.ways)))
+    val l1ICopy = Input(UInt(cacheParams.ways.W))
+    val candidateTags = Output(Vec(cacheParams.ways, UInt(tagBits.W)))
+    val candidateSet = Output(UInt(setBits.W))
   })
 
   def invalid_way_sel(metaVec: Seq[MetaEntry]) = {
@@ -158,6 +162,40 @@ class Directory(implicit p: Parameters) extends L2Module {
   val tagWen  = io.tagWReq.valid
   val metaWen = io.metaWReq.valid
   val replacerWen = WireInit(false.B)
+  val sdbp = Option.when(cacheParams.replacement == "sdbp")(Module(new SDBP(sets, ways, cacheParams.sdbp)))
+  val deadBits = Option.when(cacheParams.replacement == "sdbp")(
+    RegInit(VecInit(Seq.fill(sets)(VecInit(Seq.fill(ways)(false.B))))))
+  sdbp.foreach { predictor =>
+    predictor.io.read.valid := io.read.fire
+    predictor.io.read.bits.set := io.read.bits.set
+    predictor.io.read.bits.tag := io.read.bits.tag
+    val info = io.read.bits.replacerInfo
+    predictor.io.read.bits.candidate := io.read.bits.refill || info.channel(0) &&
+      (info.opcode === AcquireBlock || info.opcode === AcquirePerm || info.opcode === Get || info.opcode === Hint)
+    predictor.io.read.bits.prefetch := info.sdbpPrefetch
+    predictor.io.read.bits.signatureValid := info.pcValid
+    predictor.io.read.bits.signature := info.signature
+    predictor.io.read.bits.indices := info.indices
+    predictor.io.commit := io.sdbpCommit
+    when(io.metaWReq.valid && io.metaWReq.bits.wmeta.state === MetaData.INVALID) {
+      for (way <- 0 until ways) {
+        when(io.metaWReq.bits.wayOH(way)) { deadBits.get(io.metaWReq.bits.set)(way) := false.B }
+      }
+    }
+    when(io.tagWReq.valid) {
+      for (way <- 0 until ways) {
+        when(io.tagWReq.bits.wayOH(way)) { deadBits.get(io.tagWReq.bits.set)(way) := false.B }
+      }
+    }
+    when(predictor.io.deadWrite.valid) {
+      deadBits.get(predictor.io.deadWrite.bits.set)(predictor.io.deadWrite.bits.way) := predictor.io.deadWrite.bits.dead
+    }
+    assert(!predictor.io.samplerWrite || io.metaWReq.valid || io.tagWReq.valid || replacerWen,
+      "Sampler write is not covered by Directory read exclusion")
+    XSPerfAccumulate("sdbp_live_training", predictor.io.liveTraining)
+    XSPerfAccumulate("sdbp_dead_training", predictor.io.deadTraining)
+    XSPerfAccumulate("sdbp_sampler_write", predictor.io.samplerWrite)
+  }
 
   // val tagArray  = Module(new SRAMTemplate(UInt(tagBits.W), sets, ways, singlePort = true))
   private val mbist = p(L2ParamKey).hasMbist
@@ -281,7 +319,8 @@ class Directory(implicit p: Parameters) extends L2Module {
   )).reduceTree(_ | _) |
     Mux(refillReqValid_s3 || reqValid_s3 && io.resp.bits.hit, UIntToOH(io.resp.bits.way, ways), 0.U(ways.W))
 
-  val occWayMask_s2 = RegEnable(occWayMask_s1, io.read.fire && io.read.bits.refill)
+  val blockedWays_s1 = if (cacheParams.replacement == "sdbp") occWayMask_s1 | ~io.read.bits.wayMask else occWayMask_s1
+  val occWayMask_s2 = RegEnable(blockedWays_s1, io.read.fire && io.read.bits.refill)
 
   io.retryFastFwd := occWayMask_s2.andR && refillReqValid_s2
   val freeWayMask_s3 = RegEnable(~occWayMask_s2, refillReqValid_s2)
@@ -293,9 +332,21 @@ class Directory(implicit p: Parameters) extends L2Module {
   val replaceWay = WireInit(UInt(wayBits.W), 0.U)
   val replaceOH = WireInit(UInt(ways.W), 0.U)
   val (inv, invalidWay, invOH) = invalid_way_sel(metaAll_s3)
-  val chosenOH = Mux(inv, invOH, replaceOH)
+  val repl_state_s3 = Wire(UInt(repl.nBits.W))
+  val chosenOH = if (cacheParams.replacement == "sdbp") {
+    val available = Mux(refillReqValid_s3, freeWayMask_s3, Fill(ways, true.B)) & req_s3.wayMask
+    val invalid = ~VecInit(metaValidVec).asUInt & available
+    val copies = VecInit(metaAll_s3.map(_.clients.orR)).asUInt | io.l1ICopy
+    val dead = deadBits.get(req_s3.set).asUInt & ~copies & available
+    val lru = repl.asInstanceOf[TrueLRU].get_replace_OH(repl_state_s3, available)
+    val selected = Mux(invalid.orR, MaskToOH(invalid), Mux(dead.orR, MaskToOH(dead), lru))
+    XSPerfAccumulate("sdbp_dead_victim", refillReqValid_s3 && !refillRetry && !invalid.orR && dead.orR)
+    XSPerfAccumulate("sdbp_lru_victim", refillReqValid_s3 && !refillRetry && !invalid.orR && !dead.orR)
+    XSPerfAccumulate("sdbp_copy_protected", refillReqValid_s3 && (deadBits.get(req_s3.set).asUInt & copies & available).orR)
+    selected
+  } else Mux(inv, invOH, replaceOH)
   // for retry bug fixing: if the chosenway not in freewaymask, choose another way
-  val finalReplOH = Mux(
+  val finalReplOH = if (cacheParams.replacement == "sdbp") chosenOH else Mux(
     Mux1H(chosenOH, freeWayMask_s3),
     chosenOH,
     MaskToOH(freeWayMask_s3)
@@ -328,6 +379,8 @@ class Directory(implicit p: Parameters) extends L2Module {
   io.resp.bits.tag   := tag_s3
   io.resp.bits.set   := set_s3
   io.resp.bits.error := error_s3  // depends on ECC
+  io.candidateTags := tagAll_s3
+  io.candidateSet := req_s3.set
   io.errOnSnp := errorOnSNP_s3
   io.resp.bits.replacerInfo := replacerInfo_s3
   io.wayOH := wayOH_s3
@@ -340,7 +393,7 @@ class Directory(implicit p: Parameters) extends L2Module {
 
   /* ======!! Replacement logic !!====== */
   /* ====== Read, choose replaceWay ====== */
-  val repl_state_s3 = if(random_repl) {
+  repl_state_s3 := (if(random_repl) {
     when(io.tagWReq.fire){
       repl.miss
     }
@@ -349,7 +402,7 @@ class Directory(implicit p: Parameters) extends L2Module {
     val repl_sram_r = replacer_sram_opt.get.io.r(io.read.fire, io.read.bits.set).resp.data(0)
     val repl_state = RegEnable(repl_sram_r, 0.U(repl.nBits.W), reqValid_s2)
     repl_state
-  }
+  })
 
   if (cacheParams.replacement == "random") {
     replaceWay := repl.get_replace_way(repl_state_s3)
@@ -379,7 +432,9 @@ class Directory(implicit p: Parameters) extends L2Module {
      (req_s3.replacerInfo.channel(2) && (req_s3.replacerInfo.opcode === Release || req_s3.replacerInfo.opcode === ReleaseData)))
   } else {
     reqValid_s3 && hit_s3 && req_s3.replacerInfo.channel(0) &&
-    (req_s3.replacerInfo.opcode === AcquirePerm || req_s3.replacerInfo.opcode === AcquireBlock)
+    (req_s3.replacerInfo.opcode === AcquirePerm || req_s3.replacerInfo.opcode === AcquireBlock ||
+      (cacheParams.replacement == "sdbp" || cacheParams.replacement == "lru").B &&
+        (req_s3.replacerInfo.opcode === Get || req_s3.replacerInfo.opcode === Hint))
   }
   val updateRefill = refillReqValid_s3 && !refillRetry
   // update replacer when A/C hit or refill

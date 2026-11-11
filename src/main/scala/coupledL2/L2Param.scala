@@ -65,6 +65,8 @@ case class IsKeywordField() extends BundleField[Bool](IsKeywordKey, Output(Bool(
 //memblock pass pc of load_miss to l2
 case object PCKey extends ControlKey[UInt]("pc")
 case class PCField(width: Int) extends BundleField[UInt](PCKey, Output(UInt(width.W)), _ := 0.U(width.W))
+case object PCValidKey extends ControlKey[Bool]("pcValid")
+case class PCValidField() extends BundleField[Bool](PCValidKey, Output(Bool()), _ := false.B)
 
 case class L2Param(
   name: String = "L2",
@@ -75,6 +77,8 @@ case class L2Param(
   channelBytes: TLChannelBeatBytes = TLChannelBeatBytes(32),
   clientCaches: Seq[L1Param] = Nil,
   replacement: String = "drrip",
+  sdbp: SDBPParams = SDBPParams(),
+  icacheCopy: Option[L1ICopyParams] = None,
   mshrs: Int = 16,
   releaseData: Int = 3,
   /* 0 for dirty alone
@@ -88,7 +92,7 @@ case class L2Param(
   echoField: Seq[BundleFieldBase] = Nil,
   reqField: Seq[BundleFieldBase] = Nil,
   respKey: Seq[BundleKeyBase] = Seq(IsHitKey),
-  reqKey: Seq[BundleKeyBase] = Seq(AliasKey, VaddrKey, PrefetchKey, ReqSourceKey, PCKey),
+  reqKey: Seq[BundleKeyBase] = Seq(AliasKey, VaddrKey, PrefetchKey, ReqSourceKey, PCKey, PCValidKey),
   respField: Seq[BundleFieldBase] = Nil,
 
   innerBuf: TLBufferParams = TLBufferParams(),
@@ -101,6 +105,8 @@ case class L2Param(
   ),
 
   hartId: Int = 0,
+  // Startup default for cache_prefetch_enable<hartId>; preserves instantiated prefetchers.
+  enablePrefetch: Boolean = true,
   // Prefetch
   prefetch: Seq[PrefetchParameters] = Nil,
   // L2 Flush
@@ -140,6 +146,11 @@ case class L2Param(
   // both EnablePrivateClint and PrivateClintRange are from soc parameters.
   PrivateClintRange: Option[AddressSet] = None
 ) {
+  if (replacement == "sdbp") {
+    sdbp.checkSets(sets)
+    require(icacheCopy.forall(_.blockBytes == blockBytes), "SDBP ICache and L2 block sizes must match")
+  }
+
   def toCacheParams: CacheParameters = CacheParameters(
     name = name,
     sets = sets,

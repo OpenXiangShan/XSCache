@@ -84,6 +84,10 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task.reqSource := a.user.lift(utility.ReqSourceKey).getOrElse(MemReqSource.NoWhere.id.U)
     task.replTask := false.B
     task.vaddr.foreach(_ := a.user.lift(VaddrKey).getOrElse(0.U))
+    task.sdbpPrefetch := a.opcode === Hint || MemReqSource.isL1Prefetch(task.reqSource) || MemReqSource.isL2Prefetch(task.reqSource)
+    task.pcValid := a.user.lift(PCValidKey).getOrElse(false.B) && !cmoAllValid && !task.sdbpPrefetch
+    task.signature := SDBPHash.signature(a.user.lift(PCKey).getOrElse(0.U(64.W)))
+    task.indices := SDBPHash.indices(task.signature, cacheParams.sdbp.predictorEntries)
     task.pc.foreach(_ := a.user.lift(PCKey).getOrElse(0.U)) 
     //miss acquire keyword
     task.isKeyword.foreach(_ := a.echo.lift(IsKeywordKey).getOrElse(false.B))
@@ -125,6 +129,7 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task.reqSource := req.pfSource
     task.replTask := false.B
     task.vaddr.foreach(_ := req.vaddr.getOrElse(0.U))
+    task.sdbpPrefetch := true.B
     task.pc.foreach(_ := 0.U)  
     task.isKeyword.foreach(_ := false.B)
     task.mergeA := false.B

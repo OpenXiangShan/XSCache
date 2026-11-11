@@ -350,6 +350,9 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     managerFn = managerPortParams
   )
 
+  val icacheCopyGeometry = cacheParams.icacheCopy.filter(_ => cacheParams.replacement == "sdbp")
+  val icacheCopySink = icacheCopyGeometry.map(geometry => BundleBridgeSink(Some(() => new L1ICopyUpdate(geometry))))
+
   val tpmeta_source_node = if(hasTPPrefetcher) Some(BundleBridgeSource(() => DecoupledIO(new TPmetaReq(hartIdLen, node.in.head._2.bundle.addressBits, offsetBits)))) else None
   val tpmeta_sink_node = if(hasTPPrefetcher) Some(BundleBridgeSink(Some(() => ValidIO(new TPmetaResp(hartIdLen, node.in.head._2.bundle.addressBits, offsetBits))))) else None
 
@@ -514,6 +517,11 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
         RegNextN(!hintChosenVec.map(h => h.valid && h.bits.hasData).reduce(_ || _), sliceAhead + 1)
       ) || Cat(releaseSourceD).orR
 
+    val icacheTracker = icacheCopyGeometry.map { geometry =>
+      val tracker = Module(new L1ICopyTracker(geometry, banks * cacheParams.ways))
+      tracker.io.update := icacheCopySink.get.bundle
+      tracker
+    }
     val slices = node.in.zip(node.out).zipWithIndex.map {
       case (((in, edgeIn), (out, edgeOut)), i) =>
         require(in.params.dataBits == out.params.dataBits)
@@ -527,6 +535,16 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
           }))
         }
         slice.io.in <> in
+        slice.io.l1ICopy.foreach { copyMask =>
+          copyMask := icacheTracker.map { tracker =>
+            for (way <- 0 until cacheParams.ways) {
+              val localBlock = slice.io.candidateBlocks.get(way)
+              val block = if (bankBits == 0) localBlock else Cat(localBlock, i.U(bankBits.W))
+              tracker.io.query(i * cacheParams.ways + way) := block
+            }
+            VecInit((0 until cacheParams.ways).map(way => tracker.io.present(i * cacheParams.ways + way))).asUInt
+          }.getOrElse(0.U)
+        }
         if (enableHintGuidedGrant) {
           // If the hint of slice X is selected at cycle T, then at cycle (T + 3) & (T + 4)
           // we will try our best to select the grant of slice X.

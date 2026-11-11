@@ -99,6 +99,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     /* write dir, including reset dir */
     val metaWReq = ValidIO(new MetaWrite)
     val tagWReq = ValidIO(new TagWrite)
+    val sdbpCommit = Valid(new SDBPCommit(cacheParams.sets, cacheParams.ways))
 
     /* read DS and write data into ReleaseBuf when the task needs to replace */
     val releaseBufWrite = ValidIO(new MSHRBufWrite())
@@ -608,6 +609,13 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.tagWReq.bits.set := req_s3.set
   io.tagWReq.bits.wayOH := Mux(mshr_refill_s3 && req_s3.replTask, io.dirReplWayOH_s3, reqWayOH_s3)
   io.tagWReq.bits.wtag := req_s3.tag
+
+  io.sdbpCommit.valid := task_s3.valid && !req_s3.denied && !req_s3.corrupt && (
+    (!mshr_req_s3 && req_s3.fromA && dirResult_s3.hit &&
+      (req_acquire_s3 || req_get_s3 || req_prefetch_s3)) || io.tagWReq.valid)
+  io.sdbpCommit.bits.set := req_s3.set
+  io.sdbpCommit.bits.way := Mux(io.tagWReq.valid, OHToUInt(io.tagWReq.bits.wayOH), dirResult_s3.way)
+  io.sdbpCommit.bits.refill := io.tagWReq.valid
 
   sink_resp_s3_b_metaWen := metaW_valid_s3_b
   sink_resp_s3_b_meta := metaW_s3_b
