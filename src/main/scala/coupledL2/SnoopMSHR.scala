@@ -561,11 +561,10 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
       meta.clients := Fill(clientBits, false.B)
     }
   }
-  // The whole nested descriptor completes after both physical writes. Keep
-  // the old residency unavailable while the newer payload is in flight.
-  when (!io.alloc.valid && io.nestedReleaseWritePending) {
-    releaseBufPayloadReady := false.B
-  }
+  // Pending also includes the conservative pre-capture owner reservation.
+  // Retain physical residency across an unrelated C/SinkC reservation; every
+  // consumer above already masks the visible payload with !pending. A newer
+  // nested descriptor becomes visible only after its complete physical write.
   when (!io.alloc.valid && io.nestedReleaseWriteDone) {
     releaseBufPayloadReady := true.B
   }

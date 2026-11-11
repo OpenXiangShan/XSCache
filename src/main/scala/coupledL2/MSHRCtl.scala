@@ -585,7 +585,12 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val replaceReserveSlotOHByParent = Seq.tabulate(mshrsAll) { parent =>
     Mux(replaceReserveValid(parent), UIntToOH(replaceReserveSlot(parent), mshrsAll), 0.U(mshrsAll.W))
   }
-  val replaceReservedSlotOH = replaceReserveSlotOHByParent.reduce(_ | _)
+  // The physical reservation ledger changes at the same edge as the parent
+  // records. Availability must read this Q, rather than decoding all parent
+  // slot IDs and ORing them into the nested-C allocator in this cycle.
+  val replaceReservedSlotOH = RegInit(0.U(mshrsAll.W))
+  assert(replaceReservedSlotOH === replaceReserveSlotOHByParent.reduce(_ | _),
+    "physical replacement reservations must agree with their parent records")
   // A captured B owns a concrete S/R slot before its Directory execution.
   // Keep the request identity with that slot so the transient pipeline can
   // release exactly the reservation it consumed.  The owner is the physical
@@ -740,11 +745,14 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val replaceReserveAllowsRead = Seq.tabulate(mshrsAll) { parent =>
     replaceReserveValid(parent)
   }
-  (0 until mshrsAll).foreach { parent =>
+  val replaceReserveReleaseParent = (0 until mshrsAll).map { parent =>
     val reserveResponse = replResponseApplied.valid && replResponseApplied.bits.mshrId === parent.U
     val reserveStale = replaceReserveValid(parent) && !refillMshrs(parent).io.status.valid &&
       !refillMshrs(parent).io.replReadWanted && !refillMshrs(parent).io.replReadInFlight
-    when(reserveResponse || reserveStale) {
+    reserveResponse || reserveStale
+  }
+  (0 until mshrsAll).foreach { parent =>
+    when(replaceReserveReleaseParent(parent)) {
       replaceReserveValid(parent) := false.B
     }
     when(replaceReserveGrant && replaceReserveGrantParentOH(parent)) {
@@ -752,6 +760,14 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       replaceReserveSlot(parent) := OHToUInt(replaceReserveGrantSlotOH)
     }
   }
+  val replaceReserveReleaseSlots = VecInit((0 until mshrsAll).map { slot =>
+    VecInit((0 until mshrsAll).map { parent =>
+      replaceReserveReleaseParent(parent) && replaceReserveValid(parent) &&
+        replaceReserveSlot(parent) === slot.U
+    }).asUInt.orR
+  }).asUInt
+  replaceReservedSlotOH := (replaceReservedSlotOH & ~replaceReserveReleaseSlots) |
+    Mux(replaceReserveGrant, replaceReserveGrantSlotOH, 0.U(mshrsAll.W))
   // A ReplacerResult issued before an invalidating snoop can return after the
   // parent has already delegated a victim to ReplaceMSHR.  It must be retried
   // after that child completes; allocating it now would give one parent two
@@ -1549,10 +1565,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   val replaceNestedwbCapture = replaceMshrs.zipWithIndex.map {
     case (_, replaceId) =>
-      nestedwbNormalActive.zipWithIndex.map {
+      VecInit(nestedwbNormalActive.zipWithIndex.map {
         case (active, parentId) =>
           active && replaceNestedTargetMatches(parentId)(replaceId)
-      }.reduce(_ || _)
+      }).asUInt.orR
   }
 
   /* Port connection of physical MSHR entries and their two contexts. */
@@ -1848,7 +1864,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       // MainPipe pulses replaceCaptureWrite with the replace slot id.
       val replaceCaptureMatch = io.fromMainPipe.replaceCaptureWrite.valid &&
         io.fromMainPipe.replaceCaptureWrite.bits === i.U
-      val orphanReplaceCapture = orphanReleaseTargetsReplace && orphanReplaceTargetOH(i)
       replaceMshrs(i).io.victimDataCaptured :=
         replaceProbeAckDataCapture || nestedReleaseDone(1)(i) || replaceCaptureMatch ||
         mirroredReplaceProbeAckDataForSlot
@@ -1857,9 +1872,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       // Evict into WriteBackFull. SinkC/ReleaseData captures may carry newer
       // data, so they retain the conservative writeback behavior.
       replaceMshrs(i).io.victimDataNeedsWriteback :=
-        replaceProbeAckDataCapture || replaceNestedwbCapture(i) ||
-        (orphanReleaseData && replaceAllocValid && selectedReplaceSlotOH(i)) ||
-        mirroredReplaceProbeAckDataForSlot || orphanReplaceCapture
+        replaceProbeAckDataCapture || nestedReleaseDone(1)(i) ||
+        mirroredReplaceProbeAckDataForSlot
       // A B that actually enters RequestArb reserves this sidecar until its
       // response leaves TXRSP/TXDAT. The reservation prevents the sidecar
       // from observing B only in S1, then releasing the same victim while B
@@ -2860,8 +2874,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   mirroredReplaceProbeAckDataDoneOH := Mux(io.releaseBufWriteExtra.valid,
     mirrorOwnerOH, 0.U(mshrsAll.W))
   mirroredReplaceProbeAckDataPendingOH :=
-    Mux(mirroredReplaceProbeAckDataCapture, mirroredReplaceProbeAckDataOH, 0.U(mshrsAll.W)) |
-      Mux(probeAckMirrorCapture.valid, UIntToOH(probeAckMirrorCapture.bits.id, mshrsAll), 0.U(mshrsAll.W)) |
+    Mux(probeAckMirrorCapture.valid, UIntToOH(probeAckMirrorCapture.bits.id, mshrsAll), 0.U(mshrsAll.W)) |
       Mux(probeAckMirrorWrite.valid, mirrorOwnerOH, 0.U(mshrsAll.W))
   when(probeAckMirrorWrite.valid) {
     assert(mirrorOwnerCurrent, "ProbeAckData mirror lost its reserved replacement generation")
@@ -2992,15 +3005,31 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         UIntToOH(target.bits.id, mshrsAll), 0.U(mshrsAll.W))
     }.reduce(_ | _)
   }
+  // An admitted C task is already held in the fixed-latency pipeline FFs
+  // before the S3 address/physical-target search begins. Conservatively pin
+  // every S/R owner during those C stages; no C event is backpressured or
+  // consumed here. At the S3 edge its complete masks/payload take over the
+  // hold. Likewise SinkC's registered route reservation precedes any accepted
+  // ProbeAckData and protects a possible replacement mirror at capture.
+  // These early Q reservations close the first-cycle gap without raw masks
+  // bypassing the registered transaction into owner ready/retirement logic.
+  val nestedReleaseCaptureHold = VecInit(io.pipeStatusVec.map(status =>
+    status.valid && status.bits.fromC)).asUInt.orR
+  val nestedReleaseOwnerHold = nestedReleaseCaptureHold || probeLookupValid
+  when(io.nestedwb.c_set_dirty) {
+    assert(nestedReleaseCaptureHold, "nested C must already own its pipeline capture reservation")
+  }
+  when(mirroredReplaceProbeAckDataCapture) {
+    assert(probeLookupValid, "ProbeAckData mirror must already own its SinkC reservation")
+  }
   (0 until 2).foreach { context =>
     val replacement = context == 1
-    val raw = if(replacement) nestedReplaceMask else nestedSnoopMask
     val captured = Mux(nestedReleaseReserved.valid,
       if(replacement) nestedReleaseReserved.bits.replace else nestedReleaseReserved.bits.snoop, 0.U(mshrsAll.W))
     val masks = Mux(nestedReleaseMasks.valid,
       if(replacement) nestedReleaseMasks.bits.replace else nestedReleaseMasks.bits.snoop, 0.U(mshrsAll.W))
     val mirror = if(replacement) mirroredReplaceProbeAckDataPendingOH else 0.U(mshrsAll.W)
-    nestedReleasePending(context) := raw | masks | captured | mirror |
+    nestedReleasePending(context) := Fill(mshrsAll, nestedReleaseOwnerHold) | masks | captured | mirror |
       descriptorMask(nestedReleaseWrite, replacement) | descriptorMask(nestedReleaseValidated, replacement) |
       descriptorMask(nestedReleaseApplied, replacement)
     nestedReleaseDone(context) := descriptorMask(nestedReleaseApplied, replacement)
