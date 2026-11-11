@@ -187,6 +187,20 @@ class L2TSHRCtrl(val sliceNum: Int, val sliceIdx: Int, val sliceNID: Int, val no
     XSPerfAccumulate(s"bop_$name", bopPerf(i))
   }
 
+  // Export existing source-qualified event pulses only for quota experiments.
+  // These counters do not participate in arbitration or completion.
+  if (paramL2.pfTshrQuota.nonEmpty || paramL2.demandReserve.nonEmpty) {
+    for ((name, source) <- Seq("vbop" -> L2PfSource.BOP, "pbop" -> L2PfSource.PBOP,
+      "sms" -> L2PfSource.SMS, "stream" -> L2PfSource.Stream, "stride" -> L2PfSource.Stride,
+      "berti" -> L2PfSource.Berti, "cdp" -> L2PfSource.CDP, "tp" -> L2PfSource.TP, "nl" -> L2PfSource.NL)) {
+      for ((metric, index) <- Seq("sent_downstream" -> L2BOPPerf.IssuedDownstream,
+        "demand_hit" -> L2BOPPerf.Useful, "redundant" -> L2BOPPerf.Redundant)) {
+        XSPerfAccumulate(s"pfB_${name}_$metric", PopCount(tshrs.map(t =>
+          t.io.bopPerf(index) && t.io.bopPerfSource(index) === source.U)))
+      }
+    }
+  }
+
   // -- TSHR Allocation connections
   val tshrAlloc = Module(new L2TSHRAlloc(new L2TSHRAllocConfig(
     cluster = Seq(Seq(L2TSHRAllocTarget.EVT), Seq(L2TSHRAllocTarget.SNP, L2TSHRAllocTarget.EVB, L2TSHRAllocTarget.REQ)), // TODO: parameterize clustering

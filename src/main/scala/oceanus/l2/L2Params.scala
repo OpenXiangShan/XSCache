@@ -28,6 +28,15 @@ case class L2Params(
     // R01: per-slice cap on shared TSHRs that admitted internal prefetch work.
     // None preserves the existing unlimited policy and adds no tracking state.
     prefetchMaxSharedTSHRs: Option[Int] = None,
+    // Per-slice runtime cap. None omits all runtime quota state/logic.
+    // >= shared capacity is unlimited; 0 stops new internal prefetch owners.
+    // Constantin samples pfTshrQuota once at simulator initialization.
+    pfTshrQuota: Option[Int] = None,
+    // Highest-index shared slots admit only demand REQ allocations. Internal
+    // PF and external Stash cannot allocate/reuse them; coherence channels
+    // keep their original dedicated slots and may nest in active demand slots.
+    // Constantin samples demandReserve once at simulator initialization.
+    demandReserve: Option[Int] = None,
 )
 
 // Standalone observation modules remain enabled; L2Top explicitly scopes this key.

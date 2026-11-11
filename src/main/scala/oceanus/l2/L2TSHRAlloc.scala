@@ -117,14 +117,40 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
   val clusterCount = config.cluster.size
   val clusterName = config.cluster.zipWithIndex.map { case (cluster, idx) => s"cluster_${idx}_${cluster.map(_.name).mkString("_")}" }
 
+  require(paramL2.prefetchMaxSharedTSHRs.isEmpty || paramL2.pfTshrQuota.isEmpty,
+    "Choose either the legacy static quota or pfTshrQuota")
+  private val quotaEnabled = paramL2.prefetchMaxSharedTSHRs.nonEmpty || paramL2.pfTshrQuota.nonEmpty
+  private val reserveEnabled = paramL2.demandReserve.nonEmpty
+
   val io = IO(new Bundle {
 
     val fromTSHR = Flipped(Vec(paramL2.mshrSize, Valid(new L2TSHRAlloc.PathFromTSHR)))
     val toTSHR = Output(Vec(paramL2.mshrSize, new L2TSHRAlloc.PathToTSHR))
 
     val fromTSHRCtrl = new L2TSHRAlloc.PathFromTSHRCtrl
-    val pfSrcID = paramL2.prefetchMaxSharedTSHRs.map(_ => Input(UInt(p(xscache.oceanus.compactchi.CCHIParametersKey).UpstreamNodeID_Width.W)))
+    val pfSrcID = if (quotaEnabled || reserveEnabled) Some(Input(UInt(p(xscache.oceanus.compactchi.CCHIParametersKey).UpstreamNodeID_Width.W))) else None
   })
+
+  // Keep demand capacity physically separate from deferrable work. In contrast
+  // to the PF owner quota, this mask includes external Stash and non-REQ fresh
+  // allocations. It does not prevent coherence reuse of an active demand slot:
+  // such nesting is required to complete the request and allocates no new slot.
+  private val sharedSlots = (0 until nMSHR).filterNot(i => config.resv.exists(_._1 == i))
+  val demandReserved = paramL2.demandReserve.map { initialReserve =>
+    require(initialReserve >= 0 && initialReserve <= sharedSlots.size,
+      "demandReserve must fit shared TSHRs")
+    val configured = Constantin.createRecord("demandReserve", BigInt(initialReserve))
+    val count = Mux(configured >= sharedSlots.size.U, sharedSlots.size.U, configured)
+    VecInit((0 until nMSHR).map { i =>
+      val rank = sharedSlots.indexOf(i)
+      if (rank < 0) false.B else count > (sharedSlots.size - 1 - rank).U
+    })
+  }
+  val demandRequest = if (reserveEnabled) {
+    val req = io.fromTSHRCtrl.RXREQ.bits
+    req.SrcID =/= io.pfSrcID.get && req.Opcode =/= CCHIOpcode.StashShared.U &&
+      req.Opcode =/= CCHIOpcode.StashUnique.U
+  } else true.B
 
   // -- The unified cluster bundle type to connect different channels into the same target Arbiter
   class ClusterBundle extends Bundle {
@@ -161,9 +187,13 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
   // deallocated. Demand/SNP/EVT/EVB reuse never clears an outstanding owner.
   // An already-owned same-PA slot costs no additional quota. The check is
   // combinational (one REQ admission per cycle), so there is no overshoot.
-  val prefetchQuotaAllows = paramL2.prefetchMaxSharedTSHRs.map { limit =>
+  val prefetchQuotaAllows = paramL2.prefetchMaxSharedTSHRs.orElse(paramL2.pfTshrQuota).map { initialLimit =>
     val shared = (0 until nMSHR).filterNot(i => config.resv.exists(_._1 == i))
-    require(limit >= 0 && limit <= shared.size, "prefetchMaxSharedTSHRs must fit shared TSHRs")
+    require(initialLimit >= 0 && initialLimit <= shared.size, "prefetch quota must fit shared TSHRs")
+    val limit = if (paramL2.pfTshrQuota.nonEmpty) {
+      val configured = Constantin.createRecord("pfTshrQuota", BigInt(initialLimit))
+      Mux(configured >= shared.size.U, shared.size.U, configured)(log2Ceil(shared.size + 1) - 1, 0)
+    } else initialLimit.U
     val owners = RegInit(VecInit(Seq.fill(nMSHR)(false.B)))
     val occupied = VecInit((0 until nMSHR).map(i => owners(i) && io.fromTSHR(i).valid))
     val used = PopCount(shared.map(i => occupied(i)))
@@ -175,9 +205,32 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
       when(io.fromTSHRCtrl.RXREQ.fire && isPrefetch &&
         (io.toTSHR(i).alloc.REQ || io.toTSHR(i).reuse.REQ)) { owners(i) := true.B }
     }
-    assert(used <= limit.U, "R01 prefetch shared TSHR quota exceeded")
+    assert(used <= limit, "prefetch shared TSHR quota exceeded")
+    if (paramL2.pfTshrQuota.nonEmpty) {
+      val blocked = io.fromTSHRCtrl.RXREQ.valid && isPrefetch && !alreadyOwned && used >= limit
+      // A denied episode can span many cycles. A changed transaction starts a
+      // new episode (overwrite queues may replace their head under backpressure).
+      // Intervening demand/arbitration can split one logical PF into episodes;
+      // this is intentionally not labelled a globally unique request count.
+      val previousBlocked = RegNext(blocked, false.B)
+      val previousRequest = RegEnable(io.fromTSHRCtrl.RXREQ.bits.asUInt, blocked)
+      val episode = blocked && (!previousBlocked || previousRequest =/= io.fromTSHRCtrl.RXREQ.bits.asUInt)
+      XSPerfAccumulate("pfQuota_blocked_cycles", blocked)
+      XSPerfAccumulate("pfQuota_denied_episodes", episode)
+      XSPerfAccumulate("pfQuota_cycles", true.B)
+      XSPerfAccumulate("pfQuota_occupancy_sum", used)
+      for (level <- 0 to shared.size) {
+        XSPerfAccumulate(s"pfQuota_occupancy_$level", used === level.U)
+      }
+      val active = PopCount(shared.map(i => io.fromTSHR(i).valid))
+      XSPerfAccumulate("pfQuota_shared_full", active === shared.size.U)
+      XSPerfAccumulate("pfQuota_req_valid", io.fromTSHRCtrl.RXREQ.valid)
+      XSPerfAccumulate("pfQuota_req_stall", io.fromTSHRCtrl.RXREQ.valid && !io.fromTSHRCtrl.RXREQ.ready)
+      XSPerfAccumulate("pfQuota_demand_stall", io.fromTSHRCtrl.RXREQ.valid && !isPrefetch && !io.fromTSHRCtrl.RXREQ.ready)
+      XSPerfAccumulate("pfQuota_demand_accept", io.fromTSHRCtrl.RXREQ.fire && !isPrefetch)
+    }
     dontTouch(used)
-    !isPrefetch || alreadyOwned || used < limit.U
+    !isPrefetch || alreadyOwned || used < limit
   }.getOrElse(true.B)
 
   val preclusterRXREQ = Wire(Decoupled(new ClusterBundle))
@@ -242,7 +295,7 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
 
   // Reservation rule: whether TSHR tIdx accepts cluster cIdx's allocation target
   val resv_allow = (0 until clusterCount).map(cIdx => io.fromTSHR.zipWithIndex.map { case (_, tIdx) =>
-    config.resv.find(_._1 == tIdx) match {
+    val original = config.resv.find(_._1 == tIdx) match {
       case Some((_, L2TSHRResvTarget.L1EVT)) => postcluster_isL1EVT(cIdx)
       case Some((_, L2TSHRResvTarget.L2EVB)) => postcluster_isL2EVB(cIdx)
       case Some((_, L2TSHRResvTarget.L3SNP)) => postcluster_isL3SNP(cIdx)
@@ -252,6 +305,9 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
       }
       case None => true.B
     }
+    demandReserved.map { protectedSlots =>
+      original && (!protectedSlots(tIdx) || (postcluster(cIdx).bits.target.REQ && demandRequest))
+    }.getOrElse(original)
   })
 
   // Allocation candidate vector conditions:
@@ -267,6 +323,28 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
           alloc_vec(c2Idx)(tIdx) && !postcluster_paddr_match_mat(cIdx)(c2Idx) })
     }
   })
+
+  if (reserveEnabled) {
+    val protectedSlots = demandReserved.get
+    val protectedActive = PopCount((0 until nMSHR).map(i => protectedSlots(i) && io.fromTSHR(i).valid))
+    val deferrable = io.fromTSHRCtrl.RXREQ.valid && !demandRequest
+    val hasUnprotectedFree = sharedSlots.map(i => !protectedSlots(i) && !io.fromTSHR(i).valid).reduce(_ || _)
+    val protectedFree = sharedSlots.map(i => protectedSlots(i) && !io.fromTSHR(i).valid).reduce(_ || _)
+    XSPerfAccumulate("demandReserve_cycles", true.B)
+    XSPerfAccumulate("demandReserve_occupancy_sum", protectedActive)
+    XSPerfAccumulate("demandReserve_demand_stall", io.fromTSHRCtrl.RXREQ.valid && demandRequest && !io.fromTSHRCtrl.RXREQ.ready)
+    XSPerfAccumulate("demandReserve_demand_accept", io.fromTSHRCtrl.RXREQ.fire && demandRequest)
+    XSPerfAccumulate("demandReserve_deferrable_stall", deferrable && !io.fromTSHRCtrl.RXREQ.ready)
+    XSPerfAccumulate("demandReserve_capacity_blocked", deferrable && !io.fromTSHRCtrl.RXREQ.ready && !hasUnprotectedFree && protectedFree)
+    for (i <- 0 until nMSHR) {
+      when(protectedSlots(i) && io.toTSHR(i).alloc.asUInt.orR) {
+        assert(io.toTSHR(i).alloc.REQ && demandRequest, "non-demand allocated a demand-reserved TSHR")
+      }
+      when(protectedSlots(i) && io.toTSHR(i).reuse.REQ) {
+        assert(demandRequest, "prefetch or Stash reused a demand-reserved TSHR")
+      }
+    }
+  }
 
   val alloc_vec_mask = Wire(Vec(clusterCount, Vec(io.fromTSHR.length, Bool())))
   alloc_vec_mask.zipWithIndex.foreach { case (mask, cIdx) =>
@@ -398,6 +476,55 @@ class L2TSHRAlloc(val config: L2TSHRAllocConfig)(implicit val p: Parameters) ext
   )}
 
   
+  // Experiment-only diagnostics. No signal below feeds the allocator policy.
+  // Lifetime type is the first admitted channel, with cluster priority resolving
+  // simultaneous same-slot allocations. It never changes on later nesting.
+  if (paramL2.pfTshrQuota.nonEmpty || reserveEnabled) {
+    val names = Seq("demand_read", "internal_prefetch", "external_stash", "write_release", "snoop", "evictback", "other")
+    val kind = RegInit(VecInit(Seq.fill(nMSHR)(6.U(3.W))))
+    val req = io.fromTSHRCtrl.RXREQ.bits
+    val isInternalPF = req.SrcID === io.pfSrcID.get
+    val isStash = req.Opcode === CCHIOpcode.StashShared.U || req.Opcode === CCHIOpcode.StashUnique.U
+    val isRead = Seq(CCHIOpcode.ReadShared, CCHIOpcode.ReadUnique, CCHIOpcode.ReadOnce, CCHIOpcode.ReadNoSnp)
+      .map(op => req.Opcode === op.U).reduce(_ || _)
+    val reqKind = Mux(isInternalPF, 1.U, Mux(isStash, 2.U, Mux(isRead, 0.U, 3.U)))
+    for (i <- 0 until nMSHR) {
+      val allocating = alloc_vec.map(_(i))
+      val selectedKind = PriorityMux(allocating.zipWithIndex.map { case (hit, c) =>
+        val t = postcluster(c).bits.target
+        hit -> Mux(t.EVT, 3.U, Mux(t.SNP, 4.U, Mux(t.EVB, 5.U, reqKind)))
+      })
+      when(allocating.reduce(_ || _)) { kind(i) := selectedKind }
+    }
+    XSPerfAccumulate("quotaDiag_cycles", true.B)
+    XSPerfAccumulate("quotaDiag_occupancy_total", PopCount(io.fromTSHR.map(_.valid)))
+    for ((name, index) <- names.zipWithIndex) {
+      XSPerfAccumulate(s"quotaDiag_occupancy_$name", PopCount((0 until nMSHR).map(i => io.fromTSHR(i).valid && kind(i) === index.U)))
+    }
+    val offered = io.fromTSHRCtrl.RXREQ.valid
+    val blocked = offered && !io.fromTSHRCtrl.RXREQ.ready
+    val noSharedFree = sharedSlots.map(i => io.fromTSHR(i).valid).reduce(_ && _)
+    // Reasons are exclusive, with precedence quota -> occupied same line ->
+    // total shared capacity -> protected capacity -> competing cluster work.
+    val quotaReason = !prefetchQuotaAllows
+    val sameLineReason = !quotaReason && io.fromTSHR.map(t => t.valid &&
+      (t.bits.paddr >> 6) === (req.Addr >> 6)).reduce(_ || _)
+    val capacityReason = !quotaReason && !sameLineReason && noSharedFree
+    val protectedReason = !quotaReason && !sameLineReason && !capacityReason && !demandRequest &&
+      !sharedSlots.map(i => !io.fromTSHR(i).valid && !demandReserved.map(_(i)).getOrElse(false.B)).reduce(_ || _)
+    val arbitrationReason = !quotaReason && !sameLineReason && !capacityReason && !protectedReason
+    val reasons = Seq("pf_quota" -> quotaReason, "same_line" -> sameLineReason, "shared_full" -> capacityReason,
+      "demand_reserved" -> protectedReason, "arbitration" -> arbitrationReason)
+    XSPerfAccumulate("quotaDiag_req_valid", offered)
+    XSPerfAccumulate("quotaDiag_req_stall", blocked)
+    XSPerfAccumulate("quotaDiag_external_read_valid", offered && !isInternalPF && isRead)
+    XSPerfAccumulate("quotaDiag_external_read_stall", blocked && !isInternalPF && isRead)
+    for ((name, reason) <- reasons) {
+      XSPerfAccumulate(s"quotaDiag_stall_$name", blocked && reason)
+      XSPerfAccumulate(s"quotaDiag_external_read_stall_$name", blocked && !isInternalPF && isRead && reason)
+    }
+  }
+
   // -- Performance counters
   val perf_stallCycleCnt_EVT = RegInit(0.U(32.W))
   val perf_stallCycleCnt_SNP = RegInit(0.U(32.W))

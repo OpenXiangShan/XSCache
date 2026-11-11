@@ -909,4 +909,12 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   pCreditPool.io.mshrGrant.zip(slices.map(_.io.fromPCreditPool)).foreach { case (sources, sinks) => {
     sinks.zip(sources).foreach { case (sink, source) => sink := source }
   }}
+  if (paramL2.pfTshrQuota.nonEmpty || paramL2.demandReserve.nonEmpty) {
+    for ((name, source) <- Seq("vbop" -> L2PfSource.BOP, "pbop" -> L2PfSource.PBOP,
+      "sms" -> L2PfSource.SMS, "stream" -> L2PfSource.Stream, "stride" -> L2PfSource.Stride,
+      "berti" -> L2PfSource.Berti, "cdp" -> L2PfSource.CDP, "tp" -> L2PfSource.TP, "nl" -> L2PfSource.NL)) {
+      XSPerfAccumulate(s"pfB_${name}_queue_overwrite", PopCount(pfQueueOverwriteBySource.map(_(pfSourceSlots.indexOf(source)))))
+    }
+  }
+
 }
