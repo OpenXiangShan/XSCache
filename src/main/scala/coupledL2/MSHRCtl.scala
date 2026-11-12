@@ -441,9 +441,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     (io.sinkCRefillWriteApplied.valid && io.sinkCRefillWriteApplied.bits.id === i.U) ||
       nestedRefillDirectApplied(i)
   }).asUInt
-  val sinkCReleaseHoldLive = VecInit(refillMshrs.map(_.io.status.valid)).asUInt
+  val refillLiveOH = VecInit(refillMshrs.map(_.io.status.valid)).asUInt
   sinkCReleaseHold :=
-    (sinkCReleaseHold | sinkCReleaseHoldSet) & ~sinkCReleaseHoldClear & sinkCReleaseHoldLive
+    (sinkCReleaseHold | sinkCReleaseHoldSet) & ~sinkCReleaseHoldClear & refillLiveOH
   when(sinkCRefillRecord.valid) {
     assert(sinkCRefillCurrent, "SinkC refill route lost its reserved normal generation")
   }
@@ -1105,9 +1105,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         "a CMO reservation must retain exclusive S/R ownership until allocation")
     }
   }
-  val activeSnoopOH = VecInit(snoopMshrs.map(_.io.status.valid)).asUInt
-  val activeReplaceOH = VecInit(replaceMshrs.map(_.io.info.valid)).asUInt
-  assert(!(activeSnoopOH & activeReplaceOH).orR,
+  assert(!(snoopStatusValidOH & replaceInfoValidOH).orR,
     "SnoopMSHR and ReplaceMSHR must not own the same ReleaseBuf slot")
 
   val sinkCProbeResponse = io.resps.sinkC.respInfo.opcode === ProbeAck ||
@@ -1157,7 +1155,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     refill.io.status.bits.set === io.nestedwb.set &&
     refill.io.status.bits.metaTag === io.nestedwb.tag
   }).asUInt
-  val refillLiveOH = VecInit(refillMshrs.map(_.io.status.valid)).asUInt
   cReleaseReplacerFence :=
     ((cReleaseReplacerFence & ~cReleaseReplacerFenceClear) | cReleaseReplacerFenceSet) &
       refillLiveOH & ~normalAllocOH
@@ -1599,11 +1596,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   io.rxdatStaleSlots := rxdatStaleSlotOH.asUInt
   io.toMainPipe.snoopDataHolds := io.snoopInfo
   io.toMainPipe.postGrantReleaseHolds := io.refillInfo
-  val sharedReleaseBufOwners = VecInit(snoopMshrs.zip(replaceMshrs).map {
-    case (snoop, replace) => snoop.io.status.valid && replace.io.info.valid
-  }).asUInt
-  assert(!sharedReleaseBufOwners.orR,
-    "SnoopMSHR and ReplaceMSHR must not share a ReleaseBuf slot")
 
   replaceMshrs.zipWithIndex.foreach { case (replace, i) =>
     val parentReleaseMatches = VecInit(normalRetireEvents.map { event =>
