@@ -1518,12 +1518,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   // an NtoB merge still installs a client copy, while mergeAneedT only says
   // whether that copy has write permission. Both Grant and refill commit use
   // these same values instead of re-deriving them independently.
-  val mergedClientValid = RegInit(false.B)
-  when(io.aMergeTask.valid) {
-    mergedClientValid := true.B
-  }.elsewhen(io.alloc.valid) {
-    mergedClientValid := false.B
-  }
   // Live merge alias until Grant snapshots it. Prefetch itself has alias=0;
   // the later Acquire's color is what L1 installs and what Probe must use.
   val mergedAlias = aliasBitsOpt.map(_ => RegInit(0.U(aliasBitsOpt.get.W)))
@@ -1532,20 +1526,20 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   }.elsewhen(io.alloc.valid) {
     mergedAlias.foreach(_ := 0.U)
   }
-  val mergedGrantNeedsT = mergedClientValid && (mergeAneedT || req_promoteT)
-  val mergedGrantClients = Fill(clientBits, mergedClientValid)
+  val mergedGrantNeedsT = mergeA && (mergeAneedT || req_promoteT)
+  val mergedGrantClients = Fill(clientBits, mergeA)
   val mergedGrantState = Mux(mergedGrantNeedsT, TRUNK, BRANCH)
   // A merged prefetch is no longer a prefetch-only ownership state: the
   // merged Acquire determines the state installed for the L1 client.
   val grantMetaState = Mux(
-    mergedClientValid,
+    mergeA,
     mergedGrantState,
     Mux(req_promoteT || req_needT, Mux(req_prefetch, TIP, TRUNK), BRANCH)
   )
   val commitMergedClientValid = Mux(
     grantMergeSemanticsLatched,
     grantMergedClientLatched,
-    mergedClientValid
+    mergeA
   )
   val commitMergedNeedsT = Mux(
     grantMergeSemanticsLatched,
@@ -1605,7 +1599,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     mp_grant.way := dirResult.way
     // Get/Prefetch keep Directory alias unchanged unless mergeA installs a
     // client copy; then Directory must match the Acquire GrantBuffer uses.
-    val grantAliasFinal = aliasFinal(mergedClientValid)
+    val grantAliasFinal = aliasFinal(mergeA)
     mp_grant.alias.foreach(_ := grantAliasFinal)
     mp_grant.aliasTask.foreach(_ := req.aliasTask.getOrElse(false.B))
     // The normal MSHR snapshots hit data in its RefillBuf when it is
@@ -2215,7 +2209,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       }
       when(!cmo_cbo) {
         grantMergeSemanticsLatched := true.B
-        grantMergedClientLatched := mergedClientValid
+        grantMergedClientLatched := mergeA
         grantMergedNeedsTLatched := mergedGrantNeedsT
         grantMergedAliasLatched.foreach(_ := mergedAlias.getOrElse(0.U))
       }
@@ -2711,7 +2705,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   val committedGrantTransfersClient = req_acquire || Mux(
     grantMergeSemanticsLatched,
     grantMergedClientLatched,
-    mergedClientValid
+    mergeA
   )
   // Reserve the snoop ordering window when RequestArb actually accepts the
   // Grant task, before it can reach MainPipe/SourceD. s_refill is registered
