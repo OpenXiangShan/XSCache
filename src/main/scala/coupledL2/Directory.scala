@@ -155,7 +155,6 @@ class Directory(implicit p: Parameters) extends L2Module {
     val metaOnHit = new MetaEntry()
     val errOnSnp = Bool()
     val wayOH = Output(UInt(cacheParams.ways.W))
-    val replWayOH = Output(UInt(cacheParams.ways.W))
     val cmoHitInvalid = Output(Bool())
     val retryFastFwd = Output(Bool())
   })
@@ -625,7 +624,6 @@ class Directory(implicit p: Parameters) extends L2Module {
     io.replResp.valid && !normalRefillRevalidateHit && !refillRetry && victimMetaJustWritten)
   io.replResp.bits.retry := !normalRefillRevalidateHit && (refillRetry || victimMetaJustWritten)
   io.replResp.bits.validHold := refillReqValid_hold_s3
-  io.replWayOH := replRespOH
 
   /* ====== Update ====== */
   // PLRU: update replacer only when A hit or refill, at stage 3

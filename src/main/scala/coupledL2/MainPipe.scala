@@ -63,7 +63,6 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val metaOnHit_s3 = Input(new MetaEntry())
     val errOnSnp_s3 = Input(Bool())
     val dirWayOH_s3 = Input(UInt(cacheParams.ways.W))
-    val dirReplWayOH_s3 = Input(UInt(cacheParams.ways.W))
     val cmoHitInvalid = Input(Bool())
     val replResp = Flipped(ValidIO(new ReplacerResult()))
     val retryFastFwd_s2 = Input(Bool())
@@ -134,9 +133,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       // (i.e. sidecar) slot, valid when grantInstallOK && victim is valid.
       val grantInstallOK = Input(Bool())
       val grantInstallSlot = Input(UInt(mshrBits.W))
-      val grantInstallGeneration = Input(UInt(8.W))
       val replParentGeneration = Input(UInt(8.W))
-      val replParentEpoch = Input(Bool())
     }
 
     /* read C-channel Release Data and write into DS */
@@ -341,8 +338,6 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val metaOnHit = new MetaEntry
     val errOnSnp = Bool()
     val wayOH = UInt(cacheParams.ways.W)
-    val replWayOH = UInt(cacheParams.ways.W)
-    val cmoHitInvalid = Bool()
     val cPayload = new PipeBufferResp
     val refill = Valid(new MSHRBufResp)
     val release = Valid(new DSBlock)
@@ -350,9 +345,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val normalRetry = Bool()
     val grantInstall = Bool()
     val grantInstallSlot = UInt(mshrBits.W)
-    val grantInstallGeneration = UInt(8.W)
     val parentGeneration = UInt(8.W)
-    val parentEpoch = Bool()
     // A post-Grant ReleaseData holder is sampled with the same task/result
     // record as the Directory decision.  Downstream B allocation must not
     // re-read the live MSHRCtl holder after this record has been captured.
@@ -598,8 +591,6 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     s3Decision.bits.metaOnHit := io.metaOnHit_s3
     s3Decision.bits.errOnSnp := io.errOnSnp_s3
     s3Decision.bits.wayOH := io.dirWayOH_s3
-    s3Decision.bits.replWayOH := io.dirReplWayOH_s3
-    s3Decision.bits.cmoHitInvalid := io.cmoHitInvalid
     s3Decision.bits.cPayload := io.bufResp
     s3Decision.bits.refill := io.refillBufResp_s3
     s3Decision.bits.release := io.releaseBufResp_s3
@@ -608,9 +599,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       task_s3_decide.bits.mshrContext === 0.U
     s3Decision.bits.grantInstall := io.fromMSHRCtl.grantInstallOK
     s3Decision.bits.grantInstallSlot := io.fromMSHRCtl.grantInstallSlot
-    s3Decision.bits.grantInstallGeneration := io.fromMSHRCtl.grantInstallGeneration
     s3Decision.bits.parentGeneration := io.fromMSHRCtl.replParentGeneration
-    s3Decision.bits.parentEpoch := io.fromMSHRCtl.replParentEpoch
     s3Decision.bits.postGrantReleaseSnoop := postGrantReleaseSnoop_decide || postGrantReleaseLate_decide
     s3Decision.bits.normalRefillOverlapsSnoopHold := normalRefillOverlapsSnoopHold_decide
     s3Decision.bits.bNeedProbe := bNeedProbe_decide

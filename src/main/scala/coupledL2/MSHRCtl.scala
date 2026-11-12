@@ -106,9 +106,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       // the reserved sidecar ReleaseBuf slot for the victim snapshot.
       val grantInstallOK = Output(Bool())
       val grantInstallSlot = Output(UInt(mshrBits.W))
-      val grantInstallGeneration = Output(UInt(8.W))
       val replParentGeneration = Output(UInt(8.W))
-      val replParentEpoch = Output(Bool())
     }
 
     // Final external TXDAT/TXRSP handshakes. A sidecar cannot release its
@@ -837,9 +835,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     replDecision.bits.cmoConflict := replRespCmoConflictCapture
   }
   io.toMainPipe.replParentGeneration := Mux1H(replRespParentOHCapture, mshrTaskGenerations(0))
-  io.toMainPipe.replParentEpoch := Mux1H(replRespParentOHCapture, refillMshrs.map(_.io.allocEpoch))
-  io.toMainPipe.grantInstallGeneration :=
-    Mux1H(replRespReservationOHCapture, mshrTaskGenerations(2)) + replRespNeedsReplaceCapture.asUInt
   val replRespParentOH = UIntToOH(replDecision.bits.response.mshrId, mshrsAll)
   val replDecisionCurrent = Mux1H(replRespParentOH, refillMshrs.map(_.io.status.valid)) &&
     Mux1H(replRespParentOH, mshrTaskGenerations(0)) === replDecision.bits.parentGeneration &&

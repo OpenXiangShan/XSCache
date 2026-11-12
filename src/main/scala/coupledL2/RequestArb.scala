@@ -150,7 +150,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   // observe the one-entry occupancy and never the Directory ready directly.
   val dirReadAdmissionValid = RegInit(false.B)
   val dirReadAdmissionBits = RegInit(0.U.asTypeOf(new DirRead()))
-  val dirReadAdmissionTask = RegInit(0.U.asTypeOf(new TaskBundle()))
   val dirReadAdmissionToken = RegInit(0.U.asTypeOf(new MainpipeLeaseToken))
   val dirReadAdmissionFire = Wire(Bool())
   // Reserve the fixed-latency Directory result/apply slot before S1. This
@@ -565,7 +564,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   dirReadAdmissionValid := dirReadAdmissionValid && !dirReadAdmissionFire || dirReadCapture
   when(dirReadCapture) {
     dirReadAdmissionBits := dirReadCaptureBits
-    dirReadAdmissionTask := dirReadCaptureTask
     dirReadAdmissionToken := mshrLeaseToken_s1
   }
 

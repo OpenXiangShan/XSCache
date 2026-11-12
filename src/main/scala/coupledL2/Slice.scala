@@ -161,7 +161,6 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
     val metaOnHit = new MetaEntry
     val errOnSnp = Bool()
     val wayOH = UInt(cacheParams.ways.W)
-    val replWayOH = UInt(cacheParams.ways.W)
     val cmoHitInvalid = Bool()
   })
   directoryEvent.result := directory.io.resp
@@ -169,7 +168,6 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   directoryEvent.metaOnHit := directory.io.metaOnHit
   directoryEvent.errOnSnp := directory.io.errOnSnp
   directoryEvent.wayOH := directory.io.wayOH
-  directoryEvent.replWayOH := directory.io.replWayOH
   directoryEvent.cmoHitInvalid := directory.io.cmoHitInvalid
   val directoryEventReg = RegNext(directoryEvent, 0.U.asTypeOf(directoryEvent))
   mainPipe.io.bufResp := RegNext(sinkC.io.bufResp)
@@ -178,7 +176,6 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   mainPipe.io.metaOnHit_s3 := directoryEventReg.metaOnHit
   mainPipe.io.errOnSnp_s3 := directoryEventReg.errOnSnp
   mainPipe.io.dirWayOH_s3 := directoryEventReg.wayOH
-  mainPipe.io.dirReplWayOH_s3 := directoryEventReg.replWayOH
   mainPipe.io.cmoHitInvalid := directoryEventReg.cmoHitInvalid
   mainPipe.io.retryFastFwd_s2 := directory.io.retryFastFwd
   mainPipe.io.fromMSHRCtl <> mshrCtl.io.toMainPipe
