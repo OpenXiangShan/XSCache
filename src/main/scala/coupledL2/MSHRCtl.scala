@@ -1019,9 +1019,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   incomingReplaceInfo.tag := incomingVictim.tag
   incomingReplaceInfo.way := incomingVictim.way
   incomingReplaceInfo.meta := incomingVictim.meta
-  incomingReplaceInfo.metaTag := incomingVictim.tag
-  incomingReplaceInfo.needRelease := true.B
-  incomingReplaceInfo.replaceData := incomingVictim.meta.dirty
 
   // Normal and replace contexts use different buffers and may share a local
   // index. Snoop and replace are mutually exclusive because both own

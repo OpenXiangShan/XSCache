@@ -228,16 +228,12 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     victim.tag := io.alloc.bits.dirResult.tag
     victim.way := io.alloc.bits.dirResult.way
     victim.meta := io.alloc.bits.dirResult.meta
-    victim.metaTag := io.alloc.bits.dirResult.tag
     victim.probeDone := !io.alloc.bits.needProbe
     victim.releaseStarted := false.B
     victim.copyBackIssued := false.B
     victim.snoopInvalidated := false.B
     victim.releaseAck := false.B
-    victim.needRelease := true.B
-    victim.replaceData := io.alloc.bits.dirResult.meta.dirty
     victim.releaseToClean := io.alloc.bits.mode === ReplaceMSHRMode.cmoClean
-    victim.leaseHeld := false.B
   }
 
   when (!io.alloc.valid) {
@@ -488,7 +484,6 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     // Every source, including a clean DS fallback, makes ReleaseBuf ready for
     // a nested snoop. Writeback policy is carried separately below.
     releaseBufCaptured := true.B
-    victim.replaceData := true.B
     releaseDataPending := false.B
   }
   when (io.victimDataNeedsWriteback) {
@@ -600,7 +595,6 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   io.info.bits := victim
   io.info.bits.releaseStarted := releaseSent
   io.info.bits.copyBackIssued := copyBackSent
-  io.info.bits.awaitingProbeAck := valid && needProbe && probeSent && !probeAck
   io.info.bits.releaseBufReady := releaseBufCaptured && !io.nestedReleaseWritePending
   io.info.bits.refillReady := probeDone && (!releaseBufRequired || releaseBufCaptured) &&
     !io.nestedReleaseWritePending

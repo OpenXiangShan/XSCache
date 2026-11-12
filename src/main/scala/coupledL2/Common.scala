@@ -379,7 +379,6 @@ class MSHRInfo(implicit p: Parameters) extends L2Bundle with HasTLChannelBits {
   // A replacement sidecar may outlive its parent normal context. These fields
   // let directory/RXSNP retain ownership of the old victim address without
   // increasing the physical MSHR or buffer count.
-  val replace = new ReplaceMSHRInfo
 }
 
 // Same-cycle replacement admission needs the victim address before its
@@ -424,12 +423,10 @@ class ReplaceMSHRInfo(implicit p: Parameters) extends L2Bundle {
   // Only a sidecar that has actually issued a probe and is still waiting for
   // its ProbeAck may consume a SinkC response by address; otherwise the probe
   // data of a stale/coincidental address match would be absorbed incorrectly.
-  val awaitingProbeAck = Bool()
   val set = UInt(setBits.W)
   val tag = UInt(tagBits.W)
   val way = UInt(wayBits.W)
   val meta = new MetaEntry
-  val metaTag = UInt(tagBits.W)
   val probeDone = Bool()
   // The lower-level release task has entered RequestArb. Its transport is
   // still live, but CHI snoops may consume ReleaseBuf until CopyBackWrData is
@@ -442,10 +439,7 @@ class ReplaceMSHRInfo(implicit p: Parameters) extends L2Bundle {
   // ReleaseBuf remains for transport, but the protocol-visible cache state is I.
   val snoopInvalidated = Bool()
   val releaseAck = Bool()
-  val needRelease = Bool()
-  val replaceData = Bool()
   val releaseToClean = Bool()
-  val leaseHeld = Bool()
 }
 
 class ReplaceRequest(implicit p: Parameters) extends L2Bundle {

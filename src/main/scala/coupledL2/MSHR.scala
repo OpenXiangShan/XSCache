@@ -2747,7 +2747,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   io.msInfo.bits.releaseToClean := releaseToClean
   io.msInfo.bits.blocksSnoop := false.B
   io.msInfo.bits.channel := req.channel
-  io.msInfo.bits.replace := 0.U.asTypeOf(new ReplaceMSHRInfo)
 
   assert(!(c_resp.valid && !io.status.bits.w_c_resp))
   assert(!(rxrsp.valid && rxrsp.bits.chiOpcode.get =/= PCrdGrant && !io.status.bits.w_d_resp))
