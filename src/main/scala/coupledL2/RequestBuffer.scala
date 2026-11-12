@@ -47,15 +47,6 @@ class ReqEntry(entries: Int = 4)(implicit p: Parameters) extends L2Bundle() {
   */
   val waitMP  = UInt(6.W)
 
-  /* which MSHR the entry is waiting for
-  * We need to compare req.tag AND dirResult.tag (if replacement)
-  *
-  * There are three occasions that we need to update it
-  * (1) when new MSHR is allocated
-  * (2) when MSHR finishes replacement(TODO)
-  * (3) when MSHR is free
-  * */
-  val waitMS  = UInt(mshrsAll.W)
 
   /* Split of waitMS by conflict kind (assigned at alloc alongside waitMS):
   * waitMSReq: conflict via the MSHR's own request line (reqTag). Clears when
@@ -325,7 +316,6 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
         io.mainPipeBlock(2),
         io.mainPipeBlock(3),
         0.U(1.W))
-      entry.waitMS  := conflictMask(in)
       entry.timer   := 1.U
       entry.waitMSReq := conflictMaskReq(in)
       entry.waitMSVic := conflictMaskVic(in)
@@ -357,7 +347,6 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     when(e.valid) {
       e.timer := e.timer + 1.U
 
-      val waitMSUpdate  = WireInit(e.waitMS)
       val waitMSReqUpdate = WireInit(e.waitMSReq)
       val waitMSVicUpdate = WireInit(e.waitMSVic)
 //      val depMaskUpdate = WireInit(e.depMask)
@@ -366,7 +355,6 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
       val retiredMask = VecInit(io.mshrInfo.map(s => !s.valid)).asUInt
       // reqTag conflicts release only at full retirement: a commit-landed
       // context still owns its address until then (see conflictMaskReq).
-      waitMSUpdate  := e.waitMS  & (~retiredMask).asUInt
       waitMSReqUpdate := e.waitMSReq & (~retiredMask).asUInt
       waitMSVicUpdate := e.waitMSVic & (~retiredMask).asUInt
 
@@ -375,7 +363,6 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
       // merging them releases this mask one edge before the new MSHR exists.
       e.waitMP := e.waitMP >> 1
       when(e.waitMP(1) === 0.U && e.waitMP(0) === 1.U) {
-        waitMSUpdate  := conflictMask(e.task)
         waitMSReqUpdate := conflictMaskReq(e.task)
         waitMSVicUpdate := conflictMaskVic(e.task)
       }
@@ -394,7 +381,6 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
       }
 
       // update info
-      e.waitMS  := waitMSUpdate
       e.waitMSReq := waitMSReqUpdate
       e.waitMSVic := waitMSVicUpdate
 //      e.depMask := depMaskUpdate
