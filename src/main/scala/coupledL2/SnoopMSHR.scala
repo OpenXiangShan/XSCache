@@ -197,8 +197,6 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   io.tasks.txdat.bits := 0.U.asTypeOf(new TaskBundle)
   io.dataRefill.valid := false.B
   io.dataRefill.bits := 0.U.asTypeOf(new DemandRefillBundle)
-  io.cmoSidecarReq := false.B
-  io.cmoSidecarMode := 0.U
 
   val nestedwbMatch = valid && dirResult.hit && meta.state =/= INVALID &&
     dirResult.set === io.nestedwb.set && dirResult.tag === io.nestedwb.tag

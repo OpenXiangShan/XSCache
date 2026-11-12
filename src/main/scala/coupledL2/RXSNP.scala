@@ -90,15 +90,9 @@ class RXSNP(
     *    release tasks to MainPipe (DS write was done in release tasks on MainPipe), the incoming snoop of Y should 
     *    be **blocked**.
     */
-  // A CMO blocks its own line and yields to its nest-ready sidecar.
-  val cmoBlockSnpMask = VecInit(io.refillInfo.map(s =>
-    s.valid && s.bits.dirHit && isValid(s.bits.meta.state) &&
-    !s.bits.s_cmoresp && (!s.bits.s_release || !s.bits.w_rprobeacklast || !s.bits.s_cmometaw) &&
-    s.bits.set === task.set && s.bits.reqTag === task.tag
-  )).asUInt
   val replaceBlockSnpMask = VecInit(io.refillInfo.zipWithIndex.map { case (s, i) =>
     !io.refillVictimDelegated(i) && s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag && !s.bits.dirHit && isValid(s.bits.meta.state) &&
-    s.bits.s_cmoresp && s.bits.w_replResp && (!s.bits.w_rprobeacklast || s.bits.w_releaseack || !RegNext(s.bits.w_replResp))
+    s.bits.w_replResp && (!s.bits.w_rprobeacklast || s.bits.w_releaseack || !RegNext(s.bits.w_replResp))
   }).asUInt
   val replaceBlockSnp = replaceBlockSnpMask.orR
   val sidecarLineMask = VecInit(io.replaceInfo.map(s =>
@@ -117,11 +111,10 @@ class RXSNP(
   val admissionTask = RegInit(0.U.asTypeOf(new TaskBundle))
   val admissionOwnerGeneration = Reg(UInt((mshrBits + 1).W))
 
-  val cmoBlockSnp = cmoBlockSnpMask.orR && !sidecarNestSnpMask.orR
 
   val normalVictimAwaitingOwnerMask = VecInit(io.refillInfo.zipWithIndex.map { case (s, i) =>
     !io.refillVictimDelegated(i) && s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag &&
-      (!s.bits.dirHit || !s.bits.s_cmoresp) && s.bits.meta.state =/= INVALID &&
+      !s.bits.dirHit && s.bits.meta.state =/= INVALID &&
       RegNext(s.bits.w_replResp) && s.bits.w_rprobeacklast && !s.bits.w_releaseack
   }).asUInt
   val normalVictimAwaitingOwner = normalVictimAwaitingOwnerMask.orR && !sidecarLineMask.orR
@@ -159,7 +152,7 @@ class RXSNP(
   val allocatingSidecarBlockSnp = allocatingSidecarMatch && !sidecarNestSnpMask.orR
   val sidecarBlockSnp = (sidecarLineMask & ~sidecarNestSnpMask).orR ||
     allocatingSidecarBlockSnp
-  val stall = reqBlockSnp || replaceBlockSnp || cmoBlockSnp || sidecarBlockSnp ||
+  val stall = reqBlockSnp || replaceBlockSnp || sidecarBlockSnp ||
     normalVictimAwaitingOwner || snoopContextBlock
 
   io.admission.valid := rxsnp.valid && io.admissionEnable && !admissionValid && !stall
@@ -206,7 +199,7 @@ class RXSNP(
       "a sidecar's own nested snoop must not be blocked by its allocation origin")
   }
   val allocBlockOnly = rxsnp.valid && allocatingSidecarBlockSnp &&
-    !(reqBlockSnp || replaceBlockSnp || cmoBlockSnp || snoopContextBlock ||
+    !(reqBlockSnp || replaceBlockSnp || snoopContextBlock ||
       (sidecarLineMask & ~sidecarNestSnpMask).orR)
   val allocBlockCnt = RegInit(0.U(8.W))
   when (allocBlockOnly) {

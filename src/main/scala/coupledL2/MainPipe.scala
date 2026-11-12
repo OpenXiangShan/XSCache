@@ -199,7 +199,6 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val readData = Bool()
     val captureRefill = Bool()
     val metaWrite = Bool()
-    val cmoInvalidate = Bool()
     val meta = new MetaEntry
   }
   def decideNormal(task: TaskBundle, dir: DirResult, meta: MetaEntry,
@@ -209,10 +208,12 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val acq = fromA && (task.opcode === AcquireBlock || task.opcode === AcquirePerm)
     val prefetch = fromA && task.opcode === Hint
     val get = fromA && task.opcode === Get
+    val cmoMeta = Mux(task.cmoAll, dir.meta, meta)
+    val cmoHit = dir.hit && isValid(cmoMeta.state)
     val clean = fromA && task.opcode === CBOClean
     action.cmoAllBlock := io.cmoAllBlock.getOrElse(false.B)
     action.cmoHitInvalid := action.cmoAllBlock && invalidCmoWay
-    val flush = fromA && task.opcode === CBOFlush && !action.cmoHitInvalid
+    val flush = fromA && task.opcode === CBOFlush
     val inval = fromA && task.opcode === CBOInval
     val wantsT = needT(task.opcode, task.param)
     val promoteT = dir.hit && isT(meta.state)
@@ -223,14 +224,13 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     action.acquireOnMiss := acq || prefetch || get
     action.needAcquire := task.fromA && (Mux(dir.hit,
       action.acquireOnHit, action.acquireOnMiss) || action.cmo)
-    action.needProbe := dir.hit && meta.clients.orR && (
-      get && meta.state === TRUNK || clean && meta.state === TRUNK || flush || inval)
-    action.needRelease := dir.hit && (clean && (action.needProbe || meta.dirty) ||
-      flush && isValid(meta.state) || inval && isValid(meta.state))
+    action.needProbe := dir.hit && meta.clients.orR && get && meta.state === TRUNK ||
+      cmoHit && cmoMeta.clients.orR && (clean && cmoMeta.state === TRUNK || flush || inval)
+    action.needRelease := cmoHit && (clean && (action.needProbe || cmoMeta.dirty) || flush || inval)
     action.needMshr := action.needAcquire || action.needProbe || action.alias
 
     action.allocation.dirResult := dir
-    action.allocation.dirResult.meta := meta
+    action.allocation.dirResult.meta := Mux(task.cmoAll, dir.meta, meta)
     action.allocation.task := task
     action.allocation.task.bufIdx := 0.U
     action.allocation.task.mshrTask := false.B
@@ -257,7 +257,6 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
         initial.s_release := false.B
         initial.w_releaseack := false.B
       }
-      when(action.cmo) { initial.s_cmoresp := false.B }
     }
     action.response := task
     action.response.mshrId := (1 << (mshrBits - 1)).U + task.sourceId
@@ -268,7 +267,6 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     action.readData := dir.hit && (get || fromA && task.opcode === AcquireBlock)
     action.captureRefill := (action.needProbe || action.alias) && action.readData
     action.metaWrite := fromA && !action.needMshr && !get && !prefetch && !action.cmo
-    action.cmoInvalidate := inval && dir.hit
     val alias = Mux(get || prefetch, meta.alias.getOrElse(0.U), task.alias.getOrElse(0.U))
     action.meta := MetaEntry(
       dirty = meta.dirty,
@@ -924,7 +922,6 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     req_s3.metaWen && !(mshr_refill_s3 && (retry || mshr_defer_refill_write_s3)) ||
       grantMergeInstall_s3
   )
-  val metaW_valid_s3_cmo = normalActionAdmitted_s3 && normalAction.cmoInvalidate
   require(clientBits == 1)
 
   val metaW_s3_a = normalAction.meta
@@ -935,7 +932,6 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val metaW_s3_mshr = WireInit(Mux(req_s3.mergeA, req_s3.aMergeTask.meta, req_s3.meta))
   metaW_s3_mshr.tagErr := req_s3.denied
   metaW_s3_mshr.dataErr := req_s3.corrupt
-  val metaW_s3_cmo  = MetaEntry()   // invalid the block
 
   val metaW_wayOH = Mux(
     commitReplWay,
@@ -944,15 +940,15 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   )
 
   io.metaWReq.valid := !resetFinish || task_s3.valid && normalActionAdmitted_s3 && (
-    metaW_valid_s3_a || metaW_valid_s3_b || metaW_valid_s3_c || metaW_valid_s3_mshr || metaW_valid_s3_cmo
+    metaW_valid_s3_a || metaW_valid_s3_b || metaW_valid_s3_c || metaW_valid_s3_mshr
   )
   io.metaWReq.bits.set := Mux(resetFinish, req_s3.set, resetIdx)
   io.metaWReq.bits.wayOH := Mux(resetFinish, metaW_wayOH, Fill(cacheParams.ways, true.B))
   io.metaWReq.bits.wmeta := Mux(
     resetFinish,
     ParallelPriorityMux(
-      Seq(metaW_valid_s3_a, metaW_valid_s3_b, metaW_valid_s3_c, metaW_valid_s3_mshr, metaW_valid_s3_cmo),
-      Seq(metaW_s3_a, metaW_s3_b, metaW_s3_c, metaW_s3_mshr, metaW_s3_cmo)
+      Seq(metaW_valid_s3_a, metaW_valid_s3_b, metaW_valid_s3_c, metaW_valid_s3_mshr),
+      Seq(metaW_s3_a, metaW_s3_b, metaW_s3_c, metaW_s3_mshr)
     ),
     MetaEntry()
   )
@@ -988,12 +984,12 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val txdat_s3_latch = true
   val isD_s3 = Mux(
     mshr_req_s3,
-    mshr_cmoresp_s3 && !io.cmoAllBlock.getOrElse(false.B) || mshr_refill_s3 && !retry && !mshr_refill_only_s3,
+    mshr_cmoresp_s3 && !req_s3.cmoAll || mshr_refill_s3 && !retry && !mshr_refill_only_s3,
     req_s3.fromC || normalAction.directSourceD
   )
   val isD_s3_ready = Mux(
     mshr_req_s3,
-    mshr_cmoresp_s3 && !io.cmoAllBlock.getOrElse(false.B) || mshr_refill_s3 && !retry && !mshr_refill_only_s3,
+    mshr_cmoresp_s3 && !req_s3.cmoAll || mshr_refill_s3 && !retry && !mshr_refill_only_s3,
     req_s3.fromC // normal A responses are latched (d_s3_latch == true)
   )
   val isTXRSP_s3 = Mux(
@@ -1472,13 +1468,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.error.bits.valid := l2Error_s5 // if not enableECC, should be false
   io.error.bits.address := Cat(task_s5.bits.tag, task_s5.bits.set, task_s5.bits.off)
 
-  /* CMO All Flush cacheline done if:
-   cacheline is INVALID -> drop @s3
-   cacheline is VALID send back resp when mshr complete CBOFlush flow with mshr_comresp_s3 @s3
-   */
-  val cmoLineDrop = task_s3.valid && sinkA_req_s3 && req_s3.opcode === CBOFlush && cmoHitInvalid
-  val cmoLineDone = io.cmoAllBlock.getOrElse(false.B) && task_s3.valid && mshr_cmoresp_s3
-  io.cmoLineDone.foreach { _ := RegNextN(cmoLineDone || cmoLineDrop, 2, Some(false.B)) }
+  val cmoLineDone = task_s3.valid && mshr_cmoresp_s3 && req_s3.cmoAll
+  io.cmoLineDone.foreach { _ := RegNextN(cmoLineDone, 2, Some(false.B)) }
 
   /* ===== Performance counters ===== */
   // SinkA requests
@@ -1494,7 +1485,6 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   XSPerfAccumulate("dir_wen_meta_a_hit_cnt", task_s3.valid && metaW_valid_s3_a)
   XSPerfAccumulate("dir_wen_meta_b_snoop_cnt", task_s3.valid && metaW_valid_s3_b)
   XSPerfAccumulate("dir_wen_meta_c_release_cnt", task_s3.valid && metaW_valid_s3_c)
-  XSPerfAccumulate("dir_wen_meta_cmo_cnt", task_s3.valid && metaW_valid_s3_cmo)
   XSPerfAccumulate("dir_wen_meta_mshr_commit_cnt",
     task_s3.valid && metaW_valid_s3_mshr && req_s3.mshrContext === 0.U && req_s3.refillOnly)
   XSPerfAccumulate("dir_wen_meta_mshr_resp_cnt",

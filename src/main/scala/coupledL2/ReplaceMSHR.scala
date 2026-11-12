@@ -14,6 +14,8 @@ import org.chipsalliance.cde.config.Parameters
 import utility.MemReqSource
 import xscache.chi.{CHIChannel, CHIREQ, HasCHIOpcodes}
 import xscache.chi.CHICohStates._
+import xscache.chi.{MemAttr, MPAM, OrderEncodings}
+import xscache.chi.RespErrEncodings._
 import freechips.rocketchip.tilelink.TLMessages._
 import freechips.rocketchip.tilelink.TLPermissions._
 import xscache.coupledL2.MetaData._
@@ -43,6 +45,9 @@ class ReplaceMSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   val parentRelease = Input(Bool())
   val info = ValidIO(new ReplaceMSHRInfo)
   val txnId = Output(UInt(mshrBits.W))
+  val txnEpoch = Output(UInt((TXNID_WIDTH - bankBits - 2 - mshrBits).W))
+  val pCrd = new PCrdQueryBundle
+  val ownsSnoopData = Output(Bool())
   val done = ValidIO(new ReplaceDone)
 }
 
@@ -81,11 +86,32 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   val releaseTgtId = RegInit(0.U(NODEID_WIDTH.W))
   val releaseDbId = RegInit(0.U(DBID_WIDTH.W))
   val compAckPending = RegInit(false.B)
+  val request = Reg(new TaskBundle)
+  val localReleaseNeeded = RegInit(false.B)
+  val cmoLocalDone = RegInit(false.B)
+  val controlSent = RegInit(false.B)
+  val controlDone = RegInit(false.B)
+  val responseIssued = RegInit(false.B)
+  val retryAck = RegInit(false.B)
+  val pCrdGranted = RegInit(false.B)
+  val retrySrcId = Reg(UInt(NODEID_WIDTH.W))
+  val retryPCrdType = Reg(UInt(PCRDTYPE_WIDTH.W))
+  val denied = RegInit(false.B)
+  val txnEpochWidth = TXNID_WIDTH - bankBits - 2 - mshrBits
+  val txnEpochGen = RegInit(0.U(txnEpochWidth.W))
+  val txnEpochSent = RegInit(0.U(txnEpochWidth.W))
+  val issuedTxnId = Cat(txnEpochGen, io.txnId)
+  io.txnEpoch := txnEpochSent
+  io.pCrd.query.valid := valid && retryAck && !pCrdGranted
+  io.pCrd.query.bits.srcID := retrySrcId
+  io.pCrd.query.bits.pCrdType := retryPCrdType
 
   val isCmoClean = mode === ReplaceMSHRMode.cmoClean
   val isCmoFlush = mode === ReplaceMSHRMode.cmoFlush
   val isCmoInval = mode === ReplaceMSHRMode.cmoInval
   val isVictim = mode === ReplaceMSHRMode.victim
+  val isCmo = !isVictim
+  io.ownsSnoopData := isVictim || localReleaseNeeded && !cmoLocalDone
   // CBO.inval discards data even for a dirty line; its release is control-only.
   val needsData = isCmoClean ||
     (!isCmoInval && (victim.meta.dirty || probeAckDataRecv))
@@ -111,8 +137,8 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     valid := true.B
     probeSent := false.B
     probeAck := false.B
-    releaseSent := false.B
-    releaseAck := false.B
+    releaseSent := io.alloc.bits.mode =/= ReplaceMSHRMode.victim && !io.alloc.bits.needRelease
+    releaseAck := io.alloc.bits.mode =/= ReplaceMSHRMode.victim && !io.alloc.bits.needRelease
     copyBackSent := false.B
     copyBackComplete := false.B
     releaseNeedsData := false.B
@@ -126,6 +152,17 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     compAckPending := false.B
     compReceived := false.B
     mode := io.alloc.bits.mode
+    request := io.alloc.bits.task
+    localReleaseNeeded := io.alloc.bits.needRelease
+    cmoLocalDone := false.B
+    controlSent := io.alloc.bits.task.cmoAll
+    controlDone := io.alloc.bits.task.cmoAll
+    responseIssued := false.B
+    retryAck := false.B
+    pCrdGranted := false.B
+    denied := false.B
+    victim.ownsWay := io.alloc.bits.parentAttached ||
+      io.alloc.bits.dirResult.hit && io.alloc.bits.dirResult.meta.state =/= INVALID
     needProbe := io.alloc.bits.needProbe
     probeParam := io.alloc.bits.probeParam
     captureFromDS := io.alloc.bits.captureFromDS
@@ -230,7 +267,7 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   releaseTask.snpHitReleaseMeta := 0.U.asTypeOf(new MetaEntry)
   releaseTask.tgtID.get := 0.U
   releaseTask.srcID.get := 0.U
-  releaseTask.txnID.get := io.txnId
+  releaseTask.txnID.get := issuedTxnId
   releaseTask.homeNID.get := 0.U
   releaseTask.dbID.get := 0.U
   releaseTask.fwdNID.get := 0.U
@@ -274,28 +311,73 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   val copyBackTaskValid = valid && releaseAck && needsCopyBack && !copyBackSent &&
     !snoopInFlight && !io.snoopStarted && !io.txreqPending &&
     !releaseDataPending && !io.releaseDataSeen && !io.nestedReleaseWritePending && releaseBufCaptured
-  io.tasks.txreq.valid := releaseTaskValid && mode === ReplaceMSHRMode.victim
-  io.tasks.txreq.bits := releaseTask.toCHIREQBundle()
+  val localTransportDone = (snoopConsumed && !releaseSent ||
+    releaseAck && !compAckPending && (!needsCopyBack || copyBackComplete)) &&
+    !snoopInFlight && !io.snoopStarted && !io.txreqPending &&
+    !releaseDataPending && !io.releaseDataSeen && !io.nestedReleaseWritePending &&
+    !io.sourceBHold && !io.sinkCOwnerHold
+  when(valid && isCmo && localTransportDone && !io.localReservationHold &&
+    !io.tasks.preparedLease.held.valid && !io.tasks.preparedLease.proposalHeld) {
+    cmoLocalDone := true.B
+  }
+  val cmoControlValid = valid && isCmo && cmoLocalDone && !controlDone &&
+    (!controlSent || retryAck && pCrdGranted) &&
+    !io.tasks.preparedLease.held.valid && !io.tasks.preparedLease.proposalHeld
+  val controlReq = WireInit(0.U.asTypeOf(new CHIREQ))
+  controlReq.qos := Fill(QOS_WIDTH, 1.U(1.W)) - 1.U
+  controlReq.tgtID := Mux(retryAck, retrySrcId, 0.U)
+  controlReq.txnID := issuedTxnId
+  controlReq.opcode := Mux(isCmoClean, CleanShared, Mux(isCmoFlush, CleanInvalid, MakeInvalid))
+  controlReq.size := log2Ceil(blockBytes).U
+  controlReq.addr := Cat(victim.tag, victim.set, 0.U(offsetBits.W))
+  controlReq.ns := enableNS.B
+  controlReq.allowRetry := !retryAck
+  controlReq.pCrdType := Mux(retryAck, retryPCrdType, 0.U)
+  controlReq.order := OrderEncodings.None
+  controlReq.memAttr := MemAttr(cacheable = true.B, allocate = true.B, device = false.B, ewa = true.B)
+  controlReq.snpAttr := true.B
+  controlReq.mpam.foreach(_ := MPAM(controlReq.ns))
+  io.tasks.txreq.valid := releaseTaskValid && isVictim || cmoControlValid
+  io.tasks.txreq.bits := Mux(isCmo, controlReq, releaseTask.toCHIREQBundle())
   io.tasks.txdat.valid := copyBackTaskValid && mode === ReplaceMSHRMode.victim
   io.tasks.txdat.bits := copyBackTask
+  val responseTask = WireInit(0.U.asTypeOf(new TaskBundle))
+  responseTask.channel := request.channel
+  responseTask.tag := victim.tag
+  responseTask.set := victim.set
+  responseTask.off := request.off
+  responseTask.opcode := CBOAck
+  responseTask.size := request.size
+  responseTask.sourceId := request.sourceId
+  responseTask.mshrTask := true.B
+  responseTask.mshrId := io.id
+  responseTask.mshrContext := 2.U
+  responseTask.cmoTask := true.B
+  responseTask.cmoAll := request.cmoAll
+  responseTask.denied := denied
+  responseTask.reqSource := request.reqSource
+  responseTask.isKeyword.foreach(_ := request.isKeyword.getOrElse(false.B))
   val mainpipeIntent = Wire(Decoupled(new TaskBundle))
   val mainpipeIssuedVariant = Wire(UInt(4.W))
   val mainpipeProposedVariant = Reg(UInt(4.W))
-  mainpipeIntent.valid := captureTaskValid ||
+  val responseTaskValid = valid && isCmo && cmoLocalDone && controlDone && !responseIssued
+  mainpipeIntent.valid := responseTaskValid || captureTaskValid ||
     (copyBackTaskValid && mode =/= ReplaceMSHRMode.victim) ||
     (releaseTaskValid && mode =/= ReplaceMSHRMode.victim)
   mainpipeIntent.bits := Mux(mainpipeProposedVariant === 0.U, captureTask,
-    Mux(mainpipeProposedVariant === 1.U, copyBackTask, releaseTask))
+    Mux(mainpipeProposedVariant === 1.U, copyBackTask,
+      Mux(mainpipeProposedVariant === 2.U, releaseTask, responseTask)))
   val mainpipeInvalidate = io.alloc.valid || io.sinkC.valid || io.rxrsp.valid ||
     io.releaseDataSeen || io.victimDataCaptured || io.victimDataNeedsWriteback ||
     io.nestedReleaseWritePending ||
     io.snoopStarted || io.snoopDoneCount.orR || io.snoopMeta.valid || io.snoopToInvalDone ||
     io.copyBackDone || io.parentRelease || io.sourceBAccepted ||
-    io.tasks.txreq.fire || io.tasks.txdat.fire || io.tasks.txrsp.fire
+    io.pCrd.grant || io.tasks.txreq.fire || io.tasks.txdat.fire || io.tasks.txrsp.fire
   mainpipeProposedVariant := MainpipeLeaseIO.freeze(io.tasks.preparedLease,
     mainpipeIntent, io.tasks.mainpipe,
-    Mux(captureTaskValid, 0.U(4.W), Mux(copyBackTaskValid, 1.U(4.W), 2.U(4.W))),
-    Mux(captureTaskValid, 3.U(3.W), 4.U(3.W)), mainpipeInvalidate)
+    Mux(responseTaskValid, 3.U(4.W),
+      Mux(captureTaskValid, 0.U(4.W), Mux(copyBackTaskValid, 1.U(4.W), 2.U(4.W)))),
+    Mux(captureTaskValid && !responseTaskValid, 3.U(3.W), 4.U(3.W)), mainpipeInvalidate)
   mainpipeIssuedVariant := mainpipeProposedVariant
   val compAckRsp = io.tasks.txrsp.bits
   compAckRsp := 0.U.asTypeOf(io.tasks.txrsp.bits.cloneType)
@@ -313,10 +395,21 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     probeSent := true.B
   }
   when (io.tasks.txreq.fire) {
-    assert(!releaseSent, "a ReplaceMSHR may capture only one TXREQ flit per episode")
-    releaseSent := true.B
-    releaseNeedsData := needsData || victimWriteEvictOrEvict
+    txnEpochSent := txnEpochGen
+    txnEpochGen := txnEpochGen + 1.U
+    when(isVictim) {
+      assert(!releaseSent, "a victim ReplaceMSHR may capture only one TXREQ flit per episode")
+      releaseSent := true.B
+      releaseNeedsData := needsData || victimWriteEvictOrEvict
+    }.otherwise {
+      assert(localTransportDone && (!controlSent || retryAck && pCrdGranted),
+        "CMO control requires drained local release or its granted retry")
+      controlSent := true.B
+      retryAck := false.B
+      pCrdGranted := false.B
+    }
   }
+  when(io.pCrd.grant) { pCrdGranted := true.B }
   when (io.tasks.txrsp.fire) {
     compAckPending := false.B
   }
@@ -329,6 +422,11 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     }.elsewhen (mainpipeIssuedVariant === 2.U) {
       releaseSent := true.B
       releaseNeedsData := needsData || victimWriteEvictOrEvict
+      txnEpochSent := txnEpochGen
+      txnEpochGen := txnEpochGen + 1.U
+    }.elsewhen (mainpipeIssuedVariant === 3.U) {
+      assert(!responseIssued, "a standalone CMO must issue its completion exactly once")
+      responseIssued := true.B
     }.elsewhen (mainpipeIssuedVariant === 1.U) {
       copyBackSent := true.B
     }
@@ -371,6 +469,13 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
       victim.probeDone := victim.probeDone || io.sinkC.bits.last
       victim.detached := victim.detached || io.sinkC.bits.last
     }
+    when (isToN(io.sinkC.bits.param)) {
+      victim.meta.clients := 0.U
+      victim.meta.state := Mux(isT(victim.meta.state), TIP, victim.meta.state)
+    }
+    when (isToB(io.sinkC.bits.param)) {
+      victim.meta.state := Mux(isT(victim.meta.state), TIP, victim.meta.state)
+    }
     when (io.sinkC.bits.opcode === ProbeAckData) {
       probeAckDataRecv := true.B
       victim.meta.dirty := true.B
@@ -383,7 +488,18 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     releaseDataPending := true.B
   }
   when (io.rxrsp.valid) {
-    when (io.rxrsp.bits.chiOpcode.get === CompDBIDResp || io.rxrsp.bits.chiOpcode.get === Comp) {
+    when(isCmo && controlSent && !controlDone) {
+      when(io.rxrsp.bits.chiOpcode.get === RetryAck) {
+        retryAck := true.B
+        retrySrcId := io.rxrsp.bits.srcID.get
+        retryPCrdType := io.rxrsp.bits.pCrdType.get
+      }
+      when(io.rxrsp.bits.chiOpcode.get === Comp) {
+        controlDone := true.B
+        denied := denied || io.rxrsp.bits.respErr.get === NDERR
+        request.traceTag.get := io.rxrsp.bits.traceTag.get
+      }
+    }.elsewhen (io.rxrsp.bits.chiOpcode.get === CompDBIDResp || io.rxrsp.bits.chiOpcode.get === Comp) {
       releaseAck := true.B
       victim.releaseAck := true.B
       releaseTgtId := io.rxrsp.bits.srcID.getOrElse(0.U)
@@ -400,7 +516,8 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   val transportRetire = releaseAck && !compAckPending &&
     (!needsCopyBack || copyBackComplete || io.copyBackDone) &&
     !snoopInFlight && !io.snoopStarted && !io.txreqPending
-  val retireEligible = valid && (consumedRetire || transportRetire) &&
+  val requestComplete = isVictim || controlDone && responseIssued
+  val retireEligible = valid && requestComplete && (consumedRetire || transportRetire) &&
     !io.nestedReleaseWritePending && !io.sourceBHold && !io.sinkCOwnerHold
   val mayRetire = retireEligible && !io.localReservationHold
   val retirementPending = RegInit(false.B)
@@ -423,12 +540,14 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     !io.victimDataNeedsWriteback && !io.snoopMeta.valid && !io.snoopDoneCount.orR
   io.info.valid := valid
   io.info.bits := victim
+  io.info.bits.ownsWay := victim.parentAttached || isCmo && victim.ownsWay
+  io.info.bits.releaseAck := releaseAck
   io.info.bits.releaseStarted := releaseSent
   io.info.bits.copyBackIssued := copyBackSent
   io.info.bits.releaseBufReady := releaseBufCaptured && !io.nestedReleaseWritePending
   io.info.bits.refillReady := probeDone && (!releaseBufRequired || releaseBufCaptured) &&
     !io.nestedReleaseWritePending
-  io.done.valid := donePulse
+  io.done.valid := donePulse && victim.parentAttached
   io.done.bits.parentId := victim.parentId
   io.done.bits.parentEpoch := victim.parentEpoch
 }

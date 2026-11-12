@@ -241,8 +241,6 @@ class MSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   val postGrantReleaseSnoopToClean = Input(Bool())
   val releaseDataDirectWrite = Input(Bool())
   val grantInstallDone = Input(Bool())
-  val cmoSidecarReq = Output(Bool())
-  val cmoSidecarMode = Output(UInt(2.W))
   val blockReplRead = Input(Bool())
   val replReadInFlight = Output(Bool())
   val replReadWanted = Output(Bool())
@@ -263,10 +261,10 @@ abstract class MSHRContextBase(implicit p: Parameters) extends CoupledL2Module w
 class MSHR(implicit p: Parameters) extends MSHRContextBase {
   val io = IO(new MSHRIO)
   val mainpipeIntent = Wire(Decoupled(new TaskBundle))
-  val mainpipeVariant = Wire(UInt(4.W))
-  val mainpipeIssuedVariant = Wire(UInt(4.W))
+  val mainpipeVariant = Wire(UInt(2.W))
+  val mainpipeIssuedVariant = Wire(UInt(2.W))
   val mainpipeInvalidate = Wire(Bool())
-  val mainpipeProposedVariant = Reg(UInt(4.W))
+  val mainpipeProposedVariant = Reg(UInt(2.W))
 
   require(chiOpt.isDefined)
 
@@ -284,12 +282,10 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   val req = RegInit(0.U.asTypeOf(new TaskBundle()))
   val dirResult = RegInit(0.U.asTypeOf(new DirResult()))
   val meta = dirResult.meta
-  val initState = Wire(new FSMState())
+  val initState = Wire(new NormalFSMState())
   initState.elements.foreach(_._2 := true.B)
-  val state = RegInit(new FSMState(), initState)
+  val state = RegInit(new NormalFSMState(), initState)
 
-  val req_released_chiOpcode = RegInit(0.U.asTypeOf(UInt(OPCODE_WIDTH.W)))
-  val req_released_likelyShared = RegInit(false.B)
 
   assert(
     !(req_valid && dirResult.hit && !isT(meta.state) && meta.dirty),
@@ -309,8 +305,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
 
   val tgtid_rcompack = Reg(UInt(NODEID_WIDTH.W)) // TgtID in CompAck of read / dataless transactions
   val txnid_rcompack = Reg(UInt(TXNID_WIDTH.W)) // TxnID in CompAck of read / dataless transactions
-  val tgtid_wcompack = Reg(UInt(NODEID_WIDTH.W)) // TgtID in WriteData / CompAck of write transactions
-  val txnid_wcompack = Reg(UInt(TXNID_WIDTH.W)) // TxnID in WriteData / CompAck of write transactions
   val srcid_retryack = Reg(UInt(NODEID_WIDTH.W)) // SrcID in RetryAck, only used for protocol retry
 
   val pcrdtype = RegInit(0.U(PCRDTYPE_WIDTH.W))
@@ -341,7 +335,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   // Hold the installed way through the Directory request pipeline after the S3 commit.
   val refillWayCommitHold = RegInit(0.U(3.W))
   val refillWayCommitPending = refillWayCommitHold.orR
-  val sidecarCmoDone = RegInit(false.B)
   val readTxnInFlight = RegInit(false.B)
   // The per-read epoch occupies [TXNID_WIDTH-bankBits-3:mshrBits], above the physical slot ID.
   val readTxnSlotBits = mshrBits
@@ -379,28 +372,18 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   val tagErr = RegInit(false.B) // L2 Tag Error
   val denied = RegInit(false.B)
   val corrupt = RegInit(false.B)
-  val cbWrDataTraceTag = RegInit(false.B)
-  val metaChi = ParallelLookUp(
-    Cat(meta.dirty, meta.state),
-    Seq(
-      Cat(false.B, INVALID) -> I,
-      Cat(false.B, BRANCH) -> SC,
-      Cat(false.B, TRUNK) -> UC,
-      Cat(false.B, TIP) -> UC,
-      Cat(true.B, TRUNK) -> UD,
-      Cat(true.B, TIP) -> UD
-    )
-  )
-
   io.pCrd.query.valid := gotRetryAck && !gotPCrdGrant
   io.pCrd.query.bits.pCrdType := pcrdtype
   io.pCrd.query.bits.srcID := srcid_retryack
 
   /* Allocation */
   when(io.alloc.valid) {
+    assert(io.alloc.bits.task.fromA && io.alloc.bits.task.opcode =/= CBOClean &&
+      io.alloc.bits.task.opcode =/= CBOFlush && io.alloc.bits.task.opcode =/= CBOInval,
+      "normal MSHR allocation must contain a non-CMO A request")
     allocEpoch := !allocEpoch
     req_valid := true.B
-    state := io.alloc.bits.state
+    state.elements.foreach { case (name, field) => field := io.alloc.bits.state.elements(name) }
     dirResult := io.alloc.bits.dirResult
     req := io.alloc.bits.task
     gotT := false.B
@@ -430,14 +413,13 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     postGrantReleaseSnoopToB := false.B
     postGrantReleaseSnoopToClean := false.B
     normalRefillDroppedByToN := false.B
-    normalRefillRevalidateNeeded := io.alloc.bits.dirResult.hit && !io.alloc.bits.task.cmoTask
+    normalRefillRevalidateNeeded := io.alloc.bits.dirResult.hit
     normalRefillRevalidateInFlight := false.B
     readTxnInFlight := false.B
     replReadInFlight := false.B
     sidecarVictimReadyLatched := false.B
     refillWritePending := false.B
     refillWayCommitHold := 0.U
-    sidecarCmoDone := false.B
     nestedReleaseRefillPending := false.B
     releaseDataBeforeProbeAckPending := false.B
     releaseDataDirectWriteSeen := false.B
@@ -449,7 +431,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     tagErr := io.alloc.bits.dirResult.hit && (io.alloc.bits.dirResult.meta.tagErr || io.alloc.bits.dirResult.error)
     denied := false.B
     corrupt := false.B
-    cbWrDataTraceTag := false.B
 
     retryTimes := 0.U
     backoffTimer := 0.U
@@ -531,97 +512,10 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
 
   val req_mayRepl = req_acquire || req_get || req_prefetch
 
-  val req_chiOpcode = req.chiOpcode.get
-
-  val snpToN = isSnpToN(req_chiOpcode)
-  val snpToB = isSnpToB(req_chiOpcode)
-
-  val req_cboClean = req.fromA && req.opcode === CBOClean
-  val req_cboFlush = req.fromA && req.opcode === CBOFlush
-  val req_cboInval = req.fromA && req.opcode === CBOInval
-
-  val cmo_cbo = req_cboClean || req_cboFlush || req_cboInval
-
   // Overwrite a live victim only after its child detaches and retains the required payload.
   val victimSafeToOverwrite = !sidecarOwnsVictim ||
     (sidecarDetached && sidecarVictimReady)
 
-  // *NOTICE: WriteBack/WriteClean(s) with nested snoops that passed dirty were not considered as
-  //          a nested hit here, which would no longer pass latest data to lower tier memories.
-  val hitDirty = dirResult.hit && meta.dirty
-  val hitWriteBack =
-    req.snpHitRelease && req.snpHitReleaseWithData && req.snpHitReleaseMeta.dirty && req.snpHitReleaseToInval
-  val hitWriteClean =
-    req.snpHitRelease && req.snpHitReleaseWithData && req.snpHitReleaseMeta.dirty && req.snpHitReleaseToClean
-  val hitWriteEvict = req.snpHitRelease && req.snpHitReleaseWithData && !req.snpHitReleaseMeta.dirty
-
-  val hitWriteX = hitWriteBack || hitWriteClean || hitWriteEvict
-  val hitWriteDirty = hitWriteBack || hitWriteClean
-  val hitDirtyOrWriteDirty = hitDirty || hitWriteDirty
-
-  val releaseToClean = req_cboClean
-
-  /**
-    * About which snoop should echo SnpRespData[Fwded] instead of SnpResp[Fwded]:
-    * 1. When the snooped block is dirty, always echo SnpRespData[Fwded], except for SnpMakeInvalid*, SnpStash*,
-    *    SnpOnceFwd, and SnpUniqueFwd.
-    * 2. When the snoop opcode is SnpCleanFwd, SnpNotSharedDirtyFwd or SnpSharedFwd, always echo SnpRespDataFwded
-    *    if RetToSrc = 1 as long as the snooped block is valid.
-    *    if L2 tagErr, not forward data
-    * 3. When the snoop opcode is non-forwarding non-stashing snoop, echo SnpRespData if RetToSrc = 1 as long as the
-    *    cache line is Shared Clean and the snoopee retains a copy of the cache line.
-    */
-  val doRespData_dirty = hitDirtyOrWriteDirty && (
-    req_chiOpcode === SnpOnce ||
-      snpToB ||
-      req_chiOpcode === SnpUnique ||
-      req_chiOpcode === SnpUniqueStash ||
-      req_chiOpcode === SnpCleanShared ||
-      req_chiOpcode === SnpCleanInvalid ||
-      req_chiOpcode === SnpPreferUnique
-  )
-  // *NOTICE: Careful on future implementation of adding 'isSnpToNFwd' into condition
-  //          'doRespData_retToSrc_fwd'. For now, 'isSnpToNFwd' only covers SnpUniqueFwd,
-  //          which should never return data to Home Node except No Fwd to Requester.
-  //          No Fwds on DCT are not implemented because Fwded responses are always perferred.
-  val doRespData_retToSrc_fwd = req.retToSrc.get &&
-    (isSnpToBFwd(req_chiOpcode) /*|| isSnpToNFwd(req_chiOpcode)*/ )
-  val doRespData_retToSrc_nonFwd = req.retToSrc.get && (
-    dirResult.hit && meta.state === BRANCH &&
-      (isSnpToBNonFwd(req_chiOpcode) || isSnpToNNonFwd(req_chiOpcode) || isSnpOnce(req_chiOpcode))
-  )
-  val doRespData_once = (hitWriteBack || hitWriteClean) &&
-    isSnpOnceFwd(req_chiOpcode) ||
-    (dirResult.hit && !meta.dirty && meta.state =/= BRANCH || hitWriteEvict) &&
-      isSnpOnce(req_chiOpcode)
-  val doRespData =
-    (doRespData_dirty || doRespData_retToSrc_fwd || doRespData_retToSrc_nonFwd || doRespData_once) && !tagErr
-
-  dontTouch(doRespData_dirty)
-  dontTouch(doRespData_retToSrc_fwd)
-  dontTouch(doRespData_retToSrc_nonFwd)
-
-  // *NOTICE: SnpUniqueStash was included in condition 'doRespData_retToSrc_nonFwd', while
-  //          the 'retToSrc' of SnpUniqueStash must be bound to 0, and whether responding
-  //          SnpRespData or SnpResp was not determined by 'retToSrc'.
-  //          the 'retToSrc' of SnpQuery must be bound to 0
-  assert(
-    !(req_valid && req_chiOpcode === SnpUniqueStash && req.retToSrc.get),
-    "specification failure: received SnpUniqueStash with RetToSrc = 1"
-  )
-  assert(
-    !(req_valid && isSnpQuery(req_chiOpcode) && req.retToSrc.get),
-    "specification failure: received SnpQuery with RetToSrc = 1"
-  )
-
-  /**
-    * About which snoop should echo SnpResp[Data]Fwded instead of SnpResp[Data]:
-    * 1. When the snoop opcode is Snp*Fwd and the snooped block is valid.
-    */
-  val doFwd = isSnpXFwd(req_chiOpcode) && dirResult.hit
-  val doFwdHitRelease = isSnpXFwd(req_chiOpcode) && hitWriteX
-
-  val gotUD = meta.dirty // TC/TTC -> UD
   val promoteT_normal = dirResult.hit && meta_no_client && meta.state === TIP
   val promoteT_L3 = !dirResult.hit && gotT
   val promoteT_alias = dirResult.hit && req.aliasTask.getOrElse(false.B) && (meta.state === TRUNK || meta.state === TIP)
@@ -631,49 +525,38 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   assert(!(req_valid && req_prefetch && dirResult.hit), "MSHR can not receive prefetch hit req")
 
   /* ======== Task allocation ======== */
-  val release_valid1 = false.B
-  val release_valid2 = false.B
-  val cmoProbeDone = state.w_rprobeacklast || sidecarDetached
   val retryReissue = !state.s_reissue.getOrElse(false.B) && !state.w_grant &&
     gotRetryAck && gotPCrdGrant
-  val cmoInitialIssue = cmo_cbo && !state.s_acquire &&
-    cmoProbeDone && state.w_releaseack && state.s_cmometaw && state.s_cbwrdata.get
-  val normalInitialIssue = !cmo_cbo && !state.s_acquire &&
-    !readTxnInFlight
-  io.tasks.txreq.valid := normalInitialIssue || cmoInitialIssue || retryReissue
+  val normalInitialIssue = !state.s_acquire && !readTxnInFlight
+  io.tasks.txreq.valid := normalInitialIssue || retryReissue
   val rcompack_valid = !state.s_rcompack.get && state.w_grant &&
     // For issue B, CompAck must not be sent until all transfers of read data have been received.
     // For issue C and afterwards, CompAck is allowed to be sent after at least one CompData packet is received.
     afterIssueCOrElse(state.w_grantfirst, state.w_grantlast)
-  val wcompack_valid = !state.s_wcompack.get && state.s_rcompack.get // wcompack can only be sent after rcompack
-  io.tasks.txrsp.valid := rcompack_valid || wcompack_valid
+  io.tasks.txrsp.valid := rcompack_valid
   val probeAdmissionBlocked = sidecarDelegatedLatched || io.replResp.valid ||
-    io.nestedwb.c_set_dirty || (req_valid && cmo_cbo && dirResult.hit && !state.s_release)
-  io.tasks.source_b.valid := !probeAdmissionBlocked && (!state.s_pprobe || !state.s_rprobe)
+    io.nestedwb.c_set_dirty
+  io.tasks.source_b.valid := !probeAdmissionBlocked && !state.s_rprobe
   when(io.sourceBAccepted) {
     assert(req_valid && io.sourceBHold, "accepted normal Probe must retain its source lifetime")
   }
   io.tasks.txdat.valid := false.B
   io.tasks.txdat.bits := 0.U.asTypeOf(new TaskBundle)
-  val mp_release_valid = release_valid1
-  val mp_cbwrdata_valid = !sidecarOwnsVictim && !state.s_cbwrdata.getOrElse(true.B) && state.w_releaseack
-  val mp_probeack_valid = !state.s_probeack && state.w_pprobeacklast
   val grantIsData = odOpGen(req.opcode) === AccessAckData || odOpGen(req.opcode) === GrantData
   val replReadBlockedBySnoopOrReplace = io.replaceActive || replRespForThisParent
   val grantNeedsReplRead = !dirResult.hit && !state.w_replResp &&
     !replReadInFlight && !io.blockReplRead && !denied && !replReadBlockedBySnoopOrReplace
-  val normalGrantPending = !cmo_cbo && !state.s_refill && !grantIssued &&
+  val normalGrantPending = !state.s_refill && !grantIssued &&
     req_valid
-  val cmoGrantPending = cmo_cbo && !state.s_cmoresp && state.w_releaseack && state.s_cbwrdata.get
   // A hit Grant waits for its request-line probe; a miss delegates the victim probe to ReplaceMSHR.
-  val grantTaskPending = (normalGrantPending || cmoGrantPending) &&
+  val grantTaskPending = normalGrantPending &&
     state.w_grantlast && state.w_grant && (state.w_rprobeacklast || !dirResult.hit) &&
     (!grantIsData || gotGrantData || probeDirty || dirResult.hit)
   val grantTaskAllowed = retryTimes < backoffThreshold.U || backoffTimer === backoffCycles.U
   val internalReplRead = grantNeedsReplRead && (io.deferGrant || grantIssued)
   val replLookupInFlight = replReadInFlight || normalRefillRevalidateInFlight
   val replReadTaskPending = req_valid &&
-    (grantTaskPending || (!cmo_cbo && grantIssued))
+    (grantTaskPending || grantIssued)
   io.replReadWanted := replReadTaskPending && grantTaskAllowed && !dirResult.hit && !state.w_replResp &&
     !replReadInFlight && !denied && !io.replaceActive
   val mp_repl_read_valid = replReadTaskPending && internalReplRead && grantTaskAllowed && !replLookupInFlight
@@ -685,11 +568,11 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     !replLookupInFlight &&
     (!mergeInstallWithGrant || (state.w_replResp && victimSafeToOverwrite))
   // Revalidation is legal for hit-at-allocation contexts even when w_replResp is already set.
-  val mp_normal_refill_revalidate_valid = req_valid && !cmo_cbo && state.s_refill &&
+  val mp_normal_refill_revalidate_valid = req_valid && state.s_refill &&
     state.w_grantlast && state.w_grant && normalRefillRevalidateNeeded &&
     !normalRefillDroppedByToN && !replLookupInFlight && victimSafeToOverwrite &&
     !io.deferGrant && !nestedReleaseDirtyThisCycle
-  val mp_normal_refill_commit_valid = req_valid && !cmo_cbo && state.s_refill &&
+  val mp_normal_refill_commit_valid = req_valid && state.s_refill &&
     state.w_grantlast && state.w_grant && state.w_replResp &&
     !mergedGrantInstalled &&
     victimSafeToOverwrite && !normalRefillCommitIssued &&
@@ -697,20 +580,8 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     !io.deferGrant && !nestedReleaseDirtyThisCycle &&
     (!postGrantReleaseSeen || postGrantReleasePayloadReady) &&
     !io.postGrantReleaseSnoopActive
-  val mp_dct_valid = !state.s_dct.getOrElse(true.B) && state.s_probeack
-  // A delegated CMO leaves metadata to its child; compensation requires a remaining Directory hit.
-  val mp_cmometaw_valid = !state.s_cmometaw && dirResult.hit &&
-    (!cmo_cbo || state.s_release)
-  mainpipeIntent.valid :=
-    mp_release_valid ||
-      mp_probeack_valid ||
-      mp_repl_read_valid ||
-      mp_grant_valid ||
-      mp_normal_refill_revalidate_valid ||
-      mp_normal_refill_commit_valid ||
-      mp_cbwrdata_valid ||
-      mp_dct_valid ||
-      mp_cmometaw_valid
+  mainpipeIntent.valid := mp_repl_read_valid || mp_grant_valid ||
+    mp_normal_refill_revalidate_valid || mp_normal_refill_commit_valid
   assert(!(mp_repl_read_valid && mp_grant_valid), "replacement read and L1-visible grant must be distinct tasks")
   assert(
     !(mp_grant_valid && mp_normal_refill_commit_valid),
@@ -730,7 +601,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   }
   // io.tasks.prefetchTrain.foreach(t => t.valid := !state.s_triggerprefetch.getOrElse(true.B))
 
-  assert(state.s_refill || state.s_cmoresp, "refill not allowed on CMO operation")
 
   when(
     replReadTaskPending &&
@@ -742,69 +612,17 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
 
   // resp and fwdState
   // *NOTICE: Snp*Fwd would enter MSHR on directory missing
-  val respCacheState = ParallelPriorityMux(
-    Seq(
-      (snpToN || tagErr) -> I,
-      snpToB -> Mux(req.snpHitReleaseToInval, I, SC),
-      isSnpOnceX(req_chiOpcode) ->
-        Mux(
-          req.snpHitReleaseToInval,
-          I,
-          Mux(
-            req.snpHitReleaseToClean,
-            Mux(req.snpHitReleaseMeta.dirty, SC, metaChi),
-            Mux(meta.dirty, UD, metaChi)
-          )
-        ),
-      (isSnpStashX(req_chiOpcode) || isSnpQuery(req_chiOpcode)) ->
-        Mux(meta.dirty, UD, metaChi),
-      isSnpCleanShared(req_chiOpcode) ->
-        Mux(isT(meta.state), UC, metaChi)
-    )
-  )
-  val respPassDirty = hitDirtyOrWriteDirty && !tagErr && (
-    snpToB ||
-      req_chiOpcode === SnpUnique ||
-      req_chiOpcode === SnpUniqueStash ||
-      req_chiOpcode === SnpCleanShared ||
-      req_chiOpcode === SnpCleanInvalid ||
-      req_chiOpcode === SnpPreferUnique
-  ) || hitWriteDirty && isSnpOnceFwd(req_chiOpcode)
-  val fwdCacheState = Mux(
-    tagErr,
-    I,
-    Mux(
-      isSnpToBFwd(req_chiOpcode),
-      SC,
-      Mux(isSnpToNFwd(req_chiOpcode), UC /*UC_UD*/, I)
-    )
-  )
-  val fwdPassDirty = isSnpToNFwd(req_chiOpcode) && hitDirtyOrWriteDirty && !tagErr
-
-  /*TXRSP for CompAck */
   val orsp = io.tasks.txrsp.bits
   orsp := 0.U.asTypeOf(io.tasks.txrsp.bits.cloneType)
-  orsp.tgtID := Mux(wcompack_valid, tgtid_wcompack, tgtid_rcompack)
+  orsp.tgtID := tgtid_rcompack
   orsp.srcID := 0.U
-  orsp.txnID := Mux(wcompack_valid, txnid_wcompack, txnid_rcompack)
+  orsp.txnID := txnid_rcompack
   orsp.dbID := 0.U
   orsp.opcode := CompAck
   orsp.resp := 0.U
   orsp.fwdState := 0.U
   orsp.traceTag := req.traceTag.get
 
-  /*TXREQ for Transaction Request*/
-  // *NOTICE: By the time of issuing Write Back (WriteBackFull or Evict), the directory
-  //          was already updated by replacing, so we should never check directory hit
-  //          on replacer-issued WriteBackFull condition.
-  val isWriteCleanFull = req_cboClean
-  val isWriteBackFull = !req_cboClean && !req_cboInval && isT(meta.state) && meta.dirty
-  val isWriteEvictFull = false.B
-  val isWriteEvictOrEvict = afterIssueEbOrElse(
-    !req_cboFlush && !req_cboInval && !isWriteCleanFull && !isWriteBackFull && !isWriteEvictFull,
-    false.B
-  )
-  val isEvict = !isWriteCleanFull && !isWriteBackFull && !isWriteEvictFull && !isWriteEvictOrEvict
   val a_task = {
     val oa = io.tasks.txreq.bits
     oa := 0.U.asTypeOf(io.tasks.txreq.bits.cloneType)
@@ -818,10 +636,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
 
     oa.opcode := ParallelPriorityMux(
       Seq(
-        release_valid2 -> req_released_chiOpcode,
-        req_cboClean -> CleanShared,
-        req_cboFlush -> CleanInvalid,
-        req_cboInval -> MakeInvalid,
         // AcquirePerm misses require ReadUnique so a later clean ProbeAck has valid backing data.
         (req_acquirePerm && dirResult.hit) -> MakeUnique,
         req_needT -> ReadUnique,
@@ -829,32 +643,14 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       )
     )
     oa.size := log2Ceil(blockBytes).U
-    oa.addr := Cat(Mux(release_valid2, dirResult.tag, req.tag), req.set, 0.U(offsetBits.W))
+    oa.addr := Cat(req.tag, req.set, 0.U(offsetBits.W))
     oa.ns := enableNS.B
-    // set 'LikelyShared' to 1 here when:
-    //  - WriteEvictOrEvict (on retry) with SC state
-    oa.likelyshared := afterIssueEbOrElse(
-      Mux(release_valid2, req_released_likelyShared, false.B),
-      false.B
-    )
+    oa.likelyshared := false.B
     oa.allowRetry := state.s_reissue.getOrElse(false.B)
     oa.order := OrderEncodings.None
     oa.pCrdType := Mux(!state.s_reissue.getOrElse(false.B), pcrdtype, 0.U)
-    // set 'ExpCompAck' to 1 here when:
-    //  - MakeUnique
-    //  - ReadUnique, ReadNotSharedDirty
-    //  - WriteEvictOrEvict (on retry)
-    oa.expCompAck := Mux(
-      release_valid2,
-      afterIssueEbOrElse(req_released_chiOpcode === WriteEvictOrEvict, false.B),
-      !cmo_cbo
-    )
-    oa.memAttr := MemAttr(
-      cacheable = true.B,
-      allocate = !release_valid2 || !isEvict && !cmo_cbo,
-      device = false.B,
-      ewa = true.B
-    )
+    oa.expCompAck := true.B
+    oa.memAttr := MemAttr(cacheable = true.B, allocate = true.B, device = false.B, ewa = true.B)
     oa.snpAttr := true.B
     oa.lpIDWithPadding := 0.U
     oa.excl := false.B
@@ -870,304 +666,13 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     ob.set := dirResult.set
     ob.off := 0.U
     ob.opcode := Probe
-    ob.param := Mux(
-      !state.s_pprobe,
-      Mux(
-        snpToB,
-        toB,
-        Mux(snpToN, toN, toT)
-      ),
-      Mux(
-        // *NOTICE: CBOClean derives upper Probe toB for now.
-        (req_get || req_cboClean) && dirResult.hit && meta.state === TRUNK,
-        toB,
-        toN
-      )
-    )
+    ob.param := Mux(req_get && dirResult.hit && meta.state === TRUNK, toB, toN)
     ob.alias.foreach(_ := meta.alias.getOrElse(0.U))
     ob
   }
 
-  val mp_release, mp_probeack, mp_repl_read, mp_grant, mp_normal_refill_revalidate, mp_normal_refill_commit,
-    mp_cbwrdata, mp_dct, mp_cmometaw =
+  val mp_repl_read, mp_grant, mp_normal_refill_revalidate, mp_normal_refill_commit =
     WireInit(0.U.asTypeOf(new TaskBundle))
-  val mp_release_task = {
-    mp_release.channel := req.channel
-    mp_release.txChannel := CHIChannel.TXREQ
-    mp_release.tag := dirResult.tag
-    mp_release.set := req.set
-    mp_release.off := 0.U
-    mp_release.alias.foreach(_ := 0.U)
-    mp_release.vaddr.foreach(_ := 0.U)
-    mp_release.isKeyword.foreach(_ := false.B)
-    // if dirty, we must ReleaseData
-    // if accessed, we ReleaseData to keep the data in L3, for future access to be faster
-    // [Access] TODO: consider use a counter
-    mp_release.opcode := 0.U // use chiOpcode
-    mp_release.param := Mux(isT(meta.state), TtoN, BtoN)
-    mp_release.size := log2Ceil(blockBytes).U
-    mp_release.sourceId := 0.U(sourceIdBits.W)
-    mp_release.bufIdx := 0.U(bufIdxBits.W)
-    mp_release.needProbeAckData := false.B
-    mp_release.mshrTask := true.B
-    mp_release.mshrId := io.id
-    mp_release.aliasTask.foreach(_ := false.B)
-    // mp_release definitely read releaseBuf and refillBuf at ReqArb
-    // and it needs to write refillData to DS, so useProbeData is set false according to DS.wdata logic
-    // * but on CMO requests, data were not fetched by the refill procedure, but written to releaseBuf
-    //   by mainpipe, so useProbeData is set to true to write data from releaseBuf into DS
-    mp_release.useProbeData := false.B
-    mp_release.readProbeDataDown := false.B
-    mp_release.mshrRetry := false.B
-    mp_release.way := dirResult.way
-    mp_release.fromL2pft.foreach(_ := false.B)
-    mp_release.needHint.foreach(_ := false.B)
-    mp_release.dirty := false.B // meta.dirty && meta.state =/= INVALID || probeDirty
-    mp_release.metaWen := false.B
-    mp_release.meta := MetaEntry()
-    mp_release.tagWen := false.B
-    // write refillData to DS on refill, write releaseData to DS on CMO
-    // When refillBuf has no valid data, it should be avoided to write data of RefillBuf to DS which is MCP2
-    mp_release.dsWen := !req_acquirePerm
-    mp_release.replTask := true.B
-    mp_release.cmoTask := cmo_cbo
-    mp_release.wayMask := 0.U(cacheParams.ways.W)
-    mp_release.reqSource := 0.U(MemReqSource.reqSourceBits.W)
-    mp_release.mergeA := false.B
-    mp_release.aMergeTask := 0.U.asTypeOf(new MergeTaskBundle)
-
-    mp_release.denied := denied
-    mp_release.corrupt := corrupt
-
-    // CHI
-    // *NOTICE: See 'isWriteBackFull' above.
-    mp_release.tgtID.get := 0.U
-    mp_release.srcID.get := 0.U
-    mp_release.txnID.get := io.id
-    mp_release.homeNID.get := 0.U
-    mp_release.dbID.get := 0.U
-    mp_release.chiOpcode.get := ParallelPriorityMux(
-      Seq(
-        isWriteBackFull -> WriteBackFull,
-        isWriteEvictFull -> WriteEvictFull,
-        isWriteEvictOrEvict -> afterIssueEbOrElse(WriteEvictOrEvict, DontCare),
-        isEvict /* Default */ -> Evict
-      )
-    )
-    mp_release.resp.get := 0.U // DontCare
-    mp_release.fwdState.get := 0.U // DontCare
-    mp_release.pCrdType.get := 0.U // DontCare // TODO: consider retry of WriteBackFull/Evict
-    mp_release.retToSrc.get := req.retToSrc.get
-    mp_release.likelyshared.get := Mux(isWriteEvictOrEvict, meta.state === BRANCH, false.B)
-    mp_release.expCompAck.get := isWriteEvictOrEvict
-    mp_release.allowRetry.get := state.s_reissue.getOrElse(false.B)
-    mp_release.memAttr.get := MemAttr(allocate = !isEvict, cacheable = true.B, device = false.B, ewa = true.B)
-
-    // CMO
-    when(cmo_cbo) {
-      mp_release.useProbeData := true.B
-      mp_release.readProbeDataDown := ParallelPriorityMux(
-        Seq(
-          req_cboClean -> true.B,
-          req_cboFlush -> isWriteBackFull,
-          req_cboInval -> false.B
-        )
-      )
-      mp_release.param := ParallelPriorityMux(
-        Seq(
-          req_cboClean -> TtoB,
-          req_cboFlush -> Mux(isT(meta.state), TtoN, BtoN),
-          req_cboInval -> Mux(isT(meta.state), TtoN, BtoN)
-        )
-      )
-      mp_release.meta := Mux(req_cboClean, meta, MetaEntry())
-      mp_release.meta.dirty := false.B
-      mp_release.meta.state := Mux(
-        req_cboClean,
-        // *NOTICE: CBOClean derives upper Probe toB for now,
-        //          so TRUNK should be turned into TIP.
-        //
-        //          ** IMPORTANT **
-        //          For operations that require subsequent Release, derived upper Probes
-        //          must be set to 'toB' to simplify and correct Release nesting mechanism.
-        Mux(meta.state === TRUNK, TIP, meta.state),
-        INVALID
-      )
-      mp_release.metaWen := true.B
-      mp_release.dsWen := probeDirty
-      mp_release.replTask := false.B
-      mp_release.chiOpcode.get := ParallelPriorityMux(
-        Seq(
-          req_cboClean -> WriteCleanFull,
-          req_cboFlush -> Mux(isWriteBackFull, WriteBackFull, Evict),
-          req_cboInval -> Evict
-        )
-      )
-      mp_release.likelyshared.get := false.B
-      mp_release.memAttr.get := MemAttr(allocate = false.B, cacheable = true.B, device = false.B, ewa = true.B)
-    }
-
-    mp_release
-  }
-
-  val mp_cbwrdata_task = {
-    mp_cbwrdata.channel := req.channel
-    mp_cbwrdata.txChannel := CHIChannel.TXDAT
-    mp_cbwrdata.tag := dirResult.tag
-    mp_cbwrdata.set := req.set
-    mp_cbwrdata.off := 0.U
-    mp_cbwrdata.alias.foreach(_ := 0.U)
-    mp_cbwrdata.vaddr.foreach(_ := 0.U)
-    mp_cbwrdata.isKeyword.foreach(_ := false.B)
-    mp_cbwrdata.opcode := 0.U
-    mp_cbwrdata.param := 0.U
-    mp_cbwrdata.size := log2Ceil(blockBytes).U
-    mp_cbwrdata.sourceId := 0.U(sourceIdBits.W)
-    mp_cbwrdata.bufIdx := 0.U(bufIdxBits.W)
-    mp_cbwrdata.needProbeAckData := false.B
-    mp_cbwrdata.mshrTask := true.B
-    mp_cbwrdata.mshrId := io.id
-    mp_cbwrdata.aliasTask.foreach(_ := false.B)
-    mp_cbwrdata.useProbeData := false.B // DontCare
-    mp_cbwrdata.readProbeDataDown := true.B
-    mp_cbwrdata.mshrRetry := false.B
-    mp_cbwrdata.way := dirResult.way
-    mp_cbwrdata.fromL2pft.foreach(_ := false.B)
-    mp_cbwrdata.needHint.foreach(_ := false.B)
-    mp_cbwrdata.dirty := false.B // DontCare
-    mp_cbwrdata.metaWen := false.B
-    mp_cbwrdata.meta := MetaEntry()
-    mp_cbwrdata.tagWen := false.B
-    mp_cbwrdata.dsWen := false.B
-    mp_cbwrdata.replTask := false.B
-    mp_cbwrdata.cmoTask := cmo_cbo
-    mp_cbwrdata.wayMask := 0.U
-    mp_cbwrdata.reqSource := 0.U
-    mp_cbwrdata.mergeA := false.B
-    mp_cbwrdata.aMergeTask := 0.U.asTypeOf(new MergeTaskBundle)
-
-    mp_cbwrdata.denied := denied
-    mp_cbwrdata.corrupt := corrupt
-
-    // CHI
-    mp_cbwrdata.tgtID.get := tgtid_wcompack
-    mp_cbwrdata.srcID.get := 0.U
-    mp_cbwrdata.txnID.get := txnid_wcompack
-    mp_cbwrdata.homeNID.get := 0.U
-    mp_cbwrdata.dbID.get := 0.U
-    mp_cbwrdata.chiOpcode.get := CopyBackWrData
-    mp_cbwrdata.resp.get := setPD(metaChi, meta.dirty)
-    mp_cbwrdata.fwdState.get := 0.U
-    mp_cbwrdata.pCrdType.get := 0.U // TODO
-    mp_cbwrdata.retToSrc.get := req.retToSrc.get // DontCare
-    mp_cbwrdata.likelyshared.get := false.B
-    mp_cbwrdata.expCompAck.get := false.B
-    mp_cbwrdata.traceTag.get := cbWrDataTraceTag
-    mp_cbwrdata
-  }
-
-  val mp_probeack_task = {
-    mp_probeack.channel := req.channel
-    mp_probeack.txChannel := Mux(doRespData, CHIChannel.TXDAT, CHIChannel.TXRSP)
-    mp_probeack.tag := req.tag
-    mp_probeack.set := req.set
-    mp_probeack.off := req.off
-    mp_probeack.alias.foreach(_ := 0.U)
-    mp_probeack.vaddr.foreach(_ := 0.U)
-    mp_probeack.isKeyword.foreach(_ := false.B)
-    mp_probeack.opcode := 0.U
-    mp_probeack.param := DontCare
-    mp_probeack.size := log2Ceil(blockBytes).U
-    mp_probeack.sourceId := 0.U(sourceIdBits.W)
-    mp_probeack.bufIdx := 0.U(bufIdxBits.W)
-    mp_probeack.needProbeAckData := false.B
-    mp_probeack.mshrTask := true.B
-    mp_probeack.mshrId := io.id
-    mp_probeack.aliasTask.foreach(_ := false.B)
-    mp_probeack.useProbeData := false.B
-    mp_probeack.readProbeDataDown := false.B
-    mp_probeack.readRefillData := true.B
-    mp_probeack.mshrRetry := false.B
-    mp_probeack.way := dirResult.way
-    mp_probeack.fromL2pft.foreach(_ := false.B)
-    mp_probeack.needHint.foreach(_ := false.B)
-    mp_probeack.dirty := hitDirty
-    mp_probeack.meta := MetaEntry(
-      /**
-        * Under what circumstances should the dirty bit be cleared:
-        * 1. If the snoop belongs to SnpToN
-        * 2. If the snoop belongs to SnpToB
-        * 3. If the snoop is SnpCleanShared
-        * 4. If the snoop is SnpOnce/SnpOnceFwd and nesting WriteCleanFull
-        * 5. If the snoop encounters tagErr
-        * Otherwise, the dirty bit should stay the same as before.
-        */
-      dirty = !tagErr && (!(
-        !dirResult.hit || !meta.dirty ||
-          snpToN ||
-          snpToB ||
-          isSnpCleanShared(req_chiOpcode) ||
-          isSnpOnceX(req_chiOpcode) && req.snpHitReleaseToClean
-      ) || isSnpOnceX(req_chiOpcode) && probeDirty),
-      state = Mux(
-        snpToN || tagErr,
-        INVALID,
-        Mux(
-          // On SnpOnceFwd nesting WriteCleanFull with UD, we went UD -> SC (T -> B here)
-          snpToB || isSnpOnceFwd(req_chiOpcode) && hitWriteClean,
-          BRANCH,
-          meta.state
-        )
-      ),
-      clients = meta.clients & Fill(clientBits, !snpToN),
-      alias = meta.alias, // [Alias] Keep alias bits unchanged
-      prefetch = !snpToN && meta_pft,
-      accessed = !snpToN && meta.accessed
-    )
-    mp_probeack.metaWen := !req.snpHitReleaseToInval
-    mp_probeack.tagWen := false.B
-    mp_probeack.dsWen := !(snpToN || tagErr) && probeDirty && !releaseDirty
-    mp_probeack.wayMask := 0.U(cacheParams.ways.W)
-    mp_probeack.reqSource := 0.U(MemReqSource.reqSourceBits.W)
-    mp_probeack.replTask := false.B
-    mp_probeack.cmoTask := cmo_cbo
-    mp_probeack.mergeA := false.B
-    mp_probeack.aMergeTask := 0.U.asTypeOf(new MergeTaskBundle)
-
-    // CHI
-    mp_probeack.tgtID.get := req.srcID.get
-    mp_probeack.srcID.get := 0.U
-    mp_probeack.txnID.get := req.txnID.get
-    mp_probeack.homeNID.get := 0.U
-    // For SnpRespData or SnpRespData, DBID is set to the same value as the TxnID of the snoop.
-    // For SnpRespDataFwded or SnpRespDataFwded, DBID is not defined and can be any value.
-    mp_probeack.dbID.get := req.txnID.getOrElse(0.U)
-    mp_probeack.chiOpcode.get := MuxLookup(
-      Cat(doFwd || doFwdHitRelease, doRespData),
-      SnpResp
-    )(
-      Seq(
-        Cat(false.B, false.B) -> SnpResp,
-        Cat(true.B, false.B) -> SnpRespFwded,
-        Cat(false.B, true.B) -> SnpRespData, // ignore SnpRespDataPtl for now
-        Cat(true.B, true.B) -> SnpRespDataFwded
-      )
-    )
-    mp_probeack.resp.get := setPD(respCacheState, respPassDirty)
-    mp_probeack.fwdState.get := setPD(fwdCacheState, fwdPassDirty)
-    mp_probeack.pCrdType.get := 0.U
-    mp_probeack.retToSrc.get := req.retToSrc.get // DontCare
-    mp_probeack.likelyshared.get := false.B
-    mp_probeack.expCompAck.get := false.B
-    mp_probeack.traceTag.get := req.traceTag.get
-    mp_probeack.snpHitRelease := req.snpHitRelease
-    mp_probeack.snpHitReleaseToInval := req.snpHitReleaseToInval
-    mp_probeack.snpHitReleaseToClean := req.snpHitReleaseToClean
-    mp_probeack.snpHitReleaseWithData := req.snpHitReleaseWithData
-    mp_probeack.snpHitReleaseIdx := req.snpHitReleaseIdx
-
-    mp_probeack
-  }
 
   val mergeA = RegInit(false.B)
   when(io.aMergeTask.valid) {
@@ -1251,7 +756,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     mp_grant.mshrTask := true.B
     mp_grant.mshrId := io.id
     mp_grant.refillOnly := false.B
-    mp_grant.deferRefillWrite := !cmo_cbo
+    mp_grant.deferRefillWrite := true.B
     mp_grant.normalRefillRevalidate := false.B
     mp_grant.way := dirResult.way
     val grantAliasFinal = aliasFinal(mergeA)
@@ -1288,11 +793,11 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     mp_grant.metaWen := false.B
     mp_grant.tagWen := false.B
     mp_grant.dsWen := false.B
-    mp_grant.grantInstallEn := !cmo_cbo && !mergeA && !denied && !nestedReleaseRefillPending
+    mp_grant.grantInstallEn := !mergeA && !denied && !nestedReleaseRefillPending
     mp_grant.fromL2pft.foreach(_ := req.fromL2pft.get)
     mp_grant.needHint.foreach(_ := false.B)
     mp_grant.replTask := grantNeedsReplRead
-    mp_grant.cmoTask := cmo_cbo
+    mp_grant.cmoTask := false.B
     mp_grant.wayMask := 0.U(cacheParams.ways.W)
     mp_grant.mshrRetry := !state.s_retry
     mp_grant.reqSource := req.reqSource
@@ -1494,7 +999,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     assert(normalRefillDroppedByToN || mp_normal_refill_commit.meta.dirty,
       "normal refill commit must preserve dirty ProbeAckData")
   }
-  when(io.tasks.mainpipe.fire && mainpipeIssuedVariant === 1.U && !cmo_cbo) {
+  when(io.tasks.mainpipe.fire && mainpipeIssuedVariant === 1.U) {
     assert(
       mergeInstallWithGrant ||
         (!mp_grant.refillOnly && mp_grant.deferRefillWrite &&
@@ -1502,7 +1007,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       "normal L1-visible grant must not update DataStorage or Directory"
     )
   }
-  when(io.tasks.mainpipe.fire && mainpipeIssuedVariant === 1.U && !cmo_cbo && mergeInstallWithGrant) {
+  when(io.tasks.mainpipe.fire && mainpipeIssuedVariant === 1.U && mergeInstallWithGrant) {
     assert(
       !mp_grant.refillOnly && mp_grant.deferRefillWrite &&
         (denied || releaseDataAlreadyCommitted ||
@@ -1521,160 +1026,23 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     )
   }
 
-  val mp_dct_task = {
-    mp_dct.channel := req.channel
-    mp_dct.txChannel := CHIChannel.TXDAT
-    mp_dct.tag := req.tag
-    mp_dct.set := req.set
-    mp_dct.off := req.off
-    mp_dct.alias.foreach(_ := 0.U)
-    mp_dct.vaddr.foreach(_ := 0.U)
-    mp_dct.isKeyword.foreach(_ := 0.U)
-    mp_dct.opcode := 0.U // DontCare
-    mp_dct.param := 0.U // DontCare
-    mp_dct.size := log2Ceil(blockBytes).U
-    mp_dct.sourceId := 0.U(sourceIdBits.W)
-    mp_dct.bufIdx := 0.U(sourceIdBits.W)
-    mp_dct.needProbeAckData := false.B
-    mp_dct.mshrTask := true.B
-    mp_dct.mshrId := io.id
-    mp_dct.aliasTask.foreach(_ := false.B)
-    mp_dct.useProbeData := true.B
-    mp_dct.readProbeDataDown := true.B
-    mp_dct.mshrRetry := false.B
-    mp_dct.way := dirResult.way
-    mp_dct.fromL2pft.foreach(_ := false.B)
-    mp_dct.needHint.foreach(_ := false.B)
-    mp_dct.dirty := hitDirty
-    mp_dct.meta := MetaEntry()
-    mp_dct.metaWen := false.B // meta is written by SnpResp[Data]Fwded, not CompData
-    mp_dct.tagWen := false.B
-    mp_dct.dsWen := false.B
-    mp_dct.wayMask := 0.U(cacheParams.ways.W)
-    mp_dct.reqSource := 0.U(MemReqSource.reqSourceBits.W)
-    mp_dct.replTask := false.B
-    mp_dct.cmoTask := cmo_cbo
-    mp_dct.mergeA := false.B
-    mp_dct.aMergeTask := 0.U.asTypeOf(new MergeTaskBundle)
-
-    // CHI
-    mp_dct.tgtID.get := req.fwdNID.get
-    mp_dct.srcID.get := 0.U
-    mp_dct.txnID.get := req.fwdTxnID.get
-    mp_dct.homeNID.get := req.srcID.get
-    mp_dct.dbID.get := req.txnID.get
-    mp_dct.chiOpcode.get := CompData
-    mp_dct.resp.get := setPD(fwdCacheState, fwdPassDirty)
-    mp_dct.fwdState.get := 0.U
-    mp_dct.pCrdType.get := 0.U // DontCare
-    mp_dct.retToSrc.get := false.B // DontCare
-    mp_dct.likelyshared.get := false.B
-    mp_dct.expCompAck.get := false.B // DontCare
-    mp_dct.traceTag.get := req.traceTag.get
-    mp_dct.snpHitRelease := req.snpHitRelease
-    mp_dct.snpHitReleaseToInval := req.snpHitReleaseToInval
-    mp_dct.snpHitReleaseToClean := req.snpHitReleaseToClean
-    mp_dct.snpHitReleaseWithData := req.snpHitReleaseWithData
-    mp_dct.snpHitReleaseIdx := req.snpHitReleaseIdx
-    mp_dct.snpHitReleaseMeta := req.snpHitReleaseMeta
-
-    mp_dct
-  }
-
-  val mp_cmometaw_task = {
-    mp_cmometaw.channel := 0.U
-    mp_cmometaw.txChannel := 0.U
-    mp_cmometaw.tag := req.tag
-    mp_cmometaw.set := req.set
-    mp_cmometaw.off := req.off
-    mp_cmometaw.alias.foreach(_ := 0.U)
-    mp_cmometaw.vaddr.foreach(_ := 0.U)
-    mp_cmometaw.isKeyword.foreach(_ := 0.U)
-    mp_cmometaw.opcode := 0.U // DontCare
-    mp_cmometaw.param := 0.U // DontCare
-    mp_cmometaw.size := log2Ceil(blockBytes).U
-    mp_cmometaw.sourceId := 0.U(sourceIdBits.W)
-    mp_cmometaw.bufIdx := 0.U(sourceIdBits.W)
-    mp_cmometaw.needProbeAckData := false.B
-    mp_cmometaw.mshrTask := true.B
-    mp_cmometaw.mshrId := io.id
-    mp_cmometaw.aliasTask.foreach(_ := false.B)
-    mp_cmometaw.useProbeData := false.B
-    mp_cmometaw.readProbeDataDown := false.B
-    mp_cmometaw.mshrRetry := false.B
-    mp_cmometaw.way := dirResult.way
-    mp_cmometaw.fromL2pft.foreach(_ := false.B)
-    mp_cmometaw.needHint.foreach(_ := false.B)
-    mp_cmometaw.dirty := hitDirty
-
-    // write meta for compensation of ProbeAck TtoB/TtoN by cbo.clean
-    // *NOTICE: There is no possible nest for 'cmometaw' task, snoops should be blocked by RXSNP.
-    mp_cmometaw.meta := meta
-    mp_cmometaw.meta.clients := meta.clients
-    mp_cmometaw.meta.dirty := false.B
-    mp_cmometaw.meta.state := TIP // write TIP for compensation of ProbeAck TtoB/TtoN by cbo.clean
-    mp_cmometaw.metaWen := true.B
-
-    mp_cmometaw.tagWen := false.B
-    mp_cmometaw.dsWen := false.B
-    mp_cmometaw.wayMask := 0.U(cacheParams.ways.W)
-    mp_cmometaw.reqSource := 0.U(MemReqSource.reqSourceBits.W)
-    mp_cmometaw.replTask := false.B
-    mp_cmometaw.cmoTask := cmo_cbo
-    mp_cmometaw.mergeA := false.B
-    mp_cmometaw.aMergeTask := 0.U.asTypeOf(new MergeTaskBundle)
-
-    // CHI
-    mp_cmometaw.tgtID.get := 0.U
-    mp_cmometaw.srcID.get := 0.U
-    mp_cmometaw.txnID.get := 0.U
-    mp_cmometaw.homeNID.get := 0.U
-    mp_cmometaw.dbID.get := 0.U
-    mp_cmometaw.chiOpcode.get := 0.U
-    mp_cmometaw.resp.get := 0.U
-    mp_cmometaw.fwdState.get := 0.U
-    mp_cmometaw.pCrdType.get := 0.U // DontCare
-    mp_cmometaw.retToSrc.get := false.B // DontCare
-    mp_cmometaw.likelyshared.get := false.B
-    mp_cmometaw.expCompAck.get := false.B // DontCare
-    mp_cmometaw.traceTag.get := 0.U
-    mp_cmometaw.snpHitRelease := req.snpHitRelease
-    mp_cmometaw.snpHitReleaseToInval := req.snpHitReleaseToInval
-    mp_cmometaw.snpHitReleaseToClean := req.snpHitReleaseToClean
-    mp_cmometaw.snpHitReleaseWithData := req.snpHitReleaseWithData
-    mp_cmometaw.snpHitReleaseIdx := req.snpHitReleaseIdx
-    mp_cmometaw.snpHitReleaseMeta := req.snpHitReleaseMeta
-
-    mp_cmometaw
-  }
-
   mainpipeIntent.bits := ParallelPriorityMux(
     Seq(
       (mainpipeProposedVariant === 0.U) -> mp_repl_read,
       (mainpipeProposedVariant === 1.U) -> mp_grant,
       (mainpipeProposedVariant === 2.U) -> mp_normal_refill_revalidate,
-      (mainpipeProposedVariant === 3.U) -> mp_normal_refill_commit,
-      (mainpipeProposedVariant === 4.U) -> mp_release,
-      (mainpipeProposedVariant === 5.U) -> mp_cbwrdata,
-      (mainpipeProposedVariant === 6.U) -> mp_probeack,
-      (mainpipeProposedVariant === 7.U) -> mp_dct,
-      (mainpipeProposedVariant === 8.U) -> mp_cmometaw
+      (mainpipeProposedVariant === 3.U) -> mp_normal_refill_commit
     )
   )
   mainpipeIntent.bits.reqSource := req.reqSource
   mainpipeIntent.bits.isKeyword.foreach(_ := req.isKeyword.getOrElse(false.B))
   mainpipeVariant := PriorityEncoder(VecInit(Seq(
     mp_repl_read_valid, mp_grant_valid, mp_normal_refill_revalidate_valid,
-    mp_normal_refill_commit_valid, mp_release_valid, mp_cbwrdata_valid,
-    mp_probeack_valid, mp_dct_valid, mp_cmometaw_valid)).asUInt)
+    mp_normal_refill_commit_valid)).asUInt)
   val grantOpcode = odOpGen(req.opcode)
   val grantClass = grantOpcode === Grant || grantOpcode === GrantData ||
     grantOpcode === AccessAckData || grantOpcode === HintAck
-  val mainpipeClass = Mux((req.fromB && mainpipeVariant =/= 8.U) ||
-    mainpipeVariant === 6.U || mainpipeVariant === 7.U, 0.U(3.W),
-    Mux(mainpipeVariant === 1.U && grantClass, 1.U(3.W),
-      Mux(mainpipeVariant === 0.U || mainpipeVariant === 2.U || mainpipeVariant === 3.U,
-        2.U(3.W), 4.U(3.W))))
+  val mainpipeClass = Mux(mainpipeVariant === 1.U && grantClass, 1.U(3.W), 2.U(3.W))
   mainpipeProposedVariant := MainpipeLeaseIO.freeze(io.tasks.preparedLease,
     mainpipeIntent, io.tasks.mainpipe, mainpipeVariant, mainpipeClass, mainpipeInvalidate)
   mainpipeIssuedVariant := mainpipeProposedVariant
@@ -1735,18 +1103,13 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
 
   /* ======== Task update ======== */
   when(io.tasks.txreq.fire) {
-    // *NOTICE: Two parts of CMO procedure (release, acquire) were all possible to be retried.
-    when(!cmo_cbo) {
-      assert(!readTxnInFlight, "a normal MSHR must not issue a second CHI read before the first retires")
-      assert(
-        normalInitialIssue || retryReissue,
-        "a normal MSHR may issue a CHI read only initially or after RetryAck + PCrdGrant"
-      )
-      readTxnInFlight := true.B
-    }
+    assert(!readTxnInFlight, "a normal MSHR must not issue a second CHI read before the first retires")
+    assert(normalInitialIssue || retryReissue,
+      "a normal MSHR may issue a CHI read only initially or after RetryAck + PCrdGrant")
+    readTxnInFlight := true.B
     readTxnEpochSent := readTxnEpochGen
     readTxnEpochGen := readTxnEpochGen + 1.U
-    state.s_acquire := Mux(cmo_cbo, state.s_acquire || state.w_releaseack, true.B)
+    state.s_acquire := true.B
     when(!state.s_reissue.get) {
       state.s_reissue.get := true.B
       gotRetryAck := false.B
@@ -1754,16 +1117,9 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     }
   }
   when(io.tasks.txrsp.fire) {
-    when(rcompack_valid) {
-      state.s_rcompack.get := true.B
-    }
-    when(wcompack_valid) {
-      state.s_wcompack.get := true.B
-    }
-    assert(!(rcompack_valid && wcompack_valid))
+    state.s_rcompack.get := true.B
   }
   when(io.sourceBAccepted) {
-    state.s_pprobe := true.B
     state.s_rprobe := true.B
     sourceBProbeIssued := true.B
   }
@@ -1785,44 +1141,20 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       when(io.tasks.mainpipe.bits.replTask) {
         replReadInFlight := true.B
       }
-      when(io.tasks.mainpipe.bits.opcode === CBOAck) {
-        state.s_cmoresp := true.B
-      }
-      when(!cmo_cbo) {
-        grantMergeSemanticsLatched := true.B
-        grantMergedClientLatched := mergeA
-        grantMergedNeedsTLatched := mergedGrantNeedsT
-        grantMergedAliasLatched.foreach(_ := mergedAlias.getOrElse(0.U))
-      }
+      grantMergeSemanticsLatched := true.B
+      grantMergedClientLatched := mergeA
+      grantMergedNeedsTLatched := mergedGrantNeedsT
+      grantMergedAliasLatched.foreach(_ := mergedAlias.getOrElse(0.U))
     }.elsewhen(mainpipeIssuedVariant === 3.U) {
       normalRefillCommitIssued := true.B
       refillWritePending := true.B
-    }.elsewhen(mainpipeIssuedVariant === 4.U) {
-      req_released_chiOpcode := io.tasks.mainpipe.bits.chiOpcode.get
-      req_released_likelyShared := io.tasks.mainpipe.bits.likelyshared.get
-      state.s_release := true.B
-      state.s_cbwrdata.get := isEvict
-      when(isEvict) {
-        meta.state := INVALID
-        meta.dirty := false.B
-      }
-    }.elsewhen(mainpipeIssuedVariant === 5.U) {
-      state.s_cbwrdata.get := true.B
-      meta.state := INVALID
-      meta.dirty := false.B
-    }.elsewhen(mainpipeIssuedVariant === 6.U) {
-      state.s_probeack := true.B
-    }.elsewhen(mainpipeIssuedVariant === 7.U) {
-      state.s_dct.get := true.B
-    }.elsewhen(mainpipeIssuedVariant === 8.U) {
-      state.s_cmometaw := true.B
     }
   }
 
   // Only the SourceD handoff marks the L1-visible Grant complete; RequestArb acceptance may retry.
   val grantTimerCycle = RegInit(0.U(64.W))
   when(io.grantSent) {
-    assert(req_valid && !cmo_cbo, "grantSent must belong to a live non-CMO normal MSHR")
+    assert(req_valid, "grantSent must belong to a live non-CMO normal MSHR")
     assert(!grantIssued, "normal MSHR emitted more than one L1-visible Grant")
     grantIssued := true.B
     grantTimerCycle := timer
@@ -1842,13 +1174,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     }
   }
 
-  when(io.replaceDone && req_valid && cmo_cbo) {
-    sidecarCmoDone := true.B
-    state.s_release := true.B
-    state.w_releaseack := true.B
-    state.s_cbwrdata.foreach(_ := true.B)
-    state.s_cmometaw := true.B
-  }
   val readTxnTerminal = readTxnInFlight && state.w_grant && state.w_grantlast &&
     state.s_rcompack.getOrElse(true.B)
   io.readDBID.valid := req_valid && state.w_grantfirst
@@ -1864,10 +1189,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   // Probe core response
   when(c_resp.valid) {
     when(c_resp.bits.opcode === ProbeAck || c_resp.bits.opcode === ProbeAckData) {
-      state.w_rprobeackfirst := true.B
       state.w_rprobeacklast := state.w_rprobeacklast || c_resp.bits.last
-      state.w_pprobeackfirst := true.B
-      state.w_pprobeacklast := state.w_pprobeacklast || c_resp.bits.last
     }
     when(c_resp.bits.opcode === ProbeAckData) {
       probeDirty := true.B
@@ -1890,22 +1212,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       corrupt := corrupt || c_resp.bits.corrupt
     }
 
-    // CMO update release on ProbeAck/ProbeAckData
-    when(req_cboClean) {
-      when(c_resp.bits.opcode === ProbeAckData && state.w_rprobeackfirst) {
-        state.s_release := false.B
-        state.w_releaseack := false.B
-      }
-      when(c_resp.bits.opcode === ProbeAck) {
-        when(meta.dirty) {
-          state.s_release := false.B
-          state.w_releaseack := false.B
-        }.otherwise {
-          // meta write compensation on ProbeAck TtoB
-          state.s_cmometaw := false.B
-        }
-      }
-    }
   }
 
   val rxdatIsU = rxdat.bits.resp.get === UC /*UC_UD*/
@@ -1981,8 +1287,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
 
     when(rxrsp.bits.chiOpcode.get === Comp) {
       // There is a pending Read transaction waiting for the Comp resp
-      // *NOTICE: In CMO transactions, releases (if there was one) always happen before acquire
-      when(!state.w_grant && (state.s_cmoresp || state.w_releaseack)) {
+      when(!state.w_grant) {
         state.w_grantfirst := true.B
         state.w_grantlast := true.B
         state.w_grant := true.B
@@ -1994,27 +1299,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
         txnid_rcompack := rxrsp.bits.dbID.getOrElse(0.U)
       }
 
-      // There is a pending Evict/WriteEvictOrEvict transaction waiting for the Comp resp
-      when(!state.w_releaseack) {
-        state.w_releaseack := true.B
-        // There is no CompAck for Comp in response of Evict. Thus there is no need to record TraceTag.
-        // Except on WriteEvictOrEvict:
-        when(isWriteEvictOrEvict) {
-          req.traceTag.get := rxrsp.bits.traceTag.get
-          // For WriteEvictOrEvict, drop CopyBackWrData on Comp
-          state.s_cbwrdata.get := true.B
-          // Schedule CompAck on Comp
-          state.s_wcompack.get := false.B
-          tgtid_wcompack := rxrsp.bits.srcID.getOrElse(0.U)
-          txnid_wcompack := rxrsp.bits.dbID.getOrElse(0.U)
-        }
-      }
-    }
-    when(rxrsp.bits.chiOpcode.get === CompDBIDResp) {
-      state.w_releaseack := true.B
-      tgtid_wcompack := rxrsp.bits.srcID.getOrElse(0.U)
-      txnid_wcompack := rxrsp.bits.dbID.getOrElse(0.U)
-      cbWrDataTraceTag := rxrsp.bits.traceTag.get
     }
     when(rxrsp.bits.chiOpcode.get === RetryAck) {
       srcid_retryack := rxrsp.bits.srcID.getOrElse(0.U)
@@ -2057,7 +1341,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     when(normalRefillRevalidateResp) {
       normalRefillRevalidateNeeded := false.B
       state.w_replResp := true.B
-      mergeInstallWithGrant := !cmo_cbo && !mergeA && !replResp.hit &&
+      mergeInstallWithGrant := !mergeA && !replResp.hit &&
         (replResp.meta.state === INVALID || !replResp.meta.clients.orR)
       when(!normalRefillDroppedByToN) {
         when(replResp.hit) {
@@ -2073,7 +1357,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
           state.w_releaseack := false.B
           when(replResp.meta.clients.orR) {
             state.s_rprobe := false.B
-            state.w_rprobeackfirst := false.B
             state.w_rprobeacklast := false.B
             sourceBProbeIssued := false.B
           }
@@ -2081,7 +1364,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       }
     }.otherwise {
       state.w_replResp := true.B
-      mergeInstallWithGrant := !dirResult.hit && !cmo_cbo && !mergeA &&
+      mergeInstallWithGrant := !dirResult.hit && !mergeA &&
         (replResp.meta.state === INVALID || !replResp.meta.clients.orR)
       normalRefillRevalidateNeeded := false.B
 
@@ -2094,7 +1377,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
         state.w_releaseack := false.B
         when(replResp.meta.clients.orR) {
           state.s_rprobe := false.B
-          state.w_rprobeackfirst := false.B
           state.w_rprobeacklast := false.B
           sourceBProbeIssued := false.B
         }
@@ -2117,20 +1399,14 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     timer := timer + 1.U
   }
 
-  val no_schedule = state.s_refill && state.s_probeack &&
-    (state.s_release || sidecarDetached) &&
+  val no_schedule = state.s_refill && (state.s_release || sidecarDetached) &&
     state.s_rcompack.getOrElse(true.B) &&
-    state.s_wcompack.getOrElse(true.B) &&
-    state.s_cbwrdata.getOrElse(true.B) &&
-    state.s_reissue.getOrElse(true.B) &&
-    state.s_dct.getOrElse(true.B) &&
-    state.s_cmoresp &&
-    state.s_cmometaw
+    state.s_reissue.getOrElse(true.B)
   val no_wait =
-    (state.w_rprobeacklast || sidecarDetached) && state.w_pprobeacklast && state.w_grantlast && state.w_grant &&
+    (state.w_rprobeacklast || sidecarDetached) && state.w_grantlast && state.w_grant &&
       (state.w_releaseack || sidecarDetached) && state.w_replResp
   val mayRetire = no_schedule && no_wait &&
-    (cmo_cbo || normalRefillCommitIssued) &&
+    normalRefillCommitIssued &&
     !refillWritePending && !refillWayCommitPending && !readTxnInFlight &&
     !replLookupInFlight && !io.postGrantReleaseSnoopActive && !io.pairLifetimeHold && !io.sourceBHold && !io.bufferWritePending && !io.sinkCOwnerHold
   val retirementPending = RegInit(false.B)
@@ -2139,7 +1415,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     !io.tasks.preparedLease.held.valid && !io.tasks.preparedLease.proposalHeld && !mainpipeInvalidate
   io.tasks.preparedLease.canPrepare := req_valid && !mayRetire && !retirementPending
   MainpipeLeaseIO.acknowledge(io.tasks.preparedLease, req_valid, io.alloc.valid, io.tasks.mainpipe.fire)
-  io.replaceParentRelease := will_free && req_valid && !cmo_cbo
+  io.replaceParentRelease := will_free && req_valid
   when(will_free && req_valid) {
     req_valid := false.B
     timer := 0.U
@@ -2168,13 +1444,12 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   io.status.bits.metaTag := dirResult.tag
   io.status.bits.needsRepl := releaseNotSent
   // wait for resps, high as valid
-  io.status.bits.w_c_resp := !state.w_rprobeacklast || !state.w_pprobeacklast
+  io.status.bits.w_c_resp := !state.w_rprobeacklast
   io.status.bits.w_d_resp := !state.w_grantlast || !state.w_grant || !state.w_releaseack
   io.status.bits.will_free := will_free
   io.status.bits.is_miss := !dirResult.hit
   io.status.bits.is_prefetch := req_prefetch
   io.status.bits.reqSource := req.reqSource
-  io.status.bits.isCmo := cmo_cbo
   io.status.bits.releaseDataWindow := false.B
 
   io.statAlloc.valid := io.alloc.valid
@@ -2183,7 +1458,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   io.statAlloc.bits.channel := io.alloc.bits.task.channel
 
   io.msInfo.valid := req_valid
-  io.msInfo.bits.isCmo := cmo_cbo
   io.msInfo.bits.set := req.set
   io.msInfo.bits.way := dirResult.way
   io.msInfo.bits.reqTag := req.tag
@@ -2192,7 +1466,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   io.msInfo.bits.aliasTask.foreach(_ := req.aliasTask.getOrElse(false.B))
   io.msInfo.bits.needRelease := !state.w_releaseack
   // if releaseTask is already in mainpipe_s1/s2, while a refillTask in mainpipe_s3, the refill should also be blocked and retry
-  // also block refill when the CMO-derived ProbeAckData was not written to DS
   io.msInfo.bits.blockRefill := releaseNotSent || RegNext(releaseNotSent, false.B) || RegNext(
     RegNext(releaseNotSent, false.B),
     false.B
@@ -2212,7 +1485,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     mergeA
   )
   val grantAccepted = state.s_refill || grantIssued
-  io.msInfo.bits.grantPending := req_valid && !cmo_cbo && committedGrantTransfersClient &&
+  io.msInfo.bits.grantPending := req_valid && committedGrantTransfersClient &&
     grantAccepted &&
     (!normalRefillCommitIssued || refillWritePending || refillWayCommitPending)
   when(io.grantSent) {
@@ -2223,8 +1496,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   io.msInfo.bits.w_grant := state.w_grant
   io.msInfo.bits.s_release := state.s_release
   io.msInfo.bits.s_refill := state.s_refill
-  io.msInfo.bits.s_cmoresp := state.s_cmoresp
-  io.msInfo.bits.s_cmometaw := state.s_cmometaw
   io.msInfo.bits.w_releaseack := state.w_releaseack
   io.msInfo.bits.w_replResp := state.w_replResp
   io.msInfo.bits.w_rprobeacklast := state.w_rprobeacklast
@@ -2232,9 +1503,8 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   io.msInfo.bits.refillCommitPending :=
     !normalRefillCommitIssued || refillWritePending || refillWayCommitPending
   io.msInfo.bits.refillCommitLanded := normalRefillCommitIssued && !refillWritePending
-  io.msInfo.bits.replaceData := isT(meta.state) && meta.dirty || // including WriteCleanFull
-    isWriteEvictFull || isWriteEvictOrEvict
-  io.msInfo.bits.releaseToClean := releaseToClean
+  io.msInfo.bits.replaceData := isT(meta.state) && meta.dirty
+  io.msInfo.bits.releaseToClean := false.B
   io.msInfo.bits.blocksSnoop := false.B
   io.msInfo.bits.channel := req.channel
 
@@ -2244,7 +1514,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   /* ======== Handling Nested C ======== */
   // for A miss, only when replResp do we finally choose a way, allowing nested C
   // for A-alias, always allowing nested C (state.w_replResp === true.B)
-  // for CMO, always allowing nested C on directory hit (state.s_cmoresp === false.B)
   val nestedwb_match = req_valid &&
     dirResult.set === io.nestedwb.set &&
     dirResult.tag === io.nestedwb.tag &&
@@ -2256,10 +1525,10 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     dirResult.tag === io.nestedwb.tag
   // A pre-read local hit lost to ToN starts its first lower read; an existing read is never replayed.
   val lostLocalHit = nestedwb_hit_match && io.nestedwb.b_toN.get && req.fromA &&
-    !cmo_cbo && state.s_acquire && !readTxnInFlight && !state.s_refill &&
+    state.s_acquire && !readTxnInFlight && !state.s_refill &&
     !grantIssued && !io.grantSent && !gotGrantData && !probeDirty
   val postGrantToN = nestedwb_hit_match && io.nestedwb.b_toN.get && req.fromA &&
-    !cmo_cbo && (grantIssued || io.grantSent)
+    (grantIssued || io.grantSent)
 
   when(nestedwb_match) {
     when(io.nestedwb.c_set_dirty) {
@@ -2278,10 +1547,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       probeDirty := false.B
     }
   }
-  XSPerfAccumulate(
-    "cmo_nested_RXSNP_inv_dirty",
-    req_valid && nestedwb_match && io.nestedwb.b_inv_dirty && req.fromA && cmo_cbo
-  )
   when(nestedwb_hit_match) {
     when(io.nestedwb.b_toClean.get && req.fromA) {
       meta.dirty := false.B
@@ -2294,8 +1559,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       meta.state := INVALID
       dirResult.hit := false.B
       meta.clients := Fill(clientBits, false.B)
-      state.w_replResp := cmo_cbo // never query replacer on CMO
-      state.s_cmometaw := true.B
+      state.w_replResp := false.B
       req.aliasTask.foreach(_ := false.B)
     }
   }
@@ -2335,28 +1599,12 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       "a snoop-consumed normal refill must retire without re-installing RefillBuf"
     )
   }
-  XSPerfAccumulate(
-    "cmo_nested_RXSNP_toClean",
-    req_valid && nestedwb_hit_match && io.nestedwb.b_toClean.get && req.fromA && cmo_cbo
-  )
-  XSPerfAccumulate(
-    "cmo_nested_RXSNP_toB",
-    req_valid && nestedwb_hit_match && io.nestedwb.b_toB.get && req.fromA && cmo_cbo
-  )
-  XSPerfAccumulate(
-    "cmo_nested_RXSNP_toN",
-    req_valid && nestedwb_hit_match && io.nestedwb.b_toN.get && req.fromA && cmo_cbo
-  )
   when(nestedReleaseTargetsRefill && io.nestedwb.c_set_dirty) {
     gotDirty := true.B
   }
   val nestedReleaseNeedsReplace = nestedwb_match && io.nestedwb.c_set_dirty &&
     !nestedReleaseTargetsRefill
   io.nestedReleaseNeedsReplace := nestedReleaseNeedsReplace
-  io.cmoSidecarReq := req_valid && cmo_cbo && dirResult.hit &&
-    !state.s_release && !sidecarDelegatedLatched
-  io.cmoSidecarMode := Mux(req_cboClean, ReplaceMSHRMode.cmoClean,
-    Mux(req_cboFlush, ReplaceMSHRMode.cmoFlush, ReplaceMSHRMode.cmoInval))
   io.nestedwbData := nestedwb_match && io.nestedwb.c_set_dirty &&
     (sidecarDelegatedLatched || nestedReleaseNeedsReplace)
 
@@ -2397,19 +1645,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
     req.opcode,
     req.channel
   )
-
-  val evictFire = io.tasks.txreq.fire && io.tasks.txreq.bits.opcode === Evict ||
-    io.tasks.mainpipe.fire && io.tasks.mainpipe.bits.opcode === Evict && io.tasks.mainpipe.bits.toTXREQ
-  val wbFire = io.tasks.txreq.fire && io.tasks.txreq.bits.opcode === WriteBackFull ||
-    io.tasks.mainpipe.fire && io.tasks.mainpipe.bits.opcode === WriteBackFull && io.tasks.mainpipe.bits.toTXREQ
-  val wcFire = io.tasks.txreq.fire && io.tasks.txreq.bits.opcode === WriteCleanFull ||
-    io.tasks.mainpipe.fire && io.tasks.mainpipe.bits.opcode === WriteCleanFull && io.tasks.mainpipe.bits.toTXREQ
-  val weFire = io.tasks.txreq.fire && io.tasks.txreq.bits.opcode === WriteEvictFull ||
-    io.tasks.mainpipe.fire && io.tasks.mainpipe.bits.opcode === WriteEvictFull && io.tasks.mainpipe.bits.toTXREQ
-  assert(!RegNext(evictFire) || state.s_cbwrdata.get, "There should be no CopyBackWrData after Evict")
-  assert(!RegNext(wbFire) || !state.s_cbwrdata.get, "There must be a CopyBackWrData after WriteBack")
-  assert(!RegNext(wcFire) || !state.s_cbwrdata.get, "There must be a CopyBackWrData after WriteClean")
-  assert(!RegNext(weFire) || !state.s_cbwrdata.get, "There must be a CopyBackWrData after WriteEvictFull")
 
   /* ======== Performance counters ======== */
   // time stamp

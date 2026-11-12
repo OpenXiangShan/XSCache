@@ -35,7 +35,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   val io = IO(new BaseSliceIO[OuterBundle] {
     override val out: OuterBundle = new OuterBundle
   })
-  val io_pCrd = IO(Vec(mshrsAll, new PCrdQueryBundle))
+  val io_pCrd = IO(Vec(2 * mshrsAll, new PCrdQueryBundle))
 
   val io_cdp_triggers = Option.when(hasCDP) (IO(ValidIO(new CDPDetectTask(dataBits=blockBits))))
 

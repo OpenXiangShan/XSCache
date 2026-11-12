@@ -151,7 +151,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val busContention = prefetchOpt.map(_ => ValidIO(new BusContentionBundle))
 
     /* to Slice Top for pCrd info.*/
-    val pCrd = Vec(mshrsAll, new PCrdQueryBundle)
+    val pCrd = Vec(2 * mshrsAll, new PCrdQueryBundle)
 
     /* for TopDown */
     val l2Miss = Output(Bool())
@@ -475,11 +475,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     )
   ).asUInt
   val replRespSnoopConflict = replRespSnoopConflictOH.orR
-  val replRespCmoConflictCapture = VecInit(refillMshrs.map { refill =>
-    replRespHasVictim && refill.io.status.valid && refill.io.status.bits.isCmo &&
-      refill.io.status.bits.set === io.replResp.bits.set &&
-      refill.io.status.bits.reqTag === io.replResp.bits.tag
-  }).asUInt.orR
   val replRespOwnerConflictCapture = replRespSidecarConflict || replRespSnoopConflict
   val replRespParentOHCapture = UIntToOH(io.replResp.bits.mshrId, mshrsAll)
   val replaceParentMatches = Seq.tabulate(mshrsAll) { parent =>
@@ -527,7 +522,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val replaceInfoValidOH = VecInit(replaceMshrs.map(_.io.info.valid)).asUInt
   val refillBlocksSnoopOH = VecInit(refillMshrs.map { refill =>
     refill.io.status.valid && (
-      refill.io.status.bits.isCmo ||
         refill.io.status.bits.w_c_resp ||
         refill.io.status.bits.releaseDataWindow
     )
@@ -542,7 +536,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   )
   val replaceSlotUnreservedOH = VecInit((0 until mshrsAll).map { i =>
     !snoopMshrs(i).io.status.valid && !replaceMshrs(i).io.info.valid &&
-      !replaceReservedSlotOH(i) && !snoopServiceSlotOH(i)
+      !replaceReservedSlotOH(i) && !snoopServiceSlotOH(i) &&
+      !(normalServiceCmo && normalServiceSlotOH(i))
   }).asUInt
   val snoopAllocRequest = io.fromMainPipe.mshr_alloc_s3.valid &&
     io.fromMainPipe.mshr_alloc_s3.bits.task.fromB
@@ -655,12 +650,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val replRespReservationOHCapture = Mux1H(replRespParentOHCapture, replaceReserveSlotOHByParent)
   val replRespNoReplaceSlotCapture = replRespNeedsReplaceRawCapture && !replRespReservationOHCapture.orR
   val replRespNeedsReplaceCapture = replRespNeedsReplaceRawCapture && !replRespNoReplaceSlotCapture
-  io.toMainPipe.replRespRetry := replRespSnoopConflict || replRespParentConflictCapture || replRespNoReplaceSlotCapture ||
-    replRespCmoConflictCapture
+  io.toMainPipe.replRespRetry := replRespSnoopConflict || replRespParentConflictCapture || replRespNoReplaceSlotCapture
   val replRespNoProbeVictim = io.replResp.valid && !io.replResp.bits.hit && !io.replResp.bits.retry &&
     (io.replResp.bits.meta.state === INVALID || !io.replResp.bits.meta.clients.orR)
   io.toMainPipe.grantInstallOK := replRespNoProbeVictim &&
-    !replRespOwnerConflictCapture && !replRespParentConflictCapture && !replRespCmoConflictCapture &&
+    !replRespOwnerConflictCapture && !replRespParentConflictCapture &&
     (io.replResp.bits.meta.state === INVALID || replRespReservationOHCapture.orR)
   io.toMainPipe.grantInstallSlot := OHToUInt(replRespReservationOHCapture)
   when(replRespSnoopConflict) {
@@ -676,7 +670,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val ownerConflict = Bool()
     val parentConflict = Bool()
     val noReplaceSlot = Bool()
-    val cmoConflict = Bool()
   }
   val replDecision = RegInit(0.U.asTypeOf(Valid(new ReplacerDecision)))
   replDecision.valid := io.replResp.valid
@@ -690,7 +683,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     replDecision.bits.ownerConflict := replRespOwnerConflictCapture
     replDecision.bits.parentConflict := replRespParentConflictCapture
     replDecision.bits.noReplaceSlot := replRespNoReplaceSlotCapture
-    replDecision.bits.cmoConflict := replRespCmoConflictCapture
   }
   io.toMainPipe.replParentGeneration := Mux1H(replRespParentOHCapture, mshrTaskGenerations(0))
   val replRespParentOH = UIntToOH(replDecision.bits.response.mshrId, mshrsAll)
@@ -707,7 +699,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val replRespOwnerConflict = replDecision.bits.ownerConflict
   val replRespParentConflict = replDecision.bits.parentConflict
   val replRespNoReplaceSlot = replDecision.bits.noReplaceSlot
-  val replRespCmoConflict = replDecision.bits.cmoConflict
   when(replDecision.valid) {
     assert(replDecisionCurrent, "replacer decision lost its retained normal parent")
     assert(replSlotCurrent, "replacer decision lost its retained sidecar slot generation")
@@ -748,19 +739,18 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val orphanReleaseData = orphanReleaseCandidate && !orphanReleaseTargetsReplace
   val replaceSlotIdle = replaceSlotUnreservedOH &
     ~Mux(replaceReserveGrant, replaceReserveGrantSlotOH, 0.U(mshrsAll.W))
-  val cmoSidecarReqOH = VecInit(refillMshrs.map(_.io.cmoSidecarReq)).asUInt
-  val cmoSidecarAlloc = cmoSidecarReqOH.orR && !io.replResp.valid && !replResponseApplied.valid &&
-    !nestedReleaseNeedsReplace && !orphanReleaseData && !snoopReservationFence &&
-    !snoopAllocRequest &&
-    replaceSlotIdle.orR
-  val cmoSidecarParentOH = PriorityEncoderOH(cmoSidecarReqOH)
+  val cmoAlloc = io.fromMainPipe.mshr_alloc_s3.valid &&
+    io.fromMainPipe.mshr_alloc_s3.bits.task.fromA &&
+    normalCmo(io.fromMainPipe.mshr_alloc_s3.bits.task)
+  val cmoAllocTask = io.fromMainPipe.mshr_alloc_s3.bits.task
+  val cmoAllocDir = io.fromMainPipe.mshr_alloc_s3.bits.dirResult
   val replaceNeedsAlloc = replRespNeedsReplace || nestedReleaseNeedsReplace ||
-    orphanReleaseData || cmoSidecarAlloc
+    orphanReleaseData || cmoAlloc
   val replaceParentOH = Mux(replRespNeedsReplace, replRespParentOH,
-    Mux(cmoSidecarAlloc, cmoSidecarParentOH, nestedReleaseParentOH))
+    nestedReleaseParentOH)
   val replaceParentId = OHToUInt(replaceParentOH)
   assert(
-    PopCount(Cat(replRespNeedsReplace, nestedReleaseNeedsReplace, orphanReleaseData, cmoSidecarAlloc)) <= 1.U,
+    PopCount(Cat(replRespNeedsReplace, nestedReleaseNeedsReplace, orphanReleaseData, cmoAlloc)) <= 1.U,
     "two independent ReplaceMSHR allocations requested in one cycle"
   )
   when(nestedReleaseNeedsReplace) {
@@ -785,11 +775,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     incomingVictim.way := replResponseApplied.bits.way
     incomingVictim.meta := replResponseApplied.bits.meta
   }
-  when(cmoSidecarAlloc) {
-    incomingVictim.tag := Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.reqTag))
-    incomingVictim.set := Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.set))
-    incomingVictim.way := Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.way))
-    incomingVictim.meta := Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.meta))
+  when(cmoAlloc) {
+    incomingVictim := cmoAllocDir
+    incomingVictim.tag := Mux(cmoAllocTask.cmoAll, cmoAllocDir.tag, cmoAllocTask.tag)
   }
   when(orphanReleaseData) {
     incomingVictim.tag := io.nestedwb.tag
@@ -807,38 +795,42 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   incomingReplaceReq.parentId := replaceParentId
   incomingReplaceReq.parentEpoch := Mux(replRespNeedsReplace, replDecision.bits.parentEpoch,
     Mux1H(replaceParentOH, refillMshrs.map(_.io.allocEpoch)))
-  incomingReplaceReq.parentAttached := !orphanReleaseData
+  incomingReplaceReq.parentAttached := !orphanReleaseData && !cmoAlloc
   incomingReplaceReq.dirResult := incomingVictim
-  incomingReplaceReq.mode := Mux(cmoSidecarAlloc,
-    Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.cmoSidecarMode)),
+  incomingReplaceReq.mode := Mux(cmoAlloc,
+    Mux(cmoAllocTask.opcode === CBOClean, ReplaceMSHRMode.cmoClean,
+      Mux(cmoAllocTask.opcode === CBOFlush, ReplaceMSHRMode.cmoFlush, ReplaceMSHRMode.cmoInval)),
     ReplaceMSHRMode.victim)
-  incomingReplaceReq.needProbe := (replRespNeedsReplace || cmoSidecarAlloc) &&
-    incomingVictim.meta.clients.orR
+  incomingReplaceReq.needRelease := !cmoAlloc || !io.fromMainPipe.mshr_alloc_s3.bits.state.s_release
+  incomingReplaceReq.needProbe := (replRespNeedsReplace || cmoAlloc) &&
+    incomingReplaceReq.needRelease && incomingVictim.meta.clients.orR
   incomingReplaceReq.probeParam := Mux(
-    cmoSidecarAlloc && incomingReplaceReq.mode === ReplaceMSHRMode.cmoClean, toB, toN)
+    cmoAlloc && incomingReplaceReq.mode === ReplaceMSHRMode.cmoClean, toB, toN)
   incomingReplaceReq.captureFromDS := (replRespNeedsReplace &&
-      !io.fromMainPipe.grantInstallDone.valid) || cmoSidecarAlloc
+    !io.fromMainPipe.grantInstallDone.valid) || cmoAlloc && incomingReplaceReq.needRelease
   incomingReplaceReq.task := 0.U.asTypeOf(new TaskBundle)
   incomingReplaceReq.task.set := incomingVictim.set
   incomingReplaceReq.task.tag := incomingVictim.tag
+  when(cmoAlloc) { incomingReplaceReq.task := cmoAllocTask }
   val incomingReplaceInfo = WireInit(0.U.asTypeOf(new ReplaceMSHRInfo))
   incomingReplaceInfo.valid := replaceNeedsAlloc
   incomingReplaceInfo.parentId := replaceParentId
   incomingReplaceInfo.parentEpoch := incomingReplaceReq.parentEpoch
-  incomingReplaceInfo.parentAttached := replaceNeedsAlloc && !orphanReleaseData
+  incomingReplaceInfo.parentAttached := incomingReplaceReq.parentAttached
+  incomingReplaceInfo.ownsWay := incomingReplaceReq.parentAttached ||
+    cmoAlloc && incomingVictim.hit && isValid(incomingVictim.meta.state)
   incomingReplaceInfo.set := incomingVictim.set
   incomingReplaceInfo.tag := incomingVictim.tag
   incomingReplaceInfo.way := incomingVictim.way
   incomingReplaceInfo.meta := incomingVictim.meta
 
   val selectedReplaceSlotOH = Mux(
-    replRespNeedsReplace,
-    replRespReservationOH,
-    PriorityEncoderOH(replaceSlotIdle)
+    cmoAlloc, normalServiceSlotOH,
+    Mux(replRespNeedsReplace, replRespReservationOH, PriorityEncoderOH(replaceSlotIdle))
   )
 
   (0 until mshrsAll).foreach { i =>
-    val incomingForParent = replaceNeedsAlloc && !orphanReleaseData && replaceParentOH(i)
+    val incomingForParent = replaceNeedsAlloc && incomingReplaceReq.parentAttached && replaceParentOH(i)
     when(incomingForParent) {
       assert(refillMshrs(i).io.status.valid, "replacement result without a live parent normal MSHR")
     }
@@ -855,10 +847,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
 
   val replaceTargetMatches = Seq.tabulate(mshrsAll) { parent =>
     replaceParentMatches(parent) |
-      Mux(replaceNeedsAlloc && !orphanReleaseData && replaceParentOH(parent), selectedReplaceSlotOH, 0.U)
+      Mux(replaceNeedsAlloc && incomingReplaceReq.parentAttached && replaceParentOH(parent), selectedReplaceSlotOH, 0.U)
   }
-  val replaceNestedAllocParentOH = Mux(nestedReleaseNeedsReplace, nestedReleaseParentOH,
-    Mux(cmoSidecarAlloc, cmoSidecarParentOH, 0.U(mshrsAll.W)))
+  val replaceNestedAllocParentOH = Mux(nestedReleaseNeedsReplace, nestedReleaseParentOH, 0.U(mshrsAll.W))
   val replaceNestedSlotOH = PriorityEncoderOH(replaceSlotIdle)
   val replaceNestedTargetMatches = Seq.tabulate(mshrsAll) { parent =>
     replaceParentMatches(parent) |
@@ -866,28 +857,26 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   assert(!(replResponseApplied.valid && io.nestedwb.c_set_dirty),
     "refill result and nested C must correspond to distinct shared-S3 tasks")
-  when(nestedReleaseNeedsReplace || cmoSidecarAlloc) {
+  when(nestedReleaseNeedsReplace) {
     assert(replaceNestedSlotOH === selectedReplaceSlotOH,
       "nested payload target must equal the actual allocated physical slot")
   }
-  val parentAlreadyHasChild = Mux1H(replaceParentOH, replaceActiveForParent)
-  val replaceSlotAvailable = Mux(replRespNeedsReplace,
-    replRespReservationOH.orR, replaceSlotIdle.orR)
+  val parentAlreadyHasChild = incomingReplaceReq.parentAttached &&
+    Mux1H(replaceParentOH, replaceActiveForParent)
+  val replaceSlotAvailable = selectedReplaceSlotOH.orR
   assert(replaceSlotAvailable === selectedReplaceSlotOH.orR,
     "replacement availability must equal the selected-slot nonzero test")
   val replaceAllocValid = replaceNeedsAlloc && replaceSlotAvailable &&
-    (orphanReleaseData || !parentAlreadyHasChild)
+    (!incomingReplaceReq.parentAttached || !parentAlreadyHasChild)
   assert(
-    !(replaceNeedsAlloc && !orphanReleaseData && parentAlreadyHasChild),
+    !(replaceNeedsAlloc && incomingReplaceReq.parentAttached && parentAlreadyHasChild),
     "replacer response for a parent that already owns a child ReplaceMSHR"
   )
   // Advertise the winning raw allocation address as one complete registered descriptor, before slot acceptance.
   val replaceAllocSnoopSources = Seq(
     (nestedReleaseNeedsReplace, nestedVictim.set, nestedVictim.tag),
     (replRespNeedsReplace, replResponseApplied.bits.set, replResponseApplied.bits.tag),
-    (cmoSidecarAlloc,
-      Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.set)),
-      Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.reqTag))),
+    (cmoAlloc, incomingVictim.set, incomingVictim.tag),
     (orphanReleaseData, io.nestedwb.set, io.nestedwb.tag)
   )
   val replaceAllocOriginRequested = ReplacementAllocAddress.requestedOrigins(
@@ -913,20 +902,23 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val pipeContextCount = PopCount(Cat(io.pipeStatusVec.map(_.valid)))
   val srContextCount = PopCount(Cat((0 until mshrsAll).map { i =>
     snoopMshrs(i).io.status.valid || replaceMshrs(i).io.info.valid ||
-      replaceReservedSlotOH(i) || snoopServiceSlotOH(i)
+      replaceReservedSlotOH(i) || snoopServiceSlotOH(i) ||
+      normalServiceCmo && normalServiceSlotOH(i)
   }))
   def allocationCredit(used: UInt): UInt = {
     val credit = RegInit(0.U(log2Ceil(mshrsAll + 1).W))
     credit := Mux(used >= mshrsAll.U, 0.U, mshrsAll.U - used)
     credit
   }
-  val normalSlotEligibleOH = VecInit(refillMshrs.zipWithIndex.map { case (refill, i) =>
-    !refill.io.status.valid && !normalServiceSlotOH(i) &&
-      (!normalCmo(io.normalReserveRequest.bits) ||
-        (!snoopMshrs(i).io.status.valid && !snoopServiceSlotOH(i)))
-  }).asUInt
+  val normalSlotEligibleOH = Mux(normalCmo(io.normalReserveRequest.bits),
+    replaceSlotIdle, VecInit(refillMshrs.zipWithIndex.map { case (refill, i) =>
+      !refill.io.status.valid && !(normalServiceSlotOH(i) && !normalServiceCmo)
+    }).asUInt)
   val normalSlotPickOH = PriorityEncoderOH(normalSlotEligibleOH)
-  io.normalReserveRequest.ready := !normalService.valid && normalSlotEligibleOH.orR
+  io.normalReserveRequest.ready := !normalService.valid && normalSlotEligibleOH.orR &&
+    (!normalCmo(io.normalReserveRequest.bits) ||
+      (PopCount(replaceSlotIdle) > 1.U && !snoopReservationFence &&
+        !replaceNeedsAlloc && !io.snoopAdmission.fire))
   io.normalReserveAck.valid := normalService.valid && !normalServiceInFlight
   io.normalReserveAck.bits := normalService.bits
   when(io.normalReserveRequest.fire) {
@@ -934,7 +926,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     normalServiceInFlight := false.B
     normalService.bits.id := OHToUInt(normalSlotPickOH)
     normalService.bits.task := io.normalReserveRequest.bits
-    normalService.bits.token.generation := Mux1H(normalSlotPickOH, mshrTaskGenerations(0)) + 1.U
+    normalService.bits.token.generation := Mux(normalCmo(io.normalReserveRequest.bits),
+      Mux1H(normalSlotPickOH, mshrTaskGenerations(2)),
+      Mux1H(normalSlotPickOH, mshrTaskGenerations(0))) + 1.U
     normalService.bits.token.sequence := normalReservationSequence + 1.U
     normalReservationSequence := normalReservationSequence + 1.U
     assert(!io.normalReserveRequest.bits.mshrTask && io.normalReserveRequest.bits.fromA,
@@ -968,15 +962,19 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     normalServiceInFlight := false.B
   }
   when(normalService.valid) {
-    assert(!Mux1H(normalServiceSlotOH, refillMshrs.map(_.io.status.valid)),
-      "a reserved normal slot must stay free until its own allocation")
-    assert(Mux1H(normalServiceSlotOH, mshrTaskGenerations(0)) + 1.U ===
-      normalService.bits.token.generation,
-      "normal reservation must retain the next allocation generation")
+    val occupied = Mux(normalServiceCmo,
+      Mux1H(normalServiceSlotOH, replaceMshrs.map(_.io.info.valid)),
+      Mux1H(normalServiceSlotOH, refillMshrs.map(_.io.status.valid)))
+    val generation = Mux(normalServiceCmo,
+      Mux1H(normalServiceSlotOH, mshrTaskGenerations(2)),
+      Mux1H(normalServiceSlotOH, mshrTaskGenerations(0)))
+    assert(!occupied, "a reserved A slot must stay free until its own allocation")
+    assert(generation + 1.U === normalService.bits.token.generation,
+      "A reservation must retain its selected pool's next allocation generation")
   }
   val snoopCredit = allocationCredit(srContextCount +& pipeContextCount +&
     io.contextReservation.asUInt +& replaceReserveGrant.asUInt +&
-    cmoSidecarAlloc.asUInt +& io.snoopAdmission.fire.asUInt)
+    cmoAlloc.asUInt +& io.snoopAdmission.fire.asUInt)
   val normalMshrFull = !normalService.valid && !normalSlotEligibleOH.orR
   val snoopMshrFull = snoopCredit === 0.U
   val mshrFull = snoopMshrFull
@@ -1106,8 +1104,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         task.set === normalService.bits.task.set && task.tag === normalService.bits.task.tag &&
         task.sourceId === normalService.bits.task.sourceId,
         "MainPipe normal allocation must consume its own pre-Directory concrete slot")
-      assert(!allocIsCmo || !Mux1H(normalServiceSlotOH, snoopMshrs.map(_.io.status.valid)),
-        "a CMO normal reservation must exclude a snoop in its physical slot")
+      assert(!allocIsCmo || !(normalServiceSlotOH &
+        (snoopStatusValidOH | replaceInfoValidOH | replaceReservedSlotOH | snoopServiceSlotOH)).orR,
+        "a CMO reservation must retain exclusive S/R ownership until allocation")
     }
   }
   val activeSnoopOH = VecInit(snoopMshrs.map(_.io.status.valid)).asUInt
@@ -1261,12 +1260,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     )
   }
 
-  val nestedwbNormalActive = refillMshrs.zipWithIndex.map { case (refill, i) =>
-    val incomingCmoCapture = cmoSidecarAlloc && cmoSidecarParentOH(i) &&
-      io.nestedwb.c_set_dirty && refill.io.status.bits.set === io.nestedwb.set &&
-      refill.io.status.bits.reqTag === io.nestedwb.tag
-    refill.io.nestedwbData || incomingCmoCapture
-  }
+  val nestedwbNormalActive = refillMshrs.map(_.io.nestedwbData)
   val nestedwbSnoopActive = snoopMshrs.map(_.io.nestedwbData)
   refillMshrs.zip(snoopMshrs).zipWithIndex.foreach {
     case ((refill, snoop), i) =>
@@ -1296,7 +1290,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
           m.io.id := i.U
           m.io.sinkCOwnerHold := sinkCProbeOwnerHold(context)(i)
           m.io.alloc.valid := selectedMSHROH(i) && io.fromMainPipe.mshr_alloc_s3.valid &&
-          (allocIsSnoop === context.B)
+          (allocIsSnoop === context.B) && !cmoAlloc
           m.io.alloc.bits := io.fromMainPipe.mshr_alloc_s3.bits
           m.io.alloc.bits.task.isKeyword
             .foreach(_ := io.fromMainPipe.mshr_alloc_s3.bits.task.isKeyword.getOrElse(false.B))
@@ -1331,8 +1325,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       refill.io.resps.rxrsp.bits := io.resps.rxrsp.respInfo
       refill.io.replResp.valid := replResponseApplied.valid && replResponseApplied.bits.mshrId === i.U
       val replRespForRefill = WireInit(replResponseApplied.bits)
-      when(replRespOwnerConflict || replRespParentConflict || replRespNoReplaceSlot ||
-        replRespCmoConflict) {
+      when(replRespOwnerConflict || replRespParentConflict || replRespNoReplaceSlot) {
         replRespForRefill.retry := true.B
       }
       refill.io.replResp.bits := replRespForRefill
@@ -1346,7 +1339,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       }
       refill.io.replaceActive := replaceActiveForParent(i)
       refill.io.replaceAccepted := replaceActiveForParent(i) ||
-        replaceAllocValid && !orphanReleaseData && replaceParentOH(i)
+        replaceAllocValid && incomingReplaceReq.parentAttached && replaceParentOH(i)
       val pendingSnoopForRefill = snoopCandidateSeen &&
         refill.io.status.valid &&
         refill.io.status.bits.set === io.fromReqArb.status_s1.b_set &&
@@ -1423,7 +1416,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         assert(commitVersionMatches, "normal commit apply must name its retained issue version")
       }
       val grantReceipt = io.fromMainPipe.grantSent
-      val grantNamesOwner = grantReceipt.valid && grantReceipt.bits.mshrId === i.U
+      val grantNamesOwner = grantReceipt.valid && grantReceipt.bits.mshrContext === 0.U &&
+        grantReceipt.bits.mshrId === i.U
       val grantVersionMatches = refill.io.status.valid && grantReceipt.bits.mshrContext === 0.U &&
         refill.io.tasks.preparedLease.held.valid &&
         grantReceipt.bits.token.asUInt === refill.io.tasks.preparedLease.held.bits.asUInt &&
@@ -1559,7 +1553,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       replaceMshrs(i).io.copyBackDone := io.txdatDone.valid &&
       io.txdatDone.bits.mshrTask && io.txdatDone.bits.mshrContext === 2.U &&
       io.txdatDone.bits.mshrId === i.U && io.txdatDone.bits.chiOpcode.get === CopyBackWrData
-      replaceMshrs(i).io.rxrsp.valid := io.resps.rxrsp.valid && io.resps.rxrsp.mshrId === replaceMshrs(i).io.txnId
+      val replaceEpochMismatch = if (readTxnEpochWidth > 0) {
+        io.resps.rxrsp.txnID(TXNID_WIDTH - bankBits - 3, mshrBits) =/= replaceMshrs(i).io.txnEpoch
+      } else false.B
+      replaceMshrs(i).io.rxrsp.valid := replaceMshrs(i).io.info.valid && io.resps.rxrsp.valid &&
+        io.resps.rxrsp.mshrId === replaceMshrs(i).io.txnId && !replaceEpochMismatch
       replaceMshrs(i).io.rxrsp.bits := io.resps.rxrsp.respInfo
 
       snoop.io.resps.rxdat.valid := false.B
@@ -1590,6 +1588,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       io.snoopInfo(i) := snoop.io.msInfo
       io.replaceInfo(i) := replaceInfoForOutput
       io.replaceInfoForSnoop(i) := replaceMshrs(i).io.info
+      io.replaceInfoForSnoop(i).valid := replaceMshrs(i).io.info.valid &&
+        replaceMshrs(i).io.ownsSnoopData
       when(replaceAllocValid && selectedReplaceSlotOH(i)) {
         assert(!replaceMshrs(i).io.info.valid,
           "new replacement must not overwrite a registered sidecar")
@@ -1597,6 +1597,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
           "new replacement is not yet a nestable ReleaseBuf owner")
       }
       io.pCrd(i) <> refill.io.pCrd
+      io.pCrd(mshrsAll + i) <> replaceMshrs(i).io.pCrd
   }
   io.replaceSnoopAdmissionIdle := VecInit(replaceMshrs.map(_.io.snoopAdmissionIdle)).asUInt
   io.rxdatStaleSlots := rxdatStaleSlotOH.asUInt
@@ -1685,7 +1686,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val busy = RegInit(false.B)
     val bits = Reg(new CHIREQ)
     val out = Wire(Decoupled(new CHIREQ))
-    m.io.tasks.txreq.ready := !busy && !io.sidecarReservationHold
+    m.io.tasks.txreq.ready := !busy && (!io.sidecarReservationHold || !m.io.ownsSnoopData)
     m.io.txreqPending := busy
     out.valid := busy
     out.bits := bits
@@ -1760,9 +1761,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       !io.sidecarReservationHold && io.toTXDAT.ready
   }
   XSPerfAccumulate("cmo_sidecar_alloc_cnt",
-    replaceNeedsAlloc && cmoSidecarAlloc && replaceAllocValid)
-  XSPerfAccumulate("replresp_cmo_conflict_retry_cnt",
-    replResponseApplied.valid && replRespCmoConflict)
+    replaceNeedsAlloc && cmoAlloc && replaceAllocValid)
   XSPerfAccumulate("txdat_direct_copyback_cnt", io.toTXDAT.fire)
   XSPerfAccumulate("txdat_direct_abort_cnt", cbPresent && !cbSelStillValid)
   XSPerfAccumulate("txdat_direct_wait_sum",

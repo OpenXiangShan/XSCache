@@ -226,7 +226,6 @@ class MSHRStatus(implicit p: Parameters) extends L2Bundle
   val w_c_resp = Bool()
   val w_d_resp = Bool()
   val will_free = Bool()
-  val isCmo = Bool()
   val releaseDataWindow = Bool()
 
   /*
@@ -259,7 +258,6 @@ class MSHRRequest(implicit p: Parameters) extends L2Bundle {
 
 // MSHR info to ReqBuf and SinkB
 class MSHRInfo(implicit p: Parameters) extends L2Bundle with HasTLChannelBits {
-  val isCmo = Bool()
   val set = UInt(setBits.W)
   val way = UInt(wayBits.W)
   val reqTag = UInt(tagBits.W)
@@ -293,8 +291,6 @@ class MSHRInfo(implicit p: Parameters) extends L2Bundle with HasTLChannelBits {
   val w_grant = Bool()
   val s_release = Bool()
   val s_refill = Bool()
-  val s_cmoresp = Bool()
-  val s_cmometaw = Bool()
   val w_releaseack = Bool()
   val w_replResp = Bool()
   val w_rprobeacklast = Bool()
@@ -331,6 +327,7 @@ object ReplacementAllocAddress {
 }
 
 class ReplaceMSHRInfo(implicit p: Parameters) extends L2Bundle {
+  val ownsWay = Bool()
   val valid = Bool()
   val parentId = UInt(mshrBits.W)
   val parentEpoch = Bool()
@@ -360,6 +357,7 @@ class ReplaceRequest(implicit p: Parameters) extends L2Bundle {
   val needProbe = Bool()
   val probeParam = UInt(3.W)
   val captureFromDS = Bool()
+  val needRelease = Bool()
 }
 
 object ReplaceMSHRMode {
@@ -405,25 +403,18 @@ class RespBundle(implicit p: Parameters) extends L2Bundle with HasCHIMsgParamete
   val respInfo = new RespInfoBundle
 }
 
-class FSMState(implicit p: Parameters) extends L2Bundle {
+class NormalFSMState(implicit p: Parameters) extends L2Bundle {
   // schedule
   val s_acquire = Bool()  // acquire downwards
   val s_rprobe = Bool()   // probe upwards, caused by replace
-  val s_pprobe = Bool()   // probe upwards, casued by probe
   val s_release = Bool()  // release downwards
-  val s_probeack = Bool() // respond probeack downwards
   val s_refill = Bool()   // respond grant upwards
   // val s_grantack = Bool() // respond grantack downwards, moved to GrantBuf
   // val s_triggerprefetch = prefetchOpt.map(_ => Bool())
   val s_retry = Bool()    // need retry when conflict
-  val s_cmoresp = Bool()  // resp upwards for finishing CMO transactions
-  val s_cmometaw = Bool() // meta write compensation for CMO transactions
 
   // wait
-  val w_rprobeackfirst = Bool()
   val w_rprobeacklast = Bool()
-  val w_pprobeackfirst = Bool()
-  val w_pprobeacklast = Bool()
   val w_grantfirst = Bool()
   val w_grantlast = Bool()
   val w_grant = Bool()
@@ -432,10 +423,20 @@ class FSMState(implicit p: Parameters) extends L2Bundle {
 
   // CHI
   val s_rcompack = chiOpt.map(_ => Bool())
-  val s_wcompack = chiOpt.map(_ => Bool())
-  val s_cbwrdata = chiOpt.map(_ => Bool())
   val s_reissue = chiOpt.map(_ => Bool())
+}
+
+class FSMState(implicit p: Parameters) extends NormalFSMState {
+  val s_pprobe = Bool()
+  val w_rprobeackfirst = Bool()
+  val w_pprobeackfirst = Bool()
+  val w_pprobeacklast = Bool()
+  val s_wcompack = chiOpt.map(_ => Bool())
+  val s_probeack = Bool()
+  val s_cbwrdata = chiOpt.map(_ => Bool())
   val s_dct = chiOpt.map(_ => Bool())
+  // Compatibility for allocation producers; production contexts do not consume this field.
+  val s_cmoresp = Bool()
 }
 
 class SourceAReq(implicit p: Parameters) extends L2Bundle {

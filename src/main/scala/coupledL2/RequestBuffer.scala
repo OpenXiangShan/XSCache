@@ -121,7 +121,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     s.valid && sameAddr(a, s.bits))).asUInt
   def conflictMaskVic(a: TaskBundle): UInt = VecInit(io.mshrInfo.map(s =>
     s.valid && a.set === s.bits.set && a.tag === s.bits.metaTag &&
-      (s.bits.needRelease || (!s.bits.isCmo && s.bits.w_replResp &&
+      (s.bits.needRelease || (s.bits.w_replResp &&
         !s.bits.dirHit && s.bits.meta.state =/= MetaData.INVALID)))).asUInt
   def conflictMask(a: TaskBundle): UInt = conflictMaskReq(a) | conflictMaskVic(a)
   def snoopConflict(a: TaskBundle): Bool = VecInit(io.snoopInfo.map(s =>

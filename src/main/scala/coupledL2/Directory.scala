@@ -301,7 +301,7 @@ class Directory(implicit p: Parameters) extends L2Module {
   val victimPendingWayMask_s3 = VecInit(io.refillInfo.map(s =>
     Mux(
       // Only an owner that will overwrite its way may suppress a Directory hit.
-      s.valid && !s.bits.isCmo && (s.bits.set === req_s3.set) && !s.bits.dirHit &&
+      s.valid && (s.bits.set === req_s3.set) && !s.bits.dirHit &&
         s.bits.w_replResp && !s.bits.refillCommitLanded,
       UIntToOH(s.bits.way, ways),
       0.U(ways.W)
@@ -338,7 +338,7 @@ class Directory(implicit p: Parameters) extends L2Module {
   )
   val replaceOwnerWayMasks_s2 = io.replaceInfo.map(s =>
     sampleOwnerWayMask(Mux(
-      s.valid && s.bits.parentAttached && (s.bits.set === req_s1.set),
+      s.valid && s.bits.ownsWay && (s.bits.set === req_s1.set),
       UIntToOH(s.bits.way, ways),
       0.U(ways.W)
     ))
