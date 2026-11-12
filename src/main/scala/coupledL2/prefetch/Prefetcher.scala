@@ -252,8 +252,10 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   // Isolated BOP experiments: only the selected BOP engines may issue data prefetches.
   val pfRcv_en = false.B
-  val pbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_pbop_en
-  val vbop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_vbop_en
+  // Original engines are independent training-only observers; only UBOP may issue.
+  val pbop_en = false.B
+  val vbop_en = false.B
+  val ubop_en = pfCtrlFromCore.l2_pf_master_en && pfCtrlFromCore.l2_vbop_en
   val tp_en = false.B
   val cdp_en = false.B
   val delay_latency = pfCtrlFromCore.l2_pf_delay_latency
@@ -353,6 +355,45 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     })))
   ) else None
 
+  val ubop = if (hasBOP) Some(
+    Module(new UBestOffsetPrefetch()(p.alterPartial {
+      case L2ParamKey =>
+        val l2Params = p(L2ParamKey)
+        l2Params.copy(prefetch =
+          Seq(BOPParameters(
+            badScore = 2,
+            crossPage = true,
+            useDelayOut = true,
+            enableStudentCover = true,
+            studentPoolSize = 4,
+            studentFilterTableBits = 4096,
+            studentHashMode = "pairs_low9",
+            studentCovThreshold = 0,
+            issueGateEnable = true,
+            issueConfThreshold = 14,
+            offsetList = Seq(
+              -117, -147, -91, 117, 147, 91,
+              -256, -250, -243, -240, -225, -216, -200,
+              -192, -180, -162, -160, -150, -144, -135, -128,
+              -125, -120, -108, -100, -96, -90, -81, -80,
+              -75, -72, -64, -60, -54, -50, -48, -45,
+              -40, -36, 32, 36, 40, 45, 48,
+              50, 54, 60, 64, 72, 75, 80, 81,
+              90, 96, 100, 108, 120, 125, 128, 135,
+              144, 150, 160, 162, 180, 192, 200, 216,
+              225, 240, 243, 250,
+              // Preserve original VBOP scan order, then append the original PBOP candidates.
+              -32, -30, -27, -25, -24, -20, -18, -16, -15,
+              -12, -10, -9, -8, -6, -5, -4, -3, -2, -1,
+              1, 2, 3, 4, 5, 6, 8, 9, 10,
+              12, 15, 16, 18, 20, 24, 25, 27, 30
+            )
+          )) ++ l2Params.prefetch.filterNot(_.isInstanceOf[BOPParameters])
+        )
+    }))
+  )
+  else None
+
   val tp = if (hasTPPrefetcher) Some(Module(new TemporalPrefetch())) else None
   // define Next-Line Prefetcher
   val nl = if (hasNLPrefetcher) Some(Module(new NextLinePrefetch())) else None
@@ -371,7 +412,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     MemReqSource.isCPUReq(train.bits.reqsource) || MemReqSource.isL1Prefetch(train.bits.reqsource)
   )
   // =================== Connection for each Prefetcher =====================
-  // Rcv > NL > VBOP > PBOP > TP > CDP
+  // Rcv > NL > UBOP > VBOP > PBOP > TP > CDP
   train.ready := true.B
   if (hasBOP) {
     val vbop_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
@@ -385,8 +426,12 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     vbop.get.io.pfCtrlOfDelayLatency := delay_latency
     vbop.get.io.train <> vbop_train_buf.io.deq
     vbop.get.io.resp <> resp
-    vbop.get.io.resp.valid := resp.valid && resp.bits.isBOP
-    vbop.get.io.tlb_req <> bop_tlb_req
+    vbop.get.io.resp.valid := false.B
+    // A training-only VBOP never allocates a request-buffer entry or uses the shared TLB.
+    vbop.get.io.tlb_req.req.ready  := true.B
+    vbop.get.io.tlb_req.resp.valid := false.B
+    vbop.get.io.tlb_req.resp.bits  := 0.U.asTypeOf(vbop.get.io.tlb_req.resp.bits)
+    vbop.get.io.tlb_req.pmp_resp   := 0.U.asTypeOf(vbop.get.io.tlb_req.pmp_resp)
 
     val pbop_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
     pbop_train_buf.io.enq.valid := train.valid && train.bits.is_other_train.getOrElse(true.B)
@@ -399,7 +444,27 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     pbop.get.io.pfCtrlOfDelayLatency := delay_latency
     pbop.get.io.train <> pbop_train_buf.io.deq
     pbop.get.io.resp <> resp
-    pbop.get.io.resp.valid := resp.valid && resp.bits.isPBOP
+    pbop.get.io.resp.valid := false.B
+
+    val ubop_train_buf = Module(new Queue(new PrefetchTrain, entries = 4))
+    ubop_train_buf.io.enq.valid := train.valid && train.bits.is_other_train.getOrElse(true.B)
+    ubop_train_buf.io.enq.bits  := train.bits
+    XSPerfAccumulate("ubop_train_drop", ubop_train_buf.io.enq.valid && !ubop_train_buf.io.enq.ready)
+    XSPerfAccumulate("ubop_train_accept", ubop_train_buf.io.enq.fire)
+    ubop.get.io.enable               := ubop_en
+    ubop.get.io.fdbkDegree           := vbopDegree
+    ubop.get.io.pfCtrlOfDelayLatency := delay_latency
+    ubop.get.io.train <> ubop_train_buf.io.deq
+    ubop.get.io.resp <> resp
+    ubop.get.io.resp.valid := resp.valid && resp.bits.isBOP
+    ubop.get.io.tlb_req <> bop_tlb_req
+
+    val bopCompare = Module(new BOPComparisonMonitor)
+    bopCompare.io.pbop := pbop.get.io.choice
+    bopCompare.io.vbop := vbop.get.io.choice
+    bopCompare.io.ubop := ubop.get.io.choice
+    assert(!pbop.get.io.req.valid && !vbop.get.io.req.valid, "Original PBOP/VBOP must remain training-only")
+    assert(!vbop.get.io.tlb_req.req.valid, "Training-only VBOP must not send TLB requests")
   }
   if (hasReceiver) {
     pfRcv.get.io.enable := pfRcv_en
@@ -461,11 +526,12 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   // =================== Connection of all Prefetchers =====================
   /* prefetchers -> pftQueue -> pipe -> Slices.SinkA */
-  private val SRC_NUM = 6
-  private val Seq(rcv_idx, nl_idx, vbop_idx, pbop_idx, tp_idx, cdp_idx) = (0 until SRC_NUM).toSeq
+  private val SRC_NUM                                                             = 7
+  private val Seq(rcv_idx, nl_idx, ubop_idx, vbop_idx, pbop_idx, tp_idx, cdp_idx) = (0 until SRC_NUM).toSeq
   val reqs = Seq(
     if (hasReceiver) Some(pfRcv.get.io.req) else None,
     if (hasNLPrefetcher) Some(nl.get.io.req) else None,
+    if (hasBOP) Some(ubop.get.io.req) else None,
     if (hasBOP) Some(vbop.get.io.req) else None,
     if (hasBOP) Some(pbop.get.io.req) else None,
     if (hasTPPrefetcher) Some(tp.get.io.req) else None,
@@ -487,6 +553,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val reqsAllowed = Seq(
     true.B,
     true.B,
+    vbopDegree.orR,
     vbopDegree.orR,
     pbopDegree.orR,
     tpDegree.orR,
@@ -517,23 +584,27 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   XSPerfAccumulate("prefetch_resp_valid", resp.valid)
   XSPerfAccumulate("prefetch_resp_in_valid", PopCount(io.resp.map(_.valid)))
   XSPerfAccumulate("prefetch_req_fromL1", reqsValid(rcv_idx))
+  XSPerfAccumulate("prefetch_req_fromUBOP", reqsValid(ubop_idx))
   XSPerfAccumulate("prefetch_req_fromVBOP", reqsValid(vbop_idx))
   XSPerfAccumulate("prefetch_req_fromPBOP", reqsValid(pbop_idx))
-  XSPerfAccumulate("prefetch_req_fromBOP", reqsValid(vbop_idx) || reqsValid(pbop_idx))
+  XSPerfAccumulate("prefetch_req_fromBOP", reqsValid(ubop_idx) || reqsValid(vbop_idx) || reqsValid(pbop_idx))
   XSPerfAccumulate("prefetch_req_fromTP", reqsValid(tp_idx))
   XSPerfAccumulate("prefetch_req_fromNL", reqsValid(nl_idx))
   XSPerfAccumulate("prefetch_req_fromCDP", reqsValid(cdp_idx))
 
   XSPerfAccumulate("prefetch_req_selectL1", reqsFire(rcv_idx))
+  XSPerfAccumulate("prefetch_req_selectUBOP", reqsFire(ubop_idx))
   XSPerfAccumulate("prefetch_req_selectVBOP", reqsFire(vbop_idx))
   XSPerfAccumulate("prefetch_req_selectPBOP", reqsFire(pbop_idx))
-  XSPerfAccumulate("prefetch_req_selectBOP", reqsFire(vbop_idx) || reqsFire(pbop_idx))
+  XSPerfAccumulate("prefetch_req_selectBOP", reqsFire(ubop_idx) || reqsFire(vbop_idx) || reqsFire(pbop_idx))
   XSPerfAccumulate("prefetch_req_selectTP", reqsFire(tp_idx))
   XSPerfAccumulate("prefetch_req_selectNL", reqsFire(nl_idx))
   XSPerfAccumulate("prefetch_req_selectCDP", reqsFire(cdp_idx))
   XSPerfAccumulate("prefetch_req_SMS_other_overlapped",
     reqsValid(rcv_idx) &&
-      (reqsValid(vbop_idx) || reqsValid(pbop_idx) || reqsValid(tp_idx) || reqsValid(nl_idx) || reqsValid(cdp_idx))
+      (reqsValid(ubop_idx) || reqsValid(vbop_idx) || reqsValid(pbop_idx) || reqsValid(tp_idx) || reqsValid(
+        nl_idx
+      ) || reqsValid(cdp_idx))
   )
 
   // NOTE: set basicDB false when debug over

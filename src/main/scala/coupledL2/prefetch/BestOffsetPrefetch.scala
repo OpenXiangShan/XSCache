@@ -417,6 +417,27 @@ class StudentPoolEntry(implicit p: Parameters) extends BOPBundle {
   val curPhaseCov = UInt(studentPhaseTrainBits.W)
 }
 
+class StudentPhasePoolEntry(implicit p: Parameters) extends BOPBundle {
+  val valid        = Bool()
+  val offset       = UInt(offsetWidth.W)
+  val absOffset    = UInt(offsetWidth.W)
+  val conf         = UInt(studentConfBits.W)
+  val lastPhaseCov = UInt(studentPhaseTrainBits.W)
+  val curPhaseCov  = UInt(studentPhaseTrainBits.W)
+}
+
+class StudentPhaseEntry(implicit p: Parameters) extends BOPBundle {
+  val pool           = Vec(studentPoolSize, new StudentPhasePoolEntry)
+  val trainCount     = UInt(studentPhaseTrainBits.W)
+  val teacherOffset  = UInt(offsetWidth.W)
+  val teacherEnable  = Bool()
+  val bestIdx        = UInt(studentPoolIdxBits.W)
+  val worstIdx       = UInt(studentPoolIdxBits.W)
+  val injectIdx      = UInt(studentPoolIdxBits.W)
+  val inject         = Bool()
+  val selectedEnable = Bool()
+}
+
 class StudentFilterUpdateReq(implicit p: Parameters) extends BOPBundle {
   val baseAddr = UInt(fullAddrBits.W)
   val offsets = Vec(studentPoolSize, SInt(offsetWidth.W))
@@ -762,6 +783,27 @@ class StudentCoverageLearner(name: String = "")(implicit p: Parameters) extends 
   XSPerfHistogram("student_worst_cov", endWorstCov, studentMetricEnable, 0, 3072, 128)
   XSPerfHistogram("student_train_count", endTrainCount, state === s_phaseEnd, 1024, 4096, 256)
   XSPerfHistogram("student_best_worst_gap", endSelectedCov - endWorstCov, studentMetricEnable, 0, 768, 64)
+
+  // Capture scores before the phase is cleared or a teacher candidate replaces a pool entry.
+  val phaseTable = ChiselDB.createTable(name + "StudentPhaseTable", new StudentPhaseEntry, basicDB = true)
+  val phaseData  = Wire(new StudentPhaseEntry)
+  for (i <- 0 until studentPoolSize) {
+    phaseData.pool(i).valid        := pool(i).valid
+    phaseData.pool(i).offset       := pool(i).offset.asUInt
+    phaseData.pool(i).absOffset    := pool(i).absOffset
+    phaseData.pool(i).conf         := pool(i).conf.asUInt
+    phaseData.pool(i).lastPhaseCov := pool(i).lastPhaseCov
+    phaseData.pool(i).curPhaseCov  := pool(i).curPhaseCov
+  }
+  phaseData.trainCount     := endTrainCount
+  phaseData.teacherOffset  := endTeacherOffset
+  phaseData.teacherEnable  := endIssueEn
+  phaseData.bestIdx        := endBestIdx
+  phaseData.worstIdx       := endWorstIdx
+  phaseData.injectIdx      := endInjectIdx
+  phaseData.inject         := endIssueEn && !endHasMatch
+  phaseData.selectedEnable := endSelectedEnable
+  phaseTable.log(phaseData, state === s_phaseEnd, site = name + "StudentPhase", clock, reset)
 }
 
 class BopReqBundle(implicit p: Parameters) extends BOPBundle{
@@ -1098,7 +1140,7 @@ class DelayQueue(name: String = "")(implicit p: Parameters) extends  BOPModule{
 
 }
 
-class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
+class VBestOffsetPrefetch(engineName: String = "vbop")(implicit p: Parameters) extends BOPModule {
   val io = IO(new Bundle() {
     val enable = Input(Bool())
     val pfCtrlOfDelayLatency = Input(UInt(10.W))
@@ -1107,17 +1149,18 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     val tlb_req = new L2ToL1TlbIO(nRespDups= 1)
     val req = DecoupledIO(new PrefetchReq)
     val resp = Flipped(DecoupledIO(new PrefetchResp))
+    val choice = Output(new BOPChoice)
   })
 
   // 0 / 1: whether to enable
-  private val cstEnable = Constantin.createRecord("vbop_enable"+cacheParams.hartId.toString, initValue = 1)
+  private val cstEnable = Constantin.createRecord(engineName + "_enable" + cacheParams.hartId.toString, initValue = 1)
   val enable = io.enable && cstEnable.orR
 
-  val delayQueue = Module(new DelayQueue("vbop"))
-  val rrTable = Module(new RecentRequestTable("vbop"))
-  val scoreTable = Module(new OffsetScoreTable("vbop"))
-  val reqFilter = Module(new PrefetchReqBuffer)
-  val student = if (enableStudentCover) Some(Module(new StudentCoverageLearner("vbop"))) else None
+  val delayQueue = Module(new DelayQueue(engineName))
+  val rrTable    = Module(new RecentRequestTable(engineName))
+  val scoreTable = Module(new OffsetScoreTable(engineName))
+  val reqFilter  = Module(new PrefetchReqBuffer(engineName))
+  val student    = if (enableStudentCover) Some(Module(new StudentCoverageLearner(engineName))) else None
   val studentTrainReady = student.map(_.io.train.ready).getOrElse(true.B)
 
   val s1_req_valid = RegInit(false.B)
@@ -1194,6 +1237,21 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   io.req <> reqFilter.io.out_req
   io.req.valid := reqFilter.io.out_req.valid
 
+  require(offsetWidth <= BOPChoice.offsetBits)
+  io.choice.teacherOffset      := teacherOffset.asSInt
+  io.choice.teacherEnable      := !teacherDisable
+  io.choice.teacherPhaseOffset := scoreTable.io.phaseBestOffsetCommitted.asSInt
+  io.choice.studentOffset      := studentSelectedOffset.asSInt
+  io.choice.studentValid       := student.map(_.io.selectedValid).getOrElse(false.B)
+  io.choice.studentEnable      := studentSelectedEnable
+  io.choice.issueOffset        := issueOffset.asSInt
+  io.choice.issueEnable        := issueEnable
+  io.choice.phaseEnd           := phaseEnd
+  io.choice.trainFire          := io.train.fire
+  io.choice.trainAddr          := s0_oldFullAddr
+  io.choice.sentFire           := io.req.fire
+  io.choice.sentOffset         := reqFilter.io.out_issueOffset
+
   XSPerfAccumulate("bop_req", io.req.fire)
   emitOffsetDistCounters("prefetch_sent_issue_offset", reqFilter.io.out_issueOffset, io.req.fire)
   XSPerfAccumulate("bop_train", io.train.fire)
@@ -1216,6 +1274,7 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     val train = Flipped(DecoupledIO(new PrefetchTrain))
     val req = DecoupledIO(new PrefetchReq)
     val resp = Flipped(DecoupledIO(new PrefetchResp))
+    val choice = Output(new BOPChoice)
   })
 
   // 0 / 1: whether to enable
@@ -1299,6 +1358,21 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   reqSkidBuffer.io.deq.ready := io.req.ready
   io.train.ready := s0_ready
   io.resp.ready := true.B
+
+  require(offsetWidth <= BOPChoice.offsetBits)
+  io.choice.teacherOffset      := teacherOffset.asSInt
+  io.choice.teacherEnable      := !teacherDisable
+  io.choice.teacherPhaseOffset := scoreTable.io.phaseBestOffsetCommitted.asSInt
+  io.choice.studentOffset      := studentSelectedOffset.asSInt
+  io.choice.studentValid       := student.map(_.io.selectedValid).getOrElse(false.B)
+  io.choice.studentEnable      := studentSelectedEnable
+  io.choice.issueOffset        := issueOffset.asSInt
+  io.choice.issueEnable        := issueEnable
+  io.choice.phaseEnd           := phaseEnd
+  io.choice.trainFire          := io.train.fire
+  io.choice.trainAddr          := s0_oldAddr
+  io.choice.sentFire           := io.req.fire
+  io.choice.sentOffset         := reqSkidBuffer.io.deq.bits.issueOffset
 
   XSPerfAccumulate("bop_req", io.req.fire)
   emitOffsetDistCounters("prefetch_sent_issue_offset", reqSkidBuffer.io.deq.bits.issueOffset, io.req.fire)
