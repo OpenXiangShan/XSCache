@@ -155,18 +155,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val l2Miss = Output(Bool())
   })
 
-  /*MSHR allocation pointer gen -> to Mainpipe*/
-  class MSHRSelector(implicit p: Parameters) extends L2Module {
-    val io = IO(new Bundle() {
-      val idle = Input(Vec(mshrsAll, Bool()))
-      val out = ValidIO(UInt(mshrsAll.W))
-    })
-    io.out.valid := ParallelOR(io.idle)
-    io.out.bits := ParallelPriorityMux(io.idle.zipWithIndex.map {
-      case (b, i) => (b, (1.U(mshrsAll.W) << i))
-    })
-  }
-
   require(
     mshrsAll < (1 << (mshrBits - 1)),
     s"physical MSHR count $mshrsAll exceeds the ID range reserved for MSHR tasks"
@@ -973,11 +961,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val snoopMshrFull = snoopCredit === 0.U
   val mshrFull = snoopMshrFull
   val a_mshrFull = normalMshrFull
-  val mshrSelector = Module(new MSHRSelector())
+  val selectedSnoopSlotOH = snoopServiceSlotOH & ~snoopStatusValidOH & ~replaceInfoValidOH
+  assert(PopCount(selectedSnoopSlotOH) <= 1.U,
+    "the reserved snoop service slot must be one-hot")
   val allocIsSnoop = io.fromMainPipe.mshr_alloc_s3.bits.task.fromB
-  val selectedMSHROH = Mux(allocIsSnoop,
-    Mux(mshrSelector.io.out.valid, mshrSelector.io.out.bits, 0.U(mshrsAll.W)),
-    normalServiceSlotOH)
+  val selectedMSHROH = Mux(allocIsSnoop, selectedSnoopSlotOH, normalServiceSlotOH)
 
   io.l2Miss := Cat(refillMshrs.map { m =>
     m.io.status.valid && m.io.status.bits.channel(0) && (
@@ -1073,9 +1061,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     assert(PopCount(postGrantReleaseSnoopTargetOH) <= 1.U,
       "one B snoop must match at most one post-Grant ReleaseData holder")
   }
-  mshrSelector.io.idle := snoopMshrs.zipWithIndex.map { case (snoop, i) =>
-    snoopServiceSlotOH(i) && !snoop.io.status.valid && !replaceMshrs(i).io.info.valid
-  }
   io.toMainPipe.mshr_alloc_ptr := Mux(allocIsSnoop,
     OHToUInt(selectedMSHROH), normalService.bits.id)
   when(snoopAllocRequest) {
@@ -1089,7 +1074,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   when(io.fromMainPipe.mshr_alloc_s3.valid) {
     when(allocIsSnoop) {
-      assert(mshrSelector.io.out.valid,
+      assert(selectedSnoopSlotOH.orR,
         "MainPipe snoop allocation must own an eligible physical slot")
     }.otherwise {
       val task = io.fromMainPipe.mshr_alloc_s3.bits.task
