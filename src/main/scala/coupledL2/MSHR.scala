@@ -82,7 +82,6 @@ class MainpipeLeaseIO(implicit p: Parameters) extends CoupledL2Bundle {
   val proposalHeld = Output(Bool())
   // The registered operation selects the payload from the proposal until the
   // lease is returned, covering the cycle the controller samples it.
-  val payloadSelectHeld = Output(Bool())
 }
 object MainpipeLeaseIO {
   // The source proposal contains no TaskBundle. Only a registered group
@@ -101,7 +100,6 @@ object MainpipeLeaseIO {
     // Stays set from the proposal through the lease return, so the payload
     // mux keeps selecting the registered operation after the proposal is
     // promoted and before the controller samples it one cycle later.
-    val payloadSelectHeld = RegInit(false.B)
     val payloadFrozen = RegInit(false.B)
     val token = Reg(chiselTypeOf(port.prepare.bits))
     val issued = RegInit(false.B)
@@ -132,7 +130,6 @@ object MainpipeLeaseIO {
       proposalClass := qosClass
       proposal := true.B
       candidateValid := true.B
-      payloadSelectHeld := true.B
     }
     // Drop an unheld proposal at the clock edge. The winning edge is excluded:
     // that proposal is being promoted into a held lease, and clearing it here
@@ -140,7 +137,6 @@ object MainpipeLeaseIO {
     when(proposal && !port.held.valid && invalidate && !port.prepare.valid) {
       proposal := false.B
       candidateValid := false.B
-      payloadSelectHeld := false.B
     }
     when(port.prepare.valid) {
       assert(!port.held.valid && proposal, "prepare must acquire a registered source proposal")
@@ -186,7 +182,6 @@ object MainpipeLeaseIO {
       (canceled || (!payloadFrozen && !candidateValid))
     port.cancel.bits := token
     port.candidate.valid := candidateValid
-    port.payloadSelectHeld := payloadSelectHeld
     port.candidate.bits.operation := operation
     port.candidate.bits.qosClass := proposalClass
     output.valid := port.held.valid && !issued && candidateValid && payloadFrozen
@@ -205,7 +200,6 @@ object MainpipeLeaseIO {
     // acknowledgment so the same operation can be retried.  An issued task
     // keeps its fence until the live intent advances or disappears.
     when(port.released.valid) {
-      payloadSelectHeld := false.B
       when(!issued) { terminalFence := false.B }
     }
     when(port.held.valid) {
