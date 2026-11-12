@@ -110,8 +110,6 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   val pairedNormalId = RegInit(0.U(mshrBits.W))
   val snpRespDone = RegInit(false.B)
   val dctDone = RegInit(false.B)
-  val denied = RegInit(false.B)
-  val corrupt = RegInit(false.B)
 
   when (io.alloc.valid) {
     assert(io.alloc.bits.task.fromB, "SnoopMSHR only accepts B-channel requests")
@@ -132,8 +130,6 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
     pairedNormalId := io.allocPairedNormalId.bits
     snpRespDone := false.B
     dctDone := false.B
-    denied := false.B
-    corrupt := false.B
     sourceBProbeIssued := false.B
   }
 
@@ -482,8 +478,6 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
     when (isParamFromT(c.param)) {
       meta.tagErr := c.denied
       meta.dataErr := c.corrupt
-      denied := denied || c.denied
-      corrupt := corrupt || c.corrupt
     }
   }
 
