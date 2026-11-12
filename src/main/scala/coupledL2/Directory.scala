@@ -283,6 +283,14 @@ class Directory(implicit p: Parameters) extends L2Module {
     io.metaWReq.bits.wayOH
   )
 
+  // Query ICache residency using the s2 SRAM result, then register it with
+  // the other victim-selection inputs on entry to s3. No live tracker or
+  // dead-bit updates may change DataStorage's address during its MCP2 hold.
+  val candidateTags_s2 = if (enableTagECC) {
+    tagRead.map(x =>
+      Cat(VecInit(Seq.tabulate(tagBankSplit)(i => x(encTagBankBits * (i + 1) - 1, encTagBankBits * i)(tagBankBits - 1, 0))))
+    )
+  } else tagRead
   val metaAll_s3 = RegEnable(metaRead, 0.U.asTypeOf(metaRead), reqValid_s2)
   val tagRead_s3 = RegEnable(tagRead, reqValid_s2)
   val tagAll_s3 = if (enableTagECC) {
@@ -334,20 +342,18 @@ class Directory(implicit p: Parameters) extends L2Module {
   val (inv, invalidWay, invOH) = invalid_way_sel(metaAll_s3)
   val repl_state_s3 = Wire(UInt(repl.nBits.W))
   val chosenOH = if (cacheParams.replacement == "sdbp") {
-    val available = Mux(refillReqValid_s3, freeWayMask_s3, Fill(ways, true.B)) & req_s3.wayMask
+    val deadMask_s3 = RegEnable(deadBits.get(req_s2.set).asUInt, 0.U(ways.W), reqValid_s2)
+    val l1ICopy_s3 = RegEnable(io.l1ICopy, 0.U(ways.W), reqValid_s2)
+    val available = Mux(refillReqValid_hold_s3, freeWayMask_s3, Fill(ways, true.B)) & req_s3.wayMask
     val invalid = ~VecInit(metaValidVec).asUInt & available
-    val copies = VecInit(metaAll_s3.map(_.clients.orR)).asUInt | io.l1ICopy
-    val dead = deadBits.get(req_s3.set).asUInt & ~copies & available
+    val copies = VecInit(metaAll_s3.map(_.clients.orR)).asUInt | l1ICopy_s3
+    val dead = deadMask_s3 & ~copies & available
     val lru = repl.asInstanceOf[TrueLRU].get_replace_OH(repl_state_s3, available)
     val selected = Mux(invalid.orR, MaskToOH(invalid), Mux(dead.orR, MaskToOH(dead), lru))
-    // MainPipe keeps the Directory result throughout DataStorage's MCP2 hold
-    // cycle. Refill-valid, dead bits and L1I copies can change after s3, so
-    // preserve the accepted victim instead of recomputing it during that cycle.
-    val selectedHold = RegEnable(selected, 0.U(ways.W), reqValid_s3)
     XSPerfAccumulate("sdbp_dead_victim", refillReqValid_s3 && !refillRetry && !invalid.orR && dead.orR)
     XSPerfAccumulate("sdbp_lru_victim", refillReqValid_s3 && !refillRetry && !invalid.orR && !dead.orR)
-    XSPerfAccumulate("sdbp_copy_protected", refillReqValid_s3 && (deadBits.get(req_s3.set).asUInt & copies & available).orR)
-    Mux(reqValid_s3, selected, selectedHold)
+    XSPerfAccumulate("sdbp_copy_protected", refillReqValid_s3 && (deadMask_s3 & copies & available).orR)
+    selected
   } else Mux(inv, invOH, replaceOH)
   // for retry bug fixing: if the chosenway not in freewaymask, choose another way
   val finalReplOH = if (cacheParams.replacement == "sdbp") chosenOH else Mux(
@@ -383,8 +389,8 @@ class Directory(implicit p: Parameters) extends L2Module {
   io.resp.bits.tag   := tag_s3
   io.resp.bits.set   := set_s3
   io.resp.bits.error := error_s3  // depends on ECC
-  io.candidateTags := tagAll_s3
-  io.candidateSet := req_s3.set
+  io.candidateTags := candidateTags_s2
+  io.candidateSet := req_s2.set
   io.errOnSnp := errorOnSNP_s3
   io.resp.bits.replacerInfo := replacerInfo_s3
   io.wayOH := wayOH_s3

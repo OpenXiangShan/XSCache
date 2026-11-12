@@ -88,6 +88,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   directory.io.msInfo := mshrCtl.io.msInfo
   directory.io.sdbpCommit := mainPipe.io.sdbpCommit
   directory.io.l1ICopy := io.l1ICopy.getOrElse(0.U)
+  // Directory queries ICache copies in s2 and holds the returned mask in s3.
   io.candidateBlocks.foreach { blocks =>
     blocks := VecInit(directory.io.candidateTags.map(tag => Cat(tag, directory.io.candidateSet)))
   }
