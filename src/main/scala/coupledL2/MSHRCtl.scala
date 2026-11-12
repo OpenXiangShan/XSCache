@@ -406,7 +406,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // of SourceB and group prepare. A late ReleaseStart is part of this capture,
   // so a previously standalone snoop re-evaluates its payload provenance.
   class SnoopPair extends Bundle {
-    val snoopId = UInt(mshrBits.W)
     val snoopGeneration = UInt(8.W)
     val set = UInt(setBits.W)
     val tag = UInt(tagBits.W)
@@ -435,7 +434,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     pair.valid := snoop.io.status.valid
     when(snoop.io.status.valid) {
       assert(PopCount(normalMatches) <= 1.U, "snoop pair must identify one normal generation")
-      pair.bits.snoopId := i.U
       pair.bits.snoopGeneration := mshrTaskGenerations(1)(i)
       pair.bits.set := snoop.io.status.bits.set
       pair.bits.tag := snoop.io.status.bits.reqTag
@@ -623,7 +621,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val snoopServiceToken = RegInit(0.U.asTypeOf(new SnoopReservationToken))
   val snoopPendingToken = RegInit(0.U.asTypeOf(new SnoopReservationToken))
   val snoopServiceValid = snoopServiceToken.valid
-  val snoopServiceSlot = snoopServiceToken.slot
   val snoopServiceTask = Reg(new TaskBundle)
   val snoopServiceSlotOH = Mux(snoopServiceToken.valid,
     UIntToOH(snoopServiceToken.slot, mshrsAll), 0.U(mshrsAll.W))
@@ -1382,8 +1379,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // altogether and leave a stale client that will never answer a later Probe.
   val sinkCProbeResponse = io.resps.sinkC.respInfo.opcode === ProbeAck ||
     io.resps.sinkC.respInfo.opcode === ProbeAckData
-  val sinkCRelease = io.resps.sinkC.respInfo.opcode === Release ||
-    io.resps.sinkC.respInfo.opcode === ReleaseData
 
   // Only a sidecar currently awaiting its own ProbeAck may consume a probe
   // response by address. A stale replace context with a coincidental set/tag
@@ -1526,9 +1521,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     if (contextIdx % 2 == 0) probeNormalOwners(contextIdx / 2) else probeSnoopOwners(contextIdx / 2)
   }
   replaceProbeSinkCMatch := VecInit((0 until mshrsAll).map(i => probeReplaceOwners(i)))
-  val respSinkCMatchByEntry = Seq.tabulate(mshrsAll) { i =>
-    resp_sinkC_match_vec(2 * i) || resp_sinkC_match_vec(2 * i + 1)
-  }
   val sinkCContextMatches = resp_sinkC_match_vec ++ replaceProbeSinkCMatch.toSeq
   sourceBProbeClaims.zipWithIndex.foreach { case (claim, source) =>
     when(io.resps.sinkC.valid && sinkCProbeResponse &&
@@ -2287,7 +2279,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   class SourceBCandidate extends Bundle {
     val request = new SourceBReq
     val source = UInt(log2Ceil(3 * mshrsAll).W)
-    val context = UInt(2.W)
     val id = UInt(mshrBits.W)
     val generation = UInt(8.W)
   }
@@ -2318,7 +2309,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       candidate.valid := true.B
       candidate.bits.request := task.bits
       candidate.bits.source := i.U
-      candidate.bits.context := (if(i < 2 * mshrsAll) i % 2 else 2).U
       candidate.bits.id := (if(i < 2 * mshrsAll) i / 2 else i - 2 * mshrsAll).U
       candidate.bits.generation := sourceBGenerations(i)
     }
@@ -2508,7 +2498,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val source = UInt(log2Up(mshrTaskGroupSize).W)
     val operation = UInt(4.W)
     val qosClass = UInt(3.W)
-    val waitCycles = UInt(6.W)
     val token = new MainpipeLeaseToken
     val completion = Valid(new PairedCompletion)
   }
@@ -2649,7 +2638,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       in.bits.source := i.U
       in.bits.operation := lease.candidate.bits.operation
       in.bits.qosClass := groupClasses(g)(i)
-      in.bits.waitCycles := mshrTaskWaitCnt(mshrTaskGroupOffsets(g) + i)
       in.bits.token.generation := mshrTaskGenerations(g)(i)
       in.bits.token.sequence := mshrTaskLeaseSequence(g)
       in.bits.completion := 0.U.asTypeOf(in.bits.completion)
@@ -2705,7 +2693,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       mshrTaskPrepared(g).source := winner.source
       mshrTaskPrepared(g).operation := winner.operation
       mshrTaskPrepared(g).qosClass := winner.qosClass
-      mshrTaskPrepared(g).waitCycles := winner.waitCycles
       mshrTaskPrepared(g).token := winner.token
       mshrTaskPrepared(g).completion := winner.completion
       if (g == 1) {
