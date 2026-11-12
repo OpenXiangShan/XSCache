@@ -225,7 +225,6 @@ class MSHRStatus(implicit p: Parameters) extends L2Bundle
   val w_c_resp = Bool()
   val w_d_resp = Bool()
   val will_free = Bool()
-  val releaseDataWindow = Bool()
 
   /*
   val way = UInt(wayBits.W)

@@ -1450,7 +1450,6 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   io.status.bits.is_miss := !dirResult.hit
   io.status.bits.is_prefetch := req_prefetch
   io.status.bits.reqSource := req.reqSource
-  io.status.bits.releaseDataWindow := false.B
 
   io.statAlloc.valid := io.alloc.valid
   io.statAlloc.bits.is_miss := !io.alloc.bits.dirResult.hit

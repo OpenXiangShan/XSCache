@@ -521,10 +521,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val snoopStatusValidOH = VecInit(snoopMshrs.map(_.io.status.valid)).asUInt
   val replaceInfoValidOH = VecInit(replaceMshrs.map(_.io.info.valid)).asUInt
   val refillBlocksSnoopOH = VecInit(refillMshrs.map { refill =>
-    refill.io.status.valid && (
-        refill.io.status.bits.w_c_resp ||
-        refill.io.status.bits.releaseDataWindow
-    )
+    refill.io.status.valid && refill.io.status.bits.w_c_resp
   }).asUInt
   val snoopBaseEligibleOH = ~(
     snoopStatusValidOH |
