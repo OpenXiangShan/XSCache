@@ -89,13 +89,13 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       val normalAllocOwner = Input(UInt(mshrBits.W))
       val normalAllocSource = Input(UInt(sourceIdBits.W))
       val replRespRetry = Input(Bool())
-      val snoopDataHolds = Flipped(Vec(mshrsAll, ValidIO(new MSHRInfo())))
-      val postGrantReleaseHolds = Flipped(Vec(mshrsAll, ValidIO(new MSHRInfo())))
       val postGrantReleaseLate = Flipped(ValidIO(new TaskBundle))
       val grantInstallOK = Input(Bool())
       val grantInstallSlot = Input(UInt(mshrBits.W))
       val replParentGeneration = Input(UInt(8.W))
     }
+    val refillInfo = Flipped(Vec(mshrsAll, ValidIO(new MSHRInfo)))
+    val snoopInfo = Flipped(Vec(mshrsAll, ValidIO(new MSHRInfo)))
 
     /* read C-channel Release Data and write into DS */
     val bufResp = Input(new PipeBufferResp)
@@ -322,7 +322,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val normalDecision = decideNormal(task_s3_decide.bits,
     io.dirResp_s3, io.metaOnHit_s3, io.cmoHitInvalid)
   val postGrantReleaseSnoop_decide = task_s3_decide.bits.fromB &&
-    io.fromMSHRCtl.postGrantReleaseHolds.map { holder =>
+    io.refillInfo.map { holder =>
       holder.valid && holder.bits.postGrantReleaseHold && holder.bits.refillCommitPending &&
         holder.bits.set === task_s3_decide.bits.set && holder.bits.reqTag === task_s3_decide.bits.tag
     }.reduce(_ || _)
@@ -342,7 +342,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val normalRefillWay_decide = Mux(commitReplWay_decide,
     io.replResp.bits.way, task_s3_decide.bits.way)
   val normalRefillOverlapsSnoopHold_decide = refillDecision_decide &&
-    io.fromMSHRCtl.snoopDataHolds.map { snoop =>
+    io.snoopInfo.map { snoop =>
       snoop.valid && snoop.bits.blockRefill && snoop.bits.set === task_s3_decide.bits.set &&
         snoop.bits.way === normalRefillWay_decide
     }.reduce(_ || _)

@@ -177,6 +177,8 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   mainPipe.io.cmoHitInvalid := directoryEventReg.cmoHitInvalid
   mainPipe.io.retryFastFwd_s2 := directory.io.retryFastFwd
   mainPipe.io.fromMSHRCtl <> mshrCtl.io.toMainPipe
+  mainPipe.io.refillInfo := mshrCtl.io.refillInfo
+  mainPipe.io.snoopInfo := mshrCtl.io.snoopInfo
   mainPipe.io.refillBufResp_s3.valid := RegNext(RegNext(refillBuf.io.r.valid, false.B), false.B)
   mainPipe.io.refillBufResp_s3.bits.id := RegNext(refillBuf.io.resp.id)
   mainPipe.io.refillBufResp_s3.bits.data := RegNext(refillBuf.io.resp.data)

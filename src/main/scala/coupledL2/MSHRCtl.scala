@@ -61,8 +61,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       val normalAllocOwner = Output(UInt(mshrBits.W))
       val normalAllocSource = Output(UInt(sourceIdBits.W))
       val replRespRetry = Output(Bool())
-      val snoopDataHolds = Vec(mshrsAll, ValidIO(new MSHRInfo()))
-      val postGrantReleaseHolds = Vec(mshrsAll, ValidIO(new MSHRInfo()))
       val postGrantReleaseLate = ValidIO(new TaskBundle)
       val grantInstallOK = Output(Bool())
       val grantInstallSlot = Output(UInt(mshrBits.W))
@@ -1594,8 +1592,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   io.replaceSnoopAdmissionIdle := VecInit(replaceMshrs.map(_.io.snoopAdmissionIdle)).asUInt
   io.rxdatStaleSlots := rxdatStaleSlotOH.asUInt
-  io.toMainPipe.snoopDataHolds := io.snoopInfo
-  io.toMainPipe.postGrantReleaseHolds := io.refillInfo
 
   replaceMshrs.zipWithIndex.foreach { case (replace, i) =>
     val parentReleaseMatches = VecInit(normalRetireEvents.map { event =>
