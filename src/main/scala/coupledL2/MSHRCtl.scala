@@ -235,9 +235,34 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val targetParentEpochs = Vec(mshrsAll, Bool())
     val targetParentAttached = Vec(mshrsAll, Bool())
   }
+  class SnoopReplaceReservation extends Bundle {
+    val targetId = UInt(mshrBits.W)
+    val targetGeneration = UInt(8.W)
+    val sourceGeneration = UInt(8.W)
+    val set = UInt(setBits.W)
+    val tag = UInt(tagBits.W)
+  }
   val snoopRetireEvents = snoopMshrs.zipWithIndex.map { case (source, i) =>
     val event = RegInit(0.U.asTypeOf(Valid(new OwnerRetirement)))
+    val reservation = RegInit(0.U.asTypeOf(Valid(new SnoopReplaceReservation)))
     val retiring = source.io.msInfo.valid && source.io.msInfo.bits.willFree
+    // Retain only the Replace route actually reserved by the captured snoop.
+    when(source.io.alloc.valid) {
+      val task = source.io.alloc.bits.task
+      val ownerOH = UIntToOH(task.snpHitReleaseIdx, mshrsAll)
+      reservation.valid := task.snpHitRelease
+      reservation.bits.targetId := task.snpHitReleaseIdx
+      reservation.bits.targetGeneration := Mux1H(ownerOH, mshrTaskGenerations(2))
+      reservation.bits.sourceGeneration := mshrTaskGenerations(1)(i) + 1.U
+      reservation.bits.set := task.set
+      reservation.bits.tag := task.tag
+      when(task.snpHitRelease) {
+        val target = Mux1H(ownerOH, replaceMshrs.map(_.io.info))
+        assert(target.valid && target.bits.set === task.set && target.bits.tag === task.tag,
+          "a nested snoop must retain its reserved Replace owner until allocation")
+      }
+    }
+    when(retiring) { reservation.valid := false.B }
     event.valid := retiring
     when(retiring) {
       event.bits.sourceId := i.U
@@ -245,10 +270,20 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       event.bits.sourceSet := source.io.msInfo.bits.set
       event.bits.sourceTag := source.io.msInfo.bits.reqTag
       event.bits.sourceEpoch := false.B
-      event.bits.targets := VecInit(replaceMshrs.map { target =>
-        target.io.info.valid && target.io.info.bits.set === source.io.msInfo.bits.set &&
-          target.io.info.bits.tag === source.io.msInfo.bits.reqTag
+      val completedTargets = VecInit(replaceMshrs.zipWithIndex.map { case (target, j) =>
+        reservation.valid && reservation.bits.targetId === j.U &&
+          reservation.bits.sourceGeneration === mshrTaskGenerations(1)(i) &&
+          reservation.bits.targetGeneration === mshrTaskGenerations(2)(j) &&
+          target.io.info.valid && target.io.info.bits.set === reservation.bits.set &&
+          target.io.info.bits.tag === reservation.bits.tag
       }).asUInt
+      event.bits.targets := completedTargets
+      when(reservation.valid) {
+        assert(reservation.bits.sourceGeneration === mshrTaskGenerations(1)(i) &&
+          reservation.bits.set === source.io.msInfo.bits.set &&
+          reservation.bits.tag === source.io.msInfo.bits.reqTag && completedTargets.orR,
+          "snoop retirement must release its retained source and Replace generations")
+      }
       event.bits.targetGenerations := VecInit(mshrTaskGenerations(2))
       event.bits.targetSets := VecInit(replaceMshrs.map(_.io.info.bits.set))
       event.bits.targetTags := VecInit(replaceMshrs.map(_.io.info.bits.tag))
