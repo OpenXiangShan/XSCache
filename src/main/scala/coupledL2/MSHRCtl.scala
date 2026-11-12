@@ -346,8 +346,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val payloadReady = Bool()
     val probePayload = Bool()
   }
-  val snoopPairSnoopGenerationSeen = RegInit(VecInit(Seq.fill(mshrsAll)(0.U(8.W))))
-  val snoopPairNormalGenerationSeen = RegInit(VecInit(Seq.fill(mshrsAll)(0.U(8.W))))
   val snoopPairs = snoopMshrs.zipWithIndex.map { case (snoop, i) =>
     val pair = RegInit(0.U.asTypeOf(Valid(new SnoopPair)))
     val normalMatches = VecInit(refillMshrs.map { normal =>
@@ -373,20 +371,16 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         (releaseStarts && Mux1H(normalMatches, refillMshrs.map(_.io.postGrantReleaseWindow)))
       pair.bits.payloadReady := Mux1H(normalMatches, refillMshrs.map(_.io.postGrantReleasePayloadReady))
       pair.bits.probePayload := Mux1H(normalMatches, refillMshrs.map(_.io.refillPayloadFromProbeAck))
-      snoopPairSnoopGenerationSeen(i) := mshrTaskGenerations(1)(i)
-      when(normalMatches.orR) {
-        snoopPairNormalGenerationSeen(OHToUInt(normalMatches)) :=
-          Mux1H(normalMatches, mshrTaskGenerations(0))
-      }
     }
     pair
   }
-  val snoopPairKnown = snoopPairs.zipWithIndex.map { case (pair, i) =>
-    pair.valid && pair.bits.snoopGeneration === snoopPairSnoopGenerationSeen(i)
-  }
-  val snoopPairNormalValid = snoopPairs.zipWithIndex.map { case (pair, i) =>
-    snoopPairKnown(i) && pair.bits.normal.valid &&
-      pair.bits.normal.bits.generation === snoopPairNormalGenerationSeen(pair.bits.normal.bits.id)
+  val snoopPairKnown = snoopPairs.map(_.valid)
+  val snoopPairNormalValid = snoopPairs.map(pair => pair.valid && pair.bits.normal.valid)
+  def pairedCompletionCurrent(completion: PairedCompletion): Bool = {
+    val pair = Mux1H(UIntToOH(completion.source, mshrsAll), snoopPairs)
+    pair.valid && pair.bits.snoopGeneration === completion.sourceToken.generation &&
+      pair.bits.normal.valid && pair.bits.normal.bits.id === completion.target &&
+      pair.bits.normal.bits.generation === completion.targetGeneration
   }
   val sinkCRefillRecord = RegInit(0.U.asTypeOf(Valid(new MSHRBufWrite)))
   val sinkCRefillGeneration = RegInit(0.U(8.W))
@@ -1985,9 +1979,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val sourceReallocated =
       VecInit(mshrTaskGenerations(g))(winner.source) =/= winner.token.generation
     val pairedOwnerReallocated = if (g == 1) {
-      winner.completion.valid &&
-        winner.completion.bits.targetGeneration =/=
-          snoopPairNormalGenerationSeen(winner.completion.bits.target)
+      winner.completion.valid && !pairedCompletionCurrent(winner.completion.bits)
     } else false.B
     sourceReallocated || pairedOwnerReallocated
   }
@@ -2129,8 +2121,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         when(winner.completion.valid) {
           assert(payload.set === winner.completion.bits.targetSet &&
             payload.tag === winner.completion.bits.targetTag &&
-            winner.completion.bits.targetGeneration ===
-              snoopPairNormalGenerationSeen(winner.completion.bits.target),
+            pairedCompletionCurrent(winner.completion.bits),
             "paired payload must retain the winner's normal owner and line")
         }
       }
