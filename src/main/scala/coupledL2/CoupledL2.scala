@@ -767,6 +767,13 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       txreqEvents.validMask := VecInit(txreqArbInputs.map(_.valid)).asUInt
       txreqEvents.readyMask := VecInit(txreqArbInputs.map(_.ready)).asUInt
       txreqEvents.outReady := txreq_arb.io.out.ready
+      txreqEvents.headValid := io.debugTopDown.robHeadPaddr.valid
+      txreqEvents.headAddress := io.debugTopDown.robHeadPaddr.bits
+      txreqEvents.requests.zip(txreqArbInputs).foreach { case (event, request) =>
+        event.address := request.bits.addr
+        event.transaction := request.bits.txnID
+        event.opcode := request.bits.opcode
+      }
       XSLog.registerCallerWithClock { (control, endpointReset, endpointClock) =>
         import chisel3.util.experimental.BoringUtils.bore
         val events = bore(txreqEvents)

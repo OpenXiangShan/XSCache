@@ -20,14 +20,24 @@ package xscache.coupledL2
 import chisel3._
 import org.chipsalliance.cde.config.Parameters
 import utility.{ChiselDB, LogPerfIO}
+import xscache.chi.CHIBundle
 
-class TxreqArbEvents(ports: Int) extends Bundle {
+class TxreqArbRequest(implicit p: Parameters) extends CHIBundle {
+  val address = UInt(ADDR_WIDTH.W)
+  val transaction = UInt(TXNID_WIDTH.W)
+  val opcode = UInt(REQ_OPCODE_WIDTH.W)
+}
+
+class TxreqArbEvents(ports: Int)(implicit p: Parameters) extends Bundle {
   val validMask = UInt(ports.W)
   val readyMask = UInt(ports.W)
   val outReady = Bool()
+  val headValid = Bool()
+  val headAddress = UInt(36.W)
+  val requests = Vec(ports, new TxreqArbRequest)
 }
 
-class TxreqArbRow(ports: Int) extends Bundle {
+class TxreqArbRow(ports: Int)(implicit p: Parameters) extends Bundle {
   val events = new TxreqArbEvents(ports)
   val nativeCycle = UInt(64.W)
   val clean = Bool()
