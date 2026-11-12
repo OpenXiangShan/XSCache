@@ -136,7 +136,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val replaceInfo = Vec(mshrsAll, ValidIO(new ReplaceMSHRInfo))
     val replaceInfoForSnoop = Vec(mshrsAll, ValidIO(new ReplaceMSHRInfo))
     val refillVictimDelegated = Output(UInt(mshrsAll.W))
-    val replaceAllocForSnoop = Vec(4, ValidIO(new ReplacementAllocAddress))
+    val replaceAllocForSnoop = ValidIO(new ReplacementAllocAddress)
     val aMergeTask = Flipped(ValidIO(new AMergeTask))
 
     /* refill read replacer result */
@@ -863,14 +863,17 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   )
   val replaceAllocOriginRequested = ReplacementAllocAddress.requestedOrigins(
     replaceAllocSnoopSources.map(_._1))
-  replaceAllocSnoopSources.zipWithIndex.foreach { case ((_, set, tag), i) =>
-    io.replaceAllocForSnoop(i).valid := RegNext(replaceAllocOriginRequested(i), false.B)
-    io.replaceAllocForSnoop(i).bits.set := RegEnable(set, replaceAllocOriginRequested(i))
-    io.replaceAllocForSnoop(i).bits.tag := RegEnable(tag, replaceAllocOriginRequested(i))
-    when(replaceAllocOriginRequested(i) && replaceAllocValid) {
-      assert(set === incomingVictim.set && tag === incomingVictim.tag,
-        "snoop allocation address must equal the accepted replacement victim")
-    }
+  val replaceAllocAddress = Wire(new ReplacementAllocAddress)
+  replaceAllocAddress.set := Mux1H(replaceAllocOriginRequested, replaceAllocSnoopSources.map(_._2))
+  replaceAllocAddress.tag := Mux1H(replaceAllocOriginRequested, replaceAllocSnoopSources.map(_._3))
+  val replaceAllocRequested = replaceAllocOriginRequested.reduce(_ || _)
+  io.replaceAllocForSnoop.valid := RegNext(replaceAllocRequested, false.B)
+  io.replaceAllocForSnoop.bits := RegEnable(replaceAllocAddress, replaceAllocRequested)
+  assert(PopCount(replaceAllocOriginRequested) <= 1.U,
+    "qualified replacement allocation origins must be one-hot")
+  when(replaceAllocRequested && replaceAllocValid) {
+    assert(replaceAllocAddress.set === incomingVictim.set && replaceAllocAddress.tag === incomingVictim.tag,
+      "snoop allocation address must equal the accepted replacement victim")
   }
 
   (0 until mshrsAll).foreach { parent =>
