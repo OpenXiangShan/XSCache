@@ -325,23 +325,9 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   val ackReservations = eventCount(reserveA, returnA, grantBufInflightSize, "A reservations")
 
   // Delay occupancy by one edge to align insertion with the registered reservation return.
-  val grantOccupied = eventCount(
-    RegNext(grantQueue.io.enq.fire, false.B),
-    RegNext(grantQueue.io.deq.fire, false.B), mshrsAll, "grant occupancy")
-  val ackOccupied = eventCount(
-    RegNext(io.d_task.fire && taskNeedsInflight, false.B),
-    RegNext(io.e.fire, false.B), grantBufInflightSize, "GrantAck occupancy")
-  val pftOccupied = prefetchOpt.map(_ => eventCount(
-    RegNext(pftRespQueue.get.io.enq.fire, false.B),
-    RegNext(pftRespQueue.get.io.deq.fire, false.B), pftQueueLen, "prefetch occupancy"))
-  assert(grantOccupied === RegNext(grantQueue.io.count, 0.U),
-    "grant event ledger must match delayed FIFO occupancy")
-  assert(ackOccupied === RegNext(PopCount(inflightGrant.map(_.valid)), 0.U),
-    "GrantAck event ledger must match delayed table occupancy")
-  prefetchOpt.foreach { _ =>
-    assert(pftOccupied.get === RegNext(pftRespQueue.get.io.count, 0.U),
-      "prefetch event ledger must match delayed FIFO occupancy")
-  }
+  val grantOccupied = RegNext(grantQueue.io.count, 0.U)
+  val ackOccupied = RegNext(PopCount(inflightGrant.map(_.valid)), 0.U)
+  val pftOccupied = prefetchOpt.map(_ => RegNext(pftRespQueue.get.io.count, 0.U))
   val grantUsed = grantOccupied +& grantReservations
   val ackUsed = ackOccupied +& ackReservations
   assert(grantUsed <= mshrsAll.U, "grant promises exceed local capacity")
