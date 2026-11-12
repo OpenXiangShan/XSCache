@@ -290,7 +290,6 @@ class MSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   val replaceActive = Input(Bool())
   // Only registered, epoch-matched child ownership, without a same-cycle
   // allocation intent. A finished child must permit a later replacer lookup.
-  val replaceLive = Input(Bool())
   // Accepted child ownership, separate from replaceActive's same-cycle
   // arbitration intent. Only this notification may latch delegation.
   val replaceAccepted = Input(Bool())
@@ -960,7 +959,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   val replReadTaskPending = req_valid &&
     (grantTaskPending || (!cmo_cbo && grantIssued))
   io.replReadWanted := replReadTaskPending && grantTaskAllowed && !dirResult.hit && !state.w_replResp &&
-    !replReadInFlight && !denied && !io.replaceLive
+    !replReadInFlight && !denied && !io.replaceActive
   val mp_repl_read_valid = replReadTaskPending && internalReplRead && grantTaskAllowed && !replLookupInFlight
   assert(
     !(mp_repl_read_valid && replReadBlockedBySnoopOrReplace),
@@ -2915,7 +2914,7 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   //
   // deadlock check
   //
-  val leaseOwnerControls = Cat(io.replaceActive, io.replaceLive, io.replaceAccepted,
+  val leaseOwnerControls = Cat(io.replaceActive, io.replaceAccepted,
     io.replaceDetached, io.replaceRefillReady, io.deferGrant,
     io.postGrantReleaseSnoopActive, io.blockReplRead)
   val leaseOwnerControlsChanged = leaseOwnerControls =/=

@@ -1662,7 +1662,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       // replResp.valid/mshrId for the allocation cycle, so probe/replRead/
       // cbwrdata still see the child on the cycle it is created.
       refill.io.replaceActive := replaceActiveForParent(i)
-      refill.io.replaceLive := replaceActiveForParent(i)
       // A full pool (or a same-cycle reservation taking its last free slot)
       // can reject an intent. The parent must keep requesting until accepted.
       refill.io.replaceAccepted := replaceActiveForParent(i) ||
@@ -1802,7 +1801,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         assert(grantVersionMatches, "SourceD receipt must name its retained normal issue version")
       }
       snoop.io.replaceActive := false.B
-      snoop.io.replaceLive := false.B
       snoop.io.replaceAccepted := false.B
       snoop.io.replaceDetached := false.B
       snoop.io.replaceRefillReady := false.B
