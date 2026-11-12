@@ -571,13 +571,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
 
   // ReleaseData and ProbeAckData read releaseBuffer
   // channel is used to differentiate GrantData and ProbeAckData
-  val snoopNeedData = task_s2.bits.fromB && task_s2.bits.toTXDAT && isSnpRespDataX(task_s2.bits.chiOpcode.get)
-  val releaseNeedData = task_s2.bits.toTXDAT && task_s2.bits.chiOpcode.get === CopyBackWrData
-  val dctNeedData = task_s2.bits.toTXDAT && task_s2.bits.chiOpcode.get === CompData
-  val cmoNeedData = task_s2.bits.toTXREQ && task_s2.bits.cmoTask && (
-    task_s2.bits.chiOpcode.get === WriteCleanFull ||
-      task_s2.bits.chiOpcode.get === WriteBackFull
-  )
   val snpHitReleaseNeedData = !mshrTask_s2 && task_s2.bits.fromB && task_s2.bits.snpHitReleaseWithData
   io.releaseBufRead_s2.valid := task_s2.valid && Mux(
     mshrTask_s2,
