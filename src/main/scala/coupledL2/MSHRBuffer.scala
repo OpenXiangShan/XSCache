@@ -46,7 +46,7 @@ class MSHRBuffer(wPorts: Int = 1)(implicit p: Parameters) extends L2Module {
     // Second read port for the direct ReplaceMSHR->TXDAT copyback path
     // (flop-based array, so this is just another read mux).
     val r2 = Flipped(ValidIO(new MSHRBufRead))
-    val resp2 = new MSHRBufResp
+    val resp2 = Output(new DSBlock)
     val w = Vec(wPorts, Flipped(ValidIO(new MSHRBufWrite)))
   })
 
@@ -73,9 +73,7 @@ class MSHRBuffer(wPorts: Int = 1)(implicit p: Parameters) extends L2Module {
   io.resp.data.data := RegEnable(rdata, 0.U.asTypeOf(rdata), io.r.valid)
 
   val rdata2 = buffer(io.r2.bits.id).asUInt
-  val rid2 = RegEnable(io.r2.bits.id, 0.U, io.r2.valid)
-  io.resp2.id := rid2
-  io.resp2.data.data := RegEnable(rdata2, 0.U.asTypeOf(rdata2), io.r2.valid)
+  io.resp2.data := RegEnable(rdata2, 0.U.asTypeOf(rdata2), io.r2.valid)
 }
 
 // may consider just choose an empty entry to insert

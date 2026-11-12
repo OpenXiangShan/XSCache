@@ -145,7 +145,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val toTXDAT = DecoupledIO(new TaskWithData())
     val txdatDirectSpace = Input(Bool())
     val releaseBufDirectRd = ValidIO(new MSHRBufRead)
-    val releaseBufDirectResp = Input(new MSHRBufResp)
+    val releaseBufDirectResp = Input(new DSBlock)
     val toSourceB = DecoupledIO(new TLBundleB(edgeIn.bundle))
 
     /* to block sourceB from sending same-addr probe until GrantAck received */
@@ -2215,7 +2215,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val cbSelStillValid = Mux1H(cbSelOH, directCbValids)
   io.toTXDAT.valid := cbPresent && cbSelStillValid && !io.sidecarReservationHold
   io.toTXDAT.bits.task := cbTaskReg
-  io.toTXDAT.bits.data := io.releaseBufDirectResp.data
+  io.toTXDAT.bits.data := io.releaseBufDirectResp
   when (cbPresent && !cbSelStillValid) {
     // Preempted by a nested snoop before TXDAT acceptance: drop the staged
     // request; the sidecar re-presents with refreshed state afterwards.
