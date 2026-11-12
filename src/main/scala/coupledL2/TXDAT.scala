@@ -34,9 +34,6 @@ class TXDATBlockBundle(implicit p: Parameters) extends TXBlockBundle {
 class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   val io = IO(new Bundle() {
     val in = Flipped(DecoupledIO(new TaskWithData()))
-    // Direct ReplaceMSHR CopyBackWrData path (victim writeback data).  The
-    // mainpipe input keeps strict priority; the direct input is gated by
-    // queue pressure with margin for its in-flight read.
     val mshrIn = Flipped(DecoupledIO(new TaskWithData()))
     val directSpace = Output(Bool())
     val out = DecoupledIO(new CHIDAT())
@@ -44,7 +41,6 @@ class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     val pipeStatusVec = Flipped(Vec(6, ValidIO(new PipeStatusWithCHI)))
     val reservedB = Input(Bool())
     val toReqArb = Output(new TXDATBlockBundle)
-    // Registered event after the final data beat leaves the TXDAT channel.
     val done = ValidIO(new TaskBundle)
   })
 
@@ -54,12 +50,6 @@ class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   require(chiOpt.isDefined)
   require(beatBytes * 8 == DATA_WIDTH)
 
-  // Worst-case data pressure in the multi-context MSHR design:
-  //   normal cbwrdata (Get-on-TRUNK/CMO paths) <= mshrsAll
-  //   ReplaceMSHR CopyBackWrData + SnoopMSHR SnpRespData <= mshrsAll
-  //     (S/R are mutually exclusive per slot)
-  // The pre-split bound of mshrsAll no longer holds; see TXREQ for details.
-  // Use customized SRAM: dual_port, max 256bits:
   val queue = Module(new Queue(new TaskBundle(), entries = 2 * mshrsAll, flow = false))
   val queueData0 = Module(new Queue(new DSBeat(), entries = 2 * mshrsAll, flow = false))
   val queueData1 = Module(new Queue(new DSBeat(), entries = 2 * mshrsAll, flow = false))
@@ -86,10 +76,6 @@ class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   io.toReqArb.blockSinkBReqEntrance := noSpaceForSinkBReq
   io.toReqArb.blockMSHRReqEntrance := noSpaceForMSHRReq
 
-  // The mainpipe input keeps strict priority and its "never full" invariant;
-  // the direct copyback input is admitted only with margin (the direct path
-  // holds at most one request between ReleaseBuf read and enqueue, which the
-  // 4-entry margin covers; see MSHRCtl).
   val noSpaceForDirect = inflightCnt >= (2 * mshrsAll - 4).U
   io.directSpace := !noSpaceForDirect
   queue.io.enq.valid := io.in.valid || io.mshrIn.valid && !noSpaceForDirect
@@ -127,10 +113,6 @@ class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   when (io.out.fire) {
     beatValids := VecInit(next_beatsOH.asBools)
   }
-  // One terminal event per cycle is the physical channel's maximum rate.
-  // MSHRCtl consumes this Valid every cycle; the owner keeps its outstanding
-  // snoop/copyback obligation until then. Capture the task continuously so
-  // external ready drives only the event FF, not every payload write enable.
   io.done.valid := RegNext(io.out.fire && !next_beatsOH.orR, false.B)
   io.done.bits := RegNext(taskR.task)
 

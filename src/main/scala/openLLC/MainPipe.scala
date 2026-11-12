@@ -380,9 +380,6 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   )
   refill_s4.valid := task_s4.valid && (
     (sharedReq_s4 || writeEvictOrEvict_s4) && !self_hit_s4 ||
-    // A WriteBackFull carries the authoritative data even when this slice
-    // still has the line.  Keep a refill entry so CopyBackWrData can be
-    // matched by the DBID returned to the RN and update the local data array.
     writeBackFull_s4 ||
     replace_snoop_s4 ||
     stashMissRefill_s4
@@ -390,8 +387,6 @@ class MainPipe(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   refill_s4.bits.state.s_refill := false.B
   refill_s4.bits.state.w_datRsp := false.B
   refill_s4.bits.state.w_snpRsp := !Cat(snpVec_refill_s4).orR
-  // Keep the requester's own address. A replace snoop targets a different
-  // line that shares this reqID, so its data must not be refilled here.
   refill_s4.bits.task := req_s4
   refill_s4.bits.task.refillTask := true.B
   refill_s4.bits.task.snpVec := snpVec_refill_s4

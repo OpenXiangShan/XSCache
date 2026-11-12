@@ -32,16 +32,11 @@ class RXSNP(
   val io = IO(new Bundle() {
     val rxsnp = Flipped(DecoupledIO(new CHISNP()))
     val task = DecoupledIO(new TaskBundle())
-    // A snapshot acquires its concrete S/R slot before becoming visible to B.
     val admissionEnable = Input(Bool())
-    // Queue occupancy is a register output, independent from owner/stall
-    // eligibility. It can release an older blocked A claim before snapshot.
     val queued = Output(Bool())
     val admission = DecoupledIO(new TaskBundle)
     val replaceAdmissionIdle = Input(UInt(mshrsAll.W))
     val sidecarReserve = ValidIO(UInt(mshrBits.W))
-    // A normal request, a snoop context, and a replacement victim can all be
-    // live concurrently. Keep their addresses independent.
     val refillInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo())))
     val snoopInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo())))
     val replaceInfo = Vec(mshrsAll, Flipped(ValidIO(new ReplaceMSHRInfo)))
@@ -72,28 +67,13 @@ class RXSNP(
     */
   val reqBlockSnpMask = VecInit(io.refillInfo.map(s =>
       s.valid && s.bits.set === task.set && s.bits.reqTag === task.tag && (
-      // A SourceD Grant has already transferred ownership to L1, while the
-      // normal refill commit may still be absent from Directory. Keep the
-      // snoop in the queue until that commit is visible; otherwise the snoop
-      // would take the transient directory-miss/no-client direct path.
       !s.bits.postGrantReleaseHold && (
         s.bits.grantPending ||
         ((s.bits.w_grantfirst || // See [2], [3] above with 's.bits.blockRefill'
           s.bits.aliasTask.getOrElse(false.B) && !s.bits.w_rprobeacklast) &&
           (s.bits.blockRefill || s.bits.w_releaseack ||
-          // A Grant task can leave the MSHR several cycles before its refill
-          // reaches DataStorage. During that interval the directory cannot serve
-          // a same-line snoop with the newly granted data.
             (s.bits.s_refill)))
       ) ||
-      // In the post-Grant ReleaseData window the paired-snoop fast path only
-      // works if the paired context is allocated before the normal commit can
-      // fire.  A snoop that is still queued cannot win that race (MainPipe
-      // congestion may delay its allocation past the commit), and would then
-      // answer a Directory-miss SnpResp while the commit re-installs the line
-      // afterwards.  Hold it until the deferred commit is fully visible; the
-      // commit never depends on a snoop that has not been allocated, so this
-      // cannot deadlock.
       s.bits.postGrantReleaseHold && s.bits.refillCommitPending
     )
   )).asUInt
@@ -110,13 +90,7 @@ class RXSNP(
     *    release tasks to MainPipe (DS write was done in release tasks on MainPipe), the incoming snoop of Y should 
     *    be **blocked**.
     */
-  // A CMO in flight only conflicts with snoops for its OWN line: blocking
-  // every snoop would deadlock against openLLC, whose snoop-unit occupancy
-  // gates the entrance that must accept the CMO sidecar's writeback.
-  // (observed: CMO waits releaseAck <- openLLC entrance blocked by full
-  // snpUnit <- snoop responses blocked here -> ReqBuf Leak).
-  // For the CMO's own line, a nestable sidecar services the snoop from its
-  // ReleaseBuf snapshot, so yield the block whenever nesting applies.
+  // A CMO blocks its own line and yields to its nest-ready sidecar.
   val cmoBlockSnpMask = VecInit(io.refillInfo.map(s =>
     s.valid && s.bits.dirHit && isValid(s.bits.meta.state) &&
     !s.bits.s_cmoresp && (!s.bits.s_release || !s.bits.w_rprobeacklast || !s.bits.s_cmometaw) &&
@@ -127,50 +101,30 @@ class RXSNP(
     s.bits.s_cmoresp && s.bits.w_replResp && (!s.bits.w_rprobeacklast || s.bits.w_releaseack || !RegNext(s.bits.w_replResp))
   }).asUInt
   val replaceBlockSnp = replaceBlockSnpMask.orR
-  // Share the same-line sidecar compare between the nest and block paths.
-  // Both feed the same-cycle RXSNP admission cone, so this is a pure
-  // combinational factoring with no handshake or protocol latency change.
   val sidecarLineMask = VecInit(io.replaceInfo.map(s =>
     s.valid && s.bits.set === task.set && s.bits.tag === task.tag
   )).asUInt
 
-  // A sidecar owns the victim ReleaseBuf until lower transport completes.
-  // CHI requires an RN to service snoops while a CopyBack is outstanding, so
-  // releaseStarted is not a blocking boundary. Only a CopyBackWrData already
-  // issued to MainPipe is immutable; wait for its final data beat in that
-  // narrow interval.
+  // Service snoops while CopyBack is outstanding; only issued immutable CopyBackWrData blocks nesting.
   val sidecarNestReadyMask = VecInit(io.replaceInfo.zipWithIndex.map { case (s, i) =>
     s.bits.probeDone && s.bits.releaseBufReady && io.replaceAdmissionIdle(i) &&
       (!s.bits.releaseStarted || !s.bits.copyBackIssued)
   }).asUInt
   val sidecarNestSnpMask = sidecarLineMask & sidecarNestReadyMask
 
-  // The whole command is frozen only after the local admission phase and
-  // concrete service-slot reservation agree. The queue head remains owned
-  // until the actual B capture, but no raw eligibility or payload can bypass
-  // this register. A nested snapshot also pins its physical ReleaseBuf owner.
+  // Capture the full snoop snapshot with its concrete S/R reservation; hold the queue owner until B acceptance.
   val admissionValid = RegInit(false.B)
   val admissionTask = RegInit(0.U.asTypeOf(new TaskBundle))
   val admissionOwnerGeneration = Reg(UInt((mshrBits + 1).W))
 
-  // A same-line snoop during a CMO is serviced by the CMO sidecar's ReleaseBuf
-  // snapshot whenever nesting applies, so the CMO block yields to nesting.
   val cmoBlockSnp = cmoBlockSnpMask.orR && !sidecarNestSnpMask.orR
 
-  // Normal's legacy victim flags describe an unresolved handoff, not a
-  // ReleaseBuf owner. All victim release traffic now belongs to ReplaceMSHR.
-  // Before delegation, wait for that owner to register. Once delegation is
-  // sticky, an absent child means its writeback has completed: do not revive
-  // the old normal index or wait for a replacement child. Read Directory.
   val normalVictimAwaitingOwnerMask = VecInit(io.refillInfo.zipWithIndex.map { case (s, i) =>
     !io.refillVictimDelegated(i) && s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag &&
       (!s.bits.dirHit || !s.bits.s_cmoresp) && s.bits.meta.state =/= INVALID &&
       RegNext(s.bits.w_replResp) && s.bits.w_rprobeacklast && !s.bits.w_releaseack
   }).asUInt
   val normalVictimAwaitingOwner = normalVictimAwaitingOwnerMask.orR && !sidecarLineMask.orR
-  // RXSNP.task.valid is low while unresolved, so RequestArb never captures
-  // the B or holds a B reservation fence. Replacement/CMO owner allocation
-  // therefore progresses independently of this waiting snoop.
   val replaceNestSnpMask = sidecarNestSnpMask
   val releaseToInvalNestSnpMask = VecInit(io.replaceInfo.map(s =>
     !s.bits.releaseToClean)).asUInt & replaceNestSnpMask
@@ -199,13 +153,6 @@ class RXSNP(
   val snoopContextBlock = VecInit(io.snoopInfo.map(s =>
     s.valid && s.bits.blocksSnoop && s.bits.set === task.set && s.bits.reqTag === task.tag
   )).asUInt.orR
-  // Allocation-stage victims cannot nest yet. Compare each raw origin address
-  // before its control mux and physical slot selection, then OR the block.
-  // R1: the origin is advertised before slot acceptance, so yield the guard
-  // once a same-line sidecar is nest-ready. The registered-sidecar term below
-  // then owns the decision (block while not ready, nest when ready), so an
-  // origin that stays valid after its allocation can never block the newly
-  // allocated sidecar's own nested snoop.
   val allocatingSidecarMatch = VecInit(io.replaceAlloc.map(s =>
     s.valid && s.bits.set === task.set && s.bits.tag === task.tag
   )).asUInt.orR
@@ -231,9 +178,6 @@ class RXSNP(
   }.elsewhen(io.task.fire) {
     admissionValid := false.B
   }
-  // The local capture phase protects the owner across the snapshot edge.
-  // This registered one-cycle event then transfers that protection into the
-  // sidecar's existing snoopInFlight tally, exactly once per nested command.
   io.sidecarReserve.valid := RegNext(admissionCapture && task.snpHitRelease, false.B)
   io.sidecarReserve.bits := RegEnable(task.snpHitReleaseIdx, admissionCapture)
 
@@ -257,16 +201,10 @@ class RXSNP(
     "stallCnt full! maybe there is a deadlock! addr => 0x%x req_opcode => %d txn_id => %d",
     rxsnp.bits.addr, rxsnp.bits.opcode, rxsnp.bits.txnID)
 
-  // A sidecar's nested snoop must never be blocked by the allocation origin
-  // that created it: the guard above yields whenever nesting is possible.
   when (allocatingSidecarBlockSnp) {
     assert(!sidecarNestSnpMask.orR,
       "a sidecar's own nested snoop must not be blocked by its allocation origin")
   }
-  // Liveness: while the origin is the only reason a snoop waits, the
-  // allocation must register its sidecar and hand the line to the terms above.
-  // The raw origin itself may outlive the allocation, so bound the
-  // exclusively-allocating-blocked window rather than the origin pulse.
   val allocBlockOnly = rxsnp.valid && allocatingSidecarBlockSnp &&
     !(reqBlockSnp || replaceBlockSnp || cmoBlockSnp || snoopContextBlock ||
       (sidecarLineMask & ~sidecarNestSnpMask).orR)

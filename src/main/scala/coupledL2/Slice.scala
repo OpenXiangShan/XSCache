@@ -152,9 +152,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   mainPipe.io.sinkCHintQInfo := reqArb.io.sinkCHintQInfo
   reqArb.io.hint_s1QueueFull := mainPipe.io.hint_s1QueueFull
   mainPipe.io.fromReqArb.status_s1 := reqArb.io.status_s1
-  // Complete S3 event: Directory, task (in MainPipe), C payload and both
-  // MSHR-buffer returns advance together. No individual hit/retry bypass
-  // reaches the owner/allocation logic ahead of the registered transaction.
+  // Register Directory, C payload and both MSHR-buffer returns as one aligned S3 transaction.
   val directoryEvent = Wire(new Bundle {
     val result = Valid(new DirResult)
     val replacement = Valid(new ReplacerResult)
@@ -212,7 +210,6 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
 
   /* Read and write release buffer */
   releaseBuf.io.r := reqArb.io.releaseBufRead_s2
-  // Second read port: direct ReplaceMSHR->TXDAT copyback path.
   releaseBuf.io.r2 := mshrCtl.io.releaseBufDirectRd
   mshrCtl.io.releaseBufDirectResp := releaseBuf.io.resp2
   val nestedWriteReleaseBuf,
@@ -250,22 +247,16 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
 
   /* Read and write refill buffer */
   refillBuf.io.r := reqArb.io.refillBufRead_s2
-  // RefillBuf has no direct-path consumer; tie off the second read port.
   refillBuf.io.r2.valid := false.B
   refillBuf.io.r2.bits := 0.U.asTypeOf(new MSHRBufRead)
   val nestedWriteRefillBuf = mshrCtl.io.nestedRefillWrite
   val rxdatWriteRefillBuf = WireInit(rxdat.io.refillBufWrite)
   val rxdatTargetsReleaseOwnedRefill =
     (UIntToOH(rxdat.io.refillBufWrite.bits.id, mshrsAll) & mshrCtl.io.refillBufReleaseOwner).orR
-  // A CompData whose DBID belongs to the previous tenant of this TxnID must
-  // not overwrite the new tenant's RefillBuf (see MSHRCtl.rxdatStaleSlots).
   val rxdatTargetsStaleSlot =
     (UIntToOH(rxdat.io.refillBufWrite.bits.id, mshrsAll) & mshrCtl.io.rxdatStaleSlots).orR
   rxdatWriteRefillBuf.valid := rxdat.io.refillBufWrite.valid &&
     !rxdatTargetsReleaseOwnedRefill && !rxdatTargetsStaleSlot
-  // A Get-on-TRUNK DS snapshot is only a fallback.  Once matching
-  // ReleaseData owns RefillBuf, a later S5 snapshot must not overwrite the
-  // authoritative dirty payload.
   val mainPipeWriteRefillBuf = WireInit(mainPipe.io.refillBufWrite)
   val mainPipeTargetsReleaseOwnedRefill =
     (UIntToOH(mainPipe.io.refillBufWrite.bits.id, mshrsAll) & mshrCtl.io.refillBufReleaseOwner).orR

@@ -80,8 +80,6 @@ class DirRead(implicit p: Parameters) extends L2Bundle {
   val replacerInfo = new ReplacerInfo()
   // dirRead when refill
   val refill = Bool()
-  // RefillBuf commit for a request that originally hit. Return the current
-  // hit way when it still exists; otherwise return a replacement candidate.
   val normalRefillRevalidate = Bool()
   val mshrId = UInt(mshrBits.W)
   // when flush l2
@@ -100,8 +98,6 @@ class DirResult(implicit p: Parameters) extends L2Bundle {
 }
 
 class ReplacerResult(implicit p: Parameters) extends L2Bundle {
-  // Valid only for normalRefillRevalidate. It distinguishes a current hit
-  // from a replacement candidate without overloading the victim metadata.
   val hit = Bool()
   val tag = UInt(tagBits.W)
   val set = UInt(setBits.W)
@@ -144,12 +140,7 @@ class Directory(implicit p: Parameters) extends L2Module {
     val metaWReq = Flipped(ValidIO(new MetaWrite))
     val tagWReq = Flipped(ValidIO(new TagWrite))
     val replResp = ValidIO(new ReplacerResult)
-    // Independent normal, snoop, and replacement ownership views are needed
-    // to reserve all live ways without hiding a normal request behind a
-    // replacement victim.
     val refillInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo)))
-    // Snoop contexts are not normal MSHRs, but a data-carrying snoop can
-    // retain a DS fallback dependency on its hit way.
     val snoopInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo)))
     val replaceInfo = Vec(mshrsAll, Flipped(ValidIO(new ReplaceMSHRInfo)))
     val metaOnHit = new MetaEntry()
@@ -306,29 +297,10 @@ class Directory(implicit p: Parameters) extends L2Module {
   val tagMatchVec = tagAll_s3.map(_ (tagBits - 1, 0) === req_s3.tag)
   val metaValidVec = metaAll_s3.map(_.state =/= MetaData.INVALID)
   val hitVecRaw = tagMatchVec.zip(metaValidVec).map(x => x._1 && x._2)
-  // Eviction-window guard (perf report 补充二十五): a channel-A lookup that
-  // hits a line just selected as a refill victim must not complete as a hit.
-  // In the deferred design the parent's commit overwrites the victim way much
-  // later than the victim selection; a hit in between would grant/promote an
-  // L1 copy that the sidecar never probes (its probe decision latched the
-  // lookup-time meta), orphaning the copy when the commit lands.  Suppressing
-  // the hit drops the request to the miss path, whose MSHR/CHI flow is
-  // serialized behind the eviction writeback at openLLC (and the MSHR-alloc
-  // conflict check on the victim metaTag holds it in the RequestBuffer until
-  // the eviction retires).  Snoop (B) and release (C) lookups keep seeing the
-  // entry: they are ordered through the replaceInfo/nestedwb machinery.
-  // The mask is evaluated at s3 from the *live* refillInfo so a lookup whose
-  // SRAM read raced the victim selection is still caught.
+  // A stale A hit must not observe a way whose owning refill has not committed yet.
   val victimPendingWayMask_s3 = VecInit(io.refillInfo.map(s =>
     Mux(
-      // Only a context that will actually overwrite its way may suppress hits
-      // on it.  A CMO is allocated with w_replResp set and dirHit clear on a
-      // miss too, but it never installs: its dirResult.way is just the
-      // lookup's invalid-way guess.  Counting it reserved that way, so a line
-      // installed there afterwards had its hits suppressed and the follow-up
-      // was allocated as a miss that installed a second copy (tl-test: "Set
-      // should not have more than one hit"). Use the stable request type:
-      // s_cmoresp becomes true before a CMO context actually retires.
+      // Only an owner that will overwrite its way may suppress a Directory hit.
       s.valid && !s.bits.isCmo && (s.bits.set === req_s3.set) && !s.bits.dirHit &&
         s.bits.w_replResp && !s.bits.refillCommitLanded,
       UIntToOH(s.bits.way, ways),
@@ -344,24 +316,7 @@ class Directory(implicit p: Parameters) extends L2Module {
     reqValid_s3 && suppressAHitDying_s3 && (victimPendingWayMask_s3 & hitVecRaw.asUInt).orR)
 
   /* ====== refill retry ====== */
-  // when refill, ways that have not finished writing its refillData back to DS (in MSHR Release),
-  // or using by Alias-Acquire (hit), can not be used for replace.
-  // choose free way to refill, if all ways are occupied, we cancel the Grant and LET IT RETRY
-  // compare is done at Stage2 for better timing
-  // The requesting MSHR's own tentative way must not block its own lookup:
-  // its dirResult.way lock only protects that way from OTHER in-flight
-  // lookups.  Otherwise a fill whose replacer state has not changed since
-  // allocation re-picks its own tentative way and is spuriously redirected
-  // to MaskToOH (measured: 99.8% of all fallbacks are such self-collisions).
-  // Sample each owner's local match/way at the read edge, before reducing
-  // across owners. The existing S2 -> S3 boundary then reduces only FFs;
-  // admission and the complete address/hold cone no longer feed a global
-  // way reduction and its wide clock enable in the same stage. These local
-  // samples update unconditionally: reqValid_s2 alone identifies a read, and
-  // the S3 record below retains exactly that read's snapshot.
   def sampleOwnerWayMask(mask: UInt): UInt = {
-    // An explicit register type is required by MaskToOH's elaboration-time
-    // width queries; RegNext(UInt) otherwise leaves this width inferred.
     val snapshot = RegInit(0.U(ways.W))
     snapshot := mask
     snapshot
@@ -381,13 +336,6 @@ class Directory(implicit p: Parameters) extends L2Module {
       0.U(ways.W)
     ))
   )
-  // ReplaceMSHR owns the victim ReleaseBuf independently of its normal parent.
-  // The Directory way only needs protection until the parent's deferred refill
-  // commit is visible: parentAttached drops at the parent's retire edge, which
-  // is gated on commitIssued + refillWriteDone + the way-commit margin, so the
-  // new tag/meta at that way are already installed before the hold releases.
-  // Holding the way for the sidecar's whole writeback lifetime shrinks
-  // freeWayMask for dozens of extra cycles and degrades victim selection.
   val replaceOwnerWayMasks_s2 = io.replaceInfo.map(s =>
     sampleOwnerWayMask(Mux(
       s.valid && s.bits.parentAttached && (s.bits.set === req_s1.set),
@@ -413,8 +361,6 @@ class Directory(implicit p: Parameters) extends L2Module {
     ))
   }
   val selfOccWayMask_s2 = VecInit(selfOwnerWayMasks_s2).reduceTree(_ | _)
-  // Assertions and counters execute at S3, so retain the same sampled read
-  // rather than consulting the next cycle's unconditional owner snapshots.
   val snoopWayHoldMask_s3 = RegEnable(snoopWayHoldMask_s2, 0.U(ways.W), refillReqValid_s2)
   val replaceWayHoldMask_s3 = RegEnable(replaceWayHoldMask_s2, 0.U(ways.W), refillReqValid_s2)
   val normalOccWayMask_s3 = RegEnable(normalOccWayMask_s2, 0.U(ways.W), refillReqValid_s2)
@@ -447,25 +393,15 @@ class Directory(implicit p: Parameters) extends L2Module {
       "a refill replacement must not select a DS way held by ReplaceMSHR")
   }
   val way_s3 = OHToUInt(wayOH_s3)
-  // wayOH_s3 is one-hot for a legal selected way and zero for a retry/no-way
-  // cycle. Preserve Mux1H's zero result on the latter while giving synthesis
-  // one indexed selector for the shared tag/meta payload path.
   val waySelected_s3 = wayOH_s3.orR
   val meta_s3 = Mux(waySelected_s3, metaAll_s3(way_s3), 0.U.asTypeOf(new MetaEntry))
   val metaOnHit_s3 = Mux1H(hitOH, metaAll_s3) // only valid when hit
   val tag_s3 = Mux(waySelected_s3, tagAll_s3(way_s3), 0.U(tagBits.W))
   val set_s3 = req_s3.set
   val replacerInfo_s3 = req_s3.replacerInfo
-  // Debug counters for the victim-selection-degradation investigation: how
-  // often the free-way mask forces the MaskToOH fallback instead of the
-  // replacer's pick, how often a refill read is retried, and the clients
-  // composition of selected victims.
   val replLookup_s3 = reqValid_s3 && req_s3.refill && !hit_s3
   val chosenBlocked_s3 = replLookup_s3 && !Mux1H(chosenOH, freeWayMask_s3)
   XSPerfAccumulate("repl_fallback_cnt", chosenBlocked_s3)
-  // Decompose what covers the chosen way when the fallback fires: the
-  // requesting MSHR's own tentative way (spurious self-collision), another
-  // normal context, a ReplaceMSHR hold, or a SnoopMSHR hold.
   XSPerfAccumulate("repl_fallback_selfWay_cnt",
     chosenBlocked_s3 && (chosenOH & selfOccWayMask_s3).orR)
   XSPerfAccumulate("repl_fallback_normalOther_cnt",
@@ -474,7 +410,6 @@ class Directory(implicit p: Parameters) extends L2Module {
     chosenBlocked_s3 && (chosenOH & replaceWayHoldMask_s3).orR)
   XSPerfAccumulate("repl_fallback_snoopHold_cnt",
     chosenBlocked_s3 && (chosenOH & snoopWayHoldMask_s3).orR)
-  // Occupancy level of each mask at lookup time (sum over lookups).
   XSPerfAccumulate("lookup_occ_normal_sum",
     Mux(replLookup_s3, PopCount(normalOccWayMask_s3), 0.U))
   XSPerfAccumulate("lookup_occ_replace_sum",
@@ -492,13 +427,6 @@ class Directory(implicit p: Parameters) extends L2Module {
   XSPerfAccumulate("repl_victim_dirty1",
     io.replResp.valid && !io.replResp.bits.retry && !io.replResp.bits.hit &&
       io.replResp.bits.meta.state =/= MetaData.INVALID && io.replResp.bits.meta.dirty)
-  // Write-port busy cycles regardless of whether a read is presented.
-  // Channel lookups never assert io.read.valid while the port is busy
-  // (RequestArb gates chnl_task_s1.valid with dirRead_s1.ready), so the
-  // dir_read_stall_* counters above only see MSHR replRead stalls.  These
-  // busy-cycle counters give the denominator for by_dir attribution:
-  // dir_busy_repl_only is exactly the share of stalls that S2 (channel
-  // lookups bypassing replacerWen) could remove.
 
   XSPerfAccumulate("dir_busy_tag_only_cnt",
     io.tagWReq.valid && !io.metaWReq.valid && !replacerWen)
@@ -544,9 +472,6 @@ class Directory(implicit p: Parameters) extends L2Module {
   // its own bank.  dirSetSplit = 1 keeps the SRAMs unsplit and degenerates to
   // the original arbitration (every write blocks every read).
   def bankOf(set: UInt): UInt = if (setBankCount == 1) 0.U else set(setBankBits - 1, 0)
-  // Decode each bank once and use a one-hot intersection for admission. This
-  // keeps the same-bank test balanced when a multi-bank directory is used,
-  // while dirSetSplit=1 naturally reduces to the original all-write stall.
   def bankOH(set: UInt): UInt = UIntToOH(bankOf(set), setBankCount)
   val readBankOH = bankOH(io.read.bits.set)
   val metaWriteConflict = io.metaWReq.valid &&
@@ -557,8 +482,6 @@ class Directory(implicit p: Parameters) extends L2Module {
     (readBankOH & bankOH(req_s3.set)).orR
   val dirReadReady = !metaWriteConflict && !tagWriteConflict && !replacerWriteConflict
   io.read.ready := dirReadReady
-  // Directory write-port breakdown for by_dir attribution: read-side stalls
-  // decomposed by which write type is blocking a same-bank read request.
   XSPerfAccumulate("dir_read_stall_tag_cnt",
     io.read.valid && !dirReadReady && tagWriteConflict)
   XSPerfAccumulate("dir_read_stall_meta_cnt",
@@ -568,10 +491,6 @@ class Directory(implicit p: Parameters) extends L2Module {
 
   /* ======!! Replacement logic !!====== */
   /* ====== Read, choose replaceWay ====== */
-  // The replacer's way selection is the head of the S3 victim cone
-  // (repl_state_s3 -> get_replace_OH -> replResp -> MSHRCtl).  The state is
-  // sampled from the replacer SRAM at S2, so the selection can be computed
-  // and registered on the same edge; S3 then only muxes the victim payload.
   val (repl_state_s3, replaceOH_s3) = if(random_repl) {
     when(io.tagWReq.fire){
       repl.miss
@@ -591,10 +510,6 @@ class Directory(implicit p: Parameters) extends L2Module {
 
   val normalRefillRevalidateHit = req_s3.normalRefillRevalidate && hit_s3
   val replRespOH = Mux(normalRefillRevalidateHit, hitOH, finalReplOH)
-  // replRespOH is one-hot for every valid refill lookup. Use its binary index
-  // for the selected victim payload so tag/meta fields share one balanced
-  // selector instead of each field building an independent Mux1H AND/OR cone.
-  // Invalid cycles remain don't-care because all consumers gate on valid.
   val replRespWay = OHToUInt(replRespOH)
   io.replResp.valid := refillReqValid_s3
   io.replResp.bits.hit := normalRefillRevalidateHit
@@ -603,14 +518,7 @@ class Directory(implicit p: Parameters) extends L2Module {
   io.replResp.bits.way := replRespWay
   io.replResp.bits.meta := metaAll_s3(replRespWay)
   io.replResp.bits.mshrId := req_s3.mshrId
-  // Stale-victim-meta guard: a meta/tag write landing in the cycle right
-  // after this lookup's SRAM read is not reflected in replResp.meta (the
-  // single-port read port is write-priority, so only a write exactly one
-  // cycle after the read can race).  If that write targeted the way we just
-  // picked -- e.g. a concurrent A-hit promotion granting a new L1 copy, or
-  // another parent's commit overwriting it -- the victim's clients/dirty
-  // bits may have changed; force a retry so the selection re-reads fresh
-  // state instead of evicting from stale meta.
+  // Forward a coincident meta/tag write into the retained victim result.
   val dirWrValid_d1 = RegNext(io.metaWReq.valid || io.tagWReq.valid, false.B)
   val dirWrSet_d1 = RegEnable(
     Mux(io.tagWReq.valid, io.tagWReq.bits.set, io.metaWReq.bits.set), 0.U(setBits.W),
@@ -640,8 +548,6 @@ class Directory(implicit p: Parameters) extends L2Module {
   // update replacer when A/C hit or refill
   replacerWen := updateHit || updateRefill
 
-  // Directory write-port breakdown for by_dir attribution: replacer state
-  // updates split by cause (hit promotion vs refill insertion).
   XSPerfAccumulate("dir_wen_replacer_updateHit_cnt", updateHit)
   XSPerfAccumulate("dir_wen_replacer_updateRefill_cnt", updateRefill)
 

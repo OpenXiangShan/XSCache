@@ -40,9 +40,6 @@ class TXRSP(implicit p: Parameters) extends CoupledL2Module {
     val pipeStatusVec = Flipped(Vec(6, ValidIO(new PipeStatusWithCHI)))
     val reservedB = Input(Bool())
     val toReqArb = Output(new TXRSPBlockBundle)
-    // Metadata is kept alongside CHIRSP so sidecar completion waits for the
-    // actual external response handshake rather than queue insertion. The
-    // terminal event is returned one cycle after that handshake.
     val done = ValidIO(new TaskBundle)
   })
 
@@ -50,12 +47,6 @@ class TXRSP(implicit p: Parameters) extends CoupledL2Module {
   assert(!io.pipeRsp.valid || io.pipeRsp.ready, "TXRSP pipe response must obey Decoupled backpressure")
   require(chiOpt.isDefined)
 
-  // Worst-case response pressure in the multi-context MSHR design:
-  //   normal rCompAck/wCompAck                <= mshrsAll
-  //   ReplaceMSHR wCompAck + SnoopMSHR SnpResp <= mshrsAll (S/R are mutually
-  //     exclusive per slot, so these two classes sum to at most mshrsAll)
-  // The pre-split bound of mshrsAll no longer holds: independent normal and
-  // replace/snoop contexts can each hold one outstanding response.
   val queue = Module(new Queue(new CHIRSP, entries = 2 * mshrsAll, flow = false))
   val taskQueue = Module(new Queue(new TaskBundle, entries = 2 * mshrsAll, flow = false))
 
@@ -97,9 +88,6 @@ class TXRSP(implicit p: Parameters) extends CoupledL2Module {
 
   io.pipeRsp.ready := queue.io.enq.ready
   io.mshrRsp.ready := !io.pipeRsp.valid && !noSpaceForSinkBReq && !noSpaceForMSHRReq
-  // This dedicated event stage accepts one response every cycle with no
-  // backpressure. The matching task follows the same edge as the actual fire;
-  // owner reservations are released only when MSHRCtl receives this event.
   io.done.valid := RegNext(io.out.fire, false.B)
   io.done.bits := RegNext(taskQueue.io.deq.bits)
 

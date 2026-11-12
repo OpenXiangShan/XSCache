@@ -257,11 +257,6 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
     pftRespQueue.get.io.deq.ready := resp.ready
 
   }
-  // The downstream pipeline is decoupled from GrantBuffer.  Admission must
-  // consume a real queue/inflight credit: the old unconditional ready relied
-  // on an assertion and could accept a task while the FIFO or GrantAck table
-  // was full.  HintAck without a merge is not stored in grantQueue, so it can
-  // still pass with no FIFO credit; prefetch HintAck uses its own queue credit.
   val taskNeedsQueue = dtaskOpcode =/= HintAck || io.d_task.bits.task.mergeA
   val taskNeedsInflight = dtaskOpcode === Grant || dtaskOpcode === GrantData ||
     io.d_task.bits.task.mergeA
@@ -302,21 +297,13 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
     inflightGrant(io.e.bits.sink).valid := false.B
   }
 
-  // E is a response to a concrete Grant owner.  Do not consume an early or
-  // out-of-range GrantAck through an unconditional ready path.
   val eOwnerValid = VecInit((0 until grantBufInflightSize).map { i =>
     io.e.bits.sink === i.U && inflightGrant(i).valid
   }).asUInt.orR
   io.e.ready := eOwnerValid
 
-  // =========== handle blocking - capacity conflict ===========
-  // Capacity is owned locally from the registered admission event until
-  // either SourceD transfers it to a queue/table or a no-D task terminates.
-  // Every A conservatively promises grant, GrantAck and prefetch space; C
-  // promises grant space. Thus retry/refill-only/CMO need no live decode here.
-  // The admission event, pending counter and credit register take three
-  // edges to settle. The held local token/S1 owner and the four-cycle local
-  // transition slot prevent any second admission during that interval.
+  // Reserve capacity at admission and return it only on queue/table transfer or a no-D terminal event.
+  // The local S1 slot covers the three registered edges needed for reservations and credit to settle.
   def eventCount(add: Bool, remove: Bool, capacity: Int, name: String): UInt = {
     val used = RegInit(0.U(log2Ceil(capacity + 1).W))
     when(add && !remove) {
@@ -337,9 +324,7 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   val grantReservations = eventCount(reserveGrant, returnGrant, mshrsAll, "grant reservations")
   val ackReservations = eventCount(reserveA, returnA, grantBufInflightSize, "A reservations")
 
-  // Register local occupancy events to align an actual insertion with the
-  // registered reservation return. Transfer never double-counts the task or
-  // borrows a same-cycle FIFO dequeue, E response or prefetch response.
+  // Delay occupancy by one edge to align insertion with the registered reservation return.
   val grantOccupied = eventCount(
     RegNext(grantQueue.io.enq.fire, false.B),
     RegNext(grantQueue.io.deq.fire, false.B), mshrsAll, "grant occupancy")
@@ -370,7 +355,6 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   val ackCredit = registeredCredit(ackUsed, grantBufInflightSize)
   val noSpaceForSinkReq = grantCredit === 0.U
   val noSpaceWaitSinkEForSinkReq = ackCredit === 0.U
-  // Keep the extra MSHR-ingress margin used by the original S0 path.
   val noSpaceForMSHRReq = grantCredit <= 1.U
   val noSpaceWaitSinkEForMSHRReq = ackCredit <= 1.U
   val pftCredit = pftOccupied.map { occupied =>

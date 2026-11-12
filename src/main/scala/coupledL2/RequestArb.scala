@@ -43,8 +43,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     val mshrTask = Flipped(DecoupledIO(new TaskBundle))
     val mshrLeaseToken = Input(new MainpipeLeaseToken)
     val taskLeaseToken_s2 = Output(new MainpipeLeaseToken)
-    // B is captured first, then reserves its service/ReleaseBuf slot, and
-    // only afterwards executes the Directory read. This event is registered.
     val bServiceStart = ValidIO(new TaskBundle)
     val sidecarReservationHold = Output(Bool())
     val snoopAdmissionEnable = Output(Bool())
@@ -80,8 +78,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     /* handle set conflict, capacity conflict */
     val fromMSHRCtl = Input(new BlockInfo())
     val fromMainPipe = Input(new BlockInfo())
-    // Refill-only normal commits read the same RefillBuf return path as
-    // SourceD tasks. They wait in S1 until preceding data responses drain.
     val blockRefillOnlyCommit = Input(Bool())
     val fromGrantBuffer = Input(new Bundle() {
       val blockSinkReqEntrance = new BlockInfo()
@@ -112,12 +108,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val s2_ready = Wire(Bool())
   val mshr_task_s1 = RegInit(0.U.asTypeOf(Valid(new TaskBundle())))
   val mshrLeaseToken_s1 = Reg(new MainpipeLeaseToken)
-  // A channel task is first selected locally, then admitted to the Directory
-  // through this one-entry token.  The token contains the narrow read payload
-  // plus the owner/provenance identity of an immutable source. Capturing A
-  // commits RequestBuffer's hold; B is already locally retained and C uses
-  // a registered arbiter hold. The complete payload stays on those register
-  // outputs until the same source/Directory handshake consumes the command.
+  // Capture commits the source owner; payload stays on its Q until the atomic source/Directory fire.
   class ChannelDirReadAdmissionToken extends Bundle {
     val valid = Bool()
     val source = UInt(2.W) // 0=C, 1=B, 2=A (sinkValids priority order)
@@ -126,9 +117,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     val generation = UInt(8.W)
     val sequence = UInt(8.W)
     val paired = Bool()
-    // Payload provenance is not used to rebuild the Directory request, but is
-    // locked and rechecked so a held token cannot be paired with a different
-    // RefillBuf/ReleaseBuf owner after an upstream context transition.
     val mshrContext = UInt(2.W)
     val refillToReleaseCopy = Bool()
     val refillBufReadId = UInt(mshrBits.W)
@@ -142,33 +130,19 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val channelDirReadAdmissionToken = RegInit(0.U.asTypeOf(new ChannelDirReadAdmissionToken))
   val channelDirReadAdmissionValid = channelDirReadAdmissionToken.valid
   val channelDirReadAdmissionFire = Wire(Bool())
-  // D109's replacement-read hold keeps its own fire event; this wire remains
-  // distinct so a channel token cannot advance mshr_task_s1 by accident.
-  // Directory read admission is owned locally after capture.  The hold keeps
-  // the complete request and its lease provenance stable while the Directory
-  // port is blocked by a same-bank write; upstream valid/ready signals only
-  // observe the one-entry occupancy and never the Directory ready directly.
   val dirReadAdmissionValid = RegInit(false.B)
   val dirReadAdmissionBits = RegInit(0.U.asTypeOf(new DirRead()))
   val dirReadAdmissionToken = RegInit(0.U.asTypeOf(new MainpipeLeaseToken))
   val dirReadAdmissionFire = Wire(Bool())
-  // Reserve the fixed-latency Directory result/apply slot before S1. This
-  // short local execution slot ends after S3 applies; response collection,
-  // ProbeAck/GrantAck and outgoing queues remain independent of it.
+  // Serialize S1 through S3 apply while local reservation events and registered credits settle.
   val localTransitionCycles = RegInit(0.U(3.W))
   val localTransitionIdle = localTransitionCycles === 0.U
-  // Registered admission turns keep the two ingress handshakes exclusive.
-  // A live MSHR valid must not decide B.ready: B reserves a sidecar whose
-  // task eligibility can in turn revoke that MSHR valid in the same cycle.
   val admitMshrTurn = RegInit(false.B)
   val bPending = RegInit(0.U.asTypeOf(Valid(new TaskBundle)))
   val bServiceReserved = RegInit(false.B)
   val bExecute = Wire(Bool())
   io.bServiceStart.valid := bPending.valid && !bServiceReserved
   io.bServiceStart.bits := bPending.bits
-  // This finite capture phase is chosen by registered scheduling state,
-  // before looking at live B.valid. It prevents a sidecar from issuing or
-  // retiring at the edge at which a B snapshot may acquire its service.
   io.reservedB := bPending.valid
   io.sidecarReservationHold := io.sinkB.valid || (bPending.valid && !bServiceReserved) ||
     (localTransitionIdle && !admitMshrTurn && !mshr_task_s1.valid && !bPending.valid)
@@ -194,8 +168,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     !mshr_task_s1.bits.replaceTask
   val mshr_refillOnlyCommit_stall = normalRefillOnlyCommit_s1 && io.blockRefillOnlyCommit
 
-  // A deferred refill task may use RequestArb only to obtain a ReplacerResult.
-  // Its later normal-context commit owns the DataStorage/Directory write.
   val deferredReplRead = mshr_task_s1.bits.deferRefillWrite
   assert(
     !s1_needs_replRead || mshr_task_s1.bits.opcode =/= GrantData ||
@@ -241,14 +213,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
 
   /* Channel interaction from s1 */
   val A_task = io.sinkA.bits
-  // The upstream candidate is still revocable until its real S1 handshake.
-  // A registered claim binds one concrete slot before the Directory read.
-  // Reconfirm the complete retained request: input-flow and CMO-all candidates
-  // may change while unconsumed, including optional training/alias fields.
   val normalReservedTask = io.normalReserveAck.bits.task
-  // CMO-all enumerates set/way internally; unused fields are sourced from
-  // the blocked external A bus and need not stay stable. Its logical identity
-  // is that set/way, and execution uses the retained complete payload below.
   val sameCmoAllLine = A_task.cmoAll && normalReservedTask.cmoAll &&
     A_task.set === normalReservedTask.set && A_task.way === normalReservedTask.way
   val normalReservationMatches = io.sinkA.valid &&
@@ -259,24 +224,15 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     (!normalReservationMatches || normalYieldForB)
   io.normalReserveConsume := io.sinkA.fire
   io.normalReserveRequest.bits := A_task
-  // Both B sources are register outputs: RXSNP's admitted snapshot and
-  // this module's pending command. No raw sidecar eligibility reaches status.
   val B_task = bPending.bits
   val bCandidateStatus = Mux(bPending.valid, bPending.bits, io.sinkB.bits)
   val C_task = io.sinkC.bits
   val block_A =
     io.fromMSHRCtl.blockA_s1 || io.fromMainPipe.blockA_s1 || io.fromGrantBuffer.blockSinkReqEntrance.blockA_s1
-  // An older claim keeps priority while A can execute. If a newly live
-  // sidecar/snoop blocks that A, return the unconsumed claim before admitting
-  // a later B. Otherwise B can be the response that releases A's blocker,
-  // while normalReserved forbids that B forever (and may hold its last slot).
   when(!io.normalReserveAck.valid) {
     normalYieldForB := false.B
   }.elsewhen(!channelDirReadAdmissionValid && normalReservationMatches && block_A &&
     (io.sinkB.valid || io.snoopQueued)) {
-    // The immutable B snapshot waits for this older claim to leave. Queue
-    // occupancy Q breaks that wait before snapshot admission; raw eligibility
-    // and sidecar payload never enter this yield or channel arbitration.
     normalYieldForB := true.B
   }
   val block_B =
@@ -286,17 +242,12 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val block_C =
     io.fromMSHRCtl.blockC_s1 || io.fromMainPipe.blockC_s1 || io.fromGrantBuffer.blockSinkReqEntrance.blockC_s1
 
-  // This phase precedes the immutable RXSNP snapshot. Do not create a new A
-  // claim at the same edge; a previously acknowledged A/C finishes first.
   io.snoopAdmissionEnable := localTransitionIdle && !admitMshrTurn && resetFinish &&
     !mshr_task_s1.valid && !bPending.valid && !channelDirReadAdmissionValid &&
     !io.normalReserveAck.valid && !io.sinkC.valid && !io.sinkB.valid && !block_B
 
 //  val noFreeWay = Wire(Bool())
 
-  // A captured B owns its capacity reservation; do not apply the pool-full
-  // test to that reservation again while it waits for execution. Transport
-  // space and existing GrantAck conflicts can still delay the local read.
   val blockReservedB = io.fromMainPipe.blockB_s1 ||
     io.fromGrantBuffer.blockSinkReqEntrance.blockB_s1
   val sinkValids = VecInit(
@@ -307,11 +258,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     )
   ).asUInt
 
-  // Select one channel candidate without consulting the Directory ready.  A
-  // candidate can therefore be captured into the registered token even while
-  // the set bank is occupied by a write.  The source ready signals below stay
-  // low until the token's Directory handshake, so each upstream payload is
-  // stable for the whole hold interval.
   val channelCandidateValid = localTransitionIdle &&
     (bPending.valid || !admitMshrTurn) && !mshr_task_s1.valid &&
     sinkValids.orR && resetFinish &&
@@ -334,9 +280,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val channelCandidatePaired = channelCandidateTask.snpHitRelease ||
     channelCandidateTask.refillToReleaseCopy || channelCandidateTask.mshrContext =/= 0.U
 
-  // Promise downstream capacity when the local owner is captured, before
-  // Directory can execute it. Only the narrow registered event crosses to
-  // GrantBuffer; neither its ledger nor credit D reads a live S1 task.
   val grantReservation = Wire(Valid(new PipeStatus))
   grantReservation.valid := s0_fire || channelCandidateValid
   grantReservation.bits.channel := Mux(s0_fire,
@@ -395,9 +338,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     channelTokenTask.readDataFromDS === channelDirReadAdmissionToken.readDataFromDS &&
     channelTokenTask.snpHitRelease === channelDirReadAdmissionToken.snpHitRelease &&
     channelTokenTask.snpHitReleaseIdx === channelDirReadAdmissionToken.snpHitReleaseIdx
-  // Ownership was transferred at capture. These comparisons are assertions,
-  // never functional valid/ready gates: a later candidate or block signal
-  // cannot revoke a command which already reserved its source and capacity.
+  // Retained owner comparisons are assertions; they must not revoke the captured Directory command.
   val channelTokenIdentityMatches =
     channelDirReadAdmissionToken.dirRead.asUInt === channelTokenDirReadBits.asUInt &&
     channelDirReadAdmissionToken.owner === channelTokenOwnerCurrent &&
@@ -410,33 +351,17 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
       "a channel Directory token must retain its committed source and provenance")
   }
 
-  // Background-class MSHR tasks (sidecar release/copyback, CMO; qosClass==4)
-  // must not preempt sink requests at s1: sinks are on the L1/openLLC
-  // critical path while background writeback work is not. The MSHRCtl-level
-  // starvation guard promotes a starving background task out of class 4, so
-  // this cannot deadlock.
   val mshrTaskBgDefer = io.mshrTask.valid && io.mshrTask.bits.qosClass === 4.U && sinkValids.orR
   io.mshrTask.ready := mshrTaskReadyBasic && !mshrTaskBgDefer
   XSPerfAccumulate("reqarb_bg_defer_cnt", mshrTaskBgDefer)
 
-  // TODO: A Hint is allowed to enter if !s2_ready for mcp2_stall
 
-  // This is the post-token execution event.  Directory ready is no longer
-  // part of A/B/C admission; it is observed only after the registered token
-  // has been presented to Directory.
   val sink_ready_basic = channelDirReadAdmissionFire
 
   io.normalReserveRequest.valid := localTransitionIdle && resetFinish &&
     !mshr_task_s1.valid && !bPending.valid && io.sinkA.valid && !block_A &&
     !io.normalReserveAck.valid && !sinkValids(0) && !io.sinkB.valid &&
     !channelDirReadAdmissionValid && !io.snoopAdmissionEnable
-  // An acknowledged A claim predates a later B candidate. Let it execute
-  // before capturing that B: a CMO claim can reserve the last eligible S/R
-  // index, so making the A wait for that blocked B would deadlock.
-  // The registered token has already chosen its channel owner. A later C
-  // candidate must not veto this A's consume after the same token has fired
-  // Directory and advanced S1. Eligibility was committed at token capture;
-  // source consumption is the very same event as the retained token fire.
   io.sinkA.ready := sink_ready_basic && channelDirReadAdmissionToken.source === 2.U
   when(io.sinkA.fire) {
     assert(io.dirRead_s1.fire && normalReserved,
@@ -444,17 +369,11 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     assert(sameCmoAllLine || A_task.asUInt === normalReservedTask.asUInt,
       "normal reservation must retain the complete upstream request")
   }
-  // The complete B already owns its concrete service slot in RXSNP. This
-  // handshake transfers the retained payload into bPending before execution.
-  // RXSNP already owns the service slot. Reapplying pool-full or a later C
-  // priority here would wait on the very reservation held by this command.
   io.sinkB.ready := localTransitionIdle && resetFinish &&
     !mshr_task_s1.valid && !bPending.valid && !channelDirReadAdmissionValid &&
     !normalReserved && !blockReservedB &&
     !io.fromTXDAT.blockSinkBReqEntrance && !io.fromTXRSP.blockSinkBReqEntrance
   io.sinkC.ready := sink_ready_basic && channelDirReadAdmissionToken.source === 0.U
-  // Execution follows the existing registered bPending/service confirmation
-  // phase and consumes the same service token acquired at the snapshot edge.
   bExecute := sink_ready_basic && channelDirReadAdmissionToken.source === 1.U
   val channelConsumes = VecInit(Seq(io.sinkC.fire, bExecute, io.sinkA.fire))
   assert(channelDirReadAdmissionFire === channelConsumes.asUInt.orR,
@@ -474,13 +393,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   assert(!bExecute || bServiceReserved, "B executed before registered service reservation")
 
   val chnl_task_s1 = Wire(Valid(new TaskBundle()))
-  // A channel task reaches S1 only when its registered Directory token is
-  // valid and the Directory accepts that token.  Until then the upstream
-  // Decoupled source sees ready low and retains the complete payload.
-  // Keep a held token visible to the local pipeline even during a data-bank
-  // bubble.  `s2_ready` gates the actual S1 fire below; including it here
-  // would feed task_s1.valid back into ds_mcp2_stall and create a FIRRTL
-  // combinational cycle.
   chnl_task_s1.valid := channelDirReadAdmissionValid && !mshr_task_s1.valid
   chnl_task_s1.bits := channelTokenTask
 
@@ -504,9 +416,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   io.sinkCHintQInfo.bits := io.sinkC.bits
 
   /* Meta read request */
-  // Build the request from the task being captured, then register the whole
-  // request before exposing it to Directory.  The hold is the sole owner of
-  // this read until Directory.fire.
   val dirReadCapture = !dirReadAdmissionValid && mshr_task_s1.valid && s1_needs_replRead &&
     s2_ready && !io.fromMainPipe.blockG_s1
   val dirReadCaptureTask = mshr_task_s1.bits
@@ -541,13 +450,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   )
   io.dirRead_s1.bits := Mux(mshrReplReadActive,
     dirReadAdmissionBits, channelDirReadAdmissionToken.dirRead)
-  // D109 replacement reads and the new A/B/C token have separate ownership
-  // events.  A channel token is consumed only when the Directory really
-  // accepts its registered payload.
   dirReadAdmissionFire := mshrReplReadActive && io.dirRead_s1.fire
-  // Same-set eligibility was reserved at capture. No new local command can
-  // enter while this owner is held, so blockG must not bypass that FF to
-  // revoke a retained read. Directory and S1 consume the token together.
+  // A retained replacement read owns its same-set execution slot until Directory and S1 fire together.
   when(mshrReplReadActive) {
     assert(dirReadAdmissionFire === s1_fire,
       "a replacement Directory token must execute and advance S1 atomically")
@@ -631,13 +535,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   task_s2.valid := s1_fire
   when(s1_fire) { task_s2.bits := task_s1.bits }
 
-  /*  val sameSet_s2 = task_s2.valid && task_s2.bits.fromA && !task_s2.bits.mshrTask && task_s2.bits.set === A_task.set
-  val sameSet_s3 = RegNext(task_s2.valid && task_s2.bits.fromA && !task_s2.bits.mshrTask) &&
-    RegEnable(task_s2.bits.set, task_s2.valid) === A_task.set
-  val sameSetCnt = PopCount(VecInit(io.msInfo.map(s => s.valid && s.bits.set === A_task.set && s.bits.fromA) :+
-    sameSet_s2 :+ sameSet_s3).asUInt)
-  noFreeWay := sameSetCnt >= cacheParams.ways.U
-   */
   io.taskToPipe_s2 := task_s2
   val channelLeaseToken_s1 = Wire(new MainpipeLeaseToken)
   channelLeaseToken_s1.generation := channelDirReadAdmissionToken.generation
@@ -647,9 +544,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
 
   // MSHR task
   val mshrTask_s2 = task_s2.valid && task_s2.bits.mshrTask
-  // A prefetch parent may complete as HintAck while carrying a merged demand
-  // response in aMergeTask. GrantBuffer replaces the parent with that task,
-  // so its data must be read from the parent's RefillBuf as well.
   val mergedAData_s2 = task_s2.bits.mergeA && task_s2.bits.aMergeTask.opcode(0)
   val mshrTask_s2_a_upwards = task_s2.bits.fromA &&
     (task_s2.bits.opcode === GrantData || task_s2.bits.opcode === Grant && task_s2.bits.dsWen ||
@@ -671,7 +565,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     task_s2.bits.readRefillData ||
     mshrTask_s2_a_upwards && !task_s2.bits.useProbeData && !task_s2.bits.readDataFromDS &&
       (!task_s2.bits.refillOnly || task_s2.bits.readRefillData))
-  // A paired snoop reads the normal slot while retaining its own task and ReleaseBuf ID.
   val snoopRefillData = task_s2.bits.mshrContext === 1.U && task_s2.bits.readRefillData
   io.refillBufRead_s2.bits.id := Mux(
     task_s2.bits.refillToReleaseCopy || snoopRefillData,
@@ -705,21 +598,14 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   /* status of each pipeline stage */
   io.status_s1.sets := VecInit(Seq(C_task.set, bCandidateStatus.set, io.ASet, mshr_task_s1.bits.set))
   io.status_s1.tags := VecInit(Seq(C_task.tag, bCandidateStatus.tag, io.ATag, mshr_task_s1.bits.tag))
-  // `sinkA` is RequestBuffer's output.  Keep this separate from `ASet/ATag`,
-  // which intentionally describe RequestBuffer's input for same-set enqueue
-  // backpressure in MainPipe.
   io.status_s1.aCandidateValid := io.sinkA.valid
   io.status_s1.aCandidateSet := A_task.set
   io.status_s1.aCandidateTag := A_task.tag
   io.status_s1.bCandidateValid := bPending.valid || io.sinkB.valid
-  // A later uncaptured B does not own this transition ahead of an older
-  // acknowledged A claim. Its candidate remains visible for conservative
-  // owner deferral, but must not create an A<->B admission wait cycle.
   io.status_s1.bValid := bPending.valid || io.sinkB.valid && !block_B && !normalReserved
   io.status_s1.bToN := (bPending.valid || io.sinkB.valid) && isSnpToN(bCandidateStatus.chiOpcode.get)
   io.status_s1.bFire := bExecute
   io.status_s1.cReleaseData := io.sinkC.valid && C_task.opcode === ReleaseData
-  // io.status_s1.isKeyword := VecInit(Seq(C_task.isKeyword, B_task.isKeyword, io.isKeyword, mshr_task_s1.bits.isKeyword))
 
   require(io.status_vec.size == 2)
   io.status_vec.zip(Seq(task_s1, task_s2)).foreach {

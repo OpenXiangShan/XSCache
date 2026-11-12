@@ -410,9 +410,6 @@ class MMIOBridgeImp(outer: MMIOBridge) extends LazyModuleImp(outer)
   io.rx.dat.ready := Cat(entries.zipWithIndex.map { case (entry, i) =>
     entry.io.chi.rx.dat.ready && io.rx.dat.bits.txnID === i.U
   }).orR
-  // A response is accepted only when its selected MMIO entry can consume it.
-  // The previous unconditional ready could acknowledge a full/blocked entry
-  // and drop the CHI RXRSP before the per-entry Decoupled handshake.
   io.rx.rsp.ready := Cat(entries.zipWithIndex.map { case (entry, i) =>
     entry.io.chi.rx.rsp.ready && io.rx.rsp.bits.txnID === i.U
   }).orR

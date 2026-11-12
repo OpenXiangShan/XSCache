@@ -19,47 +19,20 @@ import xscache.chi.CHICohStates._
 import xscache.chi.{CHIChannel, CHIREQ, CHIRSP, HasCHIOpcodes}
 import xscache.coupledL2.prefetch.DemandRefillBundle
 
-/**
-  * The B-channel half of a physical MSHR entry.
-  *
-  * It deliberately contains no L3 read, replacement, retry, CompAck, CMO, or
-  * Grant state. Those remain in the single refill/evict [[MSHR]] paired with it.
-  * The only transaction state kept here is the state needed to complete a snoop
-  * that requires an L1 Probe and/or a DCT response.
-  */
 class SnoopMSHRIO(implicit p: Parameters) extends MSHRIO {
-  // dirResult.hit may describe replacement metadata rather than a DS hit.
   val allocDirectoryHit = Input(Bool())
   val pairSearchPending = Input(Bool())
-  // A paired normal MSHR can hold dirty ProbeAckData in RefillBuf. This is
-  // distinct from normal RXDAT, which remains with the normal request until
-  // the RXSNP refill/Grant interlock has released the snoop.
   val normalRefillPayloadFromProbeAck = Input(Bool())
-  // A paired normal context accepted a post-Grant ReleaseData(TtoN). The
-  // client has already relinquished the line, so this snoop must not issue a
-  // second TL Probe; after the payload reaches this snoop's ReleaseBuf it
-  // must return that data as SnpRespData.
   val normalRefillPostGrantReleasePending = Input(Bool())
-  // Source-side indicator: the paired normal's RefillBuf already holds the
-  // post-Grant ReleaseData. Local ReleaseBuf residency is tracked separately.
   val normalRefillPayloadFromPostGrantRelease = Input(Bool())
-  // Physical index of the paired normal context (Valid when pending).
   val pairedNormalId = Flipped(ValidIO(UInt(mshrBits.W)))
-  // Allocation capture is independent of the selected physical snoop slot.
-  // Live inputs above refer only to this context's registered address.
   val allocPostGrantReleasePending = Input(Bool())
   val allocPostGrantReleasePayload = Input(Bool())
   val allocPairedNormalId = Flipped(ValidIO(UInt(mshrBits.W)))
-  // MainPipe finished RefillBuf[N] -> ReleaseBuf[S] for this snoop.
   val releaseBufCopyDone = Input(Bool())
   val nestedReleaseWritePending = Input(Bool())
   val nestedReleaseWriteDone = Input(Bool())
-  // Frozen operation provenance, consumed with the registered task at
-  // prepare. The controller binds its paired owner and outcome before issue.
   val postGrantReleaseResponse = Output(Bool())
-  // MainPipe acceptance only queues a CHI snoop response. Keep this context
-  // visible until its terminal TXRSP/TXDAT handshake, so same-address A/B
-  // requests cannot pass through the response queueing window.
   val snpRespDone = Input(Bool())
   val dctDone = Input(Bool())
 }
@@ -71,9 +44,7 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
 
   val valid = RegInit(false.B)
   val sourceBProbeIssued = RegInit(false.B)
-  // Only normal MSHR allocations can create replacement transactions.
   io.allocEpoch := false.B
-  // Snoop contexts issue no CHI read of their own, so they never own a DBID.
   io.readDBID.valid := false.B
   io.readDBID.bits := 0.U
   io.readTxnEpoch := 0.U
@@ -97,13 +68,9 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   stateInit.elements.foreach(_._2 := true.B)
   val state = RegInit(stateInit)
   val probeDirty = RegInit(false.B)
-  // `probeDirty` is local ProbeAckData bookkeeping.  It is not sufficient to
-  // reinterpret an arbitrary snoop as the paired normal-refill handoff.
   val normalProbePayloadLatched = RegInit(false.B)
   val normalPostGrantReleasePendingLatched = RegInit(false.B)
   val normalPostGrantReleasePayloadLatched = RegInit(false.B)
-  // Local ReleaseBuf[S] residency for post-Grant ReleaseData (nestedwb dual-write
-  // or late RefillBuf[N]->ReleaseBuf[S] copy). Independent of normal's RefillBuf.
   val releaseBufPayloadReady = RegInit(false.B)
   val releaseBufCopyInFlight = RegInit(false.B)
   val pairedNormalIdValid = RegInit(false.B)
@@ -138,8 +105,6 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   val snpToN = isSnpToN(reqOpcode)
   val snpToB = isSnpToB(reqOpcode)
   val hitDirty = dirResult.hit && meta.dirty
-  // Start from a fixed-width CHI state so the later setPD operands retain a
-  // concrete width through all directory-state combinations.
   val metaChi = WireDefault(I)
   when (!meta.dirty && meta.state === INVALID) {
     metaChi := I
@@ -173,9 +138,6 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
     (req.retToSrc.get && meta.state === BRANCH &&
       (reqOpcode === SnpOnce || reqOpcode === SnpUnique || reqOpcode === SnpPreferUnique || isSnpToBNonFwd(reqOpcode)))
   )
-  // Only the paired normal RefillBuf provenance creates the special data
-  // response path.  A standalone ProbeAckData must keep the original CHI
-  // response decision; otherwise it can overwrite an older ordered read.
   when (!io.alloc.valid && io.normalRefillPayloadFromProbeAck) {
     normalProbePayloadLatched := true.B
   }
@@ -194,8 +156,6 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
     normalPostGrantReleasePendingLatched
   val normalPostGrantSourcePayload = io.normalRefillPayloadFromPostGrantRelease ||
     normalPostGrantReleasePayloadLatched
-  // Post-Grant SnpRespData always reads this snoop's ReleaseBuf, after nestedwb
-  // dual-write or a late RefillBuf[N]->ReleaseBuf[S] copy.
   val normalPostGrantReleasePayload = normalPostGrantReleasePending && releaseBufPayloadReady &&
     !io.nestedReleaseWritePending
   val normalRefillPayload = normalProbePayload || normalPostGrantReleasePayload
@@ -225,7 +185,6 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
       reqOpcode === SnpCleanShared || reqOpcode === SnpCleanInvalid || reqOpcode === SnpPreferUnique
   )
   val fwdCacheState = Mux(tagErr, I, Mux(isSnpToBFwd(reqOpcode),
-    // The snoopee can return I while the forwarded requester receives SC.
     SC, Mux(isSnpToNFwd(reqOpcode), UC, I)))
   val fwdPassDirty = isSnpToNFwd(reqOpcode) &&
     (hitDirtyOrWriteDirty || normalRefillPayload) && !tagErr
@@ -236,19 +195,14 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   io.tasks.txrsp.bits := 0.U.asTypeOf(new CHIRSP)
   io.tasks.txdat.valid := false.B
   io.tasks.txdat.bits := 0.U.asTypeOf(new TaskBundle)
-  // The snoop context never completes a demand/prefetch refill.
   io.dataRefill.valid := false.B
   io.dataRefill.bits := 0.U.asTypeOf(new DemandRefillBundle)
   io.cmoSidecarReq := false.B
   io.cmoSidecarMode := 0.U
 
-  // A post-Grant ReleaseData proves the client no longer owns this block.
-  // Waiting for a new ProbeAck would deadlock against the C release path.
   val nestedwbMatch = valid && dirResult.hit && meta.state =/= INVALID &&
     dirResult.set === io.nestedwb.set && dirResult.tag === io.nestedwb.tag
-  // The accepted notification arrives one cycle after the Probe packet became
-  // irrevocable. A Release can replace an unissued Probe only before that
-  // edge; in the notification cycle its already-owned ProbeAck is mandatory.
+  // After Probe acceptance, its ProbeAck remains mandatory even if a Release arrives before notification.
   val nestedwbCompletesUnissuedProbe = nestedwbMatch && !state.s_pprobe &&
     !sourceBProbeIssued && !io.sourceBAccepted
   val nestedReleaseReplacesProbe = nestedwbCompletesUnissuedProbe &&
@@ -264,12 +218,7 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   io.tasks.source_b.bits.alias.foreach(_ := meta.alias.getOrElse(0.U))
 
   val mpCopyValid = needLateRefillToReleaseCopy
-  // A paired post-Grant snoop must not answer before the dirty payload has
-  // actually landed in this slot's ReleaseBuf.  SourceB is suppressed in that
-  // case, so w_pprobeacklast is vacuously satisfied; without the final clause
-  // the response task fires while the RefillBuf[N]->ReleaseBuf[S] copy is
-  // still in flight and emits a data-less SnpResp, dropping the only copy of
-  // the line's newest dirty data.
+  // A post-Grant snoop may respond only after its dirty payload reaches this ReleaseBuf.
   val mpProbeAckValid = valid && !state.s_probeack && !mpCopyValid &&
     (state.w_pprobeacklast ||
       (normalPostGrantReleasePayload && !sourceBProbeIssued && !io.sourceBAccepted)) &&
@@ -277,14 +226,11 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   val mpDctValid = valid && !state.s_dct.getOrElse(true.B) && state.s_probeack
   val mainpipeIntent = Wire(Decoupled(new TaskBundle))
   val mainpipeIssuedOperation = Wire(UInt(4.W))
-  // Registered by the lease below. Declared here so the payload mux can use
-  // the same select the lease samples into its task register.
   val mainpipeProposedOperation = Reg(UInt(4.W))
   mainpipeIntent.valid := (mpCopyValid || mpProbeAckValid || mpDctValid) &&
     !io.nestedReleaseWritePending && !io.pairSearchPending &&
     (!normalProbePayload || pairedNormalIdValid)
 
-  // Late copy: RefillBuf[pairedNormalId] -> ReleaseBuf[io.id]. No CHI side effect.
   val copyTask = WireInit(0.U.asTypeOf(new TaskBundle))
   copyTask.channel := req.channel
   copyTask.txChannel := 0.U
@@ -304,9 +250,6 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   copyTask.wayMask := 0.U
   copyTask.reqSource := MemReqSource.NoWhere.id.U
 
-  // Post-Grant dirty data always lives in this snoop's ReleaseBuf (unified path),
-  // including when the allocator happened to choose the same physical index as N.
-  // ProbeAckData mirrored into the paired normal RefillBuf still uses readRefillData.
   val postGrantUsesReleaseBuf = normalPostGrantReleasePayload
   val probeAckUsesRefillBuf = normalProbePayload && !postGrantUsesReleaseBuf
   val probeAckTask = WireInit(0.U.asTypeOf(new TaskBundle))
@@ -337,9 +280,6 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
     prefetch = !snpToN && meta.prefetch.getOrElse(false.B),
     accessed = !snpToN && meta.accessed
   )
-  // When the paired normal request has not installed its tag yet, this snoop
-  // has no Directory way of its own. The normal context applies the exported
-  // transition during its final RefillBuf commit instead.
   probeAckTask.metaWen := !req.snpHitReleaseToInval &&
     !(normalPostGrantReleasePayload && !dirResult.hit)
   probeAckTask.dsWen := !(snpToN || tagErr) && probeDirty
@@ -394,9 +334,7 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   dctTask.snpHitReleaseWithData := req.snpHitReleaseWithData
   dctTask.snpHitReleaseIdx := req.snpHitReleaseIdx
   dctTask.snpHitReleaseMeta := req.snpHitReleaseMeta
-  // Select with the registered operation the lease returns, which is the
-  // value the prepare edge captures. The live operation only decides the next
-  // proposal, so it must not fan out into this mux.
+  // Select payload from the leased operation Q, never from the live arbitration result.
   mainpipeIntent.bits := Mux(mainpipeProposedOperation(1, 0) === 0.U, copyTask,
     Mux(mainpipeProposedOperation(1, 0) === 1.U, probeAckTask, dctTask))
   val leaseOwnerControls = Cat(io.normalRefillPayloadFromProbeAck,
@@ -442,8 +380,6 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   }
   when (io.tasks.mainpipe.fire) {
     when (mainpipeIssuedVariant === 0.U) {
-      // ReleaseBuf write completes later in MainPipe S5; releaseBufCopyDone
-      // (or nestedwb claim) marks local residency ready.
       releaseBufCopyInFlight := true.B
     }.elsewhen (mainpipeIssuedVariant === 1.U) {
       state.s_probeack := true.B
@@ -518,28 +454,12 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   io.msInfo.bits.meta := meta
   io.msInfo.bits.metaTag := dirResult.tag
   io.msInfo.bits.dirHit := dirResult.hit
-  // A snoop may still need this DS way as the fallback source for SnpRespData
-  // or a forwarded response.  Keep the way out of refill replacement until
-  // this context has finished; ReleaseBuf is not guaranteed to contain a copy
-  // for every clean response path.
-  // A miss nested in replacement owns a ReleaseBuf snapshot, not the lookup's
-  // unrelated candidate DS way. Preserve that distinction through allocation.
   io.msInfo.bits.blockRefill := directoryWayValid && dirResult.hit &&
     (doRespData || doFwd || meta.state === TRUNK)
   io.msInfo.bits.w_rprobeacklast := state.w_pprobeacklast
   io.msInfo.bits.blocksSnoop := true.B
   io.msInfo.bits.channel := req.channel
 
-  // A Release( Data ) received before SourceB issues its Probe has already
-  // relinquished the client, so it can directly complete the snoop.  Once B
-  // has fired, its ProbeAck remains mandatory; completing here would free the
-  // context before that already-issued response arrives.
-  // Post-Grant snoops often miss Directory (tag not installed yet). Still claim
-  // the nestedwb dirty beat into ReleaseBuf[S] by request address.
-  // Use only the registered pending latch here: the live pending IO is derived
-  // from alloc.valid / selector eligibility, and feeding it into nestedwbData
-  // would close a combinational cycle through orphan/replace allocation.
-  // A same-cycle alloc+nestedwb miss is covered by the late RefillBuf copy.
   val nestedwbPostGrantMatch = valid && normalPostGrantReleasePendingLatched &&
     req.set === io.nestedwb.set && req.tag === io.nestedwb.tag
   when (nestedReleaseReplacesProbe) {
@@ -558,10 +478,7 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
       meta.clients := Fill(clientBits, false.B)
     }
   }
-  // Pending also includes the conservative pre-capture owner reservation.
-  // Retain physical residency across an unrelated C/SinkC reservation; every
-  // consumer above already masks the visible payload with !pending. A newer
-  // nested descriptor becomes visible only after its complete physical write.
+  // Pending hides payload visibility without clearing the physical ReleaseBuf residency flag.
   when (!io.alloc.valid && io.nestedReleaseWriteDone) {
     releaseBufPayloadReady := true.B
   }

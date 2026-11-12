@@ -37,14 +37,10 @@ class MSHRBufWrite(implicit p: Parameters) extends L2Bundle {
   val beatMask = Output(UInt(beatSize.W))
 }
 
-// MSHR Buffer is indexed by physical MSHR ID. MSHRCtl grants a per-entry lease
-// before either context can issue a Probe that may return ProbeAckData.
 class MSHRBuffer(wPorts: Int = 1)(implicit p: Parameters) extends L2Module {
   val io = IO(new Bundle() {
     val r = Flipped(ValidIO(new MSHRBufRead))
     val resp = new MSHRBufResp
-    // Second read port for the direct ReplaceMSHR->TXDAT copyback path
-    // (flop-based array, so this is just another read mux).
     val r2 = Flipped(ValidIO(new MSHRBufRead))
     val resp2 = Output(new DSBlock)
     val w = Vec(wPorts, Flipped(ValidIO(new MSHRBufWrite)))

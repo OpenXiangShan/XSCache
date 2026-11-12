@@ -25,12 +25,8 @@ import xscache.chi.{HasCHIOpcodes, MemAttr, OrderEncodings}
 
 class SnoopEntry(implicit p: Parameters) extends TaskEntry {
   val ready  = Bool()
-  // TXSNP may finish before the target RN returns SnpResp/SnpRespData.  Keep
-  // this context visible to RequestArb throughout that response window.
   val issued = Bool()
   val waitID = UInt(TXNID_WIDTH.W) // Indicates which CompAck the task needs to wait for to wake itself up
-  // Dirty data returned by a replace snoop. A replace snoop targets the line
-  // being evicted, not the requester's line, so its data cannot ride the refill.
   val data = new DSBlock()
   val beatValids = Vec(beatSize, Bool())
   val passDirty = Bool()
@@ -50,16 +46,13 @@ class SnoopUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     /* CompAck from upstream RXRSP channel */
     val ack = Flipped(ValidIO(new Resp()))
 
-    /* Snoop completion from upstream RXRSP/RXDAT channels */
     val snpRsp = Flipped(ValidIO(new Resp()))
     val snpData = Flipped(ValidIO(new RespWithData()))
 
     /* snoop buffers info */
     val snpInfo = Vec(mshrs.snoop, ValidIO(new BlockInfo()))
 
-    /* write the evicted line of a replace snoop back to memory */
     val writeback = ValidIO(new MemRequest(withData = true))
-    // alloc_s6 is shared with MainPipe, which wins the mux in Slice
     val writebackAccept = Input(Bool())
     val memInfo = Flipped(Vec(mshrs.memory, ValidIO(new MemInfo())))
   })
@@ -92,8 +85,6 @@ class SnoopUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     * snoop with the same target address triggered by a Read/Dataless request
     */
   val insertIdx = PriorityEncoder(buffer.map(!_.valid))
-  // Do not bypass the buffer: a direct TXSNP flow would have no entry to
-  // reserve the address while its SnpResp is still in flight.
   val alloc = !full && in.valid
   when(alloc) {
     val entry = buffer(insertIdx)
@@ -124,8 +115,6 @@ class SnoopUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   }
 
   /* Issue */
-  // Issued entries stay allocated until every selected RN has returned its
-  // snoop response; only unissued entries are candidates for TXSNP.
   issueArb.io.in.zip(buffer).foreach { case (in, e) =>
     in.valid := e.valid && e.ready && !e.issued
     in.bits := e.task
@@ -134,7 +123,6 @@ class SnoopUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   out.valid := arbValid
   out.bits := issueArb.io.out.bits
 
-  /* Mark issued, then retain the address until SnpResp/SnpRespData. */
   when(out.fire && arbValid) {
     val entry = buffer(issueArb.io.chosen)
     entry.ready := false.B
@@ -160,8 +148,6 @@ class SnoopUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     val completedOH = Mux(rspMatch, rspOH, 0.U(numRNs.W)) |
       Mux(dataMatch, dataOH, 0.U(numRNs.W))
     val remainingOH = entry.task.snpVec.asUInt & ~completedOH
-    // A replace snoop's SnpRespData carries the evicted line. Capture every
-    // beat here; only its last beat retires the RN from snpVec.
     val replData = snpData.valid && isSnpRespDataX(snpData.bits.opcode) &&
       entry.valid && entry.issued && entry.task.replSnp &&
       entry.task.txnID === snpData.bits.txnID
@@ -184,19 +170,12 @@ class SnoopUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     }
   }
 
-  /* Write the evicted line back once every beat has arrived. The entry stays
-     allocated until the write is accepted, so a stalled alloc_s6 cannot drop it. */
   val wbVec = VecInit(buffer.map(e =>
     e.valid && e.issued && e.task.replSnp && e.passDirty &&
       !e.task.snpVec.asUInt.orR && e.beatValids.asUInt.andR
   ))
   val wbIdx = PriorityEncoder(wbVec)
   val wbEntry = buffer(wbIdx)
-  // reqID is Cat(0, bank, writeback-marker, sequence).  A fixed marker alone
-  // is insufficient: several replace snoops can complete together, and a
-  // freed SnoopUnit slot may be reused while its previous WriteNoSnpFull is
-  // still resident in MemUnit.  Give every accepted writeback a unique local
-  // sequence so MemUnit's response match cannot see two entries with one ID.
   val wbSeqWidth = TXNID_WIDTH - bankBits - 2
   val wbSeq = RegInit(0.U(wbSeqWidth.W))
   val wbTxnID = Cat(0.U(1.W), wbEntry.task.bank, 1.U(1.W), wbSeq)

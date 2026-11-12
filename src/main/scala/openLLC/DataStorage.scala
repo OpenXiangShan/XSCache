@@ -45,12 +45,6 @@ class WBEntry(implicit p: Parameters) extends LLCBundle {
 
 class DataStorage(implicit p: Parameters) extends LLCModule {
   val io = IO(new Bundle() {
-    /**
-      * Support read and write request in the same cycle.
-      * Reads normally observe the data before a same-cycle write. The
-      * writeFirst input enables an explicit write-first exception for the
-      * dirty replacement-snoop path.
-      */
     val read  = Flipped(ValidIO(new DSRequest()))
     val write = Flipped(ValidIO(new DSRequest()))
     val rdata = Output(new DSBlock())
@@ -87,8 +81,6 @@ class DataStorage(implicit p: Parameters) extends LLCModule {
   }
 
   /* SRAM write logic */
-  // Flush when a new write replaces the buffered logical cache line. A way
-  // alone is not enough: different tags can reuse the same (way, set).
   val writeBack = wen && writeBuffer.valid && !writeHitsBufferedLine
   array.io.w.apply(writeBack, writeBuffer.data, writeBuffer.blockIdx, 1.U)
 

@@ -3,7 +3,6 @@ package xscache.coupledL2.prefetch
 import chisel3._
 import chisel3.util._
 
-/** Byte address plus a signed cache-line offset, without a full-address ripple carry. */
 object BOPAddressAdd {
   def apply(addr: UInt, offset: SInt, offsetBits: Int): UInt = {
     require(offsetBits > 0)
@@ -21,8 +20,6 @@ object BOPAddressAdd {
       (sum0, sum1, (a ^ b).andR, hi - lo + 1)
     }
 
-    // Compute every group carry in parallel. Only the small local additions
-    // ripple; the prefix depth grows logarithmically with the address width.
     var generate = chunks.map { case (sum0, _, _, bits) => sum0(bits) }
     var propagate = chunks.map(_._3)
     var distance = 1

@@ -103,8 +103,6 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   // ==================== Hint Queue ====================
   val hintEntries = mshrsAll
   val hintEntriesWidth = log2Ceil(hintEntries)
-  // Keep hint acceptance behind registered FIFO credit; a flow queue would
-  // let l1Hint.ready bypass an empty/full queue in the same cycle.
   val hintQueue = Module(new Queue(new HintQueueEntry, hintEntries, pipe = false, flow = false))
   val canFlow_s1 = !hintQueue.io.deq.valid || hintQueue.io.count === 1.U && hintQueue.io.deq.fire
   val valid_s1 = mshr_GrantData_s1 || mshr_Grant_s1 || mshr_AccessAckData_s1 || mshr_CBOAck_s1 || chn_Release_s1

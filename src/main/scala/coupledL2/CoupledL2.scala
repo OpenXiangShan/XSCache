@@ -169,8 +169,6 @@ trait HasCoupledL2Parameters {
 
   def hartIdLen: Int = p(MaxHartIdBits)
 
-  // A physical entry contains one normal context, one replace context and one snoop context.
-  // All externally visible IDs and buffer depths remain physical-entry based.
   def mshrsAll = cacheParams.mshrs
   def idsAll = 256// ids of L2 //TODO: Paramterize like this: max(mshrsAll * 2, sourceIdAll * 2)
   def mshrBits = log2Up(idsAll)
@@ -821,10 +819,6 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
     mshrPCrdGrants.zip(mshrPCrdArbGrants).foreach { case (grant, arb) => grant := arb }
 
     val pCrdGrantFire = rxrsp.fire && isPCrdGrant
-    // The PCrdGrant descriptor enters the credit-controlled queue on the
-    // same handshake as RXRSP.  Keeping the descriptor and its admission
-    // credit in one Decoupled transaction prevents a delayed valid from
-    // overrunning a queue that became full in the meantime.
     pCrdQueue_s2.io.enq.valid := pCrdGrantFire
     pCrdQueue_s2.io.enq.bits.pCrdType := rxrsp.bits.pCrdType
     pCrdQueue_s2.io.enq.bits.srcID := rxrsp.bits.srcID

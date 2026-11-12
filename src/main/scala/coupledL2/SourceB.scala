@@ -33,8 +33,6 @@ class GrantStatus(implicit p: Parameters) extends L2Bundle {
 
 class ProbeEntry(implicit p: Parameters) extends L2Bundle {
   val valid = Bool()
-  // Queue enqueue is only a registered transport handoff; keep the probe
-  // entry owned until the external B channel accepts the packet.
   val sent = Bool()
   val checked = Bool()
   val rdy   = Bool()
@@ -105,8 +103,6 @@ class SourceB(implicit p: Parameters) extends L2Module {
       i.valid := p.valid && !p.sent && p.checked && p.rdy
       i.bits  := p.task
       when(i.fire) {
-        // Keep the owner occupied while the registered output slot waits
-        // for an external B handshake.
         p.sent := true.B
       }
   }
@@ -128,9 +124,6 @@ class SourceB(implicit p: Parameters) extends L2Module {
 
   /* ======== Update rdy ======== */
   probes foreach { p =>
-    // SourceB already owns the full task after io.task.fire. Check the
-    // registered address on the following cycle so source arbitration and
-    // the Grant CAM are separated without advancing the source's fire.
     val conflictMask = io.grantStatus.map(s =>
       s.valid && s.set === p.task.set && s.tag === p.task.tag
     )

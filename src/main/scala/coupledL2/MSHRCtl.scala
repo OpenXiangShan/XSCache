@@ -45,72 +45,30 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       val mshr_alloc_s3 = Flipped(ValidIO(new MSHRRequest()))
       val snoopDirectoryHit = Input(Bool())
       val normalReservationDone = Flipped(ValidIO(new MainpipeLeaseDone))
-      // MainPipe signals that a replace capture task (DS read of a client-less
-      // victim) wrote the victim data into the replace slot's ReleaseBuf.
       val replaceCaptureWrite = Flipped(ValidIO(UInt(mshrBits.W)))
-      // MainPipe finished a late RefillBuf[N] -> ReleaseBuf[S] copy for a
-      // post-Grant snoop that allocated after the ReleaseData payload.
       val refillToReleaseCopyWrite = Flipped(ValidIO(UInt(mshrBits.W)))
-      // MainPipe has reached S3 and completed a normal refill commit. A
-      // post-Grant toN may cancel its DS/meta write at that point.
       val refillWriteDone = Flipped(ValidIO(new MainpipeLeaseDone))
-      // MainPipe has actually transferred a normal L1-visible response to
-      // GrantBuffer. The registered handoff carries its retained issue token;
-      // a task merely accepted by RequestArb can still be dropped on retry.
       val grantSent = Flipped(ValidIO(new MainpipeLeaseDone))
-      // A C ReleaseData direct-write was committed at MainPipe S3.  Match it
-      // back to any normal MSHR that owns the same request line.
       val releaseDataDirectWrite = Flipped(ValidIO(new TaskBundle))
-      // A dirty C ReleaseData which misses the L2 directory has no normal
-      // context to own its lower-level writeback.
       val orphanReleaseData = Input(Bool())
-      // A toN snoop which required no SnoopMSHR has committed its Directory
-      // invalidation at MainPipe S3.
       val snoopToNDirectDone = Flipped(ValidIO(new TaskBundle))
-      // A refill grant merged the refill install into its own S3 pass
-      // (victim snapshot read + Directory write).  Bits carry the parent
-      // normal-context id; the same cycle any ReplaceMSHR allocation for
-      // this ReplacerResult must forgo its own DS capture.
       val grantInstallDone = Flipped(ValidIO(UInt(mshrBits.W)))
     }
     val toMainPipe = new Bundle() {
       val mshr_alloc_ptr = Output(UInt(mshrBits.W))
-      // MainPipe's normal A/CMO allocation must consume the exact registered
-      // reservation that admitted its Directory read.  This identity gate is
-      // deliberately source+owner+generation+sequence paired; a later legal
-      // A carrying the same source receives a fresh reservation token.
       val normalAllocAdmission = Output(Bool())
       val normalAllocToken = Output(new MainpipeLeaseToken)
       val normalAllocOwner = Output(UInt(mshrBits.W))
       val normalAllocSource = Output(UInt(sourceIdBits.W))
-      // A replacement victim is still owned by another context. MainPipe must
-      // drop this grant/replacer pass exactly as it drops Directory.retry;
-      // notifying only the parent MSHR would leave an irrevocable SourceD task.
       val replRespRetry = Output(Bool())
-      // Data-carrying snoops reserve their hit DS way until the snoop context
-      // retires.  MainPipe uses this only as a write-side safety assertion;
-      // Directory enforces the actual replacement exclusion.
       val snoopDataHolds = Vec(mshrsAll, ValidIO(new MSHRInfo()))
-      // A normal context may hold a post-Grant ReleaseData in RefillBuf even
-      // though Directory already sees no L1 client. MainPipe must allocate a
-      // paired SnoopMSHR for a same-line B so it can return that payload.
       val postGrantReleaseHolds = Vec(mshrsAll, ValidIO(new MSHRInfo()))
-      // A ReleaseData accepted after the S3 holder snapshot still needs to
-      // pair a same-line B.  This registered address event carries that late
-      // ownership edge into MainPipe without re-reading a moving holder.
       val postGrantReleaseLate = ValidIO(new TaskBundle)
-      // The ReplacerResult returning at MainPipe S3 selects a no-probe
-      // victim (invalid or client-less) with no ownership conflict and, for
-      // a valid victim, a live ReleaseBuf reservation.  MainPipe may then
-      // merge the refill install into the grant pass; grantInstallSlot is
-      // the reserved sidecar ReleaseBuf slot for the victim snapshot.
       val grantInstallOK = Output(Bool())
       val grantInstallSlot = Output(UInt(mshrBits.W))
       val replParentGeneration = Output(UInt(8.W))
     }
 
-    // Final external TXDAT/TXRSP handshakes. A sidecar cannot release its
-    // ReleaseBuf merely because MainPipe has enqueued the message.
     val txdatDone = Input(ValidIO(new TaskBundle))
     val txrspDone = Input(ValidIO(new TaskBundle))
 
@@ -134,14 +92,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
 
     /* send reqs */
     val toTXREQ = DecoupledIO(new CHIREQ())
-    // Occupancy of the per-ReplaceMSHR TXREQ skids.  These flits have left
-    // their sidecar but have not reached the TXREQ queue yet, so TXREQ must
-    // count them in inflightCnt/noSpace alongside the pipeline statuses.
     val replaceTxreqPendingCnt = Output(UInt(log2Up(mshrsAll + 1).W))
     val toTXRSP = DecoupledIO(new CHIRSP()) // TODO: unify with main pipe, which should be TaskBundle
-    // Direct ReplaceMSHR CopyBackWrData: task+data enqueued into TXDAT
-    // without a MainPipe pass.  Data comes from the ReleaseBuf second read
-    // port, read when the sidecar is picked below.
     val toTXDAT = DecoupledIO(new TaskWithData())
     val txdatDirectSpace = Input(Bool())
     val releaseBufDirectRd = ValidIO(new MSHRBufRead)
@@ -157,9 +109,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       val rxrsp = new RespBundle() //releaseAck(CompDBID) from CHI
       val rxdat = new RespBundle() //AcquireBlock(CompData) from CHI
     })
-    // ReleaseData bypasses RespBundle and travels SinkC -> RequestArb ->
-    // MainPipe. SinkC provides its accepted address early so a replacement
-    // sidecar cannot copy back stale ProbeAckData before it arrives.
     val sinkCReleaseData = Input(ValidIO(new TaskBundle))
     val sinkCProbeRouteRequest = Input(ValidIO(new TaskBundle))
     val sinkCProbeRouteReady = Output(Bool())
@@ -169,42 +118,21 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val sinkCRefillWrite = Input(Valid(new MSHRBufWrite))
     val sinkCRefillWriteApplied = Output(Valid(new MSHRBufWrite))
     val releaseBufWriteId = Output(UInt(mshrBits.W))
-    // A ProbeAckData can belong to a live snoop and a victim sidecar for the
-    // same line. Keep the regular writer and expose the sidecar mirror as an
-    // independent ReleaseBuf write port.
     val releaseBufWriteIdExtra = Output(ValidIO(UInt(mshrBits.W)))
-    // Registered mirror route carries payload and target generation together.
     val releaseBufWriteExtra = Output(ValidIO(new MSHRBufWrite))
     val releaseBufWriteExtraGeneration = Output(UInt(8.W))
-    // ProbeAckData for a normal context (Get-on-TRUNK / cache-alias) is
-    // captured into the normal slot's RefillBuf; the sidecar and snoop own
-    // the ReleaseBuf entries.
     val refillBufWriteId = Output(ValidIO(UInt(mshrBits.W)))
-    // If a snoop and normal context share a physical entry for the same
-    // cache line, ProbeAckData must update both contexts.  The snoop still
-    // needs ReleaseBuf to produce SnpRespData, while the normal Grant must
-    // not consume its earlier RefillBuf snapshot.
     val snoopRefillBufWriteId = Output(ValidIO(UInt(mshrBits.W)))
 
     /* nested writeback */
     val nestedwb = Input(new NestedWriteback)
     val nestedwbPayload = Input(new DSBlock)
-    // Both ports belong to one registered descriptor and complete together.
     val nestedReleaseWrites = Vec(2, ValidIO(new MSHRBufWrite))
     val nestedReleaseAuthority = Output(UInt(mshrsAll.W))
-    // ReleaseData for the line currently being refilled supersedes the
-    // normal context's earlier CompData/DS snapshot.
     val nestedRefillWrite = Output(ValidIO(new MSHRBufWrite))
-    // Once ReleaseData replaces a normal context's payload, later beats from
-    // its already-issued L3 read remain control responses only.
     val refillBufReleaseOwner = Output(UInt(mshrsAll.W))
-    // Slots whose current tenant has already accepted a read response with a
-    // different DBID than the CompData on io.resps.rxdat.  That beat belongs to
-    // an earlier tenant of the same TxnID and must reach neither the MSHR nor
-    // its RefillBuf.
     val rxdatStaleSlots = Output(UInt(mshrsAll.W))
 
-    /* Independent normal, snoop, and replacement ownership views. */
     val refillInfo = Vec(mshrsAll, ValidIO(new MSHRInfo()))
     val snoopInfo = Vec(mshrsAll, ValidIO(new MSHRInfo()))
     val replaceInfo = Vec(mshrsAll, ValidIO(new ReplaceMSHRInfo))
@@ -241,8 +169,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     })
   }
 
-  // A normal context and a snoop context share one physical MSHR ID. Only the
-  // normal context participates in L3 read/replacer/Grant paths.
   require(
     mshrsAll < (1 << (mshrBits - 1)),
     s"physical MSHR count $mshrsAll exceeds the ID range reserved for MSHR tasks"
@@ -257,11 +183,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     when(allocate) { generation := generation + 1.U }
     generation
   })
-  // One entry per possible SourceB owner. Acceptance atomically claims the
-  // actual transmitted line before the registered owner notification. Keep
-  // that immutable key until the precisely routed final ProbeAck returns;
-  // neither a later Directory/victim tag nor a delayed probeIssued marker
-  // may change the identity of an already accepted Probe.
+  // An accepted Probe pins its transmitted key and generation until its final routed ProbeAck.
   class SourceBProbeClaim extends Bundle {
     val valid = Bool()
     val set = UInt(setBits.W)
@@ -272,8 +194,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     Seq.fill(3 * mshrsAll)(0.U.asTypeOf(new SourceBProbeClaim))))
   val sourceBGenerations = (0 until mshrsAll).flatMap(i =>
     Seq(mshrTaskGenerations(0)(i), mshrTaskGenerations(1)(i))) ++ mshrTaskGenerations(2)
-  // One concrete normal slot is promised before an A reads Directory.
-  // It remains reserved through either allocation or the hit/noalloc result.
   val normalService = RegInit(0.U.asTypeOf(Valid(new NormalSlotReservation)))
   val normalServiceInFlight = RegInit(false.B)
   val normalReservationSequence = RegInit(0.U(8.W))
@@ -282,9 +202,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   def normalCmo(task: TaskBundle): Bool = task.opcode === CBOClean ||
     task.opcode === CBOFlush || task.opcode === CBOInval
   val normalServiceCmo = normalService.valid && normalCmo(normalService.bits.task)
-  // The unique selected MainPipe issue owns one directed completion record.
-  // Target identity/outcome are captured with the prepared operation, before
-  // ticket arbitration. Issue only transports this already-bound descriptor.
   class PairedCompletion extends Bundle {
     val target = UInt(mshrBits.W)
     val targetGeneration = UInt(8.W)
@@ -303,8 +220,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val completionSourceVersionMatches = completionSourceLease.valid &&
     completionSourceLease.bits.asUInt === postGrantCompletion.bits.sourceToken.asUInt
 
-  // Retirement mailboxes capture OLD source and target identities at the
-  // actual retirement edge. Apply never reads a retired/reused source slot.
+  // Capture retiring source and target versions before either physical slot can be reused.
   class OwnerRetirement extends Bundle {
     val sourceId = UInt(mshrBits.W)
     val sourceGeneration = UInt(8.W)
@@ -364,19 +280,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     }
     event
   }
-  // SinkC announces an accepted ReleaseData beat before the completed C task
-  // reaches RequestArb. Keep that address in a one-cycle descriptor so all
-  // owner/late-event consumers use one registered identity and do not rebuild
-  // wide address comparisons from the live SinkC channel.
   val sinkCReleaseEvent = RegInit(0.U.asTypeOf(Valid(new TaskBundle)))
   sinkCReleaseEvent.valid := io.sinkCReleaseData.valid
   when(io.sinkCReleaseData.valid) {
     sinkCReleaseEvent.bits := io.sinkCReleaseData.bits
   }
-  // Pin the normal owner at the same acceptance edge as the ReleaseData
-  // descriptor.  The address descriptor remains useful to late-event
-  // consumers, while the hold path consumes this registered slot/generation
-  // pair instead of re-running a wide live owner search after acceptance.
   val sinkCReleaseOwner = RegInit(0.U(mshrsAll.W))
   val sinkCReleaseOwnerGeneration = RegInit(VecInit(Seq.fill(mshrsAll)(0.U(8.W))))
   val sinkCReleaseOwnerCapture = VecInit(refillMshrs.map { refill =>
@@ -402,9 +310,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }).asUInt
   io.toMainPipe.postGrantReleaseLate.valid := postGrantReleaseLateMatch.orR
   io.toMainPipe.postGrantReleaseLate.bits := sinkCReleaseEvent.bits
-  // Full pair context, including a known absence, is registered independently
-  // of SourceB and group prepare. A late ReleaseStart is part of this capture,
-  // so a previously standalone snoop re-evaluates its payload provenance.
+  // Register both a matching normal owner and a known absence before snoop preparation.
   class SnoopPair extends Bundle {
     val snoopGeneration = UInt(8.W)
     val set = UInt(setBits.W)
@@ -419,9 +325,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val payloadReady = Bool()
     val probePayload = Bool()
   }
-  // Snapshots of the generations each registered pair was built from. An
-  // allocation advances the live generation, so a pair goes stale by mismatch
-  // with this register instead of a per-cycle Mux1H over live owner state.
   val snoopPairSnoopGenerationSeen = RegInit(VecInit(Seq.fill(mshrsAll)(0.U(8.W))))
   val snoopPairNormalGenerationSeen = RegInit(VecInit(Seq.fill(mshrsAll)(0.U(8.W))))
   val snoopPairs = snoopMshrs.zipWithIndex.map { case (snoop, i) =>
@@ -449,9 +352,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         (releaseStarts && Mux1H(normalMatches, refillMshrs.map(_.io.postGrantReleaseWindow)))
       pair.bits.payloadReady := Mux1H(normalMatches, refillMshrs.map(_.io.postGrantReleasePayloadReady))
       pair.bits.probePayload := Mux1H(normalMatches, refillMshrs.map(_.io.refillPayloadFromProbeAck))
-      // Snapshot the generations this pair was built from. A later allocation
-      // advances the live generation, and the pair becomes stale by mismatch
-      // without re-reading the owner's status, set, or tag.
       snoopPairSnoopGenerationSeen(i) := mshrTaskGenerations(1)(i)
       when(normalMatches.orR) {
         snoopPairNormalGenerationSeen(OHToUInt(normalMatches)) :=
@@ -483,11 +383,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val sinkCRefillPending =
     Mux(io.sinkCRefillWrite.valid, UIntToOH(io.sinkCRefillWrite.bits.id, mshrsAll), 0.U(mshrsAll.W)) |
       Mux(sinkCRefillRecord.valid, sinkCRefillOwnerOH, 0.U(mshrsAll.W))
-  // SinkC ReleaseData is accepted before its two-beat payload reaches the
-  // RefillBuf write port.  Pin the matching normal owner across that gap so
-  // retirement cannot invalidate the generation between C acceptance and
-  // refill-record capture.  A matching C RefillBuf write or MainPipe direct
-  // C path releases the hold; an unrelated owner disappearance also clears it.
   val sinkCReleaseHold = RegInit(0.U(mshrsAll.W))
   val sinkCReleaseHoldSet = VecInit(refillMshrs.zipWithIndex.map { case (refill, i) =>
     val ownerPinned = sinkCReleaseOwnerLive(i)
@@ -499,8 +394,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         (refill.io.msInfo.bits.s_refill && refill.io.msInfo.bits.w_grantlast) ||
         refill.io.postGrantReleaseWindow || refill.io.postGrantReleaseHold)
   }).asUInt
-  // Direct-write exemption is sampled with the complete nested transaction.
-  // Its owner notification and hold return follow the physical write receipt.
   val nestedRefillPending = Wire(UInt(mshrsAll.W))
   val nestedRefillApplied = Wire(UInt(mshrsAll.W))
   val nestedRefillDirectApplied = Wire(UInt(mshrsAll.W))
@@ -519,8 +412,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   when(sinkCRefillRecord.valid) {
     assert(sinkCRefillCurrent, "SinkC refill route lost its reserved normal generation")
   }
-  // Index0 is snoop, index1 is replacement. These retain each owner until
-  // the entire nested-data transaction has physically written and applied.
   val nestedReleasePending = Wire(Vec(2, UInt(mshrsAll.W)))
   val nestedReleaseDone = Wire(Vec(2, UInt(mshrsAll.W)))
   val mshrs: Seq[MSHRContextBase] = refillMshrs.zip(snoopMshrs).flatMap {
@@ -531,24 +422,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   require(mshrs.size == 2 * mshrsAll)
   require(mshrsAll >= 2, "independent ReplaceMSHR needs one reservable physical slot")
 
-  // A replacement is an independent transaction. Its physical ID owns only
-  // ReleaseBuf/SourceB/CHI writeback; parentId continues to own RefillBuf and
-  // the eventual DS install. ReplacerResult has no backpressure, and nested C
-  // cannot migrate data between ReleaseBuf entries, so the reserved slot must
-  // be allocated in the same cycle as this response.
-  // Every valid victim is captured into its sidecar ReleaseBuf before the
-  // parent reuses its DS way. Dirty victims later use that snapshot for
-  // WriteBackFull; clean victims can still use it for a late nested snoop and
-  // otherwise issue data-less Evict. ReplaceMSHR waits for its client Probe,
-  // so a real ProbeAckData takes precedence over the DS fallback. The replacer
-  // prefers invalid ways (state === INVALID): those are free ways, not
-  // victims, and must not create a ReplaceMSHR.
   val replRespHasVictim = io.replResp.valid && !io.replResp.bits.hit && !io.replResp.bits.retry &&
     io.replResp.bits.meta.state =/= INVALID
-  // Directory replacement results have no backpressure. A detached orphan
-  // sidecar or an active snoop may still own the selected victim. Replacing
-  // that line would create two ReleaseBuf owners for one address. Feed the
-  // result back as a retry and re-read after the current owner retires.
   val replRespSidecarConflictOH = VecInit(
     replaceMshrs.map(m =>
       replRespHasVictim && m.io.info.valid &&
@@ -565,11 +440,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     )
   ).asUInt
   val replRespSnoopConflict = replRespSnoopConflictOH.orR
-  // A line with a live CMO context must not be evicted from under it: the
-  // CMO sidecar will probe/capture/write back that very line.  Force the
-  // replacer read to retry until the CMO retires, mirroring the sidecar and
-  // snoop conflicts. Keep even a retiring CMO until its req_valid register
-  // clears; a same-cycle will_free exemption fed allocation back into retry.
   val replRespCmoConflictCapture = VecInit(refillMshrs.map { refill =>
     replRespHasVictim && refill.io.status.valid && refill.io.status.bits.isCmo &&
       refill.io.status.bits.set === io.replResp.bits.set &&
@@ -587,26 +457,16 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   val replaceActiveForParent = replaceParentMatches.map(_.orR)
 
-  // A ReplacerResult has no backpressure. Reserve an S/R-mutual ReleaseBuf
-  // slot before a normal MSHR may issue the lookup, then transfer that
-  // reservation atomically to ReplaceMSHR when the victim is valid.
   val replResponseApplied = Wire(Valid(new ReplacerResult))
   val replaceReserveValid = RegInit(VecInit(Seq.fill(mshrsAll)(false.B)))
   val replaceReserveSlot = Reg(Vec(mshrsAll, UInt(mshrBits.W)))
   val replaceReserveSlotOHByParent = Seq.tabulate(mshrsAll) { parent =>
     Mux(replaceReserveValid(parent), UIntToOH(replaceReserveSlot(parent), mshrsAll), 0.U(mshrsAll.W))
   }
-  // The physical reservation ledger changes at the same edge as the parent
-  // records. Availability must read this Q, rather than decoding all parent
-  // slot IDs and ORing them into the nested-C allocator in this cycle.
+  // Update the physical bitmap on the same edge as each parent reservation.
   val replaceReservedSlotOH = RegInit(0.U(mshrsAll.W))
   assert(replaceReservedSlotOH === replaceReserveSlotOHByParent.reduce(_ | _),
     "physical replacement reservations must agree with their parent records")
-  // A captured B owns a concrete S/R slot before its Directory execution.
-  // Keep the request identity with that slot so the transient pipeline can
-  // release exactly the reservation it consumed.  The owner is the physical
-  // S/R index and generation is a controller-local epoch; neither is inferred
-  // again from the live MSHR vectors in blockB_s1.
   class SnoopReservationToken extends Bundle {
     val valid = Bool()
     val slot = UInt(mshrBits.W)
@@ -628,14 +488,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     PopCount(replaceReservedSlotOH) === PopCount(replaceReserveValid.asUInt),
     "each pending replacer lookup must own one unique S/R reservation"
   )
-  // Keep the S/R candidate view independent from RequestArb's S1 handshake.
-  // A B request may complete directly in MainPipe, so reserving a physical
-  // slot for every (or every toN) B perturbs ReplaceMSHR selection.
-  // Build the eligibility vector with bit-parallel masks. The old per-slot
-  // boolean map expressed the same truth table, but replicated the slot-valid
-  // fan-in in the blockB_s1 cone that also drives RXSNP/ReleaseBuf admission.
-  // This exact physical eligibility is checked at capture/reservation;
-  // aggregate admission capacity comes from the registered credit ledger.
   val snoopStatusValidOH = VecInit(snoopMshrs.map(_.io.status.valid)).asUInt
   val replaceInfoValidOH = VecInit(replaceMshrs.map(_.io.info.valid)).asUInt
   val refillBlocksSnoopOH = VecInit(refillMshrs.map { refill =>
@@ -657,26 +509,13 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     !snoopMshrs(i).io.status.valid && !replaceMshrs(i).io.info.valid &&
       !replaceReservedSlotOH(i) && !snoopServiceSlotOH(i)
   }).asUInt
-  // A B request has priority over a new replacement reservation.  The
-  // reservation is registered only at the next edge, so granting it in the
-  // same cycle as a SnoopMSHR allocation would let both contexts select the
-  // same ReleaseBuf slot.
   val snoopAllocRequest = io.fromMainPipe.mshr_alloc_s3.valid &&
     io.fromMainPipe.mshr_alloc_s3.bits.task.fromB
-  // A B admitted at S1 does not reveal whether it needs a SnoopMSHR until
-  // S3. Keep its capacity available across those two stages: a new Replace
-  // reservation must not consume the last slot after the S1 admission
-  // check. RXSNP's candidate can depend on same-cycle replacement ownership,
-  // so let it settle for one cycle before admitting it or fencing reserves.
   val snoopCandidateSeen = RegNext(io.fromReqArb.status_s1.bCandidateValid, false.B)
   val snoopEntering_s2 = RegNext(io.fromReqArb.status_s1.bFire, false.B)
   val snoopEntering_s3 = RegNext(snoopEntering_s2, false.B)
   val snoopEnteringDecision = RegNext(snoopEntering_s3, false.B)
   val snoopEnteringApply = RegNext(snoopEnteringDecision, false.B)
-  // bFire transfers the already-registered service token into a one-entry
-  // pending record. This is the only extra occupancy that can exist between
-  // service registration and apply; it is intentionally narrow and carries
-  // identity rather than a global count of pipeline stages.
   when(io.fromReqArb.status_s1.bFire) {
     assert(snoopServiceToken.valid, "B entered the pipeline without a service token")
     assert(!snoopPendingToken.valid, "multiple B tokens entered the single service window")
@@ -731,9 +570,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     snoopPendingToken.txnID === snoopServiceToken.txnID &&
     snoopPendingToken.source === snoopServiceToken.source &&
     snoopPendingToken.owner === snoopServiceToken.owner
-  // A pending token normally aliases the service token and must not consume
-  // the same physical slot a second time. If service is canceled/invalidated
-  // first, retain the pending token's concrete slot as the sole extra fence.
   val snoopPendingExtra = snoopPendingToken.valid && !snoopPendingMatchesService
   val snoopPendingExtraSlotOH = Mux(snoopPendingExtra,
     UIntToOH(snoopPendingToken.slot, mshrsAll), 0.U(mshrsAll.W))
@@ -778,10 +614,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }).asUInt
   replaceReservedSlotOH := (replaceReservedSlotOH & ~replaceReserveReleaseSlots) |
     Mux(replaceReserveGrant, replaceReserveGrantSlotOH, 0.U(mshrsAll.W))
-  // A ReplacerResult issued before an invalidating snoop can return after the
-  // parent has already delegated a victim to ReplaceMSHR.  It must be retried
-  // after that child completes; allocating it now would give one parent two
-  // ReleaseBuf-owning children.
   val replRespParentConflictCapture = replRespHasVictim &&
     Mux1H(replRespParentOHCapture, replaceActiveForParent)
   val replRespNeedsReplaceRawCapture = replRespHasVictim && !replRespOwnerConflictCapture && !replRespParentConflictCapture
@@ -790,10 +622,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val replRespNeedsReplaceCapture = replRespNeedsReplaceRawCapture && !replRespNoReplaceSlotCapture
   io.toMainPipe.replRespRetry := replRespSnoopConflict || replRespParentConflictCapture || replRespNoReplaceSlotCapture ||
     replRespCmoConflictCapture
-  // A refill grant pass may merge the refill install when its folded
-  // ReplacerResult selects a no-probe victim.  The victim/slot/ownership
-  // side of that decision lives here (single source); MainPipe adds the
-  // task identity and the MSHR pre-filters request-side corner cases.
   val replRespNoProbeVictim = io.replResp.valid && !io.replResp.bits.hit && !io.replResp.bits.retry &&
     (io.replResp.bits.meta.state === INVALID || !io.replResp.bits.meta.clients.orR)
   io.toMainPipe.grantInstallOK := replRespNoProbeVictim &&
@@ -803,8 +631,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   when(replRespSnoopConflict) {
     assert(PopCount(replRespSnoopConflictOH) === 1.U, "replacement victim matches multiple active snoop contexts")
   }
-  // The action, response, reservation and old parent identity form one
-  // execution record. No conflict/slot decision is recomputed at apply.
   class ReplacerDecision extends Bundle {
     val response = new ReplacerResult
     val parentGeneration = UInt(8.W)
@@ -851,15 +677,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     assert(replDecisionCurrent, "replacer decision lost its retained normal parent")
     assert(replSlotCurrent, "replacer decision lost its retained sidecar slot generation")
   }
-  // An invalid victim may become dirty when a nested C ReleaseData reaches
-  // MainPipe after the replacer selected it.  Allocate a sidecar in that same
-  // cycle so its payload is routed directly into the new ReleaseBuf entry.
   val nestedReleaseParentOH = VecInit(refillMshrs.map(_.io.nestedReleaseNeedsReplace)).asUInt
   val nestedReleaseNeedsReplace = nestedReleaseParentOH.orR &&
     !Mux1H(nestedReleaseParentOH, replaceActiveForParent)
-  // These ownership predicates depend only on registered MSHR state and the
-  // incoming C task. Do not use nestedwbData here: normal nestedwbData also
-  // observes replaceActive, which is driven by this cycle's allocation.
   val snoopNestedwbActive = VecInit(snoopMshrs.map(_.io.nestedwbData)).asUInt
   val refillNestedwbActive = VecInit(refillMshrs.map { refill =>
     io.nestedwb.c_set_dirty && refill.io.status.valid &&
@@ -873,25 +693,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val normalAllocOH = VecInit(refillMshrs.map(_.io.alloc.valid)).asUInt
   val sinkCProbeNormalOwnerHold = WireDefault(0.U(mshrsAll.W))
   refillBufReleaseOwner := (refillBufReleaseOwner | refillNestedwbActive) & ~normalAllocOH
-  // A registered SinkC ReleaseData hold is the newest payload authority from
-  // acceptance until its own RefillBuf/direct-write edge.  Expose it only to
-  // the RXDAT/MainPipe fallback gates; the SinkC and nested C write ports are
-  // independent and remain enabled to install the authoritative payload.
-  // SinkC ReleaseData owns the matching RefillBuf from acceptance through
-  // its pending/applied write edge.  Feed that complete owner mask to the
-  // RXDAT/MainPipe fallback gates; keep nested C routing on its existing
-  // ownership rule because nested writes are the C payload installation path.
-  // A probe route fences RXDAT/MainPipe only while SinkC is carrying the
-  // probe payload.  A same-cycle ReleaseData acceptance has its own buffered
-  // owner/apply path and must not suppress an already-issued MainPipe write.
   val sinkCRefillAuthority = sinkCReleaseHold | sinkCRefillPending |
     (sinkCProbeNormalOwnerHold & ~Fill(mshrsAll, io.sinkCReleaseData.valid))
   io.refillBufReleaseOwner := refillBufReleaseOwner | refillNestedwbActive | sinkCRefillAuthority
-  // Existing contexts own matching nested writes. A directory-miss C write
-  // with no normal/snoop owner can still belong to a detached ReplaceMSHR:
-  // its parent has retired, but its ReleaseBuf and victim transaction remain
-  // live. Reuse that sidecar instead of allocating a second one for the same
-  // victim.
   val orphanReleaseCandidate = io.fromMainPipe.orphanReleaseData &&
     !nestedReleaseParentOH.orR && !snoopNestedwbActive.orR &&
     !refillNestedwbActive.orR
@@ -907,22 +711,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   val orphanReleaseTargetsReplace = orphanReplaceTargetOH.orR
   val orphanReleaseData = orphanReleaseCandidate && !orphanReleaseTargetsReplace
-  // A CMO context whose hit line needs a lower-level writeback requests a
-  // CMO-mode ReplaceMSHR (probe+capture+release of its own line).  Lowest
-  // priority: it waits behind any replacement-path allocation and never
-  // preempts a snoop allocation.  The parent keeps requesting until the
-  // child appears, so no reservation is needed.
   val replaceSlotIdle = replaceSlotUnreservedOH &
     ~Mux(replaceReserveGrant, replaceReserveGrantSlotOH, 0.U(mshrsAll.W))
   val cmoSidecarReqOH = VecInit(refillMshrs.map(_.io.cmoSidecarReq)).asUInt
-  // Any returning lookup gets this cycle; retry the CMO from its registered
-  // request next cycle instead of routing victim-tag conflict logic through
-  // the CMO's same-cycle ReleaseData target.
-  // Like a new replacer reservation, a background CMO child must preserve
-  // capacity already promised to a B candidate or a B in S2/S3. It has no
-  // pipeline entry in pipeContextCount, so merely excluding S3 allocation
-  // allows it to consume the last S/R slot in the B's S1 handshake cycle.
-  // The parent's registered request remains pending until this fence clears.
   val cmoSidecarAlloc = cmoSidecarReqOH.orR && !io.replResp.valid && !replResponseApplied.valid &&
     !nestedReleaseNeedsReplace && !orphanReleaseData && !snoopReservationFence &&
     !snoopAllocRequest &&
@@ -960,8 +751,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     incomingVictim.meta := replResponseApplied.bits.meta
   }
   when(cmoSidecarAlloc) {
-    // The CMO's own hit line plays the victim role: way/meta come from the
-    // parent's live registers (a hit never re-reads the replacer).
     incomingVictim.tag := Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.reqTag))
     incomingVictim.set := Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.set))
     incomingVictim.way := Mux1H(cmoSidecarParentOH, refillMshrs.map(_.io.msInfo.bits.way))
@@ -990,18 +779,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     ReplaceMSHRMode.victim)
   incomingReplaceReq.needProbe := (replRespNeedsReplace || cmoSidecarAlloc) &&
     incomingVictim.meta.clients.orR
-  // A victim replacement must revoke every upper copy before its old data is
-  // released to L3.  ReplaceRequest is zero-initialized, and zero is toT.
-  // CBO.clean keeps the line shared (probe toB); flush/inval revoke it.
   incomingReplaceReq.probeParam := Mux(
     cmoSidecarAlloc && incomingReplaceReq.mode === ReplaceMSHRMode.cmoClean, toB, toN)
-  // When the parent's grant pass merges the install this very cycle, it also
-  // performs the victim DS snapshot (ReleaseBuf write lands at its S5), so
-  // the new sidecar must not issue a second capture of its own.
-  // CMO sidecars always capture from DS -- including CBO.inval, whose Evict
-  // carries no data but whose ReleaseBuf snapshot lets a racing same-line
-  // snoop be answered with the pre-invalidation contents (nestability is
-  // what breaks the CMO <-> snoop deadlock cycle).
   incomingReplaceReq.captureFromDS := (replRespNeedsReplace &&
       !io.fromMainPipe.grantInstallDone.valid) || cmoSidecarAlloc
   incomingReplaceReq.task := 0.U.asTypeOf(new TaskBundle)
@@ -1017,10 +796,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   incomingReplaceInfo.way := incomingVictim.way
   incomingReplaceInfo.meta := incomingVictim.meta
 
-  // Normal and replace contexts use different buffers and may share a local
-  // index. Snoop and replace are mutually exclusive because both own
-  // ReleaseBuf[i]. A ReplacerResult consumes its parent reservation; nested
-  // C/orphan paths use an unreserved S/R slot.
   val selectedReplaceSlotOH = Mux(
     replRespNeedsReplace,
     replRespReservationOH,
@@ -1047,9 +822,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     replaceParentMatches(parent) |
       Mux(replaceNeedsAlloc && !orphanReleaseData && replaceParentOH(parent), selectedReplaceSlotOH, 0.U)
   }
-  // Nested C and a returning refill lookup are different tasks in the shared
-  // S3 pipeline. Only nested/Cmo admission can create a new nested-data target;
-  // an unrelated ReplacerResult must not enter that physical-slot mux.
   val replaceNestedAllocParentOH = Mux(nestedReleaseNeedsReplace, nestedReleaseParentOH,
     Mux(cmoSidecarAlloc, cmoSidecarParentOH, 0.U(mshrsAll.W)))
   val replaceNestedSlotOH = PriorityEncoderOH(replaceSlotIdle)
@@ -1063,13 +835,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     assert(replaceNestedSlotOH === selectedReplaceSlotOH,
       "nested payload target must equal the actual allocated physical slot")
   }
-  // A parent that still owns a child ReplaceMSHR must not allocate a second
-  // one: the child's victim data / ReleaseBuf is still live, and the parent
-  // only re-queries the replacer after the child's done pulse. Guard both the
-  // allocation and the replacer response.
   val parentAlreadyHasChild = Mux1H(replaceParentOH, replaceActiveForParent)
-  // Availability needs no priority encoding; the physical onehot remains
-  // unchanged for ownership and buffer routing.
   val replaceSlotAvailable = Mux(replRespNeedsReplace,
     replRespReservationOH.orR, replaceSlotIdle.orR)
   assert(replaceSlotAvailable === selectedReplaceSlotOH.orR,
@@ -1080,22 +846,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     !(replaceNeedsAlloc && !orphanReleaseData && parentAlreadyHasChild),
     "replacer response for a parent that already owns a child ReplaceMSHR"
   )
-  // New replacements cannot supply a nested snoop yet: incomingReplaceInfo
-  // has neither probeDone nor releaseBufReady. Advertise their addresses
-  // independently of slot selection, while keeping registered sidecars
-  // indexed as their ReleaseBuf owners.
-  //
-  // Register each complete pre-acceptance origin independently. The short
-  // local execution slot excludes B capture while these S3 allocations
-  // apply, so the next capture sees both their registered fence and owner.
-  // The accepted allocation still owns actual ReplaceMSHR/ReleaseBuf routing.
-  //
-  // Lifetime: every raw origin is either a one-cycle pulse (replResp,
-  // nested C, orphan ReleaseData) or, for the CMO, already qualified by
-  // replaceSlotIdle and the reservation fences, so it coincides with an
-  // accepted allocation in any legal cycle. RXSNP additionally yields this
-  // block to a nest-ready sidecar, so an origin that outlives its allocation
-  // can never block that sidecar's own nested snoop.
+  // Advertise the winning raw allocation address as one complete registered descriptor, before slot acceptance.
   val replaceAllocSnoopSources = Seq(
     (nestedReleaseNeedsReplace, nestedVictim.set, nestedVictim.tag),
     (replRespNeedsReplace, replResponseApplied.bits.set, replResponseApplied.bits.tag),
@@ -1107,14 +858,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val replaceAllocOriginRequested = ReplacementAllocAddress.requestedOrigins(
     replaceAllocSnoopSources.map(_._1))
   replaceAllocSnoopSources.zipWithIndex.foreach { case ((_, set, tag), i) =>
-    // The local transition slot excludes B capture during S3 apply. Register
-    // the complete origin at that edge, so the next capture sees registered
-    // ownership and address together; never delay only its safety-valid bit.
     io.replaceAllocForSnoop(i).valid := RegNext(replaceAllocOriginRequested(i), false.B)
     io.replaceAllocForSnoop(i).bits.set := RegEnable(set, replaceAllocOriginRequested(i))
     io.replaceAllocForSnoop(i).bits.tag := RegEnable(tag, replaceAllocOriginRequested(i))
-    // A raw origin may be rejected by capacity or parent ownership; only an
-    // accepted one must equal the victim actually allocated this cycle.
     when(replaceAllocOriginRequested(i) && replaceAllocValid) {
       assert(set === incomingVictim.set && tag === incomingVictim.tag,
         "snoop allocation address must equal the accepted replacement victim")
@@ -1129,24 +875,16 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     assert(PopCount(replaceTargetMatches(parent)) <= 1.U, "one normal MSHR must have one physical ReleaseBuf target")
   }
 
-  // Normal contexts own RefillBuf independently of the S/R ReleaseBuf pool.
-  // Normal slots use the concrete reservation ledger below; the shared
-  // S/R pool retains its conservative registered capacity credit.
   val pipeContextCount = PopCount(Cat(io.pipeStatusVec.map(_.valid)))
   val srContextCount = PopCount(Cat((0 until mshrsAll).map { i =>
     snoopMshrs(i).io.status.valid || replaceMshrs(i).io.info.valid ||
       replaceReservedSlotOH(i) || snoopServiceSlotOH(i)
   }))
-  // Capacity is promised at admission, not borrowed combinationally from
-  // this cycle's Directory result or context retirement. Include S1 and
-  // autonomous reservations as well as all in-flight apply-stage work.
   def allocationCredit(used: UInt): UInt = {
     val credit = RegInit(0.U(log2Ceil(mshrsAll + 1).W))
     credit := Mux(used >= mshrsAll.U, 0.U, mshrsAll.U - used)
     credit
   }
-  // Normal admission promises an actual free slot, rather than a delayed
-  // aggregate credit which would require another free-slot pick at S3.
   val normalSlotEligibleOH = VecInit(refillMshrs.zipWithIndex.map { case (refill, i) =>
     !refill.io.status.valid && !normalServiceSlotOH(i) &&
       (!normalCmo(io.normalReserveRequest.bits) ||
@@ -1178,10 +916,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     normalService.valid := false.B
   }
   val normalReservationDone = io.fromMainPipe.normalReservationDone
-  // The S3 task is not itself a Decoupled transaction.  Export only the
-  // already-registered reservation identity; MainPipe performs the narrow
-  // token/owner/source check at S3.  This keeps the allocation admission off
-  // the wide live set/tag/TaskBundle cone while still pairing A ownership.
   val normalAllocTask = io.fromMainPipe.mshr_alloc_s3.bits.task
   val normalReservationIdentityMatch = normalService.valid && normalServiceInFlight &&
     normalReservationDone.valid &&
@@ -1213,8 +947,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val mshrFull = snoopMshrFull
   val a_mshrFull = normalMshrFull
   val mshrSelector = Module(new MSHRSelector())
-  // Only snoop allocation still uses the S/R service selector. Normal apply
-  // consumes the concrete claim and never consults a live free-slot pick.
   val allocIsSnoop = io.fromMainPipe.mshr_alloc_s3.bits.task.fromB
   val selectedMSHROH = Mux(allocIsSnoop,
     Mux(mshrSelector.io.out.valid, mshrSelector.io.out.bits, 0.U(mshrsAll.W)),
@@ -1226,10 +958,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       m.io.status.bits.reqSource === MemReqSource.CPUStoreData.id.U
     )
   }).orR
-  // RequestArb gives B priority over A only in the B handshake cycle.  Keep
-  // the exact toN address reserved across B's S2/S3 allocation window, then
-  // transfer the reservation to the allocated SnoopMSHR until its final CHI
-  // response leaves TXDAT/TXRSP.
   val pendingToNValid = RegInit(VecInit(Seq.fill(mshrsAll)(false.B)))
   val pendingToNSet = Reg(Vec(mshrsAll, UInt(setBits.W)))
   val pendingToNTag = Reg(Vec(mshrsAll, UInt(tagBits.W)))
@@ -1240,9 +968,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val bToNFire = io.bServiceStart.valid && isSnpToN(io.bServiceStart.bits.chiOpcode.get)
   val pendingToNFreeOH = PriorityEncoderOH(VecInit(pendingToNValid.map(x => !x)).asUInt)
   val pendingToNFull = !pendingToNFreeOH.orR
-  // Admission reserves a physical service slot at the snapshot edge. Raw
-  // allocating C/replacer work wins this edge and the queued snoop retries;
-  // background new reservations yield to the registered local capture phase.
   io.snoopAdmission.ready := !snoopServiceValid && snoopBaseEligibleOH.orR &&
     !nestedReleaseNeedsReplace && !orphanReleaseData &&
     !io.replResp.valid && !replResponseApplied.valid &&
@@ -1259,8 +984,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       io.fromMainPipe.snoopToNDirectDone.bits.set === pendingToNSet(i) &&
       io.fromMainPipe.snoopToNDirectDone.bits.tag === pendingToNTag(i)
   })
-  // Match the captured OLD retiring source, including its allocation, before
-  // reducing. A different same-line snoop must not release this toN fence.
   val pendingToNContextWillFree = VecInit((0 until mshrsAll).map { i =>
     val matches = RegNext(VecInit(snoopRetireEvents.map { event =>
       event.valid && pendingToNValid(i) && pendingToNHasSnoopContext(i) &&
@@ -1282,7 +1005,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       when(pendingToNAllocated(i)) {
         pendingToNHasSnoopContext(i) := true.B
         pendingToNSnoopId(i) := OHToUInt(selectedMSHROH)
-        // Allocation increments the source generation at this same edge.
         pendingToNSnoopGeneration(i) := Mux1H(selectedMSHROH,
           mshrTaskGenerations(1)) + 1.U
       }
@@ -1312,18 +1034,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       }
     }
   }
-  // S/R are mutually exclusive owners of ReleaseBuf[i]. Normal uses only
-  // RefillBuf[i], so N+R is legal and normal allocation must not observe R[i].
-  // CMO retains its existing N+S restriction.
+  // Snoop and replacement share ReleaseBuf exclusively; normal independently owns RefillBuf.
   val allocIsCmo = normalCmo(io.fromMainPipe.mshr_alloc_s3.bits.task)
-  // Match the normal context that holds a post-Grant ReleaseData for this B.
-  // Used only for pairing / RefillBuf[N]->ReleaseBuf[S] copy source selection.
-  // Allocation no longer pins the snoop onto that same physical index: the
-  // snoop keeps its own ReleaseBuf and consumes a mirrored/copied payload.
   val postGrantReleaseSnoopTargetOH = VecInit(refillMshrs.zipWithIndex.map { case (refill, i) =>
-    // The late C event can be the first registered indication of ownership;
-    // pair the B with that same normal context before postGrantReleaseHold
-    // becomes visible on its MSHR status bus.
     allocIsSnoop && refill.io.status.valid &&
       (refill.io.postGrantReleaseHold || postGrantReleaseLateMatch(i)) &&
       refill.io.status.bits.set === io.fromMainPipe.mshr_alloc_s3.bits.task.set &&
@@ -1333,8 +1046,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     assert(PopCount(postGrantReleaseSnoopTargetOH) <= 1.U,
       "one B snoop must match at most one post-Grant ReleaseData holder")
   }
-  // Transfer the exact physical slot reserved before B execution. It has
-  // remained unavailable to replacement for the entire lookup/apply window.
   mshrSelector.io.idle := snoopMshrs.zipWithIndex.map { case (snoop, i) =>
     snoopServiceSlotOH(i) && !snoop.io.status.valid && !replaceMshrs(i).io.info.valid
   }
@@ -1368,24 +1079,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val activeReplaceOH = VecInit(replaceMshrs.map(_.io.info.valid)).asUInt
   assert(!(activeSnoopOH & activeReplaceOH).orR,
     "SnoopMSHR and ReplaceMSHR must not own the same ReleaseBuf slot")
-  // A normal allocation may legally share its local index with a newly
-  // allocated ReplaceMSHR because their RefillBuf/ReleaseBuf ownership is
-  // disjoint. A snoop allocation is excluded above from the selected R slot.
 
-  // SinkC carries both ProbeAck( Data ) and proactive Release( Data ).  A
-  // proactive release still updates a matching normal MSHR's client state,
-  // while only a probe response may complete a snoop or replacement context.
-  // Otherwise a ReleaseData can be mistaken for a snoop ProbeAck, or skipped
-  // altogether and leave a stale client that will never answer a later Probe.
   val sinkCProbeResponse = io.resps.sinkC.respInfo.opcode === ProbeAck ||
     io.resps.sinkC.respInfo.opcode === ProbeAckData
 
-  // Only a sidecar currently awaiting its own ProbeAck may consume a probe
-  // response by address. A stale replace context with a coincidental set/tag
-  // match must not absorb another probe's data.
   val replaceProbeSinkCMatch = Wire(Vec(mshrsAll, Bool()))
-  // A ReleaseData takes SinkC's task path rather than resps.sinkC. It
-  // supersedes any earlier ProbeAckData for the same delegated victim.
   val replaceReleaseDataMatch = VecInit(replaceMshrs.map { m =>
     sinkCReleaseEvent.valid && m.io.info.valid &&
       (!m.io.info.bits.releaseAck || m.io.acceptsLateReleaseData) &&
@@ -1393,21 +1091,12 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     sinkCReleaseEvent.bits.tag === m.io.info.bits.tag
   })
   val replaceSinkCMatch = replaceProbeSinkCMatch
-  // The directory can select a dirty snoop-owned victim in the final
-  // ProbeAckData cycle.  The new sidecar is not awaiting a probe yet, so it
-  // cannot match replaceProbeSinkCMatch.  Mirror this accepted data into the
-  // selected slot and mark it captured before a later data-less ProbeAck can
-  // cause stale DataStorage contents to be copied back.
   val incomingReplaceProbeAckDataCapture = io.resps.sinkC.valid &&
     io.resps.sinkC.respInfo.last &&
     io.resps.sinkC.respInfo.opcode === ProbeAckData &&
     replRespNeedsReplaceCapture && replRespReservationOHCapture.orR &&
     io.resps.sinkC.set === io.replResp.bits.set &&
     io.resps.sinkC.tag === io.replResp.bits.tag
-  // A sidecar can already be live while a snoop owns the ProbeAckData for the
-  // same line. The sidecar may not have sent its own Probe yet, so its direct
-  // SinkC match is deliberately false. Mirror the authoritative data before
-  // the later data-less ProbeAck would otherwise fall back to stale DS data.
   val activeReplaceProbeAckDataOH = VecInit(replaceMshrs.zipWithIndex.map {
     case (m, i) =>
       io.resps.sinkC.valid && io.resps.sinkC.respInfo.last &&
@@ -1426,9 +1115,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   when(activeReplaceProbeAckDataCapture) {
     assert(PopCount(activeReplaceProbeAckDataOH) === 1.U, "ProbeAckData matches multiple active ReplaceMSHRs")
   }
-  // A retry has no committed ReplacerResult, so a ReleaseData for the stale
-  // candidate may proceed. Once SinkC accepts it, hold the matching normal
-  // MSHR's next replacer read until that C task reaches MainPipe S3.
   val cReleaseReplacerFence = RegInit(0.U(mshrsAll.W))
   val cReleaseReplacerFenceSet = VecInit(refillMshrs.map { refill =>
     sinkCReleaseEvent.valid && refill.io.status.valid &&
@@ -1446,9 +1132,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     ((cReleaseReplacerFence & ~cReleaseReplacerFenceClear) | cReleaseReplacerFenceSet) &
       refillLiveOH & ~normalAllocOH
 
-  // The live lookup ends at owner-local FFs. No accepted C beat repeats
-  // this search: a second FF stage encodes the buffer route, then SinkC may
-  // accept the message. Owner pins span both stages and all data beats.
+  // Pin C owners before capturing the buffer route; all beats use that retained route.
   val probeLookupValid = RegInit(false.B)
   val probeRouteValid = RegInit(false.B)
   val probeNormalOwners = RegInit(0.U(mshrsAll.W))
@@ -1542,11 +1226,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     )
   }
 
-  // A nested ReleaseData can belong to either half of a physical entry.  The
-  // normal half redirects an already-delegated victim to ReplaceMSHR; the
-  // snoop half keeps its own physical ReleaseBuf entry for SnpRespData. Both
-  // halves may legitimately match the same line and therefore need two
-  // independent ReleaseBuf writes.
   val nestedwbNormalActive = refillMshrs.zipWithIndex.map { case (refill, i) =>
     val incomingCmoCapture = cmoSidecarAlloc && cmoSidecarParentOH(i) &&
       io.nestedwb.c_set_dirty && refill.io.status.bits.set === io.nestedwb.set &&
@@ -1558,8 +1237,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     case ((refill, snoop), i) =>
       when(nestedwbNormalActive(i) && replaceNestedTargetMatches(i).orR) {
         val targetInfo = Mux1H(replaceNestedTargetMatches(i), replaceMshrs.map(_.io.info.bits))
-        // During the allocation cycle the target's registers are not valid yet;
-        // its address is nevertheless exactly incomingReplaceReq.
         val targetSet = Mux(replaceNeedsAlloc && replaceParentOH(i), incomingReplaceReq.dirResult.set, targetInfo.set)
         val targetTag = Mux(replaceNeedsAlloc && replaceParentOH(i), incomingReplaceReq.dirResult.tag, targetInfo.tag)
         assert(
@@ -1576,7 +1253,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       }).asUInt.orR
   }
 
-  /* Port connection of physical MSHR entries and their two contexts. */
   val rxdatStaleSlotOH = WireDefault(VecInit(Seq.fill(mshrsAll)(false.B)))
   refillMshrs.zip(snoopMshrs).zipWithIndex.foreach {
     case ((refill, snoop), i) =>
@@ -1596,19 +1272,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
           m.io.aMergeTask.bits := io.aMergeTask.bits.task
       }
 
-      // A CompData is routed by TxnID, which is this slot's index and is reused
-      // as soon as the context retires.  A response to the previous tenant can
-      // therefore still be in flight and would silently complete the new
-      // context's read (tl-test: uncached Get "Data mismatch", the returned
-      // data belonging to the address the slot read for its previous tenant).
-      // Once this context has accepted its own first beat it latched that
-      // response's DBID; a later beat must carry the same one.
       val rxdatForThisSlot = io.resps.rxdat.valid && io.resps.rxdat.mshrId === i.U
       val rxdatDBIDMismatch = refill.io.readDBID.valid &&
         io.resps.rxdat.respInfo.dbID.get =/= refill.io.readDBID.bits
-      // The TxnID high bits carry the epoch of the read that was issued.  A
-      // response whose epoch is not the one this context sent belongs to an
-      // earlier tenant and must be dropped before it can complete the read.
+      // Reject responses whose TxnID epoch belongs to an earlier tenant of the slot.
       val readTxnEpochWidth = (TXNID_WIDTH - bankBits - 2) - mshrBits
       val rxdatEpochMismatch = if (readTxnEpochWidth > 0) {
         io.resps.rxdat.txnID(TXNID_WIDTH - bankBits - 3, mshrBits) =/= refill.io.readTxnEpoch
@@ -1634,61 +1301,25 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         replRespForRefill.retry := true.B
       }
       refill.io.replResp.bits := replRespForRefill
-      // The grant pass merged the refill install at S3: the later refillOnly
-      // commit of this parent degenerates to the RefillBuf->DS write alone.
       refill.io.grantInstallDone :=
         io.fromMainPipe.grantInstallDone.valid && io.fromMainPipe.grantInstallDone.bits === i.U
-      // The direct TXDAT path is ReplaceMSHR-only.
       refill.io.tasks.txdat.ready := false.B
       val parentReplaceMatch = replaceParentMatches(i)
       val parentReplaceInfo = WireInit(0.U.asTypeOf(new ReplaceMSHRInfo))
       when(parentReplaceMatch.orR) {
         parentReplaceInfo := Mux1H(parentReplaceMatch, replaceMshrs.map(_.io.info.bits))
       }
-      // Feed the parent the registered child ownership, not the allocation
-      // intent: the latter closes the replResp -> replaceActive -> willFree ->
-      // RXSNP task-valid cone.  MSHR adds a narrow same-cycle fence on
-      // replResp.valid/mshrId for the allocation cycle, so probe/replRead/
-      // cbwrdata still see the child on the cycle it is created.
       refill.io.replaceActive := replaceActiveForParent(i)
-      // A full pool (or a same-cycle reservation taking its last free slot)
-      // can reject an intent. The parent must keep requesting until accepted.
       refill.io.replaceAccepted := replaceActiveForParent(i) ||
         replaceAllocValid && !orphanReleaseData && replaceParentOH(i)
-      // A nested B request reaches MainPipe S3 two cycles before its
-      // SnoopMSHR becomes valid. Treat the S1 B candidate as a transient
-      // snoop owner until allocation has caught up, so SourceD is deferred
-      // until the snoop ordering point is known.
-      // A normal MSHR owns its request line only.  `metaTag` is a ReplaceMSHR
-      // victim while `needsRepl` is set, so a B.toN for that victim must stay
-      // on the replacement/snoop path and must not cancel this normal refill.
-      // Use the raw B candidate, not the already-gated bValid: bValid depends
-      // on MSHRCtl's blockB_s1, which itself depends on the B's toN status, so
-      // feeding it back here closes a long MSHRCtl<->RequestArb cone.  A B
-      // candidate blocked only by the snoop/replace pool defers this grant
-      // conservatively; that pool drains independently of this normal's
-      // commit, so the extra deferral cannot deadlock.
-      // snoopCandidateSeen is the registered bCandidateValid.  blockB_s1
-      // forbids a B from firing on its first candidate cycle, so every fire
-      // cycle has snoopCandidateSeen set and the address compare below still
-      // catches it; a blocked candidate only adds a conservative deferral.
       val pendingSnoopForRefill = snoopCandidateSeen &&
         refill.io.status.valid &&
         refill.io.status.bits.set === io.fromReqArb.status_s1.b_set &&
         refill.io.status.bits.reqTag === io.fromReqArb.status_s1.b_tag
-      // A matching B candidate defers only the irrevocable L1-visible Grant.
-      // It must not revoke or replay the normal MSHR's one lower CHI read:
-      // the HN serializes that read response behind the snoop, while RXSNP
-      // blocks later snoops during the Refill/Grant critical window.
       val nestedBToNForRefill = io.nestedwb.b_toN.getOrElse(false.B) &&
         refill.io.status.valid &&
         refill.io.status.bits.set === io.nestedwb.set &&
         refill.io.status.bits.reqTag === io.nestedwb.tag
-      // A voluntary dirty ReleaseData can precede the ProbeAck for a
-      // Get-on-TRUNK request.  In that order the release payload, rather
-      // than the old DS fallback, is the data that must reach AccessAckData.
-      // SinkC exposes it on its first accepted beat so Grant cannot pass the
-      // ProbeAck/ReleaseData crossing before the payload is captured.
       val releaseDataBeforeProbeAck = sinkCReleaseEvent.valid &&
         refill.io.status.valid && !refill.io.msInfo.bits.w_rprobeacklast &&
         refill.io.status.bits.set === sinkCReleaseEvent.bits.set &&
@@ -1697,10 +1328,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         refill.io.postGrantReleaseWindow &&
         refill.io.status.bits.set === sinkCReleaseEvent.bits.set &&
         refill.io.status.bits.reqTag === sinkCReleaseEvent.bits.tag
-      // A detached victim can still be held by a snoop in a different slot.
-      // Its physical DS way must remain reserved even when the normal request
-      // has a different tag. Include the hold before preparing a refill, and
-      // let deferGrant's lease invalidation revoke an older unissued proposal.
       val snoopHoldsRefillWay = snoopMshrs.map { candidate =>
         candidate.io.msInfo.valid && candidate.io.msInfo.bits.blockRefill &&
           candidate.io.msInfo.bits.set === refill.io.status.bits.set &&
@@ -1712,28 +1339,15 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       refill.io.postGrantReleaseData := postGrantReleaseData
       refill.io.releaseDataDirectWrite := nestedRefillDirectApplied(i)
       refill.io.nestedRefillWriteDone := nestedRefillApplied(i)
-      // The matching snoop can be in a different temporary allocation phase
-      // in the cycle before its `status` register becomes valid. Include that
-      // allocation pulse so the normal cannot retire or commit around it.
-      // The same SnoopMSHR req_set/req_tag match feeds active, ToN, ToB, and
-      // ToClean. Compare the packed line address once per candidate so the
-      // internal SnoopMSHR request fields do not rebuild four equality cones.
       val refillLineKey = Cat(refill.io.status.bits.reqTag, refill.io.status.bits.set)
       val postGrantReleaseSnoopLineMatch = snoopMshrs.map { candidate =>
         candidate.io.status.valid &&
           Cat(candidate.io.status.bits.reqTag, candidate.io.status.bits.set) === refillLineKey
       }
       val postGrantReleaseSnoopActive = postGrantReleaseSnoopLineMatch.reduce(_ || _)
-      // Every selected snoop receives the same task. The allocation request
-      // therefore protects this line before its physical slot is selected;
-      // OR-ing per-slot alloc.valid would unnecessarily feed the replacer /
-      // reservation / selector chain back into the parent's retirement path.
-      // The allocation assertion above guarantees that the request has a slot.
       val postGrantReleaseSnoopAllocating = snoopAllocRequest &&
         io.fromMainPipe.mshr_alloc_s3.bits.task.set === refill.io.status.bits.set &&
         io.fromMainPipe.mshr_alloc_s3.bits.task.tag === refill.io.status.bits.reqTag
-      // The pair pins this target before prepare; the directed completion
-      // record extends that fence through the owner-apply edge.
       refill.io.bufferWritePending := sinkCRefillPending(i) || sinkCReleaseHold(i) ||
         sinkCProbeOwnerHold(0)(i) || nestedRefillPending(i)
       refill.io.pairLifetimeHold := snoopPairs.zipWithIndex.map { case (pair, s) =>
@@ -1754,16 +1368,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       refill.io.postGrantReleaseSnoopToN := applyPostGrantCompletion && postGrantCompletion.bits.outcome === 1.U
       refill.io.postGrantReleaseSnoopToB := applyPostGrantCompletion && postGrantCompletion.bits.outcome === 2.U
       refill.io.postGrantReleaseSnoopToClean := applyPostGrantCompletion && postGrantCompletion.bits.outcome === 3.U
-      // Directory's ReplacerResult cannot be backpressured. Do not let this
-      // normal context issue a lookup until it owns an S/R-mutual reservation
-      // for the resulting ReplaceMSHR and ReleaseBuf slot.
       refill.io.blockReplRead := cReleaseReplacerFence(i) || cReleaseReplacerFenceSet(i) ||
         !replaceReserveAllowsRead(i)
       refill.io.replaceDetached := parentReplaceMatch.orR && parentReplaceInfo.detached
       refill.io.replaceRefillReady := parentReplaceMatch.orR && parentReplaceInfo.refillReady
-      // CMO completion: a child ReplaceMSHR (cmoClean/Flush/Inval mode) pulses
-      // done when its lower-level writeback finished; the parent normal CMO
-      // context proceeds with its control request / CBOAck.
       refill.io.replaceDone := Cat(replaceMshrs.zipWithIndex.map {
         case (r, j) =>
           r.io.done.valid && r.io.info.bits.parentAttached && r.io.done.bits.parentId === i.U &&
@@ -1806,9 +1414,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       snoop.io.releaseDataDirectWrite := false.B
       snoop.io.nestedRefillWriteDone := false.B
       snoop.io.grantInstallDone := false.B
-      // Only ProbeAckData provenance may be reused by the paired snoop. A
-      // normal RXDAT remains owned by the normal request until RXSNP has
-      // released its Refill/Grant critical window.
       val pairedProbeAckDataMirrored = io.resps.sinkC.valid && io.resps.sinkC.respInfo.last &&
         io.resps.sinkC.respInfo.opcode === ProbeAckData &&
         resp_sinkC_match_vec(2 * i + 1) && refill.io.status.valid &&
@@ -1832,8 +1437,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       snoop.io.pairedNormalId.bits := pair.bits.normal.bits.id
       snoop.io.pairLifetimeHold := false.B
       snoop.io.bufferWritePending := false.B
-      // Capture the allocation address match at the same edge as req/state.
-      // Do not feed alloc.valid/slot-selector into an active SourceB gate.
       snoop.io.allocPostGrantReleasePending := postGrantReleaseSnoopTargetOH.orR
       snoop.io.allocPostGrantReleasePayload := VecInit(
         refillMshrs.zipWithIndex.map { case (candidate, j) =>
@@ -1845,7 +1448,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       when(snoop.io.alloc.valid) {
         assert(!snoop.io.status.valid, "snoop allocation must target an idle context")
       }
-      // MainPipe S5 pulses refillToReleaseCopyWrite with the destination snoop id.
       snoop.io.nestedReleaseWritePending := nestedReleasePending(0)(i)
       snoop.io.nestedReleaseWriteDone := nestedReleaseDone(0)(i)
       replaceMshrs(i).io.nestedReleaseWritePending := nestedReleasePending(1)(i)
@@ -1863,28 +1465,14 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         io.resps.sinkC.respInfo.opcode === ProbeAckData && replaceProbeSinkCMatch(i)
       val mirroredReplaceProbeAckDataForSlot =
         mirroredReplaceProbeAckDataDoneOH(i)
-      // Client-less victims are captured from DS by the replace capture task;
-      // MainPipe pulses replaceCaptureWrite with the replace slot id.
       val replaceCaptureMatch = io.fromMainPipe.replaceCaptureWrite.valid &&
         io.fromMainPipe.replaceCaptureWrite.bits === i.U
       replaceMshrs(i).io.victimDataCaptured :=
         replaceProbeAckDataCapture || nestedReleaseDone(1)(i) || replaceCaptureMatch ||
         mirroredReplaceProbeAckDataForSlot
-      // A DS fallback capture only snapshots an already-clean victim for a
-      // possible nested snoop. It must not promote the sidecar's lower-level
-      // Evict into WriteBackFull. SinkC/ReleaseData captures may carry newer
-      // data, so they retain the conservative writeback behavior.
       replaceMshrs(i).io.victimDataNeedsWriteback :=
         replaceProbeAckDataCapture || nestedReleaseDone(1)(i) ||
         mirroredReplaceProbeAckDataForSlot
-      // A B that actually enters RequestArb reserves this sidecar until its
-      // response leaves TXRSP/TXDAT. The reservation prevents the sidecar
-      // from observing B only in S1, then releasing the same victim while B
-      // is still in MainPipe.
-      // Any snoop that consumes this sidecar's ReleaseBuf must reserve it --
-      // including one arriving after the copyback was issued (a late snoop is
-      // still served from the snapshot).  snoopDone is unconditional, so the
-      // reservation must be too, or the completion asserts.
       replaceMshrs(i).io.localReservationHold := io.sidecarReservationHold
       replaceMshrs(i).io.snoopStarted := io.sidecarSnoopReserve.valid &&
         io.sidecarSnoopReserve.bits === i.U
@@ -1896,12 +1484,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       replaceMshrs(i).io.snoopMeta.valid := snoopResponseMatches.reduce(_ || _)
       replaceMshrs(i).io.snoopMeta.bits := Mux1H(snoopResponseMatches,
         Seq(io.txdatDone.bits.meta, io.txrspDone.bits.meta))
-      // A forwarding snoop owns both its HN response and requester CompData.
-      // Count its context retirement once, after both terminal handshakes.
-      // Each completion owns an existing snoopInFlight reservation. Keep that
-      // reservation outstanding through identity match, reduction, and apply.
-      // Every context and each physical terminal port has its own bitmap bit,
-      // preserving multiple simultaneous completions without queue backpressure.
       val contextSnoopDoneMatches = snoopRetireEvents.map { event =>
         event.valid && event.bits.targets(i) && replaceMshrs(i).io.info.valid &&
           event.bits.targetGenerations(i) === mshrTaskGenerations(2)(i) &&
@@ -1930,9 +1512,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       val snoopToInvalDone = Seq(io.txdatDone, io.txrspDone).map { done =>
         done.valid && done.bits.fromB && done.bits.snpHitRelease &&
         done.bits.chiOpcode.get =/= CompData &&
-        // A clean sidecar can also lose the line to an invalidating snoop.
-        // The response state (I or I_PD) records that outcome; the release
-        // mode alone only describes the state before the snoop.
         (done.bits.snpHitReleaseToInval ||
           done.bits.snpHitReleaseToClean && done.bits.resp.get(1, 0) === 0.U) &&
         done.bits.snpHitReleaseIdx === i.U && replaceMshrs(i).io.info.valid &&
@@ -1957,7 +1536,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       snoop.io.tasks.txreq.ready := false.B
       snoop.io.tasks.txdat.ready := false.B
       snoop.io.pCrd.grant := false.B
-      // the snoop context has no grant path to defer
       snoop.io.deferGrant := false.B
       val snoopRespDone = Seq(io.txdatDone, io.txrspDone).map { done =>
         done.valid && done.bits.mshrTask && done.bits.mshrContext === 1.U &&
@@ -1968,10 +1546,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         io.txdatDone.bits.mshrContext === 1.U && io.txdatDone.bits.mshrId === i.U &&
         io.txdatDone.bits.chiOpcode.get === CompData
 
-      // Never multiplex the victim over the normal request address. RXSNP
-      // needs both views in the same cycle: normal `reqTag` protects a
-      // Grant-to-refill window, while ReplaceMSHR owns only the victim and
-      // ReleaseBuf lifecycle.
       val replaceInfoForOutput = WireInit(replaceMshrs(i).io.info)
       when(replaceAllocValid && selectedReplaceSlotOH(i)) {
         replaceInfoForOutput.valid := true.B
@@ -1999,9 +1573,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   assert(!sharedReleaseBufOwners.orR,
     "SnoopMSHR and ReplaceMSHR must not share a ReleaseBuf slot")
 
-  // A normal slot can be reused before its detached child finishes writeback.
-  // Release only the parent association at the normal MSHR's actual retire
-  // edge; the child remains fully visible as an independent victim context.
   replaceMshrs.zipWithIndex.foreach { case (replace, i) =>
     val parentReleaseMatches = VecInit(normalRetireEvents.map { event =>
       event.valid && event.bits.targets(i) && replace.io.info.valid &&
@@ -2014,8 +1585,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         event.bits.sourceId === replace.io.info.bits.parentId &&
         event.bits.sourceEpoch === replace.io.info.bits.parentEpoch
     }).asUInt
-    // Parent detach is an identity-bound event too. The old sidecar may have
-    // retired normally while this notification travelled; reject a new tenant.
     val parentReleaseMatched = RegNext(parentReleaseMatches, 0.U(mshrsAll.W))
     val parentReleaseMatchGeneration = RegNext(mshrTaskGenerations(2)(i), 0.U(8.W))
     val parentReleaseApply = RegNext(parentReleaseMatched.orR, false.B)
@@ -2026,11 +1595,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
 
   /* Reserve 1 entry for SinkB */
-  // A ReleaseData must not update the victim line while a normal MSHR that
-  // was already active at its arrival still waits for its replacement read.
-  // The replacer snapshots that victim's tag/meta before C writes. A release
-  // to another line in the same set is independent and must keep flowing;
-  // otherwise it can block the ReleaseAck needed by an outstanding Probe.
   val cReleaseReplacerWaiters = VecInit(refillMshrs.map { refill =>
     refill.io.status.valid && refill.io.replReadInFlight &&
     refill.io.msInfo.bits.set === io.fromReqArb.status_s1.c_set &&
@@ -2052,13 +1616,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     (cReleaseWaitersLatched & cReleaseReplacerWaiters).orR,
     cReleaseReplacerWaiters.orR
   )
-  // A matching sidecar holds the only up-to-date copy of an evicted line in
-  // ReleaseBuf until its writeback has actually left the cache.  Do not admit
-  // the RequestBuffer output candidate for that line: a lower-level read
-  // could otherwise return the older memory image before the sidecar's
-  // release/CopyBack sequence is complete.  `a_tag/a_set` describe ReqBuf's
-  // input and can differ from its queued output, so they are not sufficient
-  // for this ownership check.
   val aSidecarConflict = VecInit(replaceMshrs.map { replace =>
     replace.io.info.valid &&
     io.fromReqArb.status_s1.aCandidateValid &&
@@ -2081,63 +1638,31 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     io.fromReqArb.status_s1.b_set === io.fromReqArb.status_s1.aCandidateSet &&
     io.fromReqArb.status_s1.b_tag === io.fromReqArb.status_s1.aCandidateTag
   io.toReqArb.blockC_s1 := io.fromReqArb.status_s1.cReleaseData && cReleaseConflictsReplacer
-  // Account for every B still in S2/S3 before admitting another potential
-  // snoop. The first candidate waits for snoopCandidateSeen so the registered
-  // reservation fence is already active when that B enters the pipeline.
   io.toReqArb.blockB_s1 := mshrFull ||
     (io.fromReqArb.status_s1.bToN && pendingToNFull) ||
     (io.fromReqArb.status_s1.bCandidateValid &&
       (!snoopCandidateSeen || snoopPendingCapacityBlock))
-  // Normal capacity is consumed only by the pre-Directory claim/ack.
-  // Its registered ack gates A execution; do not reinsert free-slot reduction
-  // into the actual Directory read after a concrete slot has been promised.
   io.toReqArb.blockA_s1 := aSidecarConflict || aSnoopConflict ||
     aPendingToNConflict || aEnteringToNConflict
   io.toReqArb.blockG_s1 := false.B
 
-  /* Acquire downwards to TXREQ*/
-  // Normal reads (latency-critical) and victim writeback requests share the
-  // direct MSHR->TXREQ path; writeback control is control-only and needs no
-  // MainPipe pass.
-  //
-  // R2: insert a one-entry registered skid per ReplaceMSHR before the shared
-  // two-level arbiter.  The live sidecar cone (state/snoopStarted ->
-  // txreq.valid/bits) previously ran through highArb and the TXREQ queue
-  // straight into the queue RAM write.  With the skid, that cone ends at a
-  // local valid/bits register and the RAM write starts from registered
-  // inputs.  Normal refill reads keep their direct, zero-added-latency path
-  // into lowArb.
-  //
-  // A capture is the sidecar's irreversible commit point (it sets
-  // releaseSent in ReplaceMSHR): the skid then owns the flit until the
-  // arbiter accepts it.  The sidecar stays valid and the retire/txdat
-  // conditions hold on !txreqPending, so the flit cannot be duplicated, and
-  // its txnID and ReleaseBuf entry are not reused while it is pending.  The
-  // request-before-CopyBackWrData ordering is preserved because the data
-  // path additionally waits for releaseAck, which the HN can only return
-  // after this request has actually left TXREQ.
   val replaceTxreqSkids = replaceMshrs.zipWithIndex.map { case (m, i) =>
     val busy = RegInit(false.B)
     val bits = Reg(new CHIREQ)
     val out = Wire(Decoupled(new CHIREQ))
-    // No bypass, one-entry FIFO: capture only when empty, hold otherwise.
     m.io.tasks.txreq.ready := !busy && !io.sidecarReservationHold
     m.io.txreqPending := busy
     out.valid := busy
     out.bits := bits
     when (m.io.tasks.txreq.fire) {
-      // fire == capture: the sidecar is still live, so its bits are stable.
       busy := true.B
       bits := m.io.tasks.txreq.bits
     }.elsewhen(out.fire) {
       busy := false.B
     }
-    // Exactly one capture per episode, and never over an undrained flit.
     when (m.io.tasks.txreq.fire) {
       assert(!busy, s"replace TXREQ skid $i captured into a non-empty entry")
     }
-    // A skid entry is a committed victim writeback.  It must never outlive
-    // the context that owns its txnID/ReleaseBuf.
     assert(!busy || m.io.info.valid,
       s"replace TXREQ skid $i holds a flit without a live sidecar")
     when (m.io.alloc.valid) {
@@ -2147,10 +1672,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   val replaceTxreqSkidAnyBusy = VecInit(replaceTxreqSkids.map(_.valid)).asUInt.orR
   io.replaceTxreqPendingCnt := PopCount(VecInit(replaceTxreqSkids.map(_.valid)))
-  // Bounded drain watchdog: the two-level RR arbiter alternates the groups
-  // and round-robins inside each group, so a skid only waits for downstream
-  // bandwidth.  This bound is far above any legitimate backpressure window;
-  // hitting it means the handshake was lost.
   val replaceTxreqSkidWait = RegInit(0.U(16.W))
   when (replaceTxreqSkidAnyBusy) {
     replaceTxreqSkidWait := Mux(replaceTxreqSkidWait === 65535.U, replaceTxreqSkidWait,
@@ -2161,21 +1682,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   assert(replaceTxreqSkidWait =/= 65535.U, "replace TXREQ skid failed to drain")
   ArbPerf(twoLevelArb(refillMshrs.map(_.io.tasks.txreq) ++ replaceTxreqSkids, io.toTXREQ, Some("txreq")), "txreq_arb")
 
-  /* Victim CopyBackWrData direct to TXDAT */
-  // The sidecar's copyback task carries no directory/DS side effect; its
-  // mainpipe pass only moved ReleaseBuf data into TXDAT.  This path does the
-  // transfer directly: pick one pending sidecar (RR), read its ReleaseBuf
-  // entry through the dedicated second port (registered response next
-  // cycle), then hold task+data for TXDAT.  A sidecar withdraws its request
-  // when a nested snoop preempts; if that happens before TXDAT accepts, the
-  // staged request is dropped and the sidecar re-presents with the post-snoop
-  // state, mirroring the pre-acceptance preemption of the RequestArb path.
+  // Register the selected copyback before reading ReleaseBuf; withdraw only before TXDAT accepts it.
   val directCbValids = VecInit(replaceMshrs.map(_.io.tasks.txdat.valid))
   val cbPresent = RegInit(false.B)
-  // The copyback pick is registered a cycle before the ReleaseBuf read.  The
-  // read id then no longer sits at the end of the txdat.valid/bFire cone, and
-  // the pick is re-confirmed when the read is issued: a sidecar withdrawn by
-  // a nested snoop drops the pick without touching ReleaseBuf.
   val cbPickOHReg = Reg(UInt(mshrsAll.W))
   val cbPickValidReg = RegInit(false.B)
   val cbSelOH = Reg(UInt(mshrsAll.W))
@@ -2198,19 +1707,13 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     cbSelOH := cbPickOHReg
     cbTaskReg := Mux1H(cbPickOHReg, replaceMshrs.map(_.io.tasks.txdat.bits))
   }.elsewhen (cbPickValidReg && !cbPickStillValid) {
-    // The sidecar withdrew before the read: drop the pick and let it present
-    // again with the post-snoop state.
     cbPickValidReg := false.B
   }
-  // ReleaseBuf resp2 is registered and holds until the next read, so the
-  // data is stable for the whole present window.
   val cbSelStillValid = Mux1H(cbSelOH, directCbValids)
   io.toTXDAT.valid := cbPresent && cbSelStillValid && !io.sidecarReservationHold
   io.toTXDAT.bits.task := cbTaskReg
   io.toTXDAT.bits.data := io.releaseBufDirectResp
   when (cbPresent && !cbSelStillValid) {
-    // Preempted by a nested snoop before TXDAT acceptance: drop the staged
-    // request; the sidecar re-presents with refreshed state afterwards.
     cbPresent := false.B
   }
   when (io.toTXDAT.fire) {
@@ -2231,11 +1734,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     PopCount(Cat(replaceMshrs.map(m => m.io.tasks.txdat.valid && !m.io.tasks.txdat.ready))))
 
   /* Response downwards to TXRSP*/
-  // ReplaceMSHR joins for the CompAck owed by a WriteEvictOrEvict Comp.
   val txrspArb = twoLevelArb(mshrs.map(_.io.tasks.txrsp) ++ replaceMshrs.map(_.io.tasks.txrsp), io.toTXRSP, Some("txrsp"))
   ArbPerf(txrspArb, "txrsp_arb")
-  // Sum contending contexts, rather than relying on ArbPerf input positions which
-  // differ between the single-context and paired-context implementations.
   XSPerfAccumulate(
     "normal_txrsp_arb_wait",
     PopCount(Cat(refillMshrs.map { m =>
@@ -2253,8 +1753,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val replaceSourceBTasks = replaceMshrs.zipWithIndex.map {
     case (m, _) =>
       val task = Wire(Decoupled(new SourceBReq))
-      // S/R mutual exclusion on the physical entry makes the sidecar the sole
-      // ReleaseBuf owner while it lives -- no lease arbitration required.
       task.valid := m.io.tasks.source_b.valid
       task.bits := m.io.tasks.source_b.bits
       m.io.tasks.source_b.ready := task.ready
@@ -2263,19 +1761,12 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val sourceBTasks = mshrs.zip(contextPhysicalIds).map {
     case (m, _) =>
       val task = Wire(Decoupled(new SourceBReq))
-      // N+X mutual exclusion (see mshrSelector idle gates) guarantees a single
-      // active probe owner per physical entry at any time.
       task.valid := m.io.tasks.source_b.valid
       task.bits := m.io.tasks.source_b.bits
       m.io.tasks.source_b.ready := task.ready
       task
   }
 
-  // SinkC ProbeAck has no transaction ID. The accepted-key claim ledger is
-  // the sole authority for outstanding lines across all three owner classes.
-  // Revocable candidates establish no claim and consume no SourceB capacity.
-  // Each source publishes a full registered candidate before the 48-way RR.
-  // Capturing a candidate never fires the owner or consumes SourceB capacity.
   class SourceBCandidate extends Bundle {
     val request = new SourceBReq
     val source = UInt(log2Ceil(3 * mshrsAll).W)
@@ -2286,16 +1777,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val sourceBCommit = RegInit(0.U.asTypeOf(Valid(new SourceBCandidate)))
   val sourceBCommitChecked = RegInit(false.B)
   val sourceBCommitConflicts = RegInit(VecInit(Seq.fill(3 * mshrsAll)(false.B)))
-  // This slot is part of the accepted Probe transport, just like SourceB's
-  // internal queue. Authorization transfers the packet and consumes its
-  // owner once; downstream ready only drains the registered packet.
   val sourceBPermit = RegInit(0.U.asTypeOf(Valid(new SourceBCandidate)))
   val sourceBCandidateOut = Wire(Decoupled(new SourceBCandidate))
   val sourceBHoldPorts = mshrs.map(_.io.sourceBHold) ++ replaceMshrs.map(_.io.sourceBHold)
   val sourceBAcceptedPorts = mshrs.map(_.io.sourceBAccepted) ++ replaceMshrs.map(_.io.sourceBAccepted)
-  // Acceptance is the unique ownership-transfer edge. Notify each owner from
-  // its own FF on the following cycle, without re-reading its live intent.
-  // The accepted packet and generation stay pinned in the transport permit.
   val sourceBAccepted = RegInit(VecInit(Seq.fill(sourceBInputs.size)(false.B)))
   sourceBAcceptedPorts.zip(sourceBAccepted).foreach { case (port, accepted) => port := accepted }
   val sourceBTaskCandidates = sourceBInputs.zipWithIndex.map { case (task, i) =>
@@ -2323,8 +1808,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     "source_b_candidate_arb")
   sourceBCandidateOut.ready := !sourceBCommit.valid
   val commitOH = UIntToOH(sourceBCommit.bits.source, sourceBInputs.size)
-  // Keep revocation local to each owner. This preserves the instantaneous
-  // intent/key check without a 48-way payload/generation mux before compare.
   val commitCurrent = VecInit(sourceBInputs.zipWithIndex.map { case (task, i) =>
     commitOH(i) && task.valid && sourceBGenerations(i) === sourceBCommit.bits.generation &&
       task.bits.asUInt === sourceBCommit.bits.request.asUInt
@@ -2333,22 +1816,14 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     sourceBCommitConflicts(i) := claim.valid &&
       claim.set === sourceBCommit.bits.request.set && claim.tag === sourceBCommit.bits.request.tag
   }
-  // Exactly one commit packet stays fixed while the per-source comparisons
-  // are registered. No other authorization can create a new claim in that
-  // window. A returning ProbeAck may only remove a conflict, costing a cycle.
-  // A new packet always clears checked; its first possible acceptance uses
-  // a complete claim/key snapshot, including a preceding acceptance edge.
+  // Hold one immutable SourceB commit while registered per-source conflicts settle before authorization.
   val commitLineBusy = sourceBCommitConflicts.asUInt.orR
   val sourceB = Module(new SourceB())
-  // Validate late owner events and claim the line at the irrevocable local
-  // acceptance edge. No SourceB queue-ready signal enters that decision.
   val authorizeSourceB = sourceBCommit.valid && sourceBCommitChecked &&
     commitCurrent && !commitLineBusy && !sourceBPermit.valid
   sourceB.io.task.valid := sourceBPermit.valid
   sourceB.io.task.bits := sourceBPermit.bits.request
   sourceBInputs.zipWithIndex.foreach { case (task, i) =>
-    // source_b publishes a revocable intent only. A registered accepted event
-    // advances the owner, even if a later event has already changed intent.
     task.ready := false.B
     sourceBAccepted(i) := authorizeSourceB && commitOH(i)
     when(authorizeSourceB && commitOH(i)) {
@@ -2407,23 +1882,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       }
   }
 
-  /* Arbitrate MSHR task to RequestArbiter with class-based QoS.
-   * Strict class priority (lower class wins) with round-robin inside a class:
-   *   0: responses — SnoopMSHR tasks and normal-context B-channel answers
-   *      (probeAck/DCT); they sit on the openLLC/L1 snoop critical path.
-   *   1: normal L1-visible grant (mp_grant) — directly sets L1 refill latency.
-   *   2: normal refill commit / replRead / revalidate — frees the MSHR and
-   *      releases its way for follow-up requests.
-   *   3: ReplaceMSHR DS capture — gates the deferred commit of its parent.
-   *   4: everything else (sidecar release/copyback, CMO, background tasks).
-   * Starvation guard: a source valid for 63 consecutive unserved cycles is
-   * promoted to class 0 until it fires.
-   */
   val mshrTask = Wire(Decoupled(new TaskBundle()))
-  // The three context types share one MainPipe admission port, but their
-  // payloads are independent. Group arbitration carries only narrow source
-  // identities. A registered winner acquires the source lease BEFORE its
-  // payload is materialized and captured into the group's prepared register.
   val mshrTaskGroups: Seq[Seq[DecoupledIO[TaskBundle]]] = Seq(
     refillMshrs.map(_.io.tasks.mainpipe),
     snoopMshrs.map(_.io.tasks.mainpipe),
@@ -2442,10 +1901,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   )
   val mshrTaskCandidates = mshrTaskLeasePorts.flatten.map(_.candidate)
   val mshrTaskClasses = mshrTaskCandidates.map(_.bits.qosClass)
-  // Register each source's class while it is valid.  The arbitration then
-  // reads a register instead of the deferGrant -> opcode -> class cone; a
-  // task type change is visible one cycle later, which only shifts a QoS
-  // hint and cannot affect correctness (the starvation guard stays).
   val mshrTaskClassReg = mshrTaskCandidates.zip(mshrTaskClasses).map { case (t, c) =>
     val r = RegInit(0.U(3.W))
     when(t.valid) { r := c }
@@ -2463,10 +1918,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val mshrTaskEffClasses = mshrTaskClassReg.zip(mshrTaskWaitCnt).map { case (c, w) =>
     Mux(w === 63.U, 0.U(3.W), c)
   }
-  // A source scheduled to retire at this edge cannot grant a fresh lease.
   val mshrTaskSrcValids = VecInit(mshrTaskCandidates.map(_.valid)).asUInt
 
-  // Per-group arbitration: best effective class, then round-robin inside it.
   val mshrTaskGroupOffsets = mshrTaskGroups.scanLeft(0)(_ + _.size).take(nMshrTaskGroups)
   def groupOf(g: Int) = mshrTaskGroups(g)
   def groupValids(g: Int): UInt = {
@@ -2487,12 +1940,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val bc = groupBestClass(g, v)
     v & VecInit(cs.map(_ === bc)).asUInt
   }
-  // Preparation holds an explicit source lifetime lease. Issue/cancel first
-  // registers a return request; the source acknowledges its exact version
-  // before the group can refill. Issued operations retain the lease until
-  // their final local MainPipe/buffer reference completes. Sources freeze
-  // variant before arbitration, materialize payload only after winning, and
-  // revoke by a versioned event cancel at either stage.
+  // Prepare leases source lifetime; issue or cancel returns that exact version after all local references end.
   class MSHRTaskWinner extends Bundle {
     val group = UInt(log2Up(nMshrTaskGroups).W)
     val source = UInt(log2Up(mshrTaskGroupSize).W)
@@ -2526,10 +1974,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val sourceOH = UIntToOH(mshrTaskWinners(g).source, mshrTaskGroupSize)
     Mux1H(sourceOH, mshrTaskLeasePorts(g).map(_.cancel))
   }
-  // A winner is correct at the edge it is chosen. Staleness is a clock-edge
-  // event, not a per-cycle re-read of the 16-wide status/generation/set/tag:
-  // reallocation advances the source generation, and the paired normal owner
-  // is tracked by the generation snapshot taken when the pair was registered.
   val mshrTaskWinnerStale = (0 until nMshrTaskGroups).map { g =>
     val winner = mshrTaskWinners(g)
     val sourceReallocated =
@@ -2545,15 +1989,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     mshrTaskPreparedValid(g) && mshrTaskLeaseValid(g) && !mshrTaskLeaseReturning(g)
   }
 
-  // The cross-group arbiter transports only a narrow ticket.  Register that
-  // ticket before selecting a prepared payload. Frozen source variants use
-  // narrow token/cancel eligibility rather than a live task-type comparison.
   val mshrTaskTicketValid = RegInit(false.B)
   val mshrTaskTicket = RegInit(0.U.asTypeOf(new MSHRTaskTicket))
-  // A ticket only names the group/source selected by the first arbiter. Keep
-  // an independently registered operation permit until the final MainPipe
-  // handshake, freezing the exact payload/token/completion descriptor and
-  // rechecking generation/cancellation at the issue edge.
   val mshrTaskIssuePermitValid = RegInit(false.B)
   val mshrTaskIssuePermit = RegInit(0.U.asTypeOf(new MSHRPreparedTask))
   val mshrTaskTicketOut = Wire(Decoupled(new MSHRTaskTicket))
@@ -2564,10 +2001,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }).asUInt)
   val mshrTaskTicketInputs = (0 until nMshrTaskGroups).map { g =>
     val ticket = Wire(Decoupled(new MSHRTaskTicket))
-    // A source cancellation is an edge-visible revocation of the prepared
-    // winner. Do not capture a new cross-group ticket on the same cycle as
-    // that revocation; otherwise the canceled source can reach the permit
-    // stage before its lease-return handshake is observed.
     ticket.valid := mshrTaskGroupReady(g) &&
       !mshrTaskGroupCancel(g).valid &&
       mshrTaskGroupClassEff(g) === mshrTaskFinalBestClass
@@ -2616,15 +2049,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     assert(mshrTaskTicketOut.bits.qosClass === mshrTaskFinalBestClass,
       "selected ticket must belong to the best effective QoS class")
   }.elsewhen(mshrTaskTicketValid && !mshrTaskTicketReady && !mshrTaskIssuePermitTake) {
-    // Cancellation consumes no source.  Do not reload on issue/cancel: the
-    // next ticket observes the updated ownership and task variant.
     mshrTaskTicketValid := false.B
   }.elsewhen(mshrTaskTicketValid &&
     Mux1H(mshrTaskTicketGroupOH, mshrTaskGroupWait.map(_ === 63.U))) {
-    // RequestArb may defer class-4 tasks while sinks have work.  Keep the
-    // existing age promotion alive after ticket capture, otherwise a held
-    // background ticket could prevent every group from making progress.
-    // Only this narrow QoS register changes; the owner and payload stay held.
     mshrTaskTicket.qosClass := 0.U
   }
 
@@ -2642,8 +2069,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       in.bits.token.sequence := mshrTaskLeaseSequence(g)
       in.bits.completion := 0.U.asTypeOf(in.bits.completion)
       if (g == 1) {
-        // Bind the paired identity at the narrow winner edge. The outcome is
-        // derived from the winner payload on the following prepared edge.
         val pair = snoopPairs(i)
         in.bits.completion.valid := lease.candidate.bits.operation(2) &&
           lease.candidate.bits.operation(1, 0) === 1.U
@@ -2668,9 +2093,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val payload = Mux1H(sourceOH, groupOf(g).map(_.bits))
     val payloadValid = Mux1H(sourceOH, groupOf(g).map(_.valid))
     val payloadOperation = Mux1H(sourceOH, mshrTaskLeasePorts(g).map(_.candidate.bits.operation))
-    // The source payload is itself a register captured at the prepare edge, so
-    // gating on the registered lease (and not a live status recheck) keeps the
-    // 16:1 TaskBundle mux off the FSM state cone.
     val preparePayload = mshrTaskLeaseValid(g) && !mshrTaskLeaseReturning(g) &&
       !mshrTaskPreparedValid(g) && payloadValid && payloadOperation === winner.operation
     val granted = mshrTask.fire && mshrTaskIssuePermitGroupOH(g)
@@ -2684,8 +2106,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       lease.release.valid := returnRequest && sourceOH(i)
       lease.release.bits := winner.token
     }
-    // The 16:1 payload mux reads ONLY the registered winner one-hot. Neither
-    // a live RR decision nor class/age arbitration enters this data path.
     when(preparePayload) {
       mshrTaskPreparedValid(g) := true.B
       mshrTaskPrepared(g).task := payload
@@ -2735,10 +2155,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       mshrTaskGroupWait(g) := 0.U
     }.elsewhen(mshrTaskLeaseValid(g) && !mshrTaskLeaseReturning(g) &&
       (granted || mshrTaskGroupCancel(g).valid || mshrTaskWinnerStale(g))) {
-      // A winner is correct at the edge it is chosen. Revocation is itself a
-      // clock-edge event: the source cancel, a reallocation of the source or
-      // its paired normal owner, or the issue that starts the lease return.
-      // None of these re-reads the 16-wide live status to revalidate the winner.
       mshrTaskLeaseReturning(g) := true.B
       mshrTaskLeaseAwaitPipe(g) := granted
       mshrTaskGroupWait(g) := 0.U
@@ -2773,8 +2189,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         "prepared payload must retain its winner and token")
     }
   }
-  // The preparation/ticket stages cannot consume a source.  An issued task
-  // drains its local references and returns the lease before fresh preparation.
   val mshrTaskGrantSrc = VecInit((0 until nMshrTaskGroups).map { g =>
     Mux(mshrTask.fire && mshrTaskIssuePermitGroupOH(g),
       UIntToOH(mshrTaskIssuePermit.source, mshrTaskGroupSize), 0.U)
@@ -2799,7 +2213,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       m.io.tasks.mainpipe.valid && !m.io.tasks.mainpipe.ready && mshrTask.ready
     }))
   )
-  // QoS observability: per-class pending pressure and starvation promotions.
   XSPerfAccumulate("qos_snoopresp_wait_sum",
     PopCount(Cat((0 until nMshrTaskSrc).map(i =>
       mshrTaskSrcValids(i) && mshrTaskClasses(i) === 0.U && !mshrTaskSources(i).ready))))
@@ -2818,23 +2231,14 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   XSPerfAccumulate("qos_starve_promote_cnt",
     PopCount(Cat((0 until nMshrTaskSrc).map(i =>
       mshrTaskSrcValids(i) && mshrTaskWaitCnt(i) === 63.U))))
-  // Every ticket carries the physical slot index for its context group.
   io.mshrTask <> mshrTask
 
-  /* releaseBuf link to MSHR id */
-  // ReleaseBuf is owned by the replace sidecar and the snoop context only;
-  // a ProbeAckData for a normal context (Get-on-TRUNK / cache-alias) is
-  // captured into that normal slot's RefillBuf instead.
   val sinkCReleaseBufWrite = io.resps.sinkC.valid && io.resps.sinkC.respInfo.last &&
     io.resps.sinkC.respInfo.opcode === ProbeAckData
   val releaseBufMatch = VecInit((0 until mshrsAll).map { i =>
     resp_sinkC_match_vec(2 * i + 1) || replaceProbeSinkCMatch(i)
   })
   io.releaseBufWriteId := probeBufferRoute.release
-  // Independent ProbeAckData mirror route: capture payload, beat mask, target
-  // sidecar id and generation before any later ReleaseBuf write. This route
-  // cannot be substituted by the nested descriptor because it may arrive
-  // after the pair was registered and must retain the newer probe payload.
   val probeAckMirrorCapture = RegInit(0.U.asTypeOf(Valid(new MSHRBufWrite)))
   val probeAckMirrorCaptureGeneration = RegInit(0.U(8.W))
   probeAckMirrorCapture.valid := mirroredReplaceProbeAckDataCapture
@@ -2842,8 +2246,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     probeAckMirrorCapture.bits.id := OHToUInt(mirroredReplaceProbeAckDataOH)
     probeAckMirrorCapture.bits.data := io.sinkCProbeAckPayload
     probeAckMirrorCapture.bits.beatMask := Fill(beatSize, true.B)
-    // The raw replacer decision reserves this slot now and allocates it at
-    // next-cycle apply. Retain that next generation even before it is live.
     probeAckMirrorCaptureGeneration := Mux1H(mirroredReplaceProbeAckDataOH,
       mshrTaskGenerations(2)) + (!activeReplaceProbeAckDataCapture).asUInt
   }
@@ -2881,7 +2283,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     )
   }
 
-  /* Nested ReleaseData: owner masks -> encoded descriptor -> writes -> apply. */
   val orphanNestedwbWrite = orphanReleaseData && replaceSlotIdle.orR
   val orphanExistingReplaceWrite = orphanReleaseTargetsReplace
   val nestedReplaceMask = VecInit(replaceNestedwbCapture).asUInt |
@@ -2923,16 +2324,13 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     nestedReleaseMasks.bits.data := io.nestedwbPayload
     nestedReleaseMasks.bits.beatMask := Fill(beatSize, true.B)
     (0 until mshrsAll).foreach { i =>
-      // A same-S3 orphan/CMO allocation creates the next generation at capture.
       nestedReleaseMasks.bits.generations(i) := Mux(nestedReplaceMask(i),
         mshrTaskGenerations(2)(i) + replaceMshrs(i).io.alloc.valid.asUInt,
         mshrTaskGenerations(1)(i))
     }
   }
 
-  // Raw C ownership/payload is first held in a reservation register. The
-  // descriptor and physical writes consume the registered record one edge
-  // later, so raw pending and done cannot cross or lose the first beat.
+  // Capture complete C payload, masks and owner versions before the physical buffer write.
   val nestedReleaseReserved = RegInit(0.U.asTypeOf(Valid(new NestedReleaseMasks)))
   nestedReleaseReserved := nestedReleaseMasks
   val nestedReleaseWrite = RegInit(0.U.asTypeOf(Valid(new NestedReleaseWrite)))
@@ -2961,9 +2359,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     !target.valid || (live && generation === target.bits.generation)
   }
   val nestedReleaseVersionsMatch = nestedReleaseWrite.bits.targets.map(nestedTargetMatches).reduce(_ && _)
-  // Validate the retained owner before the physical write stage. Pending
-  // pins it through the next edge, so the generation mux never enters the
-  // ReleaseBuf write-enable/decode cone.
   val nestedReleaseValidated = RegInit(0.U.asTypeOf(Valid(new NestedReleaseWrite)))
   nestedReleaseValidated.valid := nestedReleaseWrite.valid && nestedReleaseVersionsMatch
   when(nestedReleaseWrite.valid && nestedReleaseVersionsMatch) {
@@ -2978,8 +2373,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   when(nestedReleaseWrite.valid) {
     assert(nestedReleaseVersionsMatch, "nested write lost its reserved owner generation")
   }
-  // There is no write backpressure. Both selected ports take effect on this
-  // edge; only their whole-descriptor event can mark either consumer ready.
   val nestedReleaseApplied = RegInit(0.U.asTypeOf(Valid(new NestedReleaseWrite)))
   nestedReleaseApplied.valid := nestedReleaseValidated.valid
   when(nestedReleaseValidated.valid) {
@@ -2991,14 +2384,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         UIntToOH(target.bits.id, mshrsAll), 0.U(mshrsAll.W))
     }.reduce(_ | _)
   }
-  // An admitted C task is already held in the fixed-latency pipeline FFs
-  // before the S3 address/physical-target search begins. Conservatively pin
-  // every S/R owner during those C stages; no C event is backpressured or
-  // consumed here. At the S3 edge its complete masks/payload take over the
-  // hold. Likewise SinkC's registered route reservation precedes any accepted
-  // ProbeAckData and protects a possible replacement mirror at capture.
-  // These early Q reservations close the first-cycle gap without raw masks
-  // bypassing the registered transaction into owner ready/retirement logic.
+  // Reserve S/R owners before C target capture; pending holds must read registered descriptors.
   val nestedReleaseCaptureHold = VecInit(io.pipeStatusVec.map(status =>
     status.valid && status.bits.fromC)).asUInt.orR
   val nestedReleaseOwnerHold = nestedReleaseCaptureHold || probeLookupValid
@@ -3020,19 +2406,12 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       descriptorMask(nestedReleaseApplied, replacement)
     nestedReleaseDone(context) := descriptorMask(nestedReleaseApplied, replacement)
   }
-  // ReleaseData is newer than in-flight DS/refill-copy/ProbeAck snapshots.
-  // Keep that provenance until physical ReleaseBuf changes owners. Their
-  // control completions still apply, but cannot overwrite authoritative data.
   val releaseOwnerAlloc = VecInit(snoopMshrs.map(_.io.alloc.valid)).asUInt |
     VecInit(replaceMshrs.map(_.io.alloc.valid)).asUInt
   val nestedReleaseAuthority = RegInit(0.U(mshrsAll.W))
   nestedReleaseAuthority := (nestedReleaseAuthority & ~releaseOwnerAlloc) | nestedReleaseMask
   io.nestedReleaseAuthority := nestedReleaseAuthority
 
-  // RefillBuf follows a complete reserved transaction too. Sample the old
-  // SinkC/direct-write precedence at S3, retain payload and owner generation,
-  // then validate/encode BEFORE the physical write register. No live address
-  // match, direct-write exemption, or generation mux reaches the buffer D.
   class NestedRefillCapture extends Bundle {
     val owners = UInt(mshrsAll.W)
     val generations = Vec(mshrsAll, UInt(8.W))
@@ -3050,9 +2429,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   val nestedRefillBlockedBySinkC =
     (refillNestedwbActive & sinkCReleaseHold & ~sinkCReleaseDirectWriteMatch).orR
-  // TtoB can direct-write DS/meta without asserting nested.c_set_dirty.
-  // Transport that completion through the same retained transaction, with
-  // no RefillBuf write or nested-payload-ready side effect.
   val nestedRefillEventOwners = refillNestedwbActive | sinkCReleaseDirectWriteMatch
   val nestedRefillCapture = RegInit(0.U.asTypeOf(Valid(new NestedRefillCapture)))
   nestedRefillCapture.valid := nestedRefillEventOwners.orR
@@ -3085,9 +2461,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   io.nestedRefillWrite.valid := nestedRefillWriter.valid && nestedRefillWriter.bits.write
   io.nestedRefillWrite.bits := nestedRefillWriter.bits.payload
-  // ValidIO buffer writes apply unconditionally at this edge. Keep the owner
-  // pinned through the registered receipt, including a suppressed fallback:
-  // that receipt acknowledges the already authoritative SinkC installation.
+  // Keep the owner pinned through the edge that physically applies the ValidIO write.
   val nestedRefillReceipt = RegNext(nestedRefillWriter, 0.U.asTypeOf(nestedRefillWriter))
   def nestedRefillOwner(record: ValidIO[NestedRefillTransaction]): UInt =
     Mux(record.valid, UIntToOH(record.bits.payload.id, mshrsAll), 0.U(mshrsAll.W))
@@ -3146,10 +2520,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   /* Performance counters */
   XSPerfAccumulate("capacity_conflict_to_sinkA", a_mshrFull)
   XSPerfAccumulate("capacity_conflict_to_sinkB", mshrFull)
-  // Debug counters for the victim-selection-degradation investigation: cycles
-  // each Directory way stays locked by an in-flight normal refill commit
-  // (blockRefill) or by a ReplaceMSHR sidecar, plus the post-Grant release
-  // hold window. Divide by miss count to get the average lock duration.
   XSPerfAccumulate("waylock_normal_sum",
     PopCount(io.refillInfo.map(s => s.valid && s.bits.blockRefill)))
   XSPerfAccumulate("waylock_replace_sum",
@@ -3211,8 +2581,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
 
   val hpm_timers = RegInit(VecInit(Seq.fill(mshrsAll)(0.U(10.W))))
-  // Capture each slot's retirement before the cross-slot count. The age test
-  // uses that same cycle's timer, retaining the original threshold/wrap rules.
   val longMissRetired = Wire(Vec(mshrsAll, Bool()))
   for (((hpm_timer, m), i) <- hpm_timers.zip(refillMshrs).zipWithIndex) {
     when(m.io.alloc.valid) {
@@ -3229,8 +2597,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     ("l2_cache_refill", io.resps.rxdat.valid && io.resps.rxdat.respInfo.last),
     ("l2_cache_rd_refill", io.resps.rxdat.valid && io.resps.rxdat.respInfo.last),
     ("l2_cache_wr_refill", false.B),
-    // PopCount retains the carry for all simultaneous slot retirements; the
-    // previous fixed four-bit sum wrapped when all sixteen slots retired.
     ("l2_cache_long_miss", PopCount(longMissRetired))
   )
   generatePerfEvent()

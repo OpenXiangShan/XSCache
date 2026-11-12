@@ -122,7 +122,6 @@ class Slice()(implicit p: Parameters) extends LLCModule {
   refillUnit.io.alloc <> mainPipe.io.refillReq_s4
 
   memUnit.io.fromMainPipe.alloc_s4 <> mainPipe.io.toMemUnit.alloc_s4
-  // A replace-snoop writeback and a MainPipe write share alloc_s6. MainPipe wins.
   val wb_s6 = snpUnit.io.writeback
   val mp_s6 = mainPipe.io.toMemUnit.alloc_s6
   memUnit.io.fromMainPipe.alloc_s6.valid := mp_s6.valid || wb_s6.valid
