@@ -31,7 +31,6 @@ class ReqEntry(entries: Int = 4)(implicit p: Parameters) extends L2Bundle() {
   val valid    = Bool()
   val rdy      = Bool()
   val task     = new TaskBundle()
-  val generation = UInt(8.W)
   val timer    = UInt(timestampBits.W) // for prefetch controller analysis
 
   // waitMP[5:0] tracks allocation/S2/capture/decision/apply/release, shifting toward bit0.
@@ -50,9 +49,9 @@ class ReqEntry(entries: Int = 4)(implicit p: Parameters) extends L2Bundle() {
 
 }
 
-class ChosenQBundle(idOHWIdth: Int = 2)(implicit p: Parameters) extends L2Bundle {
-  val bits = new ReqEntry()
-  val idOH = UInt(idOHWIdth.W)
+class RequestIssue(entries: Int)(implicit p: Parameters) extends L2Bundle {
+  val task = new TaskBundle
+  val idOH = UInt(entries.W)
 }
 
 class AMergeTask(implicit p: Parameters) extends L2Bundle {
@@ -98,11 +97,9 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   io.ASet := admitted.bits.set
 
   val buffer = RegInit(VecInit(Seq.fill(entries)(0.U.asTypeOf(new ReqEntry))))
-  val issueArb = Module(new TwoLevelRRArbiter(new ReqEntry, entries))
+  val issueArb = Module(new TwoLevelRRArbiter(new TaskBundle, entries))
   ArbPerf(issueArb, "issueArb")
-  val chosenQ = Module(new Queue(new ChosenQBundle(entries), entries = 1, pipe = false, flow = false))
-  val chosenQValid = chosenQ.io.deq.valid
-  val issueHold = RegInit(0.U.asTypeOf(new ChosenQBundle(entries)))
+  val issueHold = RegInit(0.U.asTypeOf(new RequestIssue(entries)))
   val issueHoldValid = RegInit(false.B)
   val issueHoldCommitted = RegInit(false.B)
 
@@ -245,7 +242,6 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
       val s1Block      = pipeBlockOut || probeBlock
 
       entry.valid   := true.B
-      entry.generation := entry.generation + 1.U
       // when Addr-Conflict / Same-Addr-Dependent / MainPipe-Block / noFreeWay-in-Set, entry not ready
       entry.rdy     := !conflict(in) && !mpBlock && !s1Block && !noFreeWay(in)// && !Cat(depMask).orR
       entry.task    := admitted.bits
@@ -264,21 +260,11 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   }
 
   /* ======== Issue ======== */
-  issueArb.io.in.zip(buffer).zipWithIndex.foreach {
-    case ((in, e), i) =>
-    in.valid := e.valid && e.rdy &&
-      !(issueHoldValid && issueHold.idOH(i))
-      in.bits  := e
+  issueArb.io.in.zip(buffer).foreach { case (in, e) =>
+    in.valid := e.valid && e.rdy
+    in.bits := e.task
   }
-
-  /* ======== chosenQ enq ======== */
-  // once fired at issueArb, it is ok to enter MainPipe without conflict
-  // however, it may be blocked for other reasons such as high-prior reqs or MSHRFull
-  // in such case, we need a place to save it
-  chosenQ.io.enq.valid := issueArb.io.out.valid
-  chosenQ.io.enq.bits.bits := issueArb.io.out.bits
-  chosenQ.io.enq.bits.idOH := issueArb.io.chosenOH
-  issueArb.io.out.ready := chosenQ.io.enq.ready
+  issueArb.io.out.ready := !issueHoldValid
 
   /* ======== Update rdy and masks ======== */
   buffer.zipWithIndex.foreach { case (e, i) =>
@@ -300,11 +286,6 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
         waitMSVicUpdate := conflictMaskVic(e.task)
       }
 
-      // when request is sent, clear it in other reqs' depMask
-//      when(io.out.fire && !canFlow) {
-//        depMaskUpdate(chosenQ.io.deq.bits.id) := false.B
-//      }
-
       // set waitMP if fired-s1-req is the same set
       val s1A_Block = io.out.fire && sameSet(e.task, io.out.bits)
       val s1B_Block = io.s1Entrance.valid && io.s1Entrance.bits.set === e.task.set
@@ -323,38 +304,27 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   }
 
   /* ======== Output ======== */
-  val cancel = !Mux1H(chosenQ.io.deq.bits.idOH, buffer.map(e => e.valid && e.rdy))
-
   val issueHoldOwnerValid = Mux1H(issueHold.idOH, buffer.map(_.valid))
-  val issueHoldGeneration = Mux1H(issueHold.idOH, buffer.map(_.generation))
-  val issueHoldSet = Mux1H(issueHold.idOH, buffer.map(_.task.set))
-  val issueHoldTag = Mux1H(issueHold.idOH, buffer.map(_.task.tag))
-  val issueHoldSource = Mux1H(issueHold.idOH, buffer.map(_.task.sourceId))
-  val issueHoldOpcode = Mux1H(issueHold.idOH, buffer.map(_.task.opcode))
   val issueHoldEntryWaitMSReq = Mux1H(issueHold.idOH, buffer.map(_.waitMSReq.orR))
   val issueHoldEntryWaitMSVic = Mux1H(issueHold.idOH, buffer.map(_.waitMSVic.orR))
   val issueHoldEntryWaitMP = Mux1H(issueHold.idOH, buffer.map(_.waitMP.orR))
   val issueHoldEntryReady = Mux1H(issueHold.idOH, buffer.map(_.rdy))
-  val issueHoldTask = issueHold.bits.task
+  val issueHoldTask = issueHold.task
   // Live conflicts update local rdy D; they never bypass its FF to revoke a retained output.
   val issueHoldCurrent = issueHoldValid && issueHoldOwnerValid &&
-    issueHoldGeneration === issueHold.bits.generation &&
-    issueHoldSet === issueHoldTask.set && issueHoldTag === issueHoldTask.tag &&
-    issueHoldSource === issueHoldTask.sourceId &&
-    issueHoldOpcode === issueHoldTask.opcode &&
     issueHoldEntryReady &&
     !issueHoldEntryWaitMSReq && !issueHoldEntryWaitMSVic && !issueHoldEntryWaitMP
   // Every output passes through issueHold Q, including when downstream is already ready.
-  val issueHoldCapture = !issueHoldValid && chosenQValid && !cancel
+  val issueHoldCapture = issueArb.io.out.fire
   val issueHoldCancel = issueHoldValid && !issueHoldCommitted && !issueHoldCurrent
   val issueHoldFire = io.out.fire
 
-  chosenQ.io.deq.ready := issueHoldCapture || cancel
   io.out.valid := issueHoldValid && (issueHoldCommitted || issueHoldCurrent)
   io.out.bits := issueHoldTask
 
   when (issueHoldCapture) {
-    issueHold := chosenQ.io.deq.bits
+    issueHold.task := issueArb.io.out.bits
+    issueHold.idOH := issueArb.io.chosenOH
     issueHoldValid := true.B
     issueHoldCommitted := false.B
   }.elsewhen (issueHoldFire || issueHoldCancel) {
@@ -362,6 +332,10 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     issueHoldCommitted := false.B
   }.elsewhen(io.issueCommit) {
     issueHoldCommitted := true.B
+  }
+  when(issueHoldValid) {
+    assert(PopCount(issueHold.idOH) === 1.U && issueHoldOwnerValid,
+      "a retained RequestBuffer owner must stay allocated until output fire")
   }
   when(io.issueCommit) {
     assert(issueHoldCurrent && !issueHoldCommitted && !io.out.fire,
@@ -400,7 +374,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     XSPerfAccumulate("reqbuf_commitlanded_release", PopCount(commitReleaseBits))
     XSPerfAccumulate("recv_prefetch", admitted.fire && isPrefetch)
     XSPerfAccumulate("recv_normal", admitted.fire && !isPrefetch)
-    XSPerfAccumulate("chosenQ_cancel", chosenQValid && cancel)
+    XSPerfAccumulate("issue_hold_cancel", issueHoldCancel)
     XSPerfAccumulate("req_buffer_mergeA", io.hasMergeA)
     XSPerfAccumulate("req_buffer_pf_block_occ", admitted.valid && isPrefetchTask(in) && pfThrottleByOcc)
     // TODO: count conflict
