@@ -123,7 +123,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     val useProbeData = Bool()
     val readProbeDataDown = Bool()
     val readRefillData = Bool()
-    val readDataFromDS = Bool()
     val snpHitRelease = Bool()
     val snpHitReleaseIdx = UInt(mshrBits.W)
   }
@@ -335,7 +334,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     channelTokenTask.useProbeData === channelDirReadAdmissionToken.useProbeData &&
     channelTokenTask.readProbeDataDown === channelDirReadAdmissionToken.readProbeDataDown &&
     channelTokenTask.readRefillData === channelDirReadAdmissionToken.readRefillData &&
-    channelTokenTask.readDataFromDS === channelDirReadAdmissionToken.readDataFromDS &&
     channelTokenTask.snpHitRelease === channelDirReadAdmissionToken.snpHitRelease &&
     channelTokenTask.snpHitReleaseIdx === channelDirReadAdmissionToken.snpHitReleaseIdx
   // Retained owner comparisons are assertions; they must not revoke the captured Directory command.
@@ -488,7 +486,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     channelDirReadAdmissionToken.useProbeData := channelCandidateTask.useProbeData
     channelDirReadAdmissionToken.readProbeDataDown := channelCandidateTask.readProbeDataDown
     channelDirReadAdmissionToken.readRefillData := channelCandidateTask.readRefillData
-    channelDirReadAdmissionToken.readDataFromDS := channelCandidateTask.readDataFromDS
     channelDirReadAdmissionToken.snpHitRelease := channelCandidateTask.snpHitRelease
     channelDirReadAdmissionToken.snpHitReleaseIdx := channelCandidateTask.snpHitReleaseIdx
   }
@@ -563,7 +560,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val replaceReleaseData = task_s2.bits.replaceTask && task_s2.bits.toTXREQ
   io.refillBufRead_s2.valid := mshrTask_s2 && (releaseRefillData ||
     task_s2.bits.readRefillData ||
-    mshrTask_s2_a_upwards && !task_s2.bits.useProbeData && !task_s2.bits.readDataFromDS &&
+    mshrTask_s2_a_upwards && !task_s2.bits.useProbeData &&
       (!task_s2.bits.refillOnly || task_s2.bits.readRefillData))
   val snoopRefillData = task_s2.bits.mshrContext === 1.U && task_s2.bits.readRefillData
   io.refillBufRead_s2.bits.id := Mux(

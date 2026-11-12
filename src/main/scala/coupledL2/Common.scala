@@ -96,7 +96,6 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   val readProbeDataDown = Bool()          // whether data from ReleaseBuf was needed on mainpipe by downward operations
                                           // reads by upwards was handled in RequestArb by 'mshrTask_s2_a_upwards'
   val readRefillData = Bool()             // whether data from RefillBuf was needed on mainpipe
-  val readDataFromDS = Bool()             // grant responds with the hit line's DS data:
 
   // For Intent
   val fromL2pft = prefetchOpt.map(_ => Bool()) // Is the prefetch req from L2(BOP) or from L1 prefetch?

@@ -837,7 +837,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     req_s3.dsWen && req_s3.readRefillData
   val mshrRefillToReleaseCopy_s3 = task_s3.valid && mshr_refill_to_release_copy_s3
   val mshrRefillBufConsumer_s3 = task_s3.valid && mshr_req_s3 &&
-    !useReleaseBufData_s3 && !req_s3.readDataFromDS &&
+    !useReleaseBufData_s3 &&
     (externalRefillBufConsumer_s3 || internalRefillBufConsumer_s3 || mshrRefillToReleaseCopy_s3)
   when(mshrRefillBufConsumer_s3) {
     val expectedRefillId = Mux(req_s3.refillToReleaseCopy, req_s3.refillBufReadId, req_s3.mshrId)
