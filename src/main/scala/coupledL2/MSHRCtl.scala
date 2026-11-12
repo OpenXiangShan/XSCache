@@ -276,6 +276,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     lifecycle.merged.bits.entry := OHToUInt(io.aMergeTask.bits.idOH)
     lifecycle.merged.bits.line := Cat(io.aMergeTask.bits.task.tag, io.aMergeTask.bits.task.set)
     lifecycle.merged.bits.source := io.aMergeTask.bits.task.reqSource
+    // Last downstream RXDAT beat, before refill scheduling and protocol cleanup complete.
+    lifecycle.returned.zip(mshrs.zip(timers)).foreach { case (event, (mshr, timer)) =>
+      event.valid := mshr.io.dataRefill.valid
+      event.bits := timer
+    }
     lifecycle.freed.zip(mshrs.zip(timers)).foreach { case (event, (mshr, timer)) =>
       event.valid := mshr.io.status.valid && mshr.io.status.bits.will_free
       event.bits := timer

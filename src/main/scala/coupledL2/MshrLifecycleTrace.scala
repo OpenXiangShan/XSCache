@@ -41,6 +41,7 @@ class MshrLifecycleEvents(implicit p: Parameters) extends L2Bundle {
   val bank = UInt(bankBits.W)
   val allocated = ValidIO(new MshrLifecycleAllocation)
   val merged = ValidIO(new MshrLifecycleMerge)
+  val returned = Vec(mshrsAll, ValidIO(UInt(64.W)))
   val freed = Vec(mshrsAll, ValidIO(UInt(64.W)))
 }
 
@@ -64,6 +65,7 @@ class MshrLifecycleLogger(implicit p: Parameters) extends CoupledL2Module {
   row.nativeDump := io.control.dump
   row.logEnable := io.control.logEnable
   val changed = io.events.allocated.valid || io.events.merged.valid ||
+    io.events.returned.map(_.valid).reduce(_ || _) ||
     io.events.freed.map(_.valid).reduce(_ || _) || row.clean || row.nativeDump
   val table = ChiselDB.createTable(s"${cacheParams.name}MshrLifecycle", new MshrLifecycleRow, basicDB = true)
   table.log(row, changed, "MSHRCtl", clock, reset)
