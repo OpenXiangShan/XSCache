@@ -684,8 +684,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   io.toMainPipe.replParentGeneration := Mux1H(replRespParentOHCapture, mshrTaskGenerations(0))
   val replRespParentOH = UIntToOH(replDecision.bits.response.mshrId, mshrsAll)
   val replDecisionCurrent = Mux1H(replRespParentOH, refillMshrs.map(_.io.status.valid)) &&
-    Mux1H(replRespParentOH, mshrTaskGenerations(0)) === replDecision.bits.parentGeneration &&
-    Mux1H(replRespParentOH, refillMshrs.map(_.io.allocEpoch)) === replDecision.bits.parentEpoch
+    Mux1H(replRespParentOH, mshrTaskGenerations(0)) === replDecision.bits.parentGeneration
   replResponseApplied.valid := replDecision.valid && replDecisionCurrent
   replResponseApplied.bits := replDecision.bits.response
   val replSlotCurrent = !replDecision.bits.needsReplace ||
