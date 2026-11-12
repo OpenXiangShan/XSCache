@@ -340,10 +340,14 @@ class Directory(implicit p: Parameters) extends L2Module {
     val dead = deadBits.get(req_s3.set).asUInt & ~copies & available
     val lru = repl.asInstanceOf[TrueLRU].get_replace_OH(repl_state_s3, available)
     val selected = Mux(invalid.orR, MaskToOH(invalid), Mux(dead.orR, MaskToOH(dead), lru))
+    // MainPipe keeps the Directory result throughout DataStorage's MCP2 hold
+    // cycle. Refill-valid, dead bits and L1I copies can change after s3, so
+    // preserve the accepted victim instead of recomputing it during that cycle.
+    val selectedHold = RegEnable(selected, 0.U(ways.W), reqValid_s3)
     XSPerfAccumulate("sdbp_dead_victim", refillReqValid_s3 && !refillRetry && !invalid.orR && dead.orR)
     XSPerfAccumulate("sdbp_lru_victim", refillReqValid_s3 && !refillRetry && !invalid.orR && !dead.orR)
     XSPerfAccumulate("sdbp_copy_protected", refillReqValid_s3 && (deadBits.get(req_s3.set).asUInt & copies & available).orR)
-    selected
+    Mux(reqValid_s3, selected, selectedHold)
   } else Mux(inv, invOH, replaceOH)
   // for retry bug fixing: if the chosenway not in freewaymask, choose another way
   val finalReplOH = if (cacheParams.replacement == "sdbp") chosenOH else Mux(
