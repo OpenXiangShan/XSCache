@@ -1433,7 +1433,8 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
 
   // alias: should protect meta from being accessed or occupied
   val releaseNotSent = !state.s_release
-  val refillWayReserved = !dirResult.hit &&
+  // A miss owns its refill way only after a replacement response is accepted.
+  val refillWayReserved = !dirResult.hit && state.w_replResp &&
     (!normalRefillCommitIssued || refillWritePending || refillWayCommitPending)
   io.status.valid := req_valid
   io.allocEpoch := allocEpoch
