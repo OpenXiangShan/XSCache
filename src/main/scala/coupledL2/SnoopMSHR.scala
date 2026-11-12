@@ -285,7 +285,8 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   // the same select the lease samples into its task register.
   val mainpipeProposedOperation = Reg(UInt(4.W))
   mainpipeIntent.valid := (mpCopyValid || mpProbeAckValid || mpDctValid) &&
-    !io.nestedReleaseWritePending && !io.pairSearchPending
+    !io.nestedReleaseWritePending && !io.pairSearchPending &&
+    (!normalProbePayload || pairedNormalIdValid)
 
   // Late copy: RefillBuf[pairedNormalId] -> ReleaseBuf[io.id]. No CHI side effect.
   val copyTask = WireInit(0.U.asTypeOf(new TaskBundle))
@@ -326,6 +327,7 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   probeAckTask.readProbeDataDown := !probeAckUsesRefillBuf &&
     (doRespData || (!(snpToN || tagErr) && probeDirty) || postGrantUsesReleaseBuf)
   probeAckTask.readRefillData := probeAckUsesRefillBuf
+  probeAckTask.refillBufReadId := pairedNormalId
   probeAckTask.way := dirResult.way
   probeAckTask.dirty := hitDirty || normalRefillPayload
   probeAckTask.meta := MetaEntry(
@@ -379,6 +381,7 @@ class SnoopMSHR(implicit p: Parameters) extends MSHRContextBase {
   dctTask.useProbeData := !probeAckUsesRefillBuf
   dctTask.readProbeDataDown := !probeAckUsesRefillBuf
   dctTask.readRefillData := probeAckUsesRefillBuf
+  dctTask.refillBufReadId := pairedNormalId
   dctTask.way := dirResult.way
   dctTask.dirty := hitDirty || normalRefillPayload
   dctTask.tgtID.get := req.fwdNID.get

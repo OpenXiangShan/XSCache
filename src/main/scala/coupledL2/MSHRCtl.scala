@@ -452,7 +452,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       pair.bits.postGrantPending := Mux1H(normalMatches, refillMshrs.map(_.io.postGrantReleaseHold)) ||
         (releaseStarts && Mux1H(normalMatches, refillMshrs.map(_.io.postGrantReleaseWindow)))
       pair.bits.payloadReady := Mux1H(normalMatches, refillMshrs.map(_.io.postGrantReleasePayloadReady))
-      pair.bits.probePayload := normalMatches(i) && refillMshrs(i).io.refillPayloadFromProbeAck
+      pair.bits.probePayload := Mux1H(normalMatches, refillMshrs.map(_.io.refillPayloadFromProbeAck))
       // Snapshot the generations this pair was built from. A later allocation
       // advances the live generation, and the pair becomes stale by mismatch
       // without re-reading the owner's status, set, or tag.
@@ -1846,7 +1846,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       snoop.io.normalRefillPostGrantReleasePending := pairNormalValid && pair.bits.postGrantPending
       snoop.io.normalRefillPayloadFromPostGrantRelease :=
         pairNormalValid && pair.bits.postGrantPending && pair.bits.payloadReady
-      snoop.io.pairedNormalId.valid := pairNormalValid && pair.bits.postGrantPending
+      snoop.io.pairedNormalId.valid := pairNormalValid
       snoop.io.pairedNormalId.bits := pair.bits.normal.bits.id
       snoop.io.pairLifetimeHold := false.B
       snoop.io.bufferWritePending := false.B

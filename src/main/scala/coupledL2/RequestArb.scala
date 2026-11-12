@@ -673,10 +673,10 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     task_s2.bits.readRefillData ||
     mshrTask_s2_a_upwards && !task_s2.bits.useProbeData && !task_s2.bits.readDataFromDS &&
       (!task_s2.bits.refillOnly || task_s2.bits.readRefillData))
-  // Late post-Grant copy reads the paired normal's RefillBuf while writing
-  // ReleaseBuf[mshrId]. Ordinary tasks still index RefillBuf by mshrId.
+  // A paired snoop reads the normal slot while retaining its own task and ReleaseBuf ID.
+  val snoopRefillData = task_s2.bits.mshrContext === 1.U && task_s2.bits.readRefillData
   io.refillBufRead_s2.bits.id := Mux(
-    task_s2.bits.refillToReleaseCopy,
+    task_s2.bits.refillToReleaseCopy || snoopRefillData,
     task_s2.bits.refillBufReadId,
     task_s2.bits.mshrId
   )
