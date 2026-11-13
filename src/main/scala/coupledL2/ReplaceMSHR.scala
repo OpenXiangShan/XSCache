@@ -311,14 +311,19 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   val copyBackTaskValid = valid && releaseAck && needsCopyBack && !copyBackSent &&
     !snoopInFlight && !io.snoopStarted && !io.txreqPending &&
     !releaseDataPending && !io.releaseDataSeen && !io.nestedReleaseWritePending && releaseBufCaptured
-  val localTransportDone = (snoopConsumed && !releaseSent ||
-    releaseAck && !compAckPending && (!needsCopyBack || copyBackComplete)) &&
+  val localReleaseComplete = snoopConsumed && !releaseSent ||
+    releaseAck && !compAckPending && (!needsCopyBack || copyBackComplete)
+  val localTransportDone = localReleaseComplete &&
     !snoopInFlight && !io.snoopStarted && !io.txreqPending &&
     !releaseDataPending && !io.releaseDataSeen && !io.nestedReleaseWritePending &&
     !io.sourceBHold && !io.sinkCOwnerHold
   when(valid && isCmo && localTransportDone && !io.localReservationHold &&
     !io.tasks.preparedLease.held.valid && !io.tasks.preparedLease.proposalHeld) {
     cmoLocalDone := true.B
+  }
+  // Unrelated C reservations may arrive after the local phase has drained.
+  when(valid && isCmo && cmoLocalDone) {
+    assert(localReleaseComplete, "CMO local release must remain complete during lower control")
   }
   val cmoControlValid = valid && isCmo && cmoLocalDone && !controlDone &&
     (!controlSent || retryAck && pCrdGranted) &&
@@ -402,7 +407,7 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
       releaseSent := true.B
       releaseNeedsData := needsData || victimWriteEvictOrEvict
     }.otherwise {
-      assert(localTransportDone && (!controlSent || retryAck && pCrdGranted),
+      assert(cmoLocalDone && localReleaseComplete && (!controlSent || retryAck && pCrdGranted),
         "CMO control requires drained local release or its granted retry")
       controlSent := true.B
       retryAck := false.B
