@@ -68,7 +68,7 @@ class TXDAT(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   val pipeStatus_s4_s5 = pipeStatus_s1_s5.drop(3)
   // inflightCnt equals the number of reqs on s2~s5 that may flow into TXDAT soon, plus queueCnt.
   // The calculation of inflightCnt might be imprecise and leads to false positive back pressue.
-  val inflightCnt = PopCount(Cat(pipeStatus_s4_s5.map(s => s.valid && s.bits.toTXDAT && (s.bits.fromB || s.bits.mshrTask)))) +
+  val inflightCnt = PopCount(Cat(pipeStatus_s4_s5.map(s => s.valid && s.bits.toTXDAT && (s.bits.fromB || s.bits.mshrTask)))) +&
     PopCount(Cat(pipeStatus_s2_s3.map(s => s.valid && Mux(s.bits.mshrTask, s.bits.toTXDAT, s.bits.fromB)))) +
     queueCnt
 
