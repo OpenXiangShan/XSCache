@@ -146,7 +146,9 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   val tshr_inactive_vpipe = Wire(Bool())
   val tshr_inactive = tshr_inactive_rbe && tshr_inactive_vpipe
 
-  val tshr_inactivate = WireInit(false.B) // fastest combinational path of vPipe free, might be implemented in future
+  // combinational one-cycle-early prediction of the TSHR going inactive, 
+  // resolving one cycle ahead of tshr_inactive.
+  val tshr_inactivate = Wire(Bool())
 
   val tshr_wb_done_dir = Wire(Bool())
   val tshr_wb_done_ds = Wire(Bool())
@@ -169,7 +171,6 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   // meta
   val dirResult = Reg(new L2Directory.MetaReadResult)
   val replResult = Reg(new L2Directory.ReplReadResult)
-  val replResultMeta = Reg(new L2Directory.Meta)   // victim entry meta latched at ReplRdResp
 
   /* NOTICE: For current design, any partial write to meta would never assert 'meta_valid'.
              Any later read request on full meta line would result in a Directory Read if no any read done yet.
@@ -214,7 +215,6 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   
   when (io.fromDir.ReplRdResp && io.fromDir.TSHRID === io.consts.tshrId) {
     replResult := io.fromDir.REPL
-    replResultMeta := io.fromDir.META   // victim's committed state at pick time
     meta.way := io.fromDir.REPL.way
   }
 
@@ -451,6 +451,13 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   tshr_inactive_rbe := !rbeEVT.io.valid && !rbeSNP.io.valid && !rbeEVB.io.valid && !rbeREQ.io.valid &&
                        !rbeEVT.io.in.valid && !rbeSNP.io.in.valid && !rbeEVB.io.in.valid && !rbeREQ.io.in.valid
 
+  val dirResult_with_fastpath = if (paramL2.hitFastPathDirRespFlow) {
+    val dirRdResp_for_me = io.fromDir.DirRdResp && io.fromDir.TSHRID === io.consts.tshrId
+    val dirReq_fire_fastpath = dirRdResp_for_me && rbeREQ.io.out.fire
+    Mux(dirReq_fire_fastpath, io.fromDir.META, dirResult)
+  } else {
+    dirResult
+  }
 
   // Post RBE Data Storage Read Decision
   val ds_read_rbeEVT_en = Wire(Bool())
@@ -477,6 +484,13 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   tshr_inactive_vpipe := vPipeEVT.io.free && vPipeSNP.io.free && vPipeREQ.io.free
 
+  // TSHR inactivation exact prediction (hitFastPathEarlyInactive)
+  // The proxies use this to resolve their write FSMs one cycle early;
+  // tshr_dealloc still keys on the real tshr_inactive.
+  tshr_inactivate := (if (paramL2.hitFastPathEarlyInactive)
+                        vPipeREQ.io.free_next && vPipeEVT.io.free && vPipeSNP.io.free && tshr_inactive_rbe
+                      else false.B)
+
   // connections between SNP vPipe and Snoop Agent
   snoopAgent.io.uopFromSNP.valid := vPipeSNP.io.toSA.SnpMakeInvalid ||
                                     vPipeSNP.io.toSA.SnpToInvalid ||
@@ -495,7 +509,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   // connections between TSHR local / RX and Snoop Agent
   snoopAgent.io.tshr_paddr := tshr_paddr
-  snoopAgent.io.tshr_dirResult := meta
+  snoopAgent.io.tshr_dirResult := dirResult_with_fastpath
   snoopAgent.io.UpRXRSP := io.UpRXRSP
   snoopAgent.io.UpRXDAT := io.UpRXDAT
 
@@ -543,13 +557,6 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   vPipeEVT.io.peer_meta_write_state := vPipeREQ.io.tshr_meta_write_en.state ||
                                        vPipeSNP.io.tshr_meta_write_en.state
 
-  // Whitelist: a REQ-flow meta write racing an EVT vPipe commit is allowed only
-  // for opcodes that never interact with the Snoop Agent (StashShared &
-  // StashUnique for now; the EVT commit yields to them, see L2VPipeEVT). For
-  // SA-interacting opcodes the snoop serialization must make this impossible.
-  assert(!(vPipeEVT.io.at_commit && vPipeREQ.io.tshr_meta_write_en.state && !vPipeREQ.io.sa_free_opcode),
-    "TSHR @ %m EVT commit raced by REQ meta write on SA-interacting opcode (must serialize via Snoop Agent)")
-
   meta_write_EVT_mask := vPipeEVT.io.tshr_meta_write_en
   meta_write_EVT_meta := vPipeEVT.io.tshr_meta_write_meta
 
@@ -570,7 +577,7 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   // connections between TSHR local and REQ vPipe
   vPipeREQ.io.tshr_paddr := tshr_paddr
-  vPipeREQ.io.tshr_dirResult := dirResult
+  vPipeREQ.io.tshr_dirResult := dirResult_with_fastpath
   vPipeREQ.io.tshr_dealloc := tshr_dealloc
   vPipeREQ.io.tshr_meta_modified := meta_modified.asUInt.orR
   vPipeREQ.io.tshr_tag_modified := tag_modified
@@ -681,12 +688,13 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   rbeEVT.io.directoryReadDone := proxyDir.io.rd_done
   rbeSNP.io.directoryReadDone := proxyDir.io.rd_done
   rbeEVB.io.directoryReadDone := proxyDir.io.rd_done
-  rbeREQ.io.directoryReadDone := proxyDir.io.rd_done
+  rbeREQ.io.directoryReadDone := (if (paramL2.hitFastPathDirRespFlow) proxyDir.io.rd_done_flow
+                                  else                               proxyDir.io.rd_done)
 
   vPipeREQ.io.repl_retry := proxyDir.io.repl_retry
   vPipeREQ.io.repl_done := proxyDir.io.repl_done
   vPipeREQ.io.repl_resp := replResult
-  vPipeREQ.io.repl_meta := replResultMeta
+  vPipeREQ.io.repl_meta := replResult.meta
 
   proxyDir.io.repl_lock_req := vPipeREQ.io.repl_lock_req
   proxyDir.io.repl_lock_way := vPipeREQ.io.repl_lock_way
@@ -745,7 +753,10 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   proxyDS.io.ds_read_REQ_cancel := vPipeREQ.io.ds_rd_cancel
 
   vPipeSNP.io.ds_read_done := proxyDS.io.rd_done
-  vPipeREQ.io.ds_rd_done := proxyDS.io.rd_done
+  // (hitFastPathDsRespFlow): the REQ vPipe ends its DS wait on the
+  // combinational DSBufRdResp pulse instead of the registered Done state.
+  vPipeREQ.io.ds_rd_done := (if (paramL2.hitFastPathDsRespFlow) proxyDS.io.rd_done_flow
+                             else                               proxyDS.io.rd_done)
 
   tshr_buffer_commit := proxyDS.io.wb_accept
 

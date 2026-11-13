@@ -31,6 +31,19 @@ import utility.Code
   * enableDRRIPEntranceReleaseUpdate is a deprecated no-op retained only for
   * source compatibility; entrance release training has been removed.
   *
+  * The hitFastPath* fields gate the hit-latency/occupancy optimizations
+  * (documented in the L2 proxy-FSM optimization series). Each is independent,
+  * elaboration-time only, and defaults on; disabling a fix removes its bypass
+  * logic. The DirRd/ReplRd response interfaces remain split in either mode:
+  *   - hitFastPathDsRespFlow: clear the DS wait on the combinational
+  *     DSBufRdResp pulse instead of the registered DSReadFSM Done.
+  *   - hitFastPathDsRespIssue: issue CompData on the selected DS response
+  *     completion instead of waiting for the registered DS wait to clear.
+  *   - hitFastPathDirRespFlow: fire the REQ vPipe on the combinational
+  *     DirRdResp pulse instead of the registered DirReadFSM Done.
+  *   - hitFastPathEarlyInactive: resolve the proxies' write FSMs one cycle
+  *     early via an exact free-at-edge prediction of the REQ vPipe.
+  *
   * These are case-class defaults, not the release-top overrides. Top_L2Top uses
   * 8 ways, 1024 sets, 32 TSHRs by default, ECC enabled, and MBIST enabled.
   */
@@ -54,6 +67,10 @@ case class L2Params(
     dirRelArbitration: String = "rr",
     dirRelSingleCycle: Boolean = true,
     enableDRRIPEntranceReleaseUpdate: Boolean = true,
+    hitFastPathDsRespFlow: Boolean = true,
+    hitFastPathDirRespFlow: Boolean = true,
+    hitFastPathEarlyInactive: Boolean = true,
+    hitFastPathDsRespIssue: Boolean = true,
 ) {
     require(Seq("dirrel-high", "rr", "dirrel-low").contains(dirRelArbitration),
       s"DirRel arbitration must be dirrel-high, rr, or dirrel-low: $dirRelArbitration")
