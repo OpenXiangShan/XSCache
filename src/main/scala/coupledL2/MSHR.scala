@@ -72,6 +72,20 @@ class SnoopSlotToken(implicit p: Parameters) extends CoupledL2Bundle {
   val generation = UInt(8.W)
   val sequence = UInt(8.W)
 }
+class OrphanReleaseSlotRequest(implicit p: Parameters) extends CoupledL2Bundle {
+  val set = UInt(setBits.W)
+  val tag = UInt(tagBits.W)
+  val sequence = UInt(8.W)
+}
+class OrphanReleaseSlotClaim(implicit p: Parameters) extends CoupledL2Bundle {
+  val valid = Bool()
+  val needsAllocation = Bool()
+  val slot = UInt(mshrBits.W)
+  val generation = UInt(8.W)
+  val set = UInt(setBits.W)
+  val tag = UInt(tagBits.W)
+  val sequence = UInt(8.W)
+}
 class MainpipeCandidate extends Bundle {
   val operation = UInt(4.W)
   val qosClass = UInt(3.W)

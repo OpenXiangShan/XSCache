@@ -80,6 +80,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       val refillWriteDone = ValidIO(new MainpipeLeaseDone)
       val grantSent = ValidIO(new MainpipeLeaseDone)
       val releaseDataDirectWrite = ValidIO(new TaskBundle)
+      val orphanReleaseReserveRequest = ValidIO(new OrphanReleaseSlotRequest)
+      val orphanReleaseReserveDone = ValidIO(new OrphanReleaseSlotClaim)
       val orphanReleaseData = Output(Bool())
       val snoopToNDirectDone = ValidIO(new TaskBundle)
       val grantInstallDone = ValidIO(UInt(mshrBits.W))
@@ -96,6 +98,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       val grantInstallOK = Input(Bool())
       val grantInstallSlot = Input(UInt(mshrBits.W))
       val replParentGeneration = Input(UInt(8.W))
+      val orphanReleaseReservation = Input(new OrphanReleaseSlotClaim)
     }
     val refillInfo = Flipped(Vec(mshrsAll, ValidIO(new MSHRInfo)))
     val snoopInfo = Flipped(Vec(mshrsAll, ValidIO(new MSHRInfo)))
@@ -288,6 +291,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   class S3Decision extends Bundle {
     val task = new TaskBundle
     val token = new MainpipeLeaseToken
+    val orphanReleaseSequence = UInt(8.W)
     val snoopSlotToken = new SnoopSlotToken
     val dir = new DirResult
     val repl = Valid(new ReplacerResult)
@@ -477,6 +481,25 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val cOrphanReleaseData_decide = task_s3_decide.bits.fromC &&
     task_s3_decide.bits.opcode === ReleaseData &&
     isParamFromT(task_s3_decide.bits.param) && !io.dirResp_s3.hit
+  val orphanReleaseSequence = RegInit(0.U(8.W))
+  val orphanReserveAtDecision = task_s3_decide.valid && cOrphanReleaseData_decide
+  val orphanReservationMatches = io.fromMSHRCtl.orphanReleaseReservation.valid &&
+    io.fromMSHRCtl.orphanReleaseReservation.sequence === s3Decision.bits.orphanReleaseSequence
+  val orphanApplyBlocked = s3Decision.valid && s3Decision.bits.cOrphanReleaseData &&
+    !orphanReservationMatches
+  val orphanReserveRetry = s3Decision.valid && s3Decision.bits.cOrphanReleaseData &&
+    !orphanReservationMatches
+  io.toMSHRCtl.orphanReleaseReserveRequest.valid := orphanReserveAtDecision || orphanReserveRetry
+  when(orphanReserveAtDecision) {
+    io.toMSHRCtl.orphanReleaseReserveRequest.bits.set := task_s3_decide.bits.set
+    io.toMSHRCtl.orphanReleaseReserveRequest.bits.tag := task_s3_decide.bits.tag
+    io.toMSHRCtl.orphanReleaseReserveRequest.bits.sequence := orphanReleaseSequence
+    orphanReleaseSequence := orphanReleaseSequence + 1.U
+  }.otherwise {
+    io.toMSHRCtl.orphanReleaseReserveRequest.bits.set := s3Decision.bits.task.set
+    io.toMSHRCtl.orphanReleaseReserveRequest.bits.tag := s3Decision.bits.task.tag
+    io.toMSHRCtl.orphanReleaseReserveRequest.bits.sequence := s3Decision.bits.orphanReleaseSequence
+  }
   val cReleaseDataDirectWrite_decide = cWen_decide &&
     task_s3_decide.bits.opcode === ReleaseData &&
     isParamFromT(task_s3_decide.bits.param)
@@ -507,10 +530,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
         io.metaOnHit_s3.state === BRANCH && isSnpToN(task_s3_decide.bits.chiOpcode.get) ||
         bDoFwd_decide && io.metaOnHit_s3.state === TRUNK
       )))
-  s3Decision.valid := task_s3_decide.valid
+  s3Decision.valid := task_s3_decide.valid || orphanApplyBlocked
   when(task_s3_decide.valid) {
     s3Decision.bits.task := task_s3_decide.bits
     s3Decision.bits.token := leaseToken_s3_decide
+    s3Decision.bits.orphanReleaseSequence := orphanReleaseSequence
     s3Decision.bits.snoopSlotToken := snoopSlotToken_s3_decide
     s3Decision.bits.dir := io.dirResp_s3
     s3Decision.bits.repl := io.replResp
@@ -547,8 +571,21 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     s3Decision.bits.normal := normalDecision
   }
   val task_s3 = Wire(Valid(new TaskBundle))
-  task_s3.valid := s3Decision.valid
+  task_s3.valid := s3Decision.valid && !orphanApplyBlocked
   task_s3.bits := s3Decision.bits.task
+  io.toMSHRCtl.orphanReleaseReserveDone.valid := task_s3.valid &&
+    s3Decision.bits.cOrphanReleaseData
+  io.toMSHRCtl.orphanReleaseReserveDone.bits := io.fromMSHRCtl.orphanReleaseReservation
+  when(orphanApplyBlocked) {
+    assert(!task_s3_decide.valid && !task_s3_capture.valid && !task_s2.valid,
+      "an orphan slot wait must hold the sole S3 decision without younger stage owners")
+  }
+  when(task_s3.valid && s3Decision.bits.cOrphanReleaseData) {
+    val claim = io.fromMSHRCtl.orphanReleaseReservation
+    assert(claim.valid && claim.sequence === s3Decision.bits.orphanReleaseSequence &&
+      claim.set === s3Decision.bits.task.set && claim.tag === s3Decision.bits.task.tag,
+      "orphan ReleaseData apply must consume its registered slot reservation")
+  }
   val leaseToken_s3 = s3Decision.bits.token
   val preApplyTask = Wire(Valid(new TaskBundle))
   preApplyTask.valid := task_s3_capture.valid || task_s3_decide.valid
@@ -1429,6 +1466,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
   io.toReqArb.blockG_s1 := task_s2.valid && s23Block('g', task_s2.bits) ||
     preApplyTask.valid && s23Block('g', preApplyTask.bits)
+  io.toReqArb.blockAll_s1 := orphanApplyBlocked
 
   /* ======== Pipeline Status ======== */
   require(io.status_vec_toD.size == 4)

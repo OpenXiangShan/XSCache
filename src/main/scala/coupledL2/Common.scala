@@ -468,6 +468,7 @@ class BlockInfo(implicit p: Parameters) extends L2Bundle {
   val blockA_s1 = Bool()
   val blockB_s1 = Bool()
   val blockC_s1 = Bool()
+  val blockAll_s1 = Bool()
 }
 
 // used for nested C Release

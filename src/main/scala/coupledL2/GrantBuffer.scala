@@ -358,6 +358,7 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   // A-replace related rprobe is handled in SourceB
   io.toReqArb.blockSinkReqEntrance.blockC_s1 := noSpaceForSinkReq
   io.toReqArb.blockSinkReqEntrance.blockG_s1 := false.B // this is not used
+    io.toReqArb.blockSinkReqEntrance.blockAll_s1 := false.B
   io.toReqArb.blockMSHRReqEntrance := noSpaceForMSHRReq || noSpaceWaitSinkEForMSHRReq || noSpaceForMSHRPft.getOrElse(false.B)
 
   // =========== XSPerf ===========

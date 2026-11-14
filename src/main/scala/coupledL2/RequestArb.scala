@@ -196,8 +196,10 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   /* ======== Stage 0 ======== */
   // if mshr_task_s1 is replRead, it might stall and wait for dirRead.ready, so we block new mshrTask from entering
   // TODO: will cause msTask path vacant for one-cycle after replRead, since not use Flow so as to avoid ready propagation
+  val blockAllEntrance = io.fromMSHRCtl.blockAll_s1 || io.fromMainPipe.blockAll_s1
   val pendingSnoopSetConflict = Wire(Bool())
   val mshrTaskReadyBasic = localTransitionIdle && admitMshrTurn && !mshr_task_s1.valid && !bPending.valid &&
+    !blockAllEntrance &&
     !io.sinkB.valid &&
     !pendingSnoopSetConflict &&
     !channelDirReadAdmissionValid &&
@@ -252,7 +254,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
 
   io.snoopAdmissionEnable := io.snoopQueued && !admitMshrTurn && resetFinish &&
     !mshr_task_s1.valid && !bPending.valid && !channelDirReadAdmissionValid &&
-    !io.normalReserveAck.valid && !io.sinkC.valid && !io.sinkB.valid && !block_B
+    !io.normalReserveAck.valid && !io.sinkC.valid && !io.sinkB.valid && !block_B && !blockAllEntrance
 
 //  val noFreeWay = Wire(Bool())
 
@@ -266,7 +268,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     )
   ).asUInt
 
-  val channelCandidateValid = localTransitionIdle &&
+  val channelCandidateValid = localTransitionIdle && !blockAllEntrance &&
     (bPending.valid || !admitMshrTurn) && !mshr_task_s1.valid &&
     sinkValids.orR && resetFinish &&
     !channelDirReadAdmissionValid && !io.sinkB.valid
@@ -371,7 +373,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
 
   val sink_ready_basic = channelDirReadAdmissionFire
 
-  io.normalReserveRequest.valid := resetFinish &&
+  io.normalReserveRequest.valid := resetFinish && !blockAllEntrance &&
     !mshr_task_s1.valid && !bPending.valid && io.sinkA.valid && !block_A &&
     !io.normalReserveAck.valid && !sinkValids(0) && !io.sinkB.valid &&
     !channelDirReadAdmissionValid && !io.snoopAdmissionEnable
@@ -556,7 +558,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     channelDirReadAdmissionToken.source === 0.U
   val hint_stall = (mshr_wouldHint_s1 || chnl_wouldHint_s1) && io.hint_s1QueueFull
 
-  s2_ready  := !ds_mcp2_stall && !hint_stall
+  s2_ready  := !ds_mcp2_stall && !hint_stall && !blockAllEntrance
 
   val task_s2 = RegInit(0.U.asTypeOf(task_s1))
   task_s2.valid := s1_fire

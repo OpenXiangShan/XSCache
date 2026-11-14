@@ -51,6 +51,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       val refillWriteDone = Flipped(ValidIO(new MainpipeLeaseDone))
       val grantSent = Flipped(ValidIO(new MainpipeLeaseDone))
       val releaseDataDirectWrite = Flipped(ValidIO(new TaskBundle))
+      val orphanReleaseReserveRequest = Flipped(ValidIO(new OrphanReleaseSlotRequest))
+      val orphanReleaseReserveDone = Flipped(ValidIO(new OrphanReleaseSlotClaim))
       val orphanReleaseData = Input(Bool())
       val snoopToNDirectDone = Flipped(ValidIO(new TaskBundle))
       val grantInstallDone = Flipped(ValidIO(UInt(mshrBits.W)))
@@ -66,6 +68,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       val grantInstallOK = Output(Bool())
       val grantInstallSlot = Output(UInt(mshrBits.W))
       val replParentGeneration = Output(UInt(8.W))
+      val orphanReleaseReservation = Output(new OrphanReleaseSlotClaim)
     }
 
     val txdatDone = Input(ValidIO(new TaskBundle))
@@ -195,8 +198,13 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     0.U.asTypeOf(Valid(new NormalSlotClaim)))))
   val cmoSlotClaims = RegInit(VecInit(Seq.fill(mshrsAll)(
     0.U.asTypeOf(Valid(new NormalSlotClaim)))))
+  val orphanReleaseSlotClaim = RegInit(0.U.asTypeOf(Valid(new OrphanReleaseSlotClaim)))
+  val orphanReservationTurn = RegInit(false.B)
   val normalClaimSlotOH = VecInit(normalSlotClaims.map(_.valid)).asUInt
   val cmoClaimSlotOH = VecInit(cmoSlotClaims.map(_.valid)).asUInt
+  val orphanReleaseClaimSlotOH = Mux(orphanReleaseSlotClaim.valid &&
+    orphanReleaseSlotClaim.bits.needsAllocation,
+    UIntToOH(orphanReleaseSlotClaim.bits.slot, mshrsAll), 0.U(mshrsAll.W))
   val normalPendingSlotOH = RegInit(0.U(mshrsAll.W))
   val srPendingSlotOH = RegInit(0.U(mshrsAll.W))
   val normalReservationSequence = RegInit(0.U(8.W))
@@ -583,7 +591,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val replaceReserveGrantParentOH = PriorityEncoderOH(replaceReserveNeedParentOH)
   val replaceReserveGrantSlotOH = PriorityEncoderOH(replaceSlotUnreservedOH)
   val replaceReserveGrant = !snoopAllocRequest && !snoopReservationFence && !io.nestedwb.c_set_dirty &&
-    !io.snoopAdmission.fire && replaceReserveNeedParentOH.orR && replaceSlotUnreservedOH.orR
+    !io.snoopAdmission.fire &&
+    !(io.fromMainPipe.orphanReleaseReserveRequest.valid && orphanReservationTurn) &&
+    replaceReserveNeedParentOH.orR && replaceSlotUnreservedOH.orR
   assert(
     !(snoopAllocRequest && replaceReserveGrant),
     "a snoop allocation must preempt a new ReplaceMSHR reservation"
@@ -708,6 +718,28 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val orphanReleaseData = orphanReleaseCandidate && !orphanReleaseTargetsReplace
   val replaceSlotIdle = replaceSlotUnreservedOH &
     ~Mux(replaceReserveGrant, replaceReserveGrantSlotOH, 0.U(mshrsAll.W))
+  val orphanReserveRequest = io.fromMainPipe.orphanReleaseReserveRequest
+  val orphanReserveTargetOH = VecInit(replaceMshrs.map { m =>
+    orphanReserveRequest.valid && m.io.info.valid &&
+      (!m.io.info.bits.releaseAck || m.io.acceptsLateReleaseData) &&
+      m.io.info.bits.set === orphanReserveRequest.bits.set &&
+      m.io.info.bits.tag === orphanReserveRequest.bits.tag
+  }).asUInt
+  when(orphanReserveRequest.valid) {
+    assert(PopCount(orphanReserveTargetOH) <= 1.U,
+      "an orphan ReleaseData reservation must match at most one existing Replace owner")
+  }
+  val orphanClaimSlotOH = UIntToOH(orphanReleaseSlotClaim.bits.slot, mshrsAll)
+  val orphanClaimExistingCurrent = orphanReleaseSlotClaim.valid &&
+    !orphanReleaseSlotClaim.bits.needsAllocation &&
+    Mux1H(orphanClaimSlotOH, replaceMshrs.map { m =>
+      m.io.info.valid &&
+        m.io.info.bits.set === orphanReleaseSlotClaim.bits.set &&
+        m.io.info.bits.tag === orphanReleaseSlotClaim.bits.tag &&
+        (!m.io.info.bits.releaseAck || m.io.acceptsLateReleaseData)
+    })
+  val orphanClaimCurrent = orphanReleaseSlotClaim.valid &&
+    (orphanReleaseSlotClaim.bits.needsAllocation || orphanClaimExistingCurrent)
   val cmoAlloc = io.fromMainPipe.mshr_alloc_s3.valid &&
     io.fromMainPipe.mshr_alloc_s3.bits.task.fromA &&
     normalCmo(io.fromMainPipe.mshr_alloc_s3.bits.task)
@@ -715,6 +747,52 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val cmoAllocDir = io.fromMainPipe.mshr_alloc_s3.bits.dirResult
   val replaceNeedsAlloc = replRespNeedsReplace || nestedReleaseNeedsReplace ||
     orphanReleaseData || cmoAlloc
+  val orphanReserveExisting = orphanReserveTargetOH.orR
+  val orphanReserveNeedsCapture = orphanReserveRequest.valid && !orphanClaimCurrent
+  val orphanReserveSlotPickOH = PriorityEncoderOH(replaceSlotIdle)
+  val orphanReserveGrant = orphanReserveNeedsCapture &&
+    (orphanReserveExisting ||
+      (orphanReserveSlotPickOH.orR &&
+        (orphanReservationTurn ||
+          !(io.snoopAdmission.valid ||
+            (io.normalReserveRequest.valid && normalCmo(io.normalReserveRequest.bits)) ||
+            replaceReserveNeedParentOH.orR)) &&
+        !io.snoopAdmission.fire &&
+        !(io.normalReserveRequest.fire && normalCmo(io.normalReserveRequest.bits)) &&
+        !replaceReserveGrant && !replaceNeedsAlloc))
+  val orphanReserveClaimOH = Mux(orphanReserveGrant && !orphanReserveExisting,
+    orphanReserveSlotPickOH, 0.U(mshrsAll.W))
+  io.toMainPipe.orphanReleaseReservation := orphanReleaseSlotClaim.bits
+  io.toMainPipe.orphanReleaseReservation.valid := orphanClaimCurrent
+  when(io.fromMainPipe.orphanReleaseReserveDone.valid) {
+    assert(orphanClaimCurrent &&
+      io.fromMainPipe.orphanReleaseReserveDone.bits.asUInt === orphanReleaseSlotClaim.bits.asUInt,
+      "orphan ReleaseData completion must return its exact slot reservation")
+    orphanReleaseSlotClaim.valid := false.B
+  }
+  when(orphanReleaseSlotClaim.valid && !orphanClaimCurrent) {
+    assert(!orphanReleaseSlotClaim.bits.needsAllocation,
+      "a registered orphan slot reservation must remain busy until its apply")
+    orphanReleaseSlotClaim.valid := false.B
+  }
+  when(orphanReserveGrant) {
+    orphanReleaseSlotClaim.valid := true.B
+    orphanReleaseSlotClaim.bits.valid := true.B
+    orphanReleaseSlotClaim.bits.needsAllocation := !orphanReserveExisting
+    orphanReleaseSlotClaim.bits.slot := OHToUInt(Mux(orphanReserveExisting,
+      orphanReserveTargetOH, orphanReserveSlotPickOH))
+    orphanReleaseSlotClaim.bits.generation := Mux1H(
+      Mux(orphanReserveExisting, orphanReserveTargetOH, orphanReserveSlotPickOH),
+      mshrTaskGenerations(2)) + (!orphanReserveExisting).asUInt
+    orphanReleaseSlotClaim.bits.set := orphanReserveRequest.bits.set
+    orphanReleaseSlotClaim.bits.tag := orphanReserveRequest.bits.tag
+    orphanReleaseSlotClaim.bits.sequence := orphanReserveRequest.bits.sequence
+  }
+  when(orphanReserveRequest.valid && !orphanReserveExisting && !orphanClaimCurrent) {
+    orphanReservationTurn := !orphanReserveGrant
+  }.elsewhen(orphanReserveGrant) {
+    orphanReservationTurn := false.B
+  }
   val replaceParentOH = Mux(replRespNeedsReplace, replRespParentOH,
     nestedReleaseParentOH)
   val replaceParentId = OHToUInt(replaceParentOH)
@@ -795,7 +873,12 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
 
   val selectedReplaceSlotOH = Mux(
     cmoAlloc, normalApplySlotOH,
-    Mux(replRespNeedsReplace, replRespReservationOH, PriorityEncoderOH(replaceSlotIdle))
+    Mux(replRespNeedsReplace, replRespReservationOH,
+      Mux(orphanReleaseData, Mux(orphanClaimCurrent &&
+        orphanReleaseSlotClaim.bits.needsAllocation &&
+        io.fromMainPipe.orphanReleaseReserveDone.valid &&
+        io.fromMainPipe.orphanReleaseReserveDone.bits.asUInt === orphanReleaseSlotClaim.bits.asUInt,
+        orphanClaimSlotOH, 0.U(mshrsAll.W)), PriorityEncoderOH(replaceSlotIdle)))
   )
 
   (0 until mshrsAll).foreach { i =>
@@ -854,6 +937,14 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val orphanReleaseAllocAccepted = orphanReleaseData && replaceAllocValid
   val orphanReleaseAllocation = RegInit(0.U.asTypeOf(Valid(new NestedReleaseAllocation)))
   orphanReleaseAllocation.valid := orphanReleaseAllocAccepted
+  when(orphanReleaseData) {
+    assert(orphanClaimCurrent && orphanReleaseSlotClaim.bits.needsAllocation &&
+      io.fromMainPipe.orphanReleaseReserveDone.valid &&
+      io.fromMainPipe.orphanReleaseReserveDone.bits.asUInt === orphanReleaseSlotClaim.bits.asUInt &&
+      orphanReleaseSlotClaim.bits.set === io.nestedwb.set &&
+      orphanReleaseSlotClaim.bits.tag === io.nestedwb.tag,
+      "orphan ReleaseData allocation must consume its exact registered slot claim")
+  }
   when(orphanReleaseAllocAccepted) {
     orphanReleaseAllocation.bits.slot := OHToUInt(selectedReplaceSlotOH)
     orphanReleaseAllocation.bits.generation :=
@@ -862,6 +953,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     orphanReleaseAllocation.bits.tag := io.nestedwb.tag
     orphanReleaseAllocation.bits.data := io.nestedwbPayload
     orphanReleaseAllocation.bits.beatMask := Fill(beatSize, true.B)
+    assert(OHToUInt(selectedReplaceSlotOH) === orphanReleaseSlotClaim.bits.slot &&
+      orphanReleaseSlotClaim.bits.generation ===
+        Mux1H(selectedReplaceSlotOH, mshrTaskGenerations(2)) + 1.U,
+      "orphan Replace allocation must fill the claimed physical slot generation")
   }
   // Advertise the winning raw allocation address as one complete registered descriptor, before slot acceptance.
   val replaceAllocSnoopSources = Seq(
@@ -893,7 +988,14 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     assert(PopCount(replaceTargetMatches(parent)) <= 1.U, "one normal MSHR must have one physical ReleaseBuf target")
   }
 
-  val pipeContextCount = PopCount(Cat(io.pipeStatusVec.map(_.valid)))
+  val pipeContextCountRaw = PopCount(Cat(io.pipeStatusVec.map(_.valid)))
+  val orphanCreditTransfer = io.fromMainPipe.orphanReleaseReserveDone.valid &&
+    io.fromMainPipe.orphanReleaseReserveDone.bits.needsAllocation
+  when(orphanCreditTransfer) {
+    assert(io.pipeStatusVec(2).valid,
+      "an orphan slot credit transfers only with its S3 apply descriptor")
+  }
+  val pipeContextCount = pipeContextCountRaw - orphanCreditTransfer.asUInt
   val srContextCount = PopCount(srBusySlotOH)
   def allocationCredit(used: UInt): UInt = {
     val credit = RegInit(0.U(log2Ceil(mshrsAll + 1).W))
@@ -915,7 +1017,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     !normalPendingSetConflict && !normalPendingSnoopConflict &&
     (!normalCmo(io.normalReserveRequest.bits) ||
       (PopCount(replaceSlotIdle) > 1.U && !snoopReservationFence &&
-        !replaceNeedsAlloc && !io.snoopAdmission.fire))
+        !replaceNeedsAlloc && !io.snoopAdmission.fire &&
+        (!orphanReserveRequest.valid || !orphanReservationTurn)))
   io.normalReserveAck.valid := normalService.valid
   io.normalReserveAck.bits := normalService.bits
   val normalClaimToken = Wire(new MainpipeLeaseToken)
@@ -988,20 +1091,36 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   val snoopReservationCompleteOH = Mux(snoopReservationComplete,
     snoopDoneOH, 0.U(mshrsAll.W))
+  val orphanReservationDoneOH = Mux(io.fromMainPipe.orphanReleaseReserveDone.valid &&
+    orphanReleaseSlotClaim.valid && orphanReleaseSlotClaim.bits.needsAllocation,
+    orphanClaimSlotOH, 0.U(mshrsAll.W))
   val srPendingClearOH = replaceReserveReleaseSlots |
-    snoopReservationCompleteOH | normalCmoCompleteOH | normalCmoCancelOH
+    snoopReservationCompleteOH | normalCmoCompleteOH | normalCmoCancelOH |
+    orphanReservationDoneOH
   val snoopAdmissionClaimOH = Mux(io.snoopAdmission.fire,
     UIntToOH(snoopServiceSlot, mshrsAll), 0.U(mshrsAll.W))
   val replaceReserveClaimOH = Mux(replaceReserveGrant,
     replaceReserveGrantSlotOH, 0.U(mshrsAll.W))
   srPendingSlotOH := (srPendingSlotOH & ~srPendingClearOH) |
-    snoopAdmissionClaimOH | replaceReserveClaimOH | normalCmoClaimOH
-  val expectedSrPendingSlotOH = replaceReservedSlotOH | snoopClaimSlotOH | cmoClaimSlotOH
+    snoopAdmissionClaimOH | replaceReserveClaimOH | normalCmoClaimOH | orphanReserveClaimOH
+  val expectedSrPendingSlotOH = replaceReservedSlotOH | snoopClaimSlotOH | cmoClaimSlotOH |
+    orphanReleaseClaimSlotOH
   assert(srPendingSlotOH === expectedSrPendingSlotOH,
     "the S/R pending bitmap must match each retained reservation token")
   assert(PopCount(srPendingSlotOH) === PopCount(replaceReserveValid.asUInt) +&
-    PopCount(snoopClaimSlotOH) +& PopCount(cmoClaimSlotOH),
+    PopCount(snoopClaimSlotOH) +& PopCount(cmoClaimSlotOH) +&
+    PopCount(orphanReleaseClaimSlotOH),
     "the S/R pending ledger must cover sidecars, snoops and CMO reservations")
+  assert(!(orphanReleaseClaimSlotOH &
+    (replaceReservedSlotOH | snoopClaimSlotOH | cmoClaimSlotOH)).orR,
+    "an orphan C reservation must own a distinct S/R slot")
+  when(orphanReleaseClaimSlotOH.orR) {
+    val claimedSlotActive = Mux1H(orphanReleaseClaimSlotOH, VecInit(srActiveSlotOH.asBools))
+    val claimedGeneration = Mux1H(orphanReleaseClaimSlotOH, mshrTaskGenerations(2))
+    assert((srPendingSlotOH & orphanReleaseClaimSlotOH).orR && !claimedSlotActive &&
+      claimedGeneration + 1.U === orphanReleaseSlotClaim.bits.generation,
+      "orphan C claim must retain its next Replace generation until apply")
+  }
   assert(!(srPendingSlotOH & srActiveSlotOH).orR,
     "an unfilled S/R reservation cannot also be active")
 
@@ -1100,6 +1219,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     !VecInit(snoopSlotClaims.map(claim => claim.valid &&
       claim.bits.token.set === io.snoopAdmission.bits.set)).asUInt.orR && !nestedReleaseNeedsReplace && !orphanReleaseData &&
     !io.replResp.valid && !replResponseApplied.valid &&
+    !(orphanReserveRequest.valid && orphanReservationTurn) &&
     !(isSnpToN(io.snoopAdmission.bits.chiOpcode.get) && pendingToNFull)
   val pendingToNAllocated = VecInit((0 until mshrsAll).map { i =>
     pendingToNValid(i) && io.fromMainPipe.mshr_alloc_s3.valid &&
@@ -1764,6 +1884,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   io.toReqArb.blockA_s1 := aSidecarConflict || aSnoopConflict ||
     aPendingToNConflict || aEnteringToNConflict
   io.toReqArb.blockG_s1 := false.B
+  io.toReqArb.blockAll_s1 := false.B
 
   val replaceTxreqSkids = replaceMshrs.zipWithIndex.map { case (m, i) =>
     val busy = RegInit(false.B)
@@ -2405,7 +2526,6 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val orphanNestedwbWrite = orphanReleaseData && replaceSlotIdle.orR
   val orphanExistingReplaceWrite = orphanReleaseTargetsReplace
   val nestedReplaceMask = VecInit(replaceNestedwbCapture).asUInt |
-    Mux(orphanNestedwbWrite, replaceNestedSlotOH, 0.U(mshrsAll.W)) |
     Mux(orphanExistingReplaceWrite, orphanReplaceTargetOH, 0.U(mshrsAll.W))
   val nestedSnoopMask = VecInit(nestedwbSnoopActive).asUInt
   val nestedReleaseMask = nestedReplaceMask | nestedSnoopMask
