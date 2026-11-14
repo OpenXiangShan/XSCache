@@ -1124,8 +1124,10 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     }
   }
 
-  // Only a successful cache-miss ReplRd acquires a refill lock and increments
-  // the resident entry's ownerCount. DirRd updates do not own the entry; DirWb
+  // Every successful allocating ReplRd acquires a refill lock and increments
+  // the resident entry's ownerCount. A request hit does not make the allocation
+  // lock-free: conflict-hit and prefill flows can select a different way while
+  // older metadata is still present. DirRd updates do not own the entry; DirWb
   // performs no replacement-algorithm update; DirRel is also a non-owner.
   // Consequently ownerCount is not a count of all CAM users or TSHR references.
   // A matching DirWb normally decrements at grant. A final owner also writes the
@@ -1133,7 +1135,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   // entry at that same edge. NeverUnlock suppresses owner retirement as before.
   // Mixed mode needs no origin writeback because originFF is already current.
   // pendClearApply retains only the existing lock-clear timing.
-  val refillLockAcquire = s3_valid && s3_isRepl && !hit_s3 && !replRetry
+  val refillLockAcquire = s3_valid && s3_isRepl && !replRetry
   val dirWbUnlock = grantDirWb && dirWbUnlockVec(winDirWb)
   val dirWbOwnerRetire = dirWbUnlock &&
     blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U
@@ -1266,8 +1268,11 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     pendClearValid := false.B
   }
 
-  when(s3_valid && s3_isRepl && !hit_s3 && !replRetry) {
-    // a TSHR may only (re)take its slot once the previous lock is gone; the
+  when(refillLockAcquire) {
+    // Keep this acquisition identical to the CAM ownerCount update: every
+    // allocating replacement reserves its way before the fill commits, even
+    // when the request hits an older valid entry. A TSHR may only (re)take its
+    // slot once the previous lock is gone; the
     // slot being vacated at this same edge counts as available
     val selfClearing = pendClearApply && pendClearIdx === s3_tshr(idxW - 1, 0)
     assert(!lockTable(s3_tshr).valid || selfClearing,
