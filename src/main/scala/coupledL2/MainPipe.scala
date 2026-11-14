@@ -70,7 +70,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
     /* send task to MSHRCtl at stage 3 */
     val toMSHRCtl = new Bundle() {
-      val mainpipeLeaseDone = ValidIO(new MainpipeLeaseDone)
+      val mainpipeLeaseDone = Vec(3, ValidIO(new MainpipeLeaseDone))
       val mshr_alloc_s3 = ValidIO(new MSHRRequest())
       val snoopReservationDone = ValidIO(new SnoopSlotToken)
       val snoopDirectoryHit = Output(Bool())
@@ -1259,15 +1259,22 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     (task_s4.valid && task_s4.bits.mshrTask && req_drop_s4, task_s4.bits, leaseToken_s4),
     (task_s5.valid && task_s5.bits.mshrTask, task_s5.bits, leaseToken_s5)
   )
-  val leaseDone = Wire(Valid(new MainpipeLeaseDone))
-  leaseDone.valid := VecInit(leaseEnds.map(_._1)).asUInt.orR
-  leaseDone.bits.mshrId := Mux1H(leaseEnds.map(x => x._1 -> x._2.mshrId))
-  leaseDone.bits.mshrContext := Mux1H(leaseEnds.map(x => x._1 -> x._2.mshrContext))
-  leaseDone.bits.token := Mux1H(leaseEnds.map(x => x._1 -> x._3))
-  assert(PopCount(leaseEnds.map(_._1)) <= 1.U,
-    "one local execution slot cannot complete two source leases in the same cycle")
-  val terminalReceipt = RegNext(leaseDone, 0.U.asTypeOf(leaseDone))
-  io.toMSHRCtl.mainpipeLeaseDone := RegNext(terminalReceipt, 0.U.asTypeOf(terminalReceipt))
+  // Each pipeline stage can retire a different leased source in the same cycle.
+  // Keep every descriptor and token independent through both existing receipt stages.
+  val leaseDoneEvents = leaseEnds.map { case (end, task, token) =>
+    val event = WireInit(0.U.asTypeOf(Valid(new MainpipeLeaseDone)))
+    event.valid := end
+    event.bits.mshrId := task.mshrId
+    event.bits.mshrContext := task.mshrContext
+    event.bits.token := token
+    event
+  }
+  val terminalReceipts = leaseDoneEvents.map { event =>
+    RegNext(event, 0.U.asTypeOf(event))
+  }
+  io.toMSHRCtl.mainpipeLeaseDone.zip(terminalReceipts).foreach { case (out, receipt) =>
+    out := RegNext(receipt, 0.U.asTypeOf(receipt))
+  }
 
   when (task_s4.valid && !req_drop_s4) {
     task_s5.bits := task_s4.bits

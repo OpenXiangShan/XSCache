@@ -382,10 +382,13 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     assert(sameCmoAllLine || A_task.asUInt === normalReservedTask.asUInt,
       "normal reservation must retain the complete upstream request")
   }
-  io.sinkB.ready := localTransitionIdle && resetFinish &&
+  // RXSNP already captured and reserved this head; refill bPending during the
+  // local execution cooldown while keeping S1/Directory admission serialized.
+  val bEntryRefillReady = resetFinish &&
     !mshr_task_s1.valid && !bPending.valid && !channelDirReadAdmissionValid &&
     !normalReserved && !blockReservedB &&
     !io.fromTXDAT.blockSinkBReqEntrance && !io.fromTXRSP.blockSinkBReqEntrance
+  io.sinkB.ready := bEntryRefillReady
   io.sinkC.ready := sink_ready_basic && channelDirReadAdmissionToken.source === 0.U
   bExecute := sink_ready_basic && channelDirReadAdmissionToken.source === 1.U
   io.bServiceConsume.valid := bExecute

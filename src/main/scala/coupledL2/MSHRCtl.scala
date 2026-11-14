@@ -41,7 +41,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
 
     /* interact with mainpipe */
     val fromMainPipe = new Bundle() {
-      val mainpipeLeaseDone = Flipped(ValidIO(new MainpipeLeaseDone))
+      val mainpipeLeaseDone = Flipped(Vec(3, ValidIO(new MainpipeLeaseDone)))
       val mshr_alloc_s3 = Flipped(ValidIO(new MSHRRequest()))
       val snoopReservationDone = Flipped(ValidIO(new SnoopSlotToken))
       val snoopDirectoryHit = Input(Bool())
@@ -2263,12 +2263,17 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     }
     when(returnRequest) { mshrTaskLeaseReturnSent(g) := true.B }
     val localDone = io.fromMainPipe.mainpipeLeaseDone
-    when(localDone.valid && localDone.bits.mshrContext === g.U) {
-      assert(mshrTaskLeaseValid(g) && mshrTaskPreparedValid(g) && mshrTaskLeaseReturning(g) &&
-        mshrTaskLeaseAwaitPipe(g) && localDone.bits.mshrId === winner.source &&
-        localDone.bits.token.asUInt === winner.token.asUInt,
-        "MainPipe terminal event must match the issued source lease version")
-      mshrTaskLeaseAwaitPipe(g) := false.B
+    val localDoneForGroup = localDone.map(done => done.valid && done.bits.mshrContext === g.U)
+    assert(PopCount(localDoneForGroup) <= 1.U,
+      "one source group cannot complete two leased tasks in the same cycle")
+    localDone.zip(localDoneForGroup).foreach { case (done, doneForGroup) =>
+      when(doneForGroup) {
+        assert(mshrTaskLeaseValid(g) && mshrTaskPreparedValid(g) && mshrTaskLeaseReturning(g) &&
+          mshrTaskLeaseAwaitPipe(g) && done.bits.mshrId === winner.source &&
+          done.bits.token.asUInt === winner.token.asUInt,
+          "MainPipe terminal event must match the issued source lease version")
+        mshrTaskLeaseAwaitPipe(g) := false.B
+      }
     }
     groupOf(g).zipWithIndex.foreach { case (s, i) =>
       s.ready := granted && mshrTaskIssuePermit.source === i.U
