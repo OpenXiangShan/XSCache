@@ -50,6 +50,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     /* block A at Entrance */
     val toReqBuf = Output(Vec(4, Bool()))
     val blockRefillOnlyCommit = Output(Bool())
+    val setStatus = Vec(5, ValidIO(new PipeSetStatus))
 
     /* handle capacity conflict of GrantBuffer */
     val status_vec_toD = Vec(4, ValidIO(new PipeStatus))
@@ -748,7 +749,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   }
   io.toMSHRCtl.normalReservationDone.valid := task_s3.valid && sinkA_req_s3
   io.toMSHRCtl.normalReservationDone.bits.mshrId := req_s3.mshrId
-  io.toMSHRCtl.normalReservationDone.bits.mshrContext := 0.U
+  io.toMSHRCtl.normalReservationDone.bits.mshrContext := Mux(normalAction.cmo, 2.U, 0.U)
   io.toMSHRCtl.normalReservationDone.bits.token := leaseToken_s3
   io.toMSHRCtl.snoopReservationDone.valid := task_s3.valid && sinkB_req_s3
   io.toMSHRCtl.snoopReservationDone.bits := s3Decision.bits.snoopSlotToken
@@ -1226,6 +1227,12 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
   task_s5.valid := task_s4.valid && !req_drop_s4
   val leaseToken_s5 = RegEnable(leaseToken_s4, task_s4.valid && !req_drop_s4)
+  io.setStatus.zip(Seq(task_s3_capture, task_s3_decide, task_s3, task_s4, task_s5))
+    .foreach { case (status, task) =>
+      status.valid := task.valid
+      status.bits.set := task.bits.set
+      status.bits.pendingSnoop := !task.bits.mshrTask && task.bits.fromB
+    }
   val sourceDTransferred_s4 = RegNext(d_s3.fire, false.B)
   val sourceDTransferred_s5 = RegNext(sourceDTransferred_s4 || d_s4.fire, false.B)
   assert(!d_s4.fire || !sourceDTransferred_s4,

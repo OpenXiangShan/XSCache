@@ -46,6 +46,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     val snoopReservationToken = Input(new SnoopSlotToken)
     val taskSnoopReservationToken_s2 = Output(new SnoopSlotToken)
     val bServiceStart = ValidIO(new TaskBundle)
+    val bServiceConsume = ValidIO(new SnoopSlotToken)
     val sidecarReservationHold = Output(Bool())
     val snoopAdmissionEnable = Output(Bool())
     val snoopQueued = Input(Bool())
@@ -76,6 +77,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     val status_s1 = Output(new PipeEntranceStatus) // set & tag of entrance status
     val status_vec = Vec(2, ValidIO(new PipeStatus))
     val status_vec_toTX = Vec(2, ValidIO(new PipeStatusWithCHI))
+    val setStatus = Vec(2, ValidIO(new PipeSetStatus))
+    val mainPipeSetStatus = Flipped(Vec(5, ValidIO(new PipeSetStatus)))
 
     /* handle set conflict, capacity conflict */
     val fromMSHRCtl = Input(new BlockInfo())
@@ -193,8 +196,10 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   /* ======== Stage 0 ======== */
   // if mshr_task_s1 is replRead, it might stall and wait for dirRead.ready, so we block new mshrTask from entering
   // TODO: will cause msTask path vacant for one-cycle after replRead, since not use Flow so as to avoid ready propagation
+  val pendingSnoopSetConflict = Wire(Bool())
   val mshrTaskReadyBasic = localTransitionIdle && admitMshrTurn && !mshr_task_s1.valid && !bPending.valid &&
     !io.sinkB.valid &&
+    !pendingSnoopSetConflict &&
     !channelDirReadAdmissionValid &&
     !io.fromGrantBuffer.blockMSHRReqEntrance &&
     !io.fromTXDAT.blockMSHRReqEntrance &&
@@ -245,7 +250,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val block_C =
     io.fromMSHRCtl.blockC_s1 || io.fromMainPipe.blockC_s1 || io.fromGrantBuffer.blockSinkReqEntrance.blockC_s1
 
-  io.snoopAdmissionEnable := localTransitionIdle && !admitMshrTurn && resetFinish &&
+  io.snoopAdmissionEnable := io.snoopQueued && !admitMshrTurn && resetFinish &&
     !mshr_task_s1.valid && !bPending.valid && !channelDirReadAdmissionValid &&
     !io.normalReserveAck.valid && !io.sinkC.valid && !io.sinkB.valid && !block_B
 
@@ -366,7 +371,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
 
   val sink_ready_basic = channelDirReadAdmissionFire
 
-  io.normalReserveRequest.valid := localTransitionIdle && resetFinish &&
+  io.normalReserveRequest.valid := resetFinish &&
     !mshr_task_s1.valid && !bPending.valid && io.sinkA.valid && !block_A &&
     !io.normalReserveAck.valid && !sinkValids(0) && !io.sinkB.valid &&
     !channelDirReadAdmissionValid && !io.snoopAdmissionEnable
@@ -383,6 +388,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     !io.fromTXDAT.blockSinkBReqEntrance && !io.fromTXRSP.blockSinkBReqEntrance
   io.sinkC.ready := sink_ready_basic && channelDirReadAdmissionToken.source === 0.U
   bExecute := sink_ready_basic && channelDirReadAdmissionToken.source === 1.U
+  io.bServiceConsume.valid := bExecute
+  io.bServiceConsume.bits := bServiceToken
   val channelConsumes = VecInit(Seq(io.sinkC.fire, bExecute, io.sinkA.fire))
   assert(channelDirReadAdmissionFire === channelConsumes.asUInt.orR,
     "a channel Directory token must execute and consume its owner atomically")
@@ -553,6 +560,14 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   when(s1_fire) { task_s2.bits := task_s1.bits }
 
   io.taskToPipe_s2 := task_s2
+  io.setStatus.zip(Seq(task_s1, task_s2)).foreach { case (status, task) =>
+    status.valid := task.valid
+    status.bits.set := task.bits.set
+    status.bits.pendingSnoop := !task.bits.mshrTask && task.bits.fromB
+  }
+  pendingSnoopSetConflict := (Seq(io.setStatus(1)) ++ io.mainPipeSetStatus).map { status =>
+    status.valid && status.bits.pendingSnoop && status.bits.set === io.mshrTask.bits.set
+  }.reduce(_ || _)
   val channelLeaseToken_s1 = Wire(new MainpipeLeaseToken)
   channelLeaseToken_s1.generation := channelDirReadAdmissionToken.generation
   channelLeaseToken_s1.sequence := channelDirReadAdmissionToken.sequence

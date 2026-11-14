@@ -69,6 +69,7 @@ class SnoopSlotToken(implicit p: Parameters) extends CoupledL2Bundle {
   val tag = UInt(tagBits.W)
   val txnID = UInt(TXNID_WIDTH.W)
   val source = UInt(sourceIdBits.W)
+  val generation = UInt(8.W)
   val sequence = UInt(8.W)
 }
 class MainpipeCandidate extends Bundle {

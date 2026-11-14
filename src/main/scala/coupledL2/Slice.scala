@@ -96,6 +96,8 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   rxsnp.io.replaceAlloc.drop(1).foreach(_ := 0.U.asTypeOf(Valid(new ReplacementAllocAddress)))
   rxsnp.io.admissionEnable := reqArb.io.snoopAdmissionEnable
   reqArb.io.snoopQueued := rxsnp.io.queued
+  rxsnp.io.pipeSetStatus := reqArb.io.setStatus ++ mainPipe.io.setStatus
+  reqArb.io.mainPipeSetStatus := mainPipe.io.setStatus
   mshrCtl.io.snoopAdmission <> rxsnp.io.admission
   mshrCtl.io.sidecarSnoopReserve := rxsnp.io.sidecarReserve
   rxsnp.io.replaceAdmissionIdle := mshrCtl.io.replaceSnoopAdmissionIdle
@@ -120,6 +122,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   reqArb.io.mshrTask <> mshrCtl.io.mshrTask
   reqArb.io.mshrLeaseToken := mshrCtl.io.mshrTaskLeaseToken
   mshrCtl.io.bServiceStart := reqArb.io.bServiceStart
+  mshrCtl.io.bServiceConsume := reqArb.io.bServiceConsume
   reqArb.io.snoopReservationToken := mshrCtl.io.snoopReservationToken
   mshrCtl.io.sidecarReservationHold := reqArb.io.sidecarReservationHold
   mshrCtl.io.contextReservation := reqArb.io.contextReservation

@@ -34,6 +34,7 @@ class RXSNP(
     val task = DecoupledIO(new TaskBundle())
     val admissionEnable = Input(Bool())
     val queued = Output(Bool())
+    val pipeSetStatus = Flipped(Vec(7, ValidIO(new PipeSetStatus)))
     val admission = DecoupledIO(new TaskBundle)
     val replaceAdmissionIdle = Input(UInt(mshrsAll.W))
     val sidecarReserve = ValidIO(UInt(mshrBits.W))
@@ -152,8 +153,10 @@ class RXSNP(
   val allocatingSidecarBlockSnp = allocatingSidecarMatch && !sidecarNestSnpMask.orR
   val sidecarBlockSnp = (sidecarLineMask & ~sidecarNestSnpMask).orR ||
     allocatingSidecarBlockSnp
+  val pipelineSetConflict = io.pipeSetStatus.map(status =>
+    status.valid && status.bits.set === task.set).reduce(_ || _)
   val stall = reqBlockSnp || replaceBlockSnp || sidecarBlockSnp ||
-    normalVictimAwaitingOwner || snoopContextBlock
+    normalVictimAwaitingOwner || snoopContextBlock || pipelineSetConflict
 
   io.admission.valid := rxsnp.valid && io.admissionEnable && !admissionValid && !stall
   io.admission.bits := task
