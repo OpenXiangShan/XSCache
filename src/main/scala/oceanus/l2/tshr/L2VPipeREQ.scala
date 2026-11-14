@@ -387,8 +387,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val w_s_repl = RegInit(false.B) // Waiting to schedule Directory Replacer Read
   val s_repl = RegInit(false.B) // Scheduling Directory Replacer Read
 
-  val w_hit_lock_release = RegInit(false.B) // Waiting for allocating response and final meta-only Directory Write-Back to release hit-way reservation
-  val s_hit_lock_release = RegInit(false.B) // Scheduling hit-way reservation release with final meta-only Directory Write-Back
+  val w_hit_lock_release = RegInit(false.B) // Waiting for allocating response and final allocating Directory Write-Back to release hit-way reservation
+  val s_hit_lock_release = RegInit(false.B) // Scheduling hit-way reservation release with final allocating Directory Write-Back
 
   val w_s_evict_up_evict = RegInit(false.B) // Waiting to schedule local eviction RXREQ EvictBack
   val s_evict_up_evict = RegInit(false.B) // Scheduling local eviction RXREQ EvictBack
@@ -1283,7 +1283,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // --------------------------------
 
   // Hold an unsatisfied initial-hit way until the original request's final
-  // allocating response has been committed by a meta-only DirWb.
+  // allocating response has been committed by a final allocating DirWb.
   val hit_lock_response = w_hit_lock_release && (
                             (p_rxreq_makeunique && dn_rxrsp_comp) ||
                             ((p_rxreq_readunique || p_rxreq_stashunique) && (
@@ -1901,7 +1901,14 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   assert(!(p_prefill_hit && w_hit_lock_release),
     "REQ vPipe conflict-hit prefill unexpectedly owns a hit-lock")
 
-  io.dir_wb_locked := w_unlock_dir
+  // Delay release until the final local tag/meta writes have registered. The
+  // pending-until-accept flags must not hold the write or it could never proceed.
+  val hit_lock_write_hold = (w_hit_lock_release || rxreq_hit_lock_accept) &&
+                            (!s_hit_lock_release ||
+                             io.tshr_meta_write_en.asUInt.orR ||
+                             io.tshr_tag_write_en)
+
+  io.dir_wb_locked := w_unlock_dir || hit_lock_write_hold
   io.ds_wb_locked := w_unlock_ds
 
   // 1. Clean local Meta (to Directory) and TSHR Buffer (to Data Storage) modified state and 
