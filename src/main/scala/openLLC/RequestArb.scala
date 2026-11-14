@@ -76,6 +76,10 @@ class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo wi
   val isWriteCleanFull_s1 = !task_s1.bits.refillTask && task_s1.bits.chiOpcode === WriteCleanFull
 
   val isRead_s1  = isReadNotSharedDirty_s1 || isReadUnique_s1 || isStashOnceShared_s1
+  // MakeUnique/MakeInvalid snoop peers with SnpMakeInvalid: hold them while a CopyBack's data is outstanding
+  // (CHI E.b 4.11.2), like reads
+  val isMake_s1 = !task_s1.bits.refillTask &&
+    (task_s1.bits.chiOpcode === MakeUnique || task_s1.bits.chiOpcode === MakeInvalid)
   val isClean_s1 = isCleanInvalid_s1 || isCleanShared_s1 || isWriteCleanFull_s1
 
   // To prevent data hazards caused by read-after-write conflicts in the directory,
@@ -123,7 +127,7 @@ class RequestArb(implicit p: Parameters) extends LLCModule with HasClientInfo wi
   val blockByMem = Cat(memInfo.map(e =>
     e.valid && Cat(e.bits.tag, e.bits.set) === Cat(tag_s1, set_s1) &&
       e.bits.opcode === WriteNoSnpFull &&
-      (task_s1.bits.refillTask || isClean_s1 || !e.bits.w_datRsp && isRead_s1)
+      (task_s1.bits.refillTask || isClean_s1 || !e.bits.w_datRsp && (isRead_s1 || isMake_s1))
   )).orR ||
     Cat(memInfo.map(e => e.valid && e.bits.reqID === reqID_s1 && !task_s1.bits.refillTask)).orR ||
     (inflight_memAccess +& potential_memAccess) >= mshrs.memory.U
