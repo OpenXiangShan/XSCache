@@ -178,8 +178,10 @@ class ResponseUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
 
   def handleSnpResp(snpRsp: Valid[Resp], snpData: Valid[RespWithData]): Unit = {
     when(snpData.valid) {
+      val src_idOH = UIntToOH(snpData.bits.srcID)(numRNs - 1, 0)
       val update_vec = buffer.map(e =>
-        e.task.reqID === snpData.bits.txnID && e.valid && !e.task.replSnp && snpData.bits.opcode === SnpRespData
+        e.task.reqID === snpData.bits.txnID && e.valid && !e.task.replSnp &&
+          (e.task.snpVec.asUInt & src_idOH).orR && snpData.bits.opcode === SnpRespData
       )
       assert(PopCount(update_vec) < 2.U, "Response task repeated")
       val canUpdate = Cat(update_vec).orR
@@ -188,16 +190,18 @@ class ResponseUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
         val entry = buffer(update_id)
         val beatId = snpData.bits.dataID >> log2Ceil(beatBytes / 16)
         val newBeatValids = entry.beatValids.asUInt | UIntToOH(beatId)
-        val src_idOH = UIntToOH(snpData.bits.srcID)(numRNs - 1, 0)
         val newSnpVec = VecInit((entry.task.snpVec.asUInt & ~src_idOH).asBools)
+        val dataLast = beatId === (beatSize - 1).U
         val isReadUnique = entry.task.chiOpcode === ReadUnique
         val isCleanInvalid = entry.task.chiOpcode === CleanInvalid
         val isCleanShared = entry.task.chiOpcode === CleanShared
         entry.beatValids := VecInit(newBeatValids.asBools)
-        entry.task.snpVec := newSnpVec
         entry.state.w_datRsp := newBeatValids.andR
-        entry.state.w_snpRsp := !Cat(newSnpVec).orR
         entry.data.data(beatId) := snpData.bits.data
+        when(dataLast) {
+          entry.task.snpVec := newSnpVec
+          entry.state.w_snpRsp := !Cat(newSnpVec).orR
+        }
         when(snpData.bits.resp(2)) {
           when(isReadUnique) {
             entry.task.resp := setPD(entry.task.resp)
@@ -209,15 +213,16 @@ class ResponseUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
     }
 
     when(snpRsp.valid) {
+      val src_idOH = UIntToOH(snpRsp.bits.srcID)(numRNs - 1, 0)
       val update_vec = buffer.map(e =>
-        e.task.reqID === snpRsp.bits.txnID && e.valid && !e.state.w_snpRsp && snpRsp.bits.opcode === SnpResp
+        e.task.reqID === snpRsp.bits.txnID && e.valid && !e.state.w_snpRsp &&
+          (e.task.snpVec.asUInt & src_idOH).orR && snpRsp.bits.opcode === SnpResp
       )
       assert(PopCount(update_vec) < 2.U, "Response task repeated")
       val canUpdate = Cat(update_vec).orR
       val update_id = PriorityEncoder(update_vec)
       when(canUpdate) {
         val entry = buffer(update_id)
-        val src_idOH = UIntToOH(snpRsp.bits.srcID)(numRNs - 1, 0)
         val newSnpVec = VecInit((entry.task.snpVec.asUInt & ~src_idOH).asBools)
         entry.task.snpVec := newSnpVec
         entry.state.w_snpRsp := !Cat(newSnpVec).orR
@@ -228,15 +233,22 @@ class ResponseUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
     when(snpData.valid && snpRsp.valid) {
       when(snpData.bits.opcode === SnpRespData && snpRsp.bits.opcode === SnpResp) {
         when(snpData.bits.txnID === snpRsp.bits.txnID) {
-          val update_vec = buffer.map(e => e.task.reqID === snpRsp.bits.txnID && e.valid && !e.state.w_snpRsp)
+          val src_idOH_dat = UIntToOH(snpData.bits.srcID)(numRNs - 1, 0)
+          val src_idOH_rsp = UIntToOH(snpRsp.bits.srcID)(numRNs - 1, 0)
+          val update_vec = buffer.map(e =>
+            e.task.reqID === snpRsp.bits.txnID && e.valid && !e.state.w_snpRsp &&
+              (e.task.snpVec.asUInt & src_idOH_dat).orR &&
+              (e.task.snpVec.asUInt & src_idOH_rsp).orR
+          )
           assert(PopCount(update_vec) < 2.U, "Response task repeated")
           val update_id = PriorityEncoder(update_vec)
           val entry = buffer(update_id)
           val canUpdate = Cat(update_vec).orR
           when(canUpdate) {
-            val src_idOH_dat = UIntToOH(snpData.bits.srcID)(numRNs - 1, 0)
-            val src_idOH_rsp = UIntToOH(snpRsp.bits.srcID)(numRNs - 1, 0)
-            val newSnpVec = VecInit((entry.task.snpVec.asUInt & ~src_idOH_dat & ~src_idOH_rsp).asBools)
+            val beatId = snpData.bits.dataID >> log2Ceil(beatBytes / 16)
+            val dataLast = beatId === (beatSize - 1).U
+            val dataClearOH = Mux(dataLast, src_idOH_dat, 0.U)
+            val newSnpVec = VecInit((entry.task.snpVec.asUInt & ~dataClearOH & ~src_idOH_rsp).asBools)
             entry.task.snpVec := newSnpVec
             entry.state.w_snpRsp := !Cat(newSnpVec).orR
           }

@@ -80,6 +80,7 @@ class DirRead(implicit p: Parameters) extends L2Bundle {
   val replacerInfo = new ReplacerInfo()
   // dirRead when refill
   val refill = Bool()
+  val normalRefillRevalidate = Bool()
   val mshrId = UInt(mshrBits.W)
   // when flush l2
   val cmoAll = Bool()
@@ -97,6 +98,7 @@ class DirResult(implicit p: Parameters) extends L2Bundle {
 }
 
 class ReplacerResult(implicit p: Parameters) extends L2Bundle {
+  val hit = Bool()
   val tag = UInt(tagBits.W)
   val set = UInt(setBits.W)
   val way = UInt(wayBits.W)
@@ -138,12 +140,12 @@ class Directory(implicit p: Parameters) extends L2Module {
     val metaWReq = Flipped(ValidIO(new MetaWrite))
     val tagWReq = Flipped(ValidIO(new TagWrite))
     val replResp = ValidIO(new ReplacerResult)
-    // used to count occWays for Grant to retry
-    val msInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo)))
+    val refillInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo)))
+    val snoopInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo)))
+    val replaceInfo = Vec(mshrsAll, Flipped(ValidIO(new ReplaceMSHRInfo)))
     val metaOnHit = new MetaEntry()
     val errOnSnp = Bool()
     val wayOH = Output(UInt(cacheParams.ways.W))
-    val replWayOH = Output(UInt(cacheParams.ways.W))
     val cmoHitInvalid = Output(Bool())
     val retryFastFwd = Output(Bool())
   })
@@ -294,26 +296,79 @@ class Directory(implicit p: Parameters) extends L2Module {
 
   val tagMatchVec = tagAll_s3.map(_ (tagBits - 1, 0) === req_s3.tag)
   val metaValidVec = metaAll_s3.map(_.state =/= MetaData.INVALID)
-  val hitVec = tagMatchVec.zip(metaValidVec).map(x => x._1 && x._2)
-
-  /* ====== refill retry ====== */
-  // when refill, ways that have not finished writing its refillData back to DS (in MSHR Release),
-  // or using by Alias-Acquire (hit), can not be used for replace.
-  // choose free way to refill, if all ways are occupied, we cancel the Grant and LET IT RETRY
-  // compare is done at Stage2 for better timing
-  val occWayMask_s1 = VecInit(io.msInfo.map(s =>
+  val hitVecRaw = tagMatchVec.zip(metaValidVec).map(x => x._1 && x._2)
+  // A stale A hit must not observe a way whose owning refill has not committed yet.
+  val victimPendingWayMask_s3 = VecInit(io.refillInfo.map(s =>
     Mux(
-      s.valid && (s.bits.set === req_s1.set) && (s.bits.blockRefill || s.bits.dirHit),
+      // Only an owner that will overwrite its way may suppress a Directory hit.
+      s.valid && (s.bits.set === req_s3.set) && !s.bits.dirHit &&
+        s.bits.w_replResp && !s.bits.refillCommitLanded,
       UIntToOH(s.bits.way, ways),
       0.U(ways.W)
     )
-  )).reduceTree(_ | _) |
-    Mux(refillReqValid_s3 || reqValid_s3 && io.resp.bits.hit, UIntToOH(io.resp.bits.way, ways), 0.U(ways.W))
+  )).reduceTree(_ | _)
+  val suppressAHitDying_s3 = req_s3.replacerInfo.channel(0) && !req_s3.refill &&
+    !req_s3.normalRefillRevalidate && !req_s3.cmoAll
+  val hitVec = hitVecRaw.zipWithIndex.map { case (h, i) =>
+    h && !(suppressAHitDying_s3 && victimPendingWayMask_s3(i))
+  }
+  XSPerfAccumulate("dir_dying_hit_suppress_cnt",
+    reqValid_s3 && suppressAHitDying_s3 && (victimPendingWayMask_s3 & hitVecRaw.asUInt).orR)
 
-  val occWayMask_s2 = RegEnable(occWayMask_s1, io.read.fire && io.read.bits.refill)
+  /* ====== refill retry ====== */
+  def sampleOwnerWayMask(mask: UInt): UInt = {
+    val snapshot = RegInit(0.U(ways.W))
+    snapshot := mask
+    snapshot
+  }
+  val normalOwnerWayMasks_s2 = io.refillInfo.zipWithIndex.map { case (s, i) =>
+    sampleOwnerWayMask(Mux(
+      s.valid && (s.bits.set === req_s1.set) && (s.bits.blockRefill || s.bits.dirHit) &&
+        req_s1.mshrId =/= i.U,
+      UIntToOH(s.bits.way, ways),
+      0.U(ways.W)
+    ))
+  }
+  val snoopOwnerWayMasks_s2 = io.snoopInfo.map(s =>
+    sampleOwnerWayMask(Mux(
+      s.valid && (s.bits.set === req_s1.set) && s.bits.blockRefill,
+      UIntToOH(s.bits.way, ways),
+      0.U(ways.W)
+    ))
+  )
+  val replaceOwnerWayMasks_s2 = io.replaceInfo.map(s =>
+    sampleOwnerWayMask(Mux(
+      s.valid && s.bits.ownsWay && (s.bits.set === req_s1.set),
+      UIntToOH(s.bits.way, ways),
+      0.U(ways.W)
+    ))
+  )
+  val pipelineWayMask_s2 = sampleOwnerWayMask(Mux(
+    refillReqValid_s3 || reqValid_s3 && io.resp.bits.hit,
+    UIntToOH(io.resp.bits.way, ways), 0.U(ways.W)))
+  val normalOccWayMask_s2 = VecInit(normalOwnerWayMasks_s2).reduceTree(_ | _)
+  val snoopWayHoldMask_s2 = VecInit(snoopOwnerWayMasks_s2).reduceTree(_ | _)
+  val replaceWayHoldMask_s2 = VecInit(replaceOwnerWayMasks_s2).reduceTree(_ | _)
+  val occWayMask_s2 = Wire(UInt(ways.W))
+  occWayMask_s2 := normalOccWayMask_s2 | snoopWayHoldMask_s2 |
+    replaceWayHoldMask_s2 | pipelineWayMask_s2
+  val selfOwnerWayMasks_s2 = io.refillInfo.zipWithIndex.map { case (s, i) =>
+    sampleOwnerWayMask(Mux(
+      s.valid && (s.bits.set === req_s1.set) && (s.bits.blockRefill || s.bits.dirHit) &&
+        io.read.bits.mshrId === i.U,
+      UIntToOH(s.bits.way, ways),
+      0.U(ways.W)
+    ))
+  }
+  val selfOccWayMask_s2 = VecInit(selfOwnerWayMasks_s2).reduceTree(_ | _)
+  val snoopWayHoldMask_s3 = RegEnable(snoopWayHoldMask_s2, 0.U(ways.W), refillReqValid_s2)
+  val replaceWayHoldMask_s3 = RegEnable(replaceWayHoldMask_s2, 0.U(ways.W), refillReqValid_s2)
+  val normalOccWayMask_s3 = RegEnable(normalOccWayMask_s2, 0.U(ways.W), refillReqValid_s2)
+  val selfOccWayMask_s3 = RegEnable(selfOccWayMask_s2, 0.U(ways.W), refillReqValid_s2)
 
   io.retryFastFwd := occWayMask_s2.andR && refillReqValid_s2
-  val freeWayMask_s3 = RegEnable(~occWayMask_s2, refillReqValid_s2)
+  val freeWayMask_s3 = RegInit(0.U(ways.W))
+  when(refillReqValid_s2) { freeWayMask_s3 := ~occWayMask_s2 }
   val refillRetry = RegEnable(occWayMask_s2.andR, refillReqValid_s2)
 
   // val hitWay = OHToUInt(hitVec)
@@ -331,12 +386,59 @@ class Directory(implicit p: Parameters) extends L2Module {
   )
   val hit_s3 = Cat(hitVec).orR || req_s3.cmoAll
   val wayOH_s3 = Mux(req_s3.cmoAll, cmoWayOH_s3, Mux(hit_s3, hitOH, finalReplOH))
+  when (reqValid_s3 && req_s3.refill && !hit_s3) {
+    assert(!(wayOH_s3 & snoopWayHoldMask_s3).orR,
+      "a refill replacement must not select a DS way held by SnoopMSHR data")
+    assert(!(wayOH_s3 & replaceWayHoldMask_s3).orR,
+      "a refill replacement must not select a DS way held by ReplaceMSHR")
+  }
   val way_s3 = OHToUInt(wayOH_s3)
-  val meta_s3 = Mux1H(wayOH_s3, metaAll_s3)
+  val waySelected_s3 = wayOH_s3.orR
+  val meta_s3 = Mux(waySelected_s3, metaAll_s3(way_s3), 0.U.asTypeOf(new MetaEntry))
   val metaOnHit_s3 = Mux1H(hitOH, metaAll_s3) // only valid when hit
-  val tag_s3 = Mux1H(wayOH_s3, tagAll_s3)
+  val tag_s3 = Mux(waySelected_s3, tagAll_s3(way_s3), 0.U(tagBits.W))
   val set_s3 = req_s3.set
   val replacerInfo_s3 = req_s3.replacerInfo
+  val replLookup_s3 = reqValid_s3 && req_s3.refill && !hit_s3
+  val chosenBlocked_s3 = replLookup_s3 && !Mux1H(chosenOH, freeWayMask_s3)
+  XSPerfAccumulate("repl_fallback_cnt", chosenBlocked_s3)
+  XSPerfAccumulate("repl_fallback_selfWay_cnt",
+    chosenBlocked_s3 && (chosenOH & selfOccWayMask_s3).orR)
+  XSPerfAccumulate("repl_fallback_normalOther_cnt",
+    chosenBlocked_s3 && (chosenOH & normalOccWayMask_s3 & ~selfOccWayMask_s3).orR)
+  XSPerfAccumulate("repl_fallback_replaceHold_cnt",
+    chosenBlocked_s3 && (chosenOH & replaceWayHoldMask_s3).orR)
+  XSPerfAccumulate("repl_fallback_snoopHold_cnt",
+    chosenBlocked_s3 && (chosenOH & snoopWayHoldMask_s3).orR)
+  XSPerfAccumulate("lookup_occ_normal_sum",
+    Mux(replLookup_s3, PopCount(normalOccWayMask_s3), 0.U))
+  XSPerfAccumulate("lookup_occ_replace_sum",
+    Mux(replLookup_s3, PopCount(replaceWayHoldMask_s3), 0.U))
+  XSPerfAccumulate("lookup_occ_snoop_sum",
+    Mux(replLookup_s3, PopCount(snoopWayHoldMask_s3), 0.U))
+  XSPerfAccumulate("repl_lookup_total", io.replResp.valid)
+  XSPerfAccumulate("repl_retry_cnt", io.replResp.valid && io.replResp.bits.retry)
+  XSPerfAccumulate("repl_victim_valid_total",
+    io.replResp.valid && !io.replResp.bits.retry && !io.replResp.bits.hit &&
+      io.replResp.bits.meta.state =/= MetaData.INVALID)
+  XSPerfAccumulate("repl_victim_clients1",
+    io.replResp.valid && !io.replResp.bits.retry && !io.replResp.bits.hit &&
+      io.replResp.bits.meta.state =/= MetaData.INVALID && io.replResp.bits.meta.clients.orR)
+  XSPerfAccumulate("repl_victim_dirty1",
+    io.replResp.valid && !io.replResp.bits.retry && !io.replResp.bits.hit &&
+      io.replResp.bits.meta.state =/= MetaData.INVALID && io.replResp.bits.meta.dirty)
+
+  XSPerfAccumulate("dir_busy_tag_only_cnt",
+    io.tagWReq.valid && !io.metaWReq.valid && !replacerWen)
+
+  XSPerfAccumulate("dir_busy_meta_only_cnt",
+    !io.tagWReq.valid && io.metaWReq.valid && !replacerWen)
+
+  XSPerfAccumulate("dir_busy_repl_only_cnt",
+    !io.tagWReq.valid && !io.metaWReq.valid && replacerWen)
+
+  XSPerfAccumulate("dir_busy_mix_cnt",
+    (PopCount(Seq(io.tagWReq.valid, io.metaWReq.valid, replacerWen)) >= 2.U))
   val errorOnSNP_s3 = if (enableTagECC) {
     Mux1H(hitOH, errorAll_s3)
   } else {
@@ -370,43 +472,66 @@ class Directory(implicit p: Parameters) extends L2Module {
   // its own bank.  dirSetSplit = 1 keeps the SRAMs unsplit and degenerates to
   // the original arbitration (every write blocks every read).
   def bankOf(set: UInt): UInt = if (setBankCount == 1) 0.U else set(setBankBits - 1, 0)
-  val readBank = bankOf(io.read.bits.set)
-  val metaWriteConflict = io.metaWReq.valid && readBank === bankOf(io.metaWReq.bits.set)
-  val tagWriteConflict = io.tagWReq.valid && readBank === bankOf(io.tagWReq.bits.set)
-  val replacerWriteConflict = replacerWen && readBank === bankOf(req_s3.set)
-  io.read.ready := !metaWriteConflict && !tagWriteConflict && !replacerWriteConflict
+  def bankOH(set: UInt): UInt = UIntToOH(bankOf(set), setBankCount)
+  val readBankOH = bankOH(io.read.bits.set)
+  val metaWriteConflict = io.metaWReq.valid &&
+    (readBankOH & bankOH(io.metaWReq.bits.set)).orR
+  val tagWriteConflict = io.tagWReq.valid &&
+    (readBankOH & bankOH(io.tagWReq.bits.set)).orR
+  val replacerWriteConflict = replacerWen &&
+    (readBankOH & bankOH(req_s3.set)).orR
+  val dirReadReady = !metaWriteConflict && !tagWriteConflict && !replacerWriteConflict
+  io.read.ready := dirReadReady
+  XSPerfAccumulate("dir_read_stall_tag_cnt",
+    io.read.valid && !dirReadReady && tagWriteConflict)
+  XSPerfAccumulate("dir_read_stall_meta_cnt",
+    io.read.valid && !dirReadReady && !tagWriteConflict && metaWriteConflict)
+  XSPerfAccumulate("dir_read_stall_replacer_cnt",
+    io.read.valid && !dirReadReady && !tagWriteConflict && !metaWriteConflict && replacerWriteConflict)
 
   /* ======!! Replacement logic !!====== */
   /* ====== Read, choose replaceWay ====== */
-  val repl_state_s3 = if(random_repl) {
+  val (repl_state_s3, replaceOH_s3) = if(random_repl) {
     when(io.tagWReq.fire){
       repl.miss
     }
-    0.U
+    (0.U(repl.nBits.W), UIntToOH(repl.get_replace_way(0.U(repl.nBits.W)), ways))
   } else {
     val repl_sram_r = replacer_sram_opt.get.io.r(io.read.fire, io.read.bits.set).resp.data(0)
-    val repl_state = RegEnable(repl_sram_r, 0.U(repl.nBits.W), reqValid_s2)
-    repl_state
+    (RegEnable(repl_sram_r, 0.U(repl.nBits.W), reqValid_s2),
+     RegEnable(repl.get_replace_OH(repl_sram_r), 0.U(ways.W), reqValid_s2))
+  }
+  replaceOH := replaceOH_s3
+  replaceWay := OHToUInt(replaceOH_s3)
+  if (cacheParams.replacement != "random") {
+    assert(!reqValid_s3 || PopCount(replaceOH) === 1.U,
+      "Replacement way should be one-hot")
   }
 
-  if (cacheParams.replacement == "random") {
-    replaceWay := repl.get_replace_way(repl_state_s3)
-    replaceOH := UIntToOH(replaceWay, ways)
-  } else {
-    replaceOH := repl.get_replace_OH(repl_state_s3)
-    assert(PopCount(replaceOH) === 1.U, "Replacement way should be one-hot")
-    replaceWay := OHToUInt(replaceOH)
-  }
-
+  val normalRefillRevalidateHit = req_s3.normalRefillRevalidate && hit_s3
+  val replRespOH = Mux(normalRefillRevalidateHit, hitOH, finalReplOH)
+  val replRespWay = OHToUInt(replRespOH)
   io.replResp.valid := refillReqValid_s3
-  io.replResp.bits.tag := Mux1H(finalReplOH, tagAll_s3)
+  io.replResp.bits.hit := normalRefillRevalidateHit
+  io.replResp.bits.tag := tagAll_s3(replRespWay)
   io.replResp.bits.set := req_s3.set
-  io.replResp.bits.way := OHToUInt(finalReplOH)
-  io.replResp.bits.meta := Mux1H(finalReplOH, metaAll_s3)
+  io.replResp.bits.way := replRespWay
+  io.replResp.bits.meta := metaAll_s3(replRespWay)
   io.replResp.bits.mshrId := req_s3.mshrId
-  io.replResp.bits.retry := refillRetry
+  // Forward a coincident meta/tag write into the retained victim result.
+  val dirWrValid_d1 = RegNext(io.metaWReq.valid || io.tagWReq.valid, false.B)
+  val dirWrSet_d1 = RegEnable(
+    Mux(io.tagWReq.valid, io.tagWReq.bits.set, io.metaWReq.bits.set), 0.U(setBits.W),
+    io.metaWReq.valid || io.tagWReq.valid)
+  val dirWrWayOH_d1 = RegEnable(
+    Mux(io.tagWReq.valid, io.tagWReq.bits.wayOH, io.metaWReq.bits.wayOH), 0.U(ways.W),
+    io.metaWReq.valid || io.tagWReq.valid)
+  val victimMetaJustWritten = dirWrValid_d1 && dirWrSet_d1 === req_s3.set &&
+    (dirWrWayOH_d1 & replRespOH).orR
+  XSPerfAccumulate("dir_victim_race_retry_cnt",
+    io.replResp.valid && !normalRefillRevalidateHit && !refillRetry && victimMetaJustWritten)
+  io.replResp.bits.retry := !normalRefillRevalidateHit && (refillRetry || victimMetaJustWritten)
   io.replResp.bits.validHold := refillReqValid_hold_s3
-  io.replWayOH := finalReplOH
 
   /* ====== Update ====== */
   // PLRU: update replacer only when A hit or refill, at stage 3
@@ -422,6 +547,9 @@ class Directory(implicit p: Parameters) extends L2Module {
   val updateRefill = refillReqValid_s3 && !refillRetry
   // update replacer when A/C hit or refill
   replacerWen := updateHit || updateRefill
+
+  XSPerfAccumulate("dir_wen_replacer_updateHit_cnt", updateHit)
+  XSPerfAccumulate("dir_wen_replacer_updateRefill_cnt", updateRefill)
 
   // hit-Promotion, miss-Insertion for RRIP
   // origin-bit marks whether the data_block is reused

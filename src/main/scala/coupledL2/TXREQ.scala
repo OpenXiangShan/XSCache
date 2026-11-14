@@ -36,8 +36,10 @@ class TXREQ(implicit p: Parameters) extends CoupledL2Module {
     val mshrReq = Flipped(DecoupledIO(new CHIREQ()))
     val out = DecoupledIO(new CHIREQ())
 
-    val pipeStatusVec = Flipped(Vec(5, ValidIO(new PipeStatusWithCHI)))
+    val pipeStatusVec = Flipped(Vec(8, ValidIO(new PipeStatusWithCHI)))
     val toReqArb = Output(new TXBlockBundle)
+
+    val replacePendingCnt = Input(UInt(log2Up(mshrsAll + 1).W))
 
     val sliceId = Input(UInt(bankBits.W))
   })
@@ -45,34 +47,30 @@ class TXREQ(implicit p: Parameters) extends CoupledL2Module {
   assert(!io.pipeReq.valid || io.pipeReq.ready, "TXREQ should always be ready for pipeline req")
   require(chiOpt.isDefined)
 
-  // TODO: an mshrsAll-entry queue is too much, evaluate for a proper size later
-  val queue = Module(new Queue(new CHIREQ, entries = mshrsAll, flow = false))
+  val queue = Module(new Queue(new CHIREQ, entries = 2 * mshrsAll, flow = false))
   
   // Back pressure logic from TXREQ
   val queueCnt = queue.io.count
   // TODO: this may be imprecise, review this later
   val pipeStatus_s1_s5 = io.pipeStatusVec
-  val pipeStatus_s2_s5 = pipeStatus_s1_s5.tail
+  val pipeStatus_s2_s5 = pipeStatus_s1_s5.drop(2)
   val pipeStatus_s1 = pipeStatus_s1_s5.head
-  val pipeStatus_s2 = pipeStatus_s1_s5(1)
-  val s2ReturnCredit = pipeStatus_s2.valid && !(pipeStatus_s2.bits.mshrTask && pipeStatus_s2.bits.toTXREQ)
-  // inflightCnt equals the number of reqs on s2~s5 that may flow into TXREQ soon, plus queueCnt.
-  // The calculation of inflightCnt might be imprecise and leads to false positive back pressue.
   val inflightCnt = PopCount(Cat(pipeStatus_s2_s5.map(s => s.valid && s.bits.mshrTask && s.bits.toTXREQ))) +
-//    pipeStatus_s1.valid.asUInt +
-    1.U - s2ReturnCredit.asUInt + //Fix Timing: always take credit and s2 return if not take 
-    queueCnt
+    (pipeStatus_s1.valid && pipeStatus_s1.bits.toTXREQ).asUInt +
+    1.U + // Leave space for simultaneous local admission and direct enqueue.
+    queueCnt +
+    io.replacePendingCnt
 
-  assert(inflightCnt <= mshrsAll.U, "in-flight overflow at TXREQ")
+  assert(inflightCnt <= (2 * mshrsAll + 4).U, "in-flight overflow at TXREQ")
 
-  val noSpace = inflightCnt >= mshrsAll.U
+  val noSpace = inflightCnt >= (2 * mshrsAll).U
 
   io.toReqArb.blockMSHRReqEntrance := noSpace
 
   queue.io.enq.valid := io.pipeReq.valid || io.mshrReq.valid && !noSpace
   queue.io.enq.bits := Mux(io.pipeReq.valid, io.pipeReq.bits, io.mshrReq.bits)
 
-  io.pipeReq.ready := true.B
+  io.pipeReq.ready := queue.io.enq.ready
   io.mshrReq.ready := !io.pipeReq.valid && !noSpace
 
   // Decoupled2LCredit(queue.io.deq, io.out)

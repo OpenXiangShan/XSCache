@@ -37,34 +37,39 @@ class TXRSP(implicit p: Parameters) extends CoupledL2Module {
     val mshrRsp = Flipped(DecoupledIO(new CHIRSP()))
     val out = DecoupledIO(new CHIRSP())
 
-    val pipeStatusVec = Flipped(Vec(5, ValidIO(new PipeStatusWithCHI)))
+    val pipeStatusVec = Flipped(Vec(8, ValidIO(new PipeStatusWithCHI)))
+    val reservedB = Input(Bool())
     val toReqArb = Output(new TXRSPBlockBundle)
+    val done = ValidIO(new TaskBundle)
   })
 
   assert(!io.pipeRsp.valid || io.pipeRsp.bits.toTXRSP, "txChannel is wrong for TXRSP")
-  assert(io.pipeRsp.ready, "TXRSP should never be full")
+  assert(!io.pipeRsp.valid || io.pipeRsp.ready, "TXRSP pipe response must obey Decoupled backpressure")
   require(chiOpt.isDefined)
 
-  // TODO: an mshrsAll-entry queue is too much, evaluate for a proper size later
-  val queue = Module(new Queue(new CHIRSP, entries = mshrsAll, flow = false))
+  val queue = Module(new Queue(new CHIRSP, entries = 2 * mshrsAll, flow = false))
+  val taskQueue = Module(new Queue(new TaskBundle, entries = 2 * mshrsAll, flow = false))
 
   // Back pressure logic from TXRSP
   val queueCnt = queue.io.count
   // TODO: this may be imprecise, review this later
   val pipeStatus_s1_s5 = io.pipeStatusVec
-  val pipeStatus_s1_s3 = pipeStatus_s1_s5.take(3)
-  val pipeStatus_s2_s3 = pipeStatus_s1_s3.tail
-  val pipeStatus_s4_s5 = pipeStatus_s1_s5.drop(3)
-  // inflightCnt equals the number of reqs on s2~s5 that may flow into TXRSP soon, plus queueCnt.
+  val pipeStatus_s1_s3 = pipeStatus_s1_s5.take(6)
+  val pipeStatus_s2_s3 = pipeStatus_s1_s3.drop(2)
+  val pipeStatus_s4_s5 = pipeStatus_s1_s5.drop(6)
+  val mshrIngress = pipeStatus_s1_s3.head
+  // Include both ingress owners: the MSHR Q below and the B owner once via reservedB.
+  // Later pipeline stages and the queue retain their existing accounting.
   // The calculation of inflightCnt might be imprecise and leads to false positive back pressue.
   val inflightCnt = PopCount(Cat(pipeStatus_s4_s5.map(s => s.valid && s.bits.toTXRSP && (s.bits.fromB || s.bits.mshrTask)))) +&
     PopCount(Cat(pipeStatus_s2_s3.map(s => s.valid && Mux(s.bits.mshrTask, s.bits.toTXRSP, s.bits.fromB)))) +
-    queueCnt
+    (mshrIngress.valid && mshrIngress.bits.toTXRSP).asUInt +
+    queueCnt + io.reservedB.asUInt
 
-  assert(inflightCnt <= mshrsAll.U, "in-flight overflow at TXRSP")
+  assert(inflightCnt <= (2 * mshrsAll + 4).U, "in-flight overflow at TXRSP")
 
-  val noSpaceForSinkBReq = inflightCnt >= mshrsAll.U
-  val noSpaceForMSHRReq = inflightCnt >= (mshrsAll-2).U
+  val noSpaceForSinkBReq = inflightCnt >= (2 * mshrsAll).U
+  val noSpaceForMSHRReq = inflightCnt >= (2 * mshrsAll - 2).U
 
   io.toReqArb.blockSinkBReqEntrance := noSpaceForSinkBReq
   io.toReqArb.blockMSHRReqEntrance := noSpaceForMSHRReq
@@ -72,12 +77,22 @@ class TXRSP(implicit p: Parameters) extends CoupledL2Module {
   io.out.valid := queue.io.deq.valid
   io.out.bits := queue.io.deq.bits
   queue.io.deq.ready := io.out.ready
+  taskQueue.io.deq.ready := io.out.ready
 
-  queue.io.enq.valid := io.pipeRsp.valid || io.mshrRsp.valid && !noSpaceForSinkBReq && !noSpaceForMSHRReq
+  val enqValid = io.pipeRsp.valid || io.mshrRsp.valid && !noSpaceForSinkBReq && !noSpaceForMSHRReq
+  queue.io.enq.valid := enqValid
   queue.io.enq.bits := Mux(io.pipeRsp.valid, toCHIRSPBundle(io.pipeRsp.bits), io.mshrRsp.bits)
+  taskQueue.io.enq.valid := enqValid
+  taskQueue.io.enq.bits := Mux(io.pipeRsp.valid, io.pipeRsp.bits, 0.U.asTypeOf(new TaskBundle))
+  assert(queue.io.enq.ready === taskQueue.io.enq.ready,
+    "TXRSP response and task queues must remain synchronized")
+  assert(queue.io.deq.valid === taskQueue.io.deq.valid,
+    "TXRSP response and task queues must remain synchronized")
 
-  io.pipeRsp.ready := true.B
+  io.pipeRsp.ready := queue.io.enq.ready
   io.mshrRsp.ready := !io.pipeRsp.valid && !noSpaceForSinkBReq && !noSpaceForMSHRReq
+  io.done.valid := RegNext(io.out.fire, false.B)
+  io.done.bits := RegNext(taskQueue.io.deq.bits)
 
   def toCHIRSPBundle(task: TaskBundle): CHIRSP = {
     val rsp = WireInit(0.U.asTypeOf(new CHIRSP()))

@@ -79,12 +79,23 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   // MSHR may send Release(Data) or Grant(Data) or ProbeAck(Data) through Main Pipe
   val mshrTask = Bool()                   // is task from mshr
   val mshrId = UInt(mshrBits.W)           // mshr entry index (used only in mshr-task)
+  val mshrContext = UInt(2.W)
+  val replaceTask = Bool()
+  val replaceCapture = Bool()
+  val refillToReleaseCopy = Bool()
+  val refillBufReadId = UInt(mshrBits.W)
+  val refillOnly = Bool()
+  val deferRefillWrite = Bool()
+  val grantInstallEn = Bool()
+  val qosClass = UInt(3.W)
+  val normalRefillRevalidate = Bool()
   val aliasTask = aliasBitsOpt.map(_ => Bool()) // Anti-alias
   val useProbeData = Bool()               // data source, true for ReleaseBuf and false for RefillBuf
   val mshrRetry = Bool()                  // is retry task for mshr conflict
 
   val readProbeDataDown = Bool()          // whether data from ReleaseBuf was needed on mainpipe by downward operations
                                           // reads by upwards was handled in RequestArb by 'mshrTask_s2_a_upwards'
+  val readRefillData = Bool()             // whether data from RefillBuf was needed on mainpipe
 
   // For Intent
   val fromL2pft = prefetchOpt.map(_ => Bool()) // Is the prefetch req from L2(BOP) or from L1 prefetch?
@@ -171,9 +182,30 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
 class PipeStatus(implicit p: Parameters) extends L2Bundle
   with HasTLChannelBits
 
+// One promise for the grant/data FIFO, whose physical depth is mshrsAll.
+// The A subset also reserves the separately sized GrantAck/prefetch tables.
+class GrantReservationToken(implicit p: Parameters) extends L2Bundle
+  with HasTLChannelBits {
+  val id = UInt(log2Ceil(mshrsAll).max(1).W)
+  val generation = UInt(8.W)
+}
+
+class PipeSetStatus(implicit p: Parameters) extends L2Bundle {
+  val set = UInt(setBits.W)
+  val pendingSnoop = Bool()
+}
+
 class PipeEntranceStatus(implicit p: Parameters) extends L2Bundle {
   val tags = Vec(4, UInt(tagBits.W))
   val sets = Vec(4, UInt(setBits.W))
+  val aCandidateValid = Bool()
+  val aCandidateTag   = UInt(tagBits.W)
+  val aCandidateSet   = UInt(setBits.W)
+  val bValid = Bool()
+  val bCandidateValid = Bool()
+  val bToN = Bool()
+  val bFire = Bool()
+  val cReleaseData = Bool()
 
   def c_tag = tags(0)
   def b_tag = tags(1)
@@ -233,6 +265,7 @@ class MSHRRequest(implicit p: Parameters) extends L2Bundle {
   val dirResult = new DirResult()
   val state = new FSMState()
   val task = new TaskBundle()
+  val snoopSlotToken = new SnoopSlotToken
 }
 
 // MSHR info to ReqBuf and SinkB
@@ -263,21 +296,92 @@ class MSHRInfo(implicit p: Parameters) extends L2Bundle with HasTLChannelBits {
   val param = UInt(3.W)
   val mergeA = Bool() // whether the mshr already merge an acquire(avoid alias merge)
 
+  val grantPending = Bool()
+
   val w_grantfirst = Bool()
   val w_grantlast = Bool()
   val w_grant = Bool()
   val s_release = Bool()
   val s_refill = Bool()
-  val s_cmoresp = Bool()
-  val s_cmometaw = Bool()
   val w_releaseack = Bool()
   val w_replResp = Bool()
   val w_rprobeacklast = Bool()
 
-  val replaceData = Bool() // If there is a replace, WriteBackFull or Evict
+  val postGrantReleaseHold = Bool()
+
+  val refillCommitPending = Bool()
+
+  val refillCommitLanded = Bool()
+
+  val replaceData = Bool() // Replacement requires a data-bearing lower-level release
 
   // release to T with data or UC (e.g. WriteCleanFull)
   val releaseToClean = Bool()
+
+  val blocksSnoop = Bool()
+
+}
+
+class ReplacementAllocAddress(implicit p: Parameters) extends L2Bundle {
+  val set = UInt(setBits.W)
+  val tag = UInt(tagBits.W)
+}
+
+object ReplacementAllocAddress {
+  // Higher-index origins have priority, matching incomingVictim assignments even on simultaneous requests.
+  def requestedOrigins(requested: Seq[Bool]): Seq[Bool] = {
+    requested.indices.map { i =>
+      requested(i) && !requested.drop(i + 1).foldLeft(false.B)(_ || _)
+    }
+  }
+  def acceptedOrigins(requested: Seq[Bool], accepted: Bool): Seq[Bool] =
+    requestedOrigins(requested).map(_ && accepted)
+}
+
+class ReplaceMSHRInfo(implicit p: Parameters) extends L2Bundle {
+  val ownsWay = Bool()
+  val valid = Bool()
+  val parentId = UInt(mshrBits.W)
+  val parentEpoch = Bool()
+  val parentAttached = Bool()
+  val detached = Bool()
+  val releaseBufReady = Bool()
+  val refillReady = Bool()
+  val set = UInt(setBits.W)
+  val tag = UInt(tagBits.W)
+  val way = UInt(wayBits.W)
+  val meta = new MetaEntry
+  val probeDone = Bool()
+  val releaseStarted = Bool()
+  val copyBackIssued = Bool()
+  val snoopInvalidated = Bool()
+  val releaseAck = Bool()
+  val releaseToClean = Bool()
+}
+
+class ReplaceRequest(implicit p: Parameters) extends L2Bundle {
+  val parentId = UInt(mshrBits.W)
+  val parentEpoch = Bool()
+  val parentAttached = Bool()
+  val dirResult = new DirResult
+  val task = new TaskBundle
+  val mode = UInt(2.W)
+  val needProbe = Bool()
+  val probeParam = UInt(3.W)
+  val captureFromDS = Bool()
+  val needRelease = Bool()
+}
+
+object ReplaceMSHRMode {
+  val victim = 0.U(2.W)
+  val cmoClean = 1.U(2.W)
+  val cmoFlush = 2.U(2.W)
+  val cmoInval = 3.U(2.W)
+}
+
+class ReplaceDone(implicit p: Parameters) extends L2Bundle {
+  val parentId = UInt(mshrBits.W)
+  val parentEpoch = Bool()
 }
 
 class RespInfoBundle(implicit p: Parameters) extends L2Bundle
@@ -302,33 +406,27 @@ class RespInfoBundle(implicit p: Parameters) extends L2Bundle
   val traceTag = chiOpt.map(_ => Bool())
 }
 
-class RespBundle(implicit p: Parameters) extends L2Bundle {
+class RespBundle(implicit p: Parameters) extends L2Bundle with HasCHIMsgParameters {
   val valid = Bool()
   val mshrId = UInt(mshrBits.W)
+  val txnID = UInt(TXNID_WIDTH.W)
   val set = UInt(setBits.W)
   val tag = UInt(tagBits.W)
   val respInfo = new RespInfoBundle
 }
 
-class FSMState(implicit p: Parameters) extends L2Bundle {
+class NormalFSMState(implicit p: Parameters) extends L2Bundle {
   // schedule
   val s_acquire = Bool()  // acquire downwards
   val s_rprobe = Bool()   // probe upwards, caused by replace
-  val s_pprobe = Bool()   // probe upwards, casued by probe
   val s_release = Bool()  // release downwards
-  val s_probeack = Bool() // respond probeack downwards
   val s_refill = Bool()   // respond grant upwards
   // val s_grantack = Bool() // respond grantack downwards, moved to GrantBuf
   // val s_triggerprefetch = prefetchOpt.map(_ => Bool())
   val s_retry = Bool()    // need retry when conflict
-  val s_cmoresp = Bool()  // resp upwards for finishing CMO transactions
-  val s_cmometaw = Bool() // meta write compensation for CMO transactions
 
   // wait
-  val w_rprobeackfirst = Bool()
   val w_rprobeacklast = Bool()
-  val w_pprobeackfirst = Bool()
-  val w_pprobeacklast = Bool()
   val w_grantfirst = Bool()
   val w_grantlast = Bool()
   val w_grant = Bool()
@@ -337,10 +435,20 @@ class FSMState(implicit p: Parameters) extends L2Bundle {
 
   // CHI
   val s_rcompack = chiOpt.map(_ => Bool())
-  val s_wcompack = chiOpt.map(_ => Bool())
-  val s_cbwrdata = chiOpt.map(_ => Bool())
   val s_reissue = chiOpt.map(_ => Bool())
+}
+
+class FSMState(implicit p: Parameters) extends NormalFSMState {
+  val s_pprobe = Bool()
+  val w_rprobeackfirst = Bool()
+  val w_pprobeackfirst = Bool()
+  val w_pprobeacklast = Bool()
+  val s_wcompack = chiOpt.map(_ => Bool())
+  val s_probeack = Bool()
+  val s_cbwrdata = chiOpt.map(_ => Bool())
   val s_dct = chiOpt.map(_ => Bool())
+  // Compatibility for allocation producers; production contexts do not consume this field.
+  val s_cmoresp = Bool()
 }
 
 class SourceAReq(implicit p: Parameters) extends L2Bundle {
@@ -368,6 +476,7 @@ class BlockInfo(implicit p: Parameters) extends L2Bundle {
   val blockA_s1 = Bool()
   val blockB_s1 = Bool()
   val blockC_s1 = Bool()
+  val blockAll_s1 = Bool()
 }
 
 // used for nested C Release

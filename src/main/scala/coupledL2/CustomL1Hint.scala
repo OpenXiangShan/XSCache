@@ -62,11 +62,11 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
 
   // ==================== Hint Generation ====================
   // Hint for "MSHRTask and ReleaseAck" will fire@s1
-  def isGrantData(t: TaskBundle):  Bool = t.fromA && t.opcode === GrantData
-  def isGrant(t: TaskBundle):      Bool = t.fromA && t.opcode === Grant
-  def isMergeGrantData(t: TaskBundle): Bool = t.fromA && t.mergeA && t.aMergeTask.opcode === GrantData
-  def isMergeGrant(t: TaskBundle):     Bool = t.fromA && t.mergeA && t.aMergeTask.opcode === Grant
-  def isAccessAckData(t: TaskBundle):  Bool = t.fromA && t.opcode === AccessAckData
+  def isGrantData(t: TaskBundle):  Bool = !t.refillOnly && t.fromA && t.opcode === GrantData
+  def isGrant(t: TaskBundle):      Bool = !t.refillOnly && t.fromA && t.opcode === Grant
+  def isMergeGrantData(t: TaskBundle): Bool = !t.refillOnly && t.fromA && t.mergeA && t.aMergeTask.opcode === GrantData
+  def isMergeGrant(t: TaskBundle):     Bool = !t.refillOnly && t.fromA && t.mergeA && t.aMergeTask.opcode === Grant
+  def isAccessAckData(t: TaskBundle):  Bool = !t.refillOnly && t.fromA && t.opcode === AccessAckData
   def isCBOAck(t: TaskBundle):         Bool = t.fromA && t.opcode === CBOAck
 
   val mshr_GrantData_s1 = io.mshrHintQInfo.valid && (isGrantData(mshr_s1) || isMergeGrantData(mshr_s1))
@@ -103,7 +103,7 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   // ==================== Hint Queue ====================
   val hintEntries = mshrsAll
   val hintEntriesWidth = log2Ceil(hintEntries)
-  val hintQueue = Module(new Queue(new HintQueueEntry, hintEntries))
+  val hintQueue = Module(new Queue(new HintQueueEntry, hintEntries, pipe = false, flow = false))
   val canFlow_s1 = !hintQueue.io.deq.valid || hintQueue.io.count === 1.U && hintQueue.io.deq.fire
   val valid_s1 = mshr_GrantData_s1 || mshr_Grant_s1 || mshr_AccessAckData_s1 || mshr_CBOAck_s1 || chn_Release_s1
   val flow_s1, drop_s1, enq_s3 = Wire(Decoupled(new HintQueueEntry))
@@ -114,7 +114,7 @@ class CustomL1Hint(implicit p: Parameters) extends L2Module {
   // staging FIFO between the s1 hint event and hintQueue; depth 2 absorbs
   // back-to-back s1 hint events, and RequestArb blocks hint-generating fires
   // when full, so a hint event always has a place to go (see assert below)
-  val hint_s1Queue = Module(new Queue(new HintQueueEntry, 2))
+  val hint_s1Queue = Module(new Queue(new HintQueueEntry, 2, pipe = false, flow = false))
   hint_s1Queue.io.enq.valid := valid_s1 && (!canFlow_s1 || !flow_s1.ready)
   hint_s1Queue.io.enq.bits  := enqBits_s1
   assert(!valid_s1 || hint_s1Queue.io.enq.ready || flow_s1.ready)

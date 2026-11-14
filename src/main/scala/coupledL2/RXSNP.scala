@@ -32,13 +32,24 @@ class RXSNP(
   val io = IO(new Bundle() {
     val rxsnp = Flipped(DecoupledIO(new CHISNP()))
     val task = DecoupledIO(new TaskBundle())
-    val msInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo())))
+    val admissionEnable = Input(Bool())
+    val queued = Output(Bool())
+    val pipeSetStatus = Flipped(Vec(8, ValidIO(new PipeSetStatus)))
+    val admission = DecoupledIO(new TaskBundle)
+    val replaceAdmissionIdle = Input(UInt(mshrsAll.W))
+    val sidecarReserve = ValidIO(UInt(mshrBits.W))
+    val refillInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo())))
+    val snoopInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo())))
+    val replaceInfo = Vec(mshrsAll, Flipped(ValidIO(new ReplaceMSHRInfo)))
+    val refillVictimDelegated = Input(UInt(mshrsAll.W))
+    val replaceAlloc = Vec(4, Flipped(ValidIO(new ReplacementAllocAddress)))
   })
 
   val rxsnp = Wire(io.rxsnp.cloneType)
-  val queue = Module(new Queue(io.rxsnp.bits.cloneType, 2, flow = false))
+  val queue = Module(new Queue(io.rxsnp.bits.cloneType, 2, pipe = false, flow = false))
   rxsnp <> queue.io.deq
   queue.io.enq <> io.rxsnp
+  io.queued := queue.io.deq.valid
   val task = Wire(new TaskBundle)
 
   /**
@@ -55,11 +66,17 @@ class RXSNP(
     *    because snoop has higher priority than request.
     * 5. Before MSHR completes Probe to L1 for alias replacing, snoop should be **blocked*.
     */
-  val reqBlockSnpMask = VecInit(io.msInfo.map(s =>
+  val reqBlockSnpMask = VecInit(io.refillInfo.map(s =>
       s.valid && s.bits.set === task.set && s.bits.reqTag === task.tag && (
-      s.bits.w_grantfirst || // See [2], [3] above with 's.bits.blockRefill'
-      s.bits.aliasTask.getOrElse(false.B) && !s.bits.w_rprobeacklast // See [5] above
-    ) && (s.bits.blockRefill || s.bits.w_releaseack) && !s.bits.willFree
+      !s.bits.postGrantReleaseHold && (
+        s.bits.grantPending ||
+        ((s.bits.w_grantfirst || // See [2], [3] above with 's.bits.blockRefill'
+          s.bits.aliasTask.getOrElse(false.B) && !s.bits.w_rprobeacklast) &&
+          (s.bits.blockRefill || s.bits.w_releaseack ||
+            (s.bits.s_refill)))
+      ) ||
+      s.bits.postGrantReleaseHold && s.bits.refillCommitPending
+    )
   )).asUInt
   val reqBlockSnp = reqBlockSnpMask.orR
 
@@ -74,46 +91,99 @@ class RXSNP(
     *    release tasks to MainPipe (DS write was done in release tasks on MainPipe), the incoming snoop of Y should 
     *    be **blocked**.
     */
-  val cmoBlockSnpMask = VecInit(io.msInfo.map(s => 
-    s.valid && s.bits.dirHit && isValid(s.bits.meta.state) &&
-    !s.bits.s_cmoresp && (!s.bits.s_release || !s.bits.w_rprobeacklast || !s.bits.s_cmometaw) &&
-    !s.bits.willFree
-  )).asUInt
-  val cmoBlockSnp = cmoBlockSnpMask.orR
-  val replaceBlockSnpMask = VecInit(io.msInfo.map(s =>
-    s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag && !s.bits.dirHit && isValid(s.bits.meta.state) &&
-    s.bits.s_cmoresp && s.bits.w_replResp && (!s.bits.w_rprobeacklast || s.bits.w_releaseack || !RegNext(s.bits.w_replResp)) &&
-    !s.bits.willFree
-  )).asUInt
+  val replaceBlockSnpMask = VecInit(io.refillInfo.zipWithIndex.map { case (s, i) =>
+    !io.refillVictimDelegated(i) && s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag && !s.bits.dirHit && isValid(s.bits.meta.state) &&
+    s.bits.w_replResp && (!s.bits.w_rprobeacklast || s.bits.w_releaseack || !RegNext(s.bits.w_replResp))
+  }).asUInt
   val replaceBlockSnp = replaceBlockSnpMask.orR
+  val sidecarLineMask = VecInit(io.replaceInfo.map(s =>
+    s.valid && s.bits.set === task.set && s.bits.tag === task.tag
+  )).asUInt
 
-  // '!s.bits.dirHit'     : Nesting a Cache Replacement subsequent release
-  // '!s.bits.s_cmoresp'  : Nesting a CMO subsequent release
-  val replaceNestSnpMask = VecInit(io.msInfo.map(s =>
-      s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag &&
-      (!s.bits.dirHit || !s.bits.s_cmoresp) && s.bits.meta.state =/= INVALID &&
+  // Service snoops while CopyBack is outstanding; only issued immutable CopyBackWrData blocks nesting.
+  val sidecarNestReadyMask = VecInit(io.replaceInfo.zipWithIndex.map { case (s, i) =>
+    s.bits.probeDone && s.bits.releaseBufReady && io.replaceAdmissionIdle(i) &&
+      (!s.bits.releaseStarted || !s.bits.copyBackIssued)
+  }).asUInt
+  val sidecarNestSnpMask = sidecarLineMask & sidecarNestReadyMask
+
+  // Capture the full snoop snapshot with its concrete S/R reservation; hold the queue owner until B acceptance.
+  val admissionValid = RegInit(false.B)
+  val admissionTask = RegInit(0.U.asTypeOf(new TaskBundle))
+  val admissionOwnerGeneration = Reg(UInt((mshrBits + 1).W))
+
+
+  val normalVictimAwaitingOwnerMask = VecInit(io.refillInfo.zipWithIndex.map { case (s, i) =>
+    !io.refillVictimDelegated(i) && s.valid && s.bits.set === task.set && s.bits.metaTag === task.tag &&
+      !s.bits.dirHit && s.bits.meta.state =/= INVALID &&
       RegNext(s.bits.w_replResp) && s.bits.w_rprobeacklast && !s.bits.w_releaseack
-    )).asUInt
-  val releaseToInvalNestSnpMask = replaceNestSnpMask & VecInit(io.msInfo.map(s =>
-      !s.bits.releaseToClean
-    )).asUInt
-  val releaseToCleanNestSnpMask = replaceNestSnpMask & VecInit(io.msInfo.map(s =>
-      s.bits.releaseToClean
-    )).asUInt
-  val replaceDataMask = VecInit(io.msInfo.map(_.bits.replaceData)).asUInt
+  }).asUInt
+  val normalVictimAwaitingOwner = normalVictimAwaitingOwnerMask.orR && !sidecarLineMask.orR
+  val replaceNestSnpMask = sidecarNestSnpMask
+  val releaseToInvalNestSnpMask = VecInit(io.replaceInfo.map(s =>
+    !s.bits.releaseToClean)).asUInt & replaceNestSnpMask
+  val releaseToCleanNestSnpMask = VecInit(io.replaceInfo.map(s =>
+    s.bits.releaseToClean)).asUInt & replaceNestSnpMask
+  val nestedSnoopDataMask = VecInit(io.replaceInfo.map(s =>
+    s.bits.releaseBufReady && !s.bits.snoopInvalidated)).asUInt
+  val sidecarAlreadyInvalidMask = VecInit(io.replaceInfo.map(s =>
+    s.valid && s.bits.snoopInvalidated
+  )).asUInt
+  when (rxsnp.valid && sidecarNestSnpMask.orR && !(sidecarNestSnpMask & sidecarAlreadyInvalidMask).orR) {
+    assert((sidecarNestSnpMask & nestedSnoopDataMask).orR,
+      "a sidecar-nested snoop must source data from the victim ReleaseBuf")
+  }
 
-  val replaceNestSnpMeta = ParallelOR(io.msInfo.zip(replaceNestSnpMask.asBools).map { case (ms, hit) => {
-    Mux(hit, ms.bits.meta, MetaEntry())
-  }})
+  val replaceNestSnpMeta = ParallelOR((0 until mshrsAll).map { i =>
+    Mux(replaceNestSnpMask(i),
+      Mux(io.replaceInfo(i).bits.snoopInvalidated, MetaEntry(), io.replaceInfo(i).bits.meta),
+      MetaEntry())
+  })
 
   assert(!rxsnp.valid || PopCount(replaceNestSnpMask) <= 1.U, "multiple replace nest snoop")
 
   task := fromSnpToTaskBundle(rxsnp.bits)
 
-  val stall = reqBlockSnp || replaceBlockSnp || cmoBlockSnp // addrConflict || replaceConflict
-  io.task.valid := rxsnp.valid && !stall
-  io.task.bits := task
-  rxsnp.ready := io.task.ready && !stall
+  val snoopContextBlock = VecInit(io.snoopInfo.map(s =>
+    s.valid && s.bits.blocksSnoop && s.bits.set === task.set && s.bits.reqTag === task.tag
+  )).asUInt.orR
+  val allocatingSidecarMatch = VecInit(io.replaceAlloc.map(s =>
+    s.valid && s.bits.set === task.set && s.bits.tag === task.tag
+  )).asUInt.orR
+  val allocatingSidecarBlockSnp = allocatingSidecarMatch && !sidecarNestSnpMask.orR
+  val sidecarBlockSnp = (sidecarLineMask & ~sidecarNestSnpMask).orR ||
+    allocatingSidecarBlockSnp
+  val pipelineSetConflict = io.pipeSetStatus.map(status =>
+    status.valid && status.bits.set === task.set).reduce(_ || _)
+  val stall = reqBlockSnp || replaceBlockSnp || sidecarBlockSnp ||
+    normalVictimAwaitingOwner || snoopContextBlock || pipelineSetConflict
+
+  io.admission.valid := rxsnp.valid && io.admissionEnable && !admissionValid && !stall
+  io.admission.bits := task
+  val admissionCapture = io.admission.fire
+  io.task.valid := admissionValid
+  io.task.bits := admissionTask
+  rxsnp.ready := io.task.fire
+
+  val admissionOwnerOH = UIntToOH(task.snpHitReleaseIdx, mshrsAll)
+  when(admissionCapture) {
+    admissionValid := true.B
+    admissionTask := task
+    admissionOwnerGeneration := Mux1H(admissionOwnerOH,
+      io.replaceInfo.map(s => Cat(s.bits.parentEpoch, s.bits.parentId)))
+  }.elsewhen(io.task.fire) {
+    admissionValid := false.B
+  }
+  io.sidecarReserve.valid := RegNext(admissionCapture && task.snpHitRelease, false.B)
+  io.sidecarReserve.bits := RegEnable(task.snpHitReleaseIdx, admissionCapture)
+
+  when(admissionValid) {
+    assert(rxsnp.valid, "a retained snoop snapshot must keep its CHI queue head")
+    assert(fromSnpToTaskBundle(rxsnp.bits).tag === admissionTask.tag &&
+      fromSnpToTaskBundle(rxsnp.bits).set === admissionTask.set &&
+      rxsnp.bits.txnID === admissionTask.txnID.get,
+      "a retained snoop snapshot must keep the same CHI request")
+  }
 
   val stallCnt = RegInit(0.U(64.W))
   when(rxsnp.fire) {
@@ -127,16 +197,41 @@ class RXSNP(
     "stallCnt full! maybe there is a deadlock! addr => 0x%x req_opcode => %d txn_id => %d",
     rxsnp.bits.addr, rxsnp.bits.opcode, rxsnp.bits.txnID)
 
-  assert(!(stall && rxsnp.fire))
+  when (allocatingSidecarBlockSnp) {
+    assert(!sidecarNestSnpMask.orR,
+      "a sidecar's own nested snoop must not be blocked by its allocation origin")
+  }
+  val allocBlockOnly = rxsnp.valid && allocatingSidecarBlockSnp &&
+    !(reqBlockSnp || replaceBlockSnp || snoopContextBlock ||
+      (sidecarLineMask & ~sidecarNestSnpMask).orR)
+  val allocBlockCnt = RegInit(0.U(8.W))
+  when (allocBlockOnly) {
+    allocBlockCnt := allocBlockCnt + 1.U
+  }.otherwise {
+    allocBlockCnt := 0.U
+  }
+  val ALLOC_BLOCK_CNT_MAX = 255.U
+  assert(allocBlockCnt =/= ALLOC_BLOCK_CNT_MAX,
+    "a snoop blocked only by an allocating sidecar must eventually be admitted")
+
+  when(io.task.fire && admissionTask.snpHitRelease) {
+    val owner = Mux1H(UIntToOH(admissionTask.snpHitReleaseIdx, mshrsAll), io.replaceInfo)
+    assert(owner.valid && owner.bits.set === admissionTask.set &&
+      owner.bits.tag === admissionTask.tag &&
+      Cat(owner.bits.parentEpoch, owner.bits.parentId) === admissionOwnerGeneration,
+      "captured nested snoop must retain its reserved ReleaseBuf owner")
+  }
+  assert(!admissionCapture || !stall)
 
   def fromSnpToTaskBundle(snp: CHISNP): TaskBundle = {
     val task = WireInit(0.U.asTypeOf(new TaskBundle))
     task.channel := "b010".U
     // Addr in CHI SNP channel has 3 fewer bits than full address
     val snpFullAddr = Cat(snp.addr, 0.U(3.W))
-    task.tag := parseAddress(snpFullAddr)._1
-    task.set := parseAddress(snpFullAddr)._2
-    task.off := parseAddress(snpFullAddr)._3
+    val snpAddress = parseAddress(snpFullAddr)
+    task.tag := snpAddress._1
+    task.set := snpAddress._2
+    task.off := snpAddress._3
     task.alias.foreach(_ := 0.U)
     task.vaddr.foreach(_ := 0.U)
     task.isKeyword.foreach(_ := false.B)
@@ -167,7 +262,7 @@ class RXSNP(
     task.snpHitRelease := replaceNestSnpMask.orR
     task.snpHitReleaseToInval := releaseToInvalNestSnpMask.orR
     task.snpHitReleaseToClean := releaseToCleanNestSnpMask.orR
-    task.snpHitReleaseWithData := (replaceNestSnpMask & replaceDataMask).orR
+    task.snpHitReleaseWithData := (replaceNestSnpMask & nestedSnoopDataMask).orR
     task.snpHitReleaseIdx := PriorityEncoder(replaceNestSnpMask)
     task.snpHitReleaseMeta := replaceNestSnpMeta
     task.tgtID.foreach(_ := 0.U) // TODO
