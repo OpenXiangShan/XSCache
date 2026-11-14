@@ -53,10 +53,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val setStatus = Vec(5, ValidIO(new PipeSetStatus))
 
     /* handle capacity conflict of GrantBuffer */
-    val status_vec_toD = Vec(4, ValidIO(new PipeStatus))
+    val status_vec_toD = Vec(5, ValidIO(new PipeStatus))
     val grantReservationReturn = ValidIO(new PipeStatus)
     /* handle capacity conflict of TX channels */
-    val status_vec_toTX = Vec(4, ValidIO(new PipeStatusWithCHI))
+    val status_vec_toTX = Vec(5, ValidIO(new PipeStatusWithCHI))
 
     /* get dir result at stage 3 */
     val dirResp_s3 = Input(new DirResult())
@@ -587,9 +587,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       "orphan ReleaseData apply must consume its registered slot reservation")
   }
   val leaseToken_s3 = s3Decision.bits.token
-  val preApplyTask = Wire(Valid(new TaskBundle))
-  preApplyTask.valid := task_s3_capture.valid || task_s3_decide.valid
-  preApplyTask.bits := Mux(task_s3_decide.valid, task_s3_decide.bits, task_s3_capture.bits)
+  val preApplyTasks = Seq(task_s3_capture, task_s3_decide)
   when(task_s3.valid && task_s3.bits.mshrTask && task_s3.bits.mshrContext === 0.U &&
       s3Decision.bits.repl.valid) {
     assert(s3Decision.bits.parentGeneration === leaseToken_s3.generation,
@@ -1453,11 +1451,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.toReqBuf(3) := task_s3.valid && s23Block('a', task_s3.bits)
 
   io.toReqArb.blockC_s1 := task_s2.valid && s23Block('c', task_s2.bits) ||
-    preApplyTask.valid && s23Block('c', preApplyTask.bits)
+    preApplyTasks.map(task => task.valid && s23Block('c', task.bits)).reduce(_ || _)
 
   io.toReqArb.blockB_s1 :=
     task_s2.valid && bBlock(task_s2.bits) ||
-    preApplyTask.valid && bBlock(preApplyTask.bits) ||
+    preApplyTasks.map(task => task.valid && bBlock(task.bits)).reduce(_ || _) ||
     task_s3.valid && bBlock(task_s3.bits) ||
     task_s4.valid && bBlock(task_s4.bits, tag = true) ||
     task_s5.valid && bBlock(task_s5.bits, tag = true)
@@ -1465,11 +1463,11 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.toReqArb.blockA_s1 := false.B
 
   io.toReqArb.blockG_s1 := task_s2.valid && s23Block('g', task_s2.bits) ||
-    preApplyTask.valid && s23Block('g', preApplyTask.bits)
+    preApplyTasks.map(task => task.valid && s23Block('g', task.bits)).reduce(_ || _)
   io.toReqArb.blockAll_s1 := orphanApplyBlocked
 
   /* ======== Pipeline Status ======== */
-  require(io.status_vec_toD.size == 4)
+  require(io.status_vec_toD.size == 5)
   io.status_vec_toD(0).valid := task_s3.valid && Mux(
     mshr_req_s3,
     mshr_refill_s3 && !retry && !mshr_refill_only_s3,
@@ -1485,14 +1483,16 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.status_vec_toD(1).bits.channel := task_s4.bits.channel
   io.status_vec_toD(2).valid        := d_s5.valid
   io.status_vec_toD(2).bits.channel := task_s5.bits.channel
-  io.status_vec_toD(3).valid := preApplyTask.valid
-  io.status_vec_toD(3).bits.channel := preApplyTask.bits.channel
+  io.status_vec_toD.drop(3).zip(preApplyTasks).foreach { case (status, task) =>
+    status.valid := task.valid
+    status.bits.channel := task.bits.channel
+  }
 
   // capacity control of TX channels
   val tx_task_s3 = Wire(Valid(new TaskBundle))
   tx_task_s3.valid := task_s3.valid // TODO: review this
   tx_task_s3.bits := req_s3
-  val tasks = Seq(preApplyTask, tx_task_s3, task_s4, task_s5)
+  val tasks = preApplyTasks ++ Seq(tx_task_s3, task_s4, task_s5)
   io.status_vec_toTX.zip(tasks).foreach { case (status, task) =>
     status.valid := task.valid
     status.bits.channel := task.bits.channel

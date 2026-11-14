@@ -148,6 +148,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   reqBuf.io.pipeStatusVec(0) := reqArb.io.status_vec(1) // s2 status
   reqBuf.io.pipeStatusVec(1) := mainPipe.io.status_vec_toD(3) // result capture
   reqBuf.io.pipeStatusVec(2) := mainPipe.io.status_vec_toD(0) // S3 apply
+  reqBuf.io.pipeStatusVec(3) := mainPipe.io.status_vec_toD(4) // retained decision
   reqBuf.io.s1Entrance := reqArb.io.s1Entrance
   reqBuf.io.taskFromArb_s2 := reqArb.io.taskToPipe_s2
 
@@ -215,6 +216,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   mshrCtl.io.pipeStatusVec(0) := (reqArb.io.status_vec)(1) // s2 status
   mshrCtl.io.pipeStatusVec(1) := mainPipe.io.status_vec_toD(3) // result capture
   mshrCtl.io.pipeStatusVec(2) := mainPipe.io.status_vec_toD(0) // S3 apply
+  mshrCtl.io.pipeStatusVec(3) := mainPipe.io.status_vec_toD(4) // retained decision
 
   /* Read and write release buffer */
   releaseBuf.io.r := reqArb.io.releaseBufRead_s2

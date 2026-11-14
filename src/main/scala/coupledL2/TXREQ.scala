@@ -36,7 +36,7 @@ class TXREQ(implicit p: Parameters) extends CoupledL2Module {
     val mshrReq = Flipped(DecoupledIO(new CHIREQ()))
     val out = DecoupledIO(new CHIREQ())
 
-    val pipeStatusVec = Flipped(Vec(6, ValidIO(new PipeStatusWithCHI)))
+    val pipeStatusVec = Flipped(Vec(7, ValidIO(new PipeStatusWithCHI)))
     val toReqArb = Output(new TXBlockBundle)
 
     val replacePendingCnt = Input(UInt(log2Up(mshrsAll + 1).W))

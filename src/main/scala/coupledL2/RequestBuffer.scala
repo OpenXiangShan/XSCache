@@ -73,7 +73,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     val taskFromArb_s2 = Flipped(ValidIO(new TaskBundle()))
 
     /* status of s2 and s3 */
-    val pipeStatusVec = Flipped(Vec(3, ValidIO(new PipeStatus)))
+    val pipeStatusVec = Flipped(Vec(4, ValidIO(new PipeStatus)))
 
     val ATag        = Output(UInt(tagBits.W))
     val ASet        = Output(UInt(setBits.W))

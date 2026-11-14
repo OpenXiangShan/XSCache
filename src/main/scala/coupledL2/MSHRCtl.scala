@@ -92,7 +92,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val normalReserveCancel = Input(Bool())
 
     /* status of s2 and s3 */
-    val pipeStatusVec = Flipped(Vec(3, ValidIO(new PipeStatus)))
+    val pipeStatusVec = Flipped(Vec(4, ValidIO(new PipeStatus)))
 
     /* send reqs */
     val toTXREQ = DecoupledIO(new CHIREQ())
