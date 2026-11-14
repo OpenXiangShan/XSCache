@@ -841,6 +841,28 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     !(replaceNeedsAlloc && incomingReplaceReq.parentAttached && parentAlreadyHasChild),
     "replacer response for a parent that already owns a child ReplaceMSHR"
   )
+  // Keep the accepted orphan C allocation identity and payload on registered
+  // state before the late nested-release validation stages consume it.
+  class NestedReleaseAllocation extends Bundle {
+    val slot = UInt(mshrBits.W)
+    val generation = UInt(8.W)
+    val set = UInt(setBits.W)
+    val tag = UInt(tagBits.W)
+    val data = new DSBlock
+    val beatMask = UInt(beatSize.W)
+  }
+  val orphanReleaseAllocAccepted = orphanReleaseData && replaceAllocValid
+  val orphanReleaseAllocation = RegInit(0.U.asTypeOf(Valid(new NestedReleaseAllocation)))
+  orphanReleaseAllocation.valid := orphanReleaseAllocAccepted
+  when(orphanReleaseAllocAccepted) {
+    orphanReleaseAllocation.bits.slot := OHToUInt(selectedReplaceSlotOH)
+    orphanReleaseAllocation.bits.generation :=
+      Mux1H(selectedReplaceSlotOH, mshrTaskGenerations(2)) + 1.U
+    orphanReleaseAllocation.bits.set := io.nestedwb.set
+    orphanReleaseAllocation.bits.tag := io.nestedwb.tag
+    orphanReleaseAllocation.bits.data := io.nestedwbPayload
+    orphanReleaseAllocation.bits.beatMask := Fill(beatSize, true.B)
+  }
   // Advertise the winning raw allocation address as one complete registered descriptor, before slot acceptance.
   val replaceAllocSnoopSources = Seq(
     (nestedReleaseNeedsReplace, nestedVictim.set, nestedVictim.tag),
@@ -2387,13 +2409,31 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     Mux(orphanExistingReplaceWrite, orphanReplaceTargetOH, 0.U(mshrsAll.W))
   val nestedSnoopMask = VecInit(nestedwbSnoopActive).asUInt
   val nestedReleaseMask = nestedReplaceMask | nestedSnoopMask
+  val orphanReleaseAllocationOH = Mux(orphanReleaseAllocation.valid,
+    UIntToOH(orphanReleaseAllocation.bits.slot, mshrsAll), 0.U(mshrsAll.W))
+  val nestedReleaseCaptureMask = nestedReleaseMask | orphanReleaseAllocationOH
   when(orphanReleaseData) {
-    assert(orphanNestedwbWrite === replaceAllocValid,
+    assert(orphanNestedwbWrite === replaceAllocValid &&
+      orphanReleaseAllocAccepted === replaceAllocValid,
       "orphan nested payload must retain its newly accepted replacement")
+  }
+  when(orphanReleaseAllocation.valid) {
+    val slotCurrent = Mux1H(orphanReleaseAllocationOH, replaceMshrs.map(_.io.info.valid))
+    val generationCurrent = Mux1H(orphanReleaseAllocationOH, mshrTaskGenerations(2))
+    val setCurrent = Mux1H(orphanReleaseAllocationOH, replaceMshrs.map(_.io.info.bits.set))
+    val tagCurrent = Mux1H(orphanReleaseAllocationOH, replaceMshrs.map(_.io.info.bits.tag))
+    assert(slotCurrent && generationCurrent === orphanReleaseAllocation.bits.generation &&
+      setCurrent === orphanReleaseAllocation.bits.set &&
+      tagCurrent === orphanReleaseAllocation.bits.tag,
+      "registered orphan C allocation lost its Replace owner identity")
+  }
+  when(orphanReleaseAllocation.valid) {
+    assert(!nestedReleaseMask.orR,
+      "a registered orphan C descriptor must be the sole nested-release capture")
   }
   assert(!(nestedReplaceMask & nestedSnoopMask).orR,
     "nested ReleaseData cannot give one physical slot two owners")
-  assert(PopCount(nestedReleaseMask) <= 2.U,
+  assert(PopCount(nestedReleaseCaptureMask) <= 2.U,
     "nested ReleaseData has more than two physical consumers")
 
   class NestedReleaseMasks extends Bundle {
@@ -2414,16 +2454,21 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val beatMask = UInt(beatSize.W)
   }
   val nestedReleaseMasks = RegInit(0.U.asTypeOf(Valid(new NestedReleaseMasks)))
-  nestedReleaseMasks.valid := nestedReleaseMask.orR
-  when(nestedReleaseMask.orR) {
+  nestedReleaseMasks.valid := nestedReleaseCaptureMask.orR
+  when(nestedReleaseCaptureMask.orR) {
     nestedReleaseMasks.bits.snoop := nestedSnoopMask
-    nestedReleaseMasks.bits.replace := nestedReplaceMask
-    nestedReleaseMasks.bits.data := io.nestedwbPayload
-    nestedReleaseMasks.bits.beatMask := Fill(beatSize, true.B)
+    nestedReleaseMasks.bits.replace := nestedReplaceMask | orphanReleaseAllocationOH
+    nestedReleaseMasks.bits.data := Mux(orphanReleaseAllocation.valid,
+      orphanReleaseAllocation.bits.data, io.nestedwbPayload)
+    nestedReleaseMasks.bits.beatMask := Mux(orphanReleaseAllocation.valid,
+      orphanReleaseAllocation.bits.beatMask, Fill(beatSize, true.B))
     (0 until mshrsAll).foreach { i =>
-      nestedReleaseMasks.bits.generations(i) := Mux(nestedReplaceMask(i),
-        mshrTaskGenerations(2)(i) + replaceMshrs(i).io.alloc.valid.asUInt,
+      nestedReleaseMasks.bits.generations(i) := Mux(orphanReleaseAllocationOH(i),
+        orphanReleaseAllocation.bits.generation,
+        Mux(nestedReplaceMask(i),
+          mshrTaskGenerations(2)(i) + replaceMshrs(i).io.alloc.valid.asUInt,
         mshrTaskGenerations(1)(i))
+      )
     }
   }
 
@@ -2497,8 +2542,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       if(replacement) nestedReleaseReserved.bits.replace else nestedReleaseReserved.bits.snoop, 0.U(mshrsAll.W))
     val masks = Mux(nestedReleaseMasks.valid,
       if(replacement) nestedReleaseMasks.bits.replace else nestedReleaseMasks.bits.snoop, 0.U(mshrsAll.W))
+    val allocation = if(replacement) orphanReleaseAllocationOH else 0.U(mshrsAll.W)
     val mirror = if(replacement) mirroredReplaceProbeAckDataPendingOH else 0.U(mshrsAll.W)
-    nestedReleasePending(context) := Fill(mshrsAll, nestedReleaseOwnerHold) | masks | captured | mirror |
+    nestedReleasePending(context) := Fill(mshrsAll, nestedReleaseOwnerHold) | allocation | masks | captured | mirror |
       descriptorMask(nestedReleaseWrite, replacement) | descriptorMask(nestedReleaseValidated, replacement) |
       descriptorMask(nestedReleaseApplied, replacement)
     nestedReleaseDone(context) := descriptorMask(nestedReleaseApplied, replacement)
@@ -2506,7 +2552,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val releaseOwnerAlloc = VecInit(snoopMshrs.map(_.io.alloc.valid)).asUInt |
     VecInit(replaceMshrs.map(_.io.alloc.valid)).asUInt
   val nestedReleaseAuthority = RegInit(0.U(mshrsAll.W))
-  nestedReleaseAuthority := (nestedReleaseAuthority & ~releaseOwnerAlloc) | nestedReleaseMask
+  nestedReleaseAuthority := (nestedReleaseAuthority & ~releaseOwnerAlloc) |
+    nestedReleaseMask | orphanReleaseAllocationOH
   io.nestedReleaseAuthority := nestedReleaseAuthority
 
   class NestedRefillCapture extends Bundle {
