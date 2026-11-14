@@ -182,6 +182,14 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
 class PipeStatus(implicit p: Parameters) extends L2Bundle
   with HasTLChannelBits
 
+// One promise for the grant/data FIFO, whose physical depth is mshrsAll.
+// The A subset also reserves the separately sized GrantAck/prefetch tables.
+class GrantReservationToken(implicit p: Parameters) extends L2Bundle
+  with HasTLChannelBits {
+  val id = UInt(log2Ceil(mshrsAll).max(1).W)
+  val generation = UInt(8.W)
+}
+
 class PipeSetStatus(implicit p: Parameters) extends L2Bundle {
   val set = UInt(setBits.W)
   val pendingSnoop = Bool()

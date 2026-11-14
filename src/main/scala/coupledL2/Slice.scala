@@ -71,6 +71,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   grantBuf.io.fromReqArb.status_s1 := reqArb.io.status_s1
   grantBuf.io.pipelineReserve := reqArb.io.grantReservation
   grantBuf.io.pipelineReturn := mainPipe.io.grantReservationReturn
+  reqArb.io.grantReservationReturn := mainPipe.io.grantReservationReturn
 
   val status_vec_toTX = reqArb.io.status_vec_toTX ++ mainPipe.io.status_vec_toTX
   txreq.io.pipeReq <> mainPipe.io.toTXREQ
@@ -155,6 +156,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   mainPipe.io.taskFromArb_s2 := reqArb.io.taskToPipe_s2
   mainPipe.io.taskLeaseToken_s2 := reqArb.io.taskLeaseToken_s2
   mainPipe.io.taskSnoopReservationToken_s2 := reqArb.io.taskSnoopReservationToken_s2
+  mainPipe.io.taskGrantReservationToken_s2 := reqArb.io.taskGrantReservationToken_s2
   mainPipe.io.mshrHintQInfo := reqArb.io.mshrHintQInfo
   mainPipe.io.sinkCHintQInfo := reqArb.io.sinkCHintQInfo
   reqArb.io.hint_s1QueueFull := mainPipe.io.hint_s1QueueFull

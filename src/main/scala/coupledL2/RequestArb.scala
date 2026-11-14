@@ -45,6 +45,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     val taskLeaseToken_s2 = Output(new MainpipeLeaseToken)
     val snoopReservationToken = Input(new SnoopSlotToken)
     val taskSnoopReservationToken_s2 = Output(new SnoopSlotToken)
+    val taskGrantReservationToken_s2 = ValidIO(new GrantReservationToken)
     val bServiceStart = ValidIO(new TaskBundle)
     val bServiceConsume = ValidIO(new SnoopSlotToken)
     val sidecarReservationHold = Output(Bool())
@@ -52,7 +53,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     val snoopQueued = Input(Bool())
     val reservedB = Output(Bool())
     val contextReservation = Output(Bool())
-    val grantReservation = ValidIO(new PipeStatus)
+    val grantReservation = ValidIO(new GrantReservationToken)
+    val grantReservationReturn = Flipped(Vec(3, ValidIO(new GrantReservationToken)))
     val normalReserveRequest = DecoupledIO(new TaskBundle)
     val normalReserveAck = Flipped(ValidIO(new NormalSlotReservation))
     val normalReserveConsume = Output(Bool())
@@ -113,6 +115,13 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val s2_ready = Wire(Bool())
   val mshr_task_s1 = RegInit(0.U.asTypeOf(Valid(new TaskBundle())))
   val mshrLeaseToken_s1 = Reg(new MainpipeLeaseToken)
+  val mshrGrantToken_s1 = RegInit(0.U.asTypeOf(Valid(new GrantReservationToken)))
+  val grantReservation = Wire(Valid(new GrantReservationToken))
+  val grantReservationOwners = RegInit(VecInit(Seq.fill(mshrsAll)(
+    0.U.asTypeOf(Valid(new GrantReservationToken)))))
+  val grantReservationBusy = VecInit(grantReservationOwners.map(_.valid)).asUInt
+  val grantReservationAvailable = !grantReservationBusy.andR
+  val grantReservationSlotOH = PriorityEncoderOH(~grantReservationBusy)
   // Capture commits the source owner; payload stays on its Q until the atomic source/Directory fire.
   class ChannelDirReadAdmissionToken extends Bundle {
     val valid = Bool()
@@ -122,6 +131,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     val generation = UInt(8.W)
     val sequence = UInt(8.W)
     val snoopSlotToken = new SnoopSlotToken
+    val grantToken = Valid(new GrantReservationToken)
     val paired = Bool()
     val mshrContext = UInt(2.W)
     val refillToReleaseCopy = Bool()
@@ -206,7 +216,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     !io.fromGrantBuffer.blockMSHRReqEntrance &&
     !io.fromTXDAT.blockMSHRReqEntrance &&
     !io.fromTXRSP.blockMSHRReqEntrance &&
-    !io.fromTXREQ.blockMSHRReqEntrance
+    !io.fromTXREQ.blockMSHRReqEntrance &&
+    (!(io.mshrTask.bits.fromA || io.mshrTask.bits.fromC) || grantReservationAvailable)
 
   s0_fire := io.mshrTask.valid && io.mshrTask.ready
 
@@ -219,6 +230,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   when(s0_fire) {
     mshr_task_s1.bits := io.mshrTask.bits
     mshrLeaseToken_s1 := io.mshrLeaseToken
+    mshrGrantToken_s1 := grantReservation
   }
 
   /* Channel interaction from s1 */
@@ -268,10 +280,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     )
   ).asUInt
 
-  val channelCandidateValid = localTransitionIdle && !blockAllEntrance &&
-    (bPending.valid || !admitMshrTurn) && !mshr_task_s1.valid &&
-    sinkValids.orR && resetFinish &&
-    !channelDirReadAdmissionValid && !io.sinkB.valid
+  val channelCandidateValid = Wire(Bool())
   val channelCandidateSource = OHToUInt(PriorityEncoderOH(sinkValids))
   io.aCommit := channelCandidateValid && channelCandidateSource === 2.U
   val channelCandidateTask = Wire(new TaskBundle())
@@ -280,6 +289,11 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     channelCandidateTask := normalReservedTask
     channelCandidateTask.mshrId := io.normalReserveAck.bits.id
   }
+  channelCandidateValid := localTransitionIdle && !blockAllEntrance &&
+    (bPending.valid || !admitMshrTurn) && !mshr_task_s1.valid &&
+    sinkValids.orR && resetFinish &&
+    !channelDirReadAdmissionValid && !io.sinkB.valid &&
+    (!(channelCandidateTask.fromA || channelCandidateTask.fromC) || grantReservationAvailable)
 
   val channelCandidateOwner = Mux(channelCandidateSource === 2.U,
     io.normalReserveAck.bits.id, channelCandidateTask.mshrId)
@@ -292,13 +306,39 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val channelCandidatePaired = channelCandidateTask.snpHitRelease ||
     channelCandidateTask.refillToReleaseCopy || channelCandidateTask.mshrContext =/= 0.U
 
-  val grantReservation = Wire(Valid(new PipeStatus))
-  grantReservation.valid := s0_fire || channelCandidateValid
-  grantReservation.bits.channel := Mux(s0_fire,
+  val grantReservationChannel = Mux(s0_fire,
     io.mshrTask.bits.channel, channelCandidateTask.channel)
+  grantReservation.valid := (s0_fire || channelCandidateValid) &&
+    (grantReservationChannel(0) || grantReservationChannel(2))
+  grantReservation.bits.channel := grantReservationChannel
+  grantReservation.bits.id := OHToUInt(grantReservationSlotOH)
+  grantReservation.bits.generation := Mux1H(grantReservationSlotOH,
+    grantReservationOwners.map(_.bits.generation)) + 1.U
   assert(!(s0_fire && channelCandidateValid),
     "one local execution slot cannot acquire two GrantBuffer reservations")
+  when(grantReservation.valid) {
+    assert(grantReservationAvailable && grantReservationSlotOH.orR,
+      "an A/C admission must own an idle registered GrantBuffer token")
+  }
   io.grantReservation := RegNext(grantReservation, 0.U.asTypeOf(grantReservation))
+  grantReservationOwners.zipWithIndex.foreach { case (owner, i) =>
+    val returns = io.grantReservationReturn.map(event => event.valid && event.bits.id === i.U)
+    assert(PopCount(returns) <= 1.U,
+      "one GrantBuffer reservation token cannot return from two terminal stages")
+    io.grantReservationReturn.zip(returns).foreach { case (event, matches) =>
+      when(matches) {
+        assert(owner.valid && event.bits.asUInt === owner.bits.asUInt,
+          "a local GrantBuffer return must name its exact outstanding token")
+        owner.valid := false.B
+      }
+    }
+    when(grantReservation.valid && grantReservationSlotOH(i)) {
+      assert(!owner.valid && !VecInit(returns).asUInt.orR,
+        "GrantBuffer token admission must use an idle Q slot")
+      owner.valid := true.B
+      owner.bits := grantReservation.bits
+    }
+  }
 
   def channelDirReadOf(task: TaskBundle): DirRead = {
     val bits = Wire(new DirRead())
@@ -511,6 +551,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     channelDirReadAdmissionToken.generation := channelCandidateGeneration
     channelDirReadAdmissionToken.sequence := channelCandidateSequence
     channelDirReadAdmissionToken.snoopSlotToken := channelCandidateSnoopToken
+    channelDirReadAdmissionToken.grantToken := grantReservation
     channelDirReadAdmissionToken.paired := channelCandidatePaired
     channelDirReadAdmissionToken.mshrContext := channelCandidateTask.mshrContext
     channelDirReadAdmissionToken.refillToReleaseCopy := channelCandidateTask.refillToReleaseCopy
@@ -582,6 +623,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     !mshr_task_s1.valid && channelDirReadAdmissionToken.source === 1.U,
     channelDirReadAdmissionToken.snoopSlotToken,
     0.U.asTypeOf(new SnoopSlotToken)), s1_fire)
+  io.taskGrantReservationToken_s2 := RegEnable(Mux(mshr_task_s1.valid,
+    mshrGrantToken_s1, channelDirReadAdmissionToken.grantToken), s1_fire)
 
   // MSHR task
   val mshrTask_s2 = task_s2.valid && task_s2.bits.mshrTask

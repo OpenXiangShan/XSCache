@@ -36,6 +36,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val taskFromArb_s2 = Flipped(ValidIO(new TaskBundle()))
     val taskLeaseToken_s2 = Input(new MainpipeLeaseToken)
     val taskSnoopReservationToken_s2 = Input(new SnoopSlotToken)
+    val taskGrantReservationToken_s2 = Flipped(ValidIO(new GrantReservationToken))
     /* status from arbiter at stage1  */
     val mshrHintQInfo = Flipped(ValidIO(new TaskBundle))
     val sinkCHintQInfo = Flipped(ValidIO(new TaskBundle))
@@ -54,7 +55,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
     /* handle capacity conflict of GrantBuffer */
     val status_vec_toD = Vec(5, ValidIO(new PipeStatus))
-    val grantReservationReturn = ValidIO(new PipeStatus)
+    val grantReservationReturn = Vec(3, ValidIO(new GrantReservationToken))
     /* handle capacity conflict of TX channels */
     val status_vec_toTX = Vec(5, ValidIO(new PipeStatusWithCHI))
 
@@ -189,6 +190,13 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val leaseToken_s3_decide = RegEnable(leaseToken_s3_capture, task_s3_capture.valid)
   val snoopSlotToken_s3_capture = RegEnable(io.taskSnoopReservationToken_s2, task_s2.valid)
   val snoopSlotToken_s3_decide = RegEnable(snoopSlotToken_s3_capture, task_s3_capture.valid)
+  val grantToken_s3_capture = RegEnable(io.taskGrantReservationToken_s2, task_s2.valid)
+  val grantToken_s3_decide = RegEnable(grantToken_s3_capture, task_s3_capture.valid)
+  when(task_s2.valid && (task_s2.bits.fromA || task_s2.bits.fromC)) {
+    assert(io.taskGrantReservationToken_s2.valid &&
+      io.taskGrantReservationToken_s2.bits.channel === task_s2.bits.channel,
+      "an A/C pipeline task must retain its admission GrantBuffer token")
+  }
   // Capture the complete aligned result, decide once, and apply only the retained decision record.
   class NormalS3Action extends Bundle {
     val allocation = new MSHRRequest
@@ -293,6 +301,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val token = new MainpipeLeaseToken
     val orphanReleaseSequence = UInt(8.W)
     val snoopSlotToken = new SnoopSlotToken
+    val grantToken = Valid(new GrantReservationToken)
     val dir = new DirResult
     val repl = Valid(new ReplacerResult)
     val metaOnHit = new MetaEntry
@@ -536,6 +545,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     s3Decision.bits.token := leaseToken_s3_decide
     s3Decision.bits.orphanReleaseSequence := orphanReleaseSequence
     s3Decision.bits.snoopSlotToken := snoopSlotToken_s3_decide
+    s3Decision.bits.grantToken := grantToken_s3_decide
     s3Decision.bits.dir := io.dirResp_s3
     s3Decision.bits.repl := io.replResp
     s3Decision.bits.metaOnHit := io.metaOnHit_s3
@@ -1204,6 +1214,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
   task_s4.valid := task_s3.valid && !req_drop_s3
   val leaseToken_s4 = RegEnable(leaseToken_s3, task_s3.valid && !req_drop_s3)
+  val grantToken_s4 = RegEnable(s3Decision.bits.grantToken, task_s3.valid && !req_drop_s3)
 
   when (task_s3.valid && !req_drop_s3) {
     task_s4.bits := source_req_s3
@@ -1262,6 +1273,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
   task_s5.valid := task_s4.valid && !req_drop_s4
   val leaseToken_s5 = RegEnable(leaseToken_s4, task_s4.valid && !req_drop_s4)
+  val grantToken_s5 = RegEnable(grantToken_s4, task_s4.valid && !req_drop_s4)
   io.setStatus.zip(Seq(task_s3_capture, task_s3_decide, task_s3, task_s4, task_s5))
     .foreach { case (status, task) =>
       status.valid := task.valid
@@ -1277,15 +1289,19 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   assert(!d_s5.valid || d_s5.ready,
     "a terminal SourceD task must own its reserved GrantBuffer capacity")
   val grantReservationEnds = Seq(
-    (d_s3.fire || task_s3.valid && req_drop_s3, task_s3.bits),
-    (d_s4.fire || task_s4.valid && req_drop_s4 && !sourceDTransferred_s4, task_s4.bits),
-    (d_s5.fire || task_s5.valid && !d_s5.valid && !sourceDTransferred_s5, task_s5.bits)
-  ).map { case (end, task) => (end && (task.fromA || task.fromC), task.channel) }
-  val grantReservationReturn = Wire(Valid(new PipeStatus))
-  grantReservationReturn.valid := VecInit(grantReservationEnds.map(_._1)).asUInt.orR
-  grantReservationReturn.bits.channel := Mux1H(grantReservationEnds)
-  assert(PopCount(grantReservationEnds.map(_._1)) <= 1.U,
-    "one local execution slot cannot return two GrantBuffer reservations")
+    (d_s3.fire || task_s3.valid && req_drop_s3, task_s3.bits, s3Decision.bits.grantToken),
+    (d_s4.fire || task_s4.valid && req_drop_s4 && !sourceDTransferred_s4, task_s4.bits, grantToken_s4),
+    (d_s5.fire || task_s5.valid && !d_s5.valid && !sourceDTransferred_s5, task_s5.bits, grantToken_s5)
+  )
+  val grantReservationReturn = Wire(Vec(3, Valid(new GrantReservationToken)))
+  grantReservationReturn.zip(grantReservationEnds).foreach { case (event, (end, task, token)) =>
+    event.valid := end && (task.fromA || task.fromC)
+    event.bits := token.bits
+    when(event.valid) {
+      assert(token.valid && token.bits.channel === task.channel,
+        "each GrantBuffer terminal event must return its own retained token")
+    }
+  }
   io.grantReservationReturn := RegNext(grantReservationReturn,
     0.U.asTypeOf(grantReservationReturn))
   // Return the source lease only after the final local task or buffer reference.

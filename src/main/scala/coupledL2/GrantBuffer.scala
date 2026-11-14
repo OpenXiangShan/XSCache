@@ -69,8 +69,8 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
     val fromReqArb = Input(new Bundle() {
       val status_s1 = new PipeEntranceStatus
     })
-    val pipelineReserve = Flipped(ValidIO(new PipeStatus))
-    val pipelineReturn = Flipped(ValidIO(new PipeStatus))
+    val pipelineReserve = Flipped(ValidIO(new GrantReservationToken))
+    val pipelineReturn = Flipped(Vec(3, ValidIO(new GrantReservationToken)))
     val toReqArb = Output(new Bundle() {
       val blockSinkReqEntrance = new BlockInfo()
       val blockMSHRReqEntrance = Bool()
@@ -303,26 +303,49 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   io.e.ready := eOwnerValid
 
   // Reserve capacity at admission and return it only on queue/table transfer or a no-D terminal event.
-  // The local S1 slot covers the three registered edges needed for reservations and credit to settle.
-  def eventCount(add: Bool, remove: Bool, capacity: Int, name: String): UInt = {
+  // Preserve every terminal identity and every simultaneous return delta.
+  def eventCount(add: Bool, remove: UInt, capacity: Int, name: String): UInt = {
     val used = RegInit(0.U(log2Ceil(capacity + 1).W))
-    when(add && !remove) {
-      assert(used < capacity.U, s"$name overflow")
-      used := used + 1.U
-    }.elsewhen(remove && !add) {
-      assert(used =/= 0.U, s"$name underflow")
-      used := used - 1.U
+    val next = (used +& add.asUInt) - remove
+    when(add || remove.orR) {
+      assert(used >= remove, s"$name underflow")
+      assert(next <= capacity.U, s"$name overflow")
+      used := next
     }
     used
   }
   val reserveGrant = io.pipelineReserve.valid &&
     (io.pipelineReserve.bits.fromA || io.pipelineReserve.bits.fromC)
-  val returnGrant = io.pipelineReturn.valid &&
-    (io.pipelineReturn.bits.fromA || io.pipelineReturn.bits.fromC)
+  val returnGrant = PopCount(io.pipelineReturn.map(event => event.valid &&
+    (event.bits.fromA || event.bits.fromC)))
   val reserveA = io.pipelineReserve.valid && io.pipelineReserve.bits.fromA
-  val returnA = io.pipelineReturn.valid && io.pipelineReturn.bits.fromA
+  val returnA = PopCount(io.pipelineReturn.map(event => event.valid && event.bits.fromA))
   val grantReservations = eventCount(reserveGrant, returnGrant, mshrsAll, "grant reservations")
   val ackReservations = eventCount(reserveA, returnA, grantBufInflightSize, "A reservations")
+  val reservationOwners = RegInit(VecInit(Seq.fill(mshrsAll)(
+    0.U.asTypeOf(Valid(new GrantReservationToken)))))
+  reservationOwners.zipWithIndex.foreach { case (owner, i) =>
+    val returns = io.pipelineReturn.map(event => event.valid && event.bits.id === i.U)
+    assert(PopCount(returns) <= 1.U,
+      "distinct terminal stages must return distinct GrantBuffer token owners")
+    io.pipelineReturn.zip(returns).foreach { case (event, matches) =>
+      when(matches) {
+        assert(owner.valid && event.bits.asUInt === owner.bits.asUInt,
+          "GrantBuffer return must match its exact reserved slot/generation/channel")
+        owner.valid := false.B
+      }
+    }
+    when(reserveGrant && io.pipelineReserve.bits.id === i.U) {
+      assert(!owner.valid && !VecInit(returns).asUInt.orR,
+        "a GrantBuffer promise must claim an idle registered token slot")
+      owner.valid := true.B
+      owner.bits := io.pipelineReserve.bits
+    }
+  }
+  assert(PopCount(reservationOwners.map(_.valid)) === grantReservations,
+    "grant reservation tally must equal its outstanding token owners")
+  assert(PopCount(reservationOwners.map(owner => owner.valid && owner.bits.fromA)) === ackReservations,
+    "A reservation tally must equal its outstanding token owners")
 
   // Delay occupancy by one edge to align insertion with the registered reservation return.
   val grantOccupied = RegNext(grantQueue.io.count, 0.U)
@@ -339,17 +362,29 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   }
   val grantCredit = registeredCredit(grantUsed, mshrsAll)
   val ackCredit = registeredCredit(ackUsed, grantBufInflightSize)
-  val noSpaceForSinkReq = grantCredit === 0.U
-  val noSpaceWaitSinkEForSinkReq = ackCredit === 0.U
-  val noSpaceForMSHRReq = grantCredit <= 1.U
-  val noSpaceWaitSinkEForMSHRReq = ackCredit <= 1.U
+  // At edge n the credit snapshot includes reservations through n-3. The
+  // receipt Q and its delay hold n-1/n-2; debit exactly those newer promises.
+  // Current terminal returns never replenish admission in the same cycle.
+  val previousReserve = RegNext(io.pipelineReserve, 0.U.asTypeOf(io.pipelineReserve))
+  val recentReserves = Seq(io.pipelineReserve, previousReserve)
+  val grantDebits = PopCount(recentReserves.map(event => event.valid &&
+    (event.bits.fromA || event.bits.fromC)))
+  val ackDebits = PopCount(recentReserves.map(event => event.valid && event.bits.fromA))
+  assert(grantDebits <= grantCredit,
+    "newer grant promises must fit within the retained credit snapshot")
+  assert(ackDebits <= ackCredit,
+    "newer A promises must fit within the retained credit snapshot")
+  val noSpaceForSinkReq = grantCredit <= grantDebits
+  val noSpaceWaitSinkEForSinkReq = ackCredit <= ackDebits
+  val noSpaceForMSHRReq = grantCredit <= (grantDebits +& 1.U)
+  val noSpaceWaitSinkEForMSHRReq = ackCredit <= (ackDebits +& 1.U)
   val pftCredit = pftOccupied.map { occupied =>
     val used = occupied +& ackReservations
     assert(used <= pftQueueLen.U, "prefetch promises exceed local capacity")
     registeredCredit(used, pftQueueLen)
   }
-  val noSpaceForSinkPft = pftCredit.map(_ === 0.U)
-  val noSpaceForMSHRPft = pftCredit.map(_ <= 1.U)
+  val noSpaceForSinkPft = pftCredit.map(_ <= ackDebits)
+  val noSpaceForMSHRPft = pftCredit.map(_ <= (ackDebits +& 1.U))
 
   io.toReqArb.blockSinkReqEntrance.blockA_s1 := noSpaceForSinkReq || noSpaceWaitSinkEForSinkReq || noSpaceForSinkPft.getOrElse(false.B)
   io.toReqArb.blockSinkReqEntrance.blockB_s1 := Cat(inflightGrant.map(g => g.valid &&
@@ -358,7 +393,7 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   // A-replace related rprobe is handled in SourceB
   io.toReqArb.blockSinkReqEntrance.blockC_s1 := noSpaceForSinkReq
   io.toReqArb.blockSinkReqEntrance.blockG_s1 := false.B // this is not used
-    io.toReqArb.blockSinkReqEntrance.blockAll_s1 := false.B
+  io.toReqArb.blockSinkReqEntrance.blockAll_s1 := false.B
   io.toReqArb.blockMSHRReqEntrance := noSpaceForMSHRReq || noSpaceWaitSinkEForMSHRReq || noSpaceForMSHRPft.getOrElse(false.B)
 
   // =========== XSPerf ===========
