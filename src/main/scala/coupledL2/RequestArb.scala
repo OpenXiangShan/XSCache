@@ -46,6 +46,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     val snoopReservationToken = Input(new SnoopSlotToken)
     val taskSnoopReservationToken_s2 = Output(new SnoopSlotToken)
     val taskGrantReservationToken_s2 = ValidIO(new GrantReservationToken)
+    val taskSequence_s2 = Output(UInt(8.W))
+    val cDecisionDone = Flipped(ValidIO(new GrantReservationToken))
     val bServiceStart = ValidIO(new TaskBundle)
     val bServiceConsume = ValidIO(new SnoopSlotToken)
     val sidecarReservationHold = Output(Bool())
@@ -149,9 +151,11 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val dirReadAdmissionBits = RegInit(0.U.asTypeOf(new DirRead()))
   val dirReadAdmissionToken = RegInit(0.U.asTypeOf(new MainpipeLeaseToken))
   val dirReadAdmissionFire = Wire(Bool())
-  // Serialize S1 through S3 apply while local reservation events and registered credits settle.
-  val localTransitionCycles = RegInit(0.U(3.W))
-  val localTransitionIdle = localTransitionCycles === 0.U
+  // Only C may wait in S3 apply for an orphan reservation. Reserve that
+  // decision before its Directory read so no younger task can reach it.
+  // Other requests use the independent fixed-latency stage registers.
+  val cDecisionOwner = RegInit(0.U.asTypeOf(Valid(new GrantReservationToken)))
+  val cDecisionAvailable = !cDecisionOwner.valid
   val admitMshrTurn = RegInit(false.B)
   val bPending = RegInit(0.U.asTypeOf(Valid(new TaskBundle)))
   val bServiceReserved = RegInit(false.B)
@@ -161,15 +165,15 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   io.bServiceStart.bits := bPending.bits
   io.reservedB := bPending.valid
   io.sidecarReservationHold := io.sinkB.valid || (bPending.valid && !bServiceReserved) ||
-    (localTransitionIdle && !admitMshrTurn && !mshr_task_s1.valid && !bPending.valid)
-  when(localTransitionIdle && !mshr_task_s1.valid && !bPending.valid &&
+    (cDecisionAvailable && !admitMshrTurn && !mshr_task_s1.valid && !bPending.valid)
+  when(cDecisionAvailable && !mshr_task_s1.valid && !bPending.valid &&
     !channelDirReadAdmissionValid) {
     admitMshrTurn := !admitMshrTurn
   }
-  when(s1_fire) {
-    localTransitionCycles := 4.U
-  }.elsewhen(!localTransitionIdle) {
-    localTransitionCycles := localTransitionCycles - 1.U
+  when(io.cDecisionDone.valid) {
+    assert(cDecisionOwner.valid && io.cDecisionDone.bits.asUInt === cDecisionOwner.bits.asUInt,
+      "C apply completion must release its exact admitted decision owner")
+    cDecisionOwner.valid := false.B
   }
 
   val s1_needs_replRead = mshr_task_s1.valid && mshr_task_s1.bits.fromA && mshr_task_s1.bits.replTask && (
@@ -208,7 +212,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   // TODO: will cause msTask path vacant for one-cycle after replRead, since not use Flow so as to avoid ready propagation
   val blockAllEntrance = io.fromMSHRCtl.blockAll_s1 || io.fromMainPipe.blockAll_s1
   val pendingSnoopSetConflict = Wire(Bool())
-  val mshrTaskReadyBasic = localTransitionIdle && admitMshrTurn && !mshr_task_s1.valid && !bPending.valid &&
+  val mshrTaskReadyBasic = cDecisionAvailable && admitMshrTurn && !mshr_task_s1.valid && !bPending.valid &&
     !blockAllEntrance &&
     !io.sinkB.valid &&
     !pendingSnoopSetConflict &&
@@ -289,7 +293,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     channelCandidateTask := normalReservedTask
     channelCandidateTask.mshrId := io.normalReserveAck.bits.id
   }
-  channelCandidateValid := localTransitionIdle && !blockAllEntrance &&
+  channelCandidateValid := cDecisionAvailable && !blockAllEntrance &&
     (bPending.valid || !admitMshrTurn) && !mshr_task_s1.valid &&
     sinkValids.orR && resetFinish &&
     !channelDirReadAdmissionValid && !io.sinkB.valid &&
@@ -319,6 +323,11 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   when(grantReservation.valid) {
     assert(grantReservationAvailable && grantReservationSlotOH.orR,
       "an A/C admission must own an idle registered GrantBuffer token")
+  }
+  when(channelCandidateValid && channelCandidateSource === 0.U) {
+    assert(!cDecisionOwner.valid && grantReservation.valid && grantReservation.bits.channel(2),
+      "C Directory admission must first own its one-deep decision reservation")
+    cDecisionOwner := grantReservation
   }
   io.grantReservation := RegNext(grantReservation, 0.U.asTypeOf(grantReservation))
   grantReservationOwners.zipWithIndex.foreach { case (owner, i) =>
@@ -424,8 +433,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     assert(sameCmoAllLine || A_task.asUInt === normalReservedTask.asUInt,
       "normal reservation must retain the complete upstream request")
   }
-  // RXSNP already captured and reserved this head; refill bPending during the
-  // local execution cooldown while keeping S1/Directory admission serialized.
+  // RXSNP already captured and reserved this head; its entry may refill while
+  // older fixed-latency stages execute. Directory service remains tokenized.
   val bEntryRefillReady = resetFinish &&
     !mshr_task_s1.valid && !bPending.valid && !channelDirReadAdmissionValid &&
     !normalReserved && !blockReservedB &&
@@ -604,6 +613,9 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val task_s2 = RegInit(0.U.asTypeOf(task_s1))
   task_s2.valid := s1_fire
   when(s1_fire) { task_s2.bits := task_s1.bits }
+  val taskSequence = RegInit(0.U(8.W))
+  when(s1_fire) { taskSequence := taskSequence + 1.U }
+  io.taskSequence_s2 := RegEnable(taskSequence, s1_fire)
 
   io.taskToPipe_s2 := task_s2
   io.setStatus.zip(Seq(task_s1, task_s2)).foreach { case (status, task) =>

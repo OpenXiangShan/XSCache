@@ -157,6 +157,8 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   mainPipe.io.taskLeaseToken_s2 := reqArb.io.taskLeaseToken_s2
   mainPipe.io.taskSnoopReservationToken_s2 := reqArb.io.taskSnoopReservationToken_s2
   mainPipe.io.taskGrantReservationToken_s2 := reqArb.io.taskGrantReservationToken_s2
+  mainPipe.io.taskSequence_s2 := reqArb.io.taskSequence_s2
+  reqArb.io.cDecisionDone := mainPipe.io.cDecisionDone
   mainPipe.io.mshrHintQInfo := reqArb.io.mshrHintQInfo
   mainPipe.io.sinkCHintQInfo := reqArb.io.sinkCHintQInfo
   reqArb.io.hint_s1QueueFull := mainPipe.io.hint_s1QueueFull
@@ -179,6 +181,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   val directoryEventReg = RegNext(directoryEvent, 0.U.asTypeOf(directoryEvent))
   mainPipe.io.bufResp := RegNext(sinkC.io.bufResp)
   mainPipe.io.dirResp_s3 := directoryEventReg.result.bits
+  mainPipe.io.dirRespValid_s3 := directoryEventReg.result.valid
   mainPipe.io.replResp := directoryEventReg.replacement
   mainPipe.io.metaOnHit_s3 := directoryEventReg.metaOnHit
   mainPipe.io.errOnSnp_s3 := directoryEventReg.errOnSnp

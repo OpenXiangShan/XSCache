@@ -37,6 +37,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val taskLeaseToken_s2 = Input(new MainpipeLeaseToken)
     val taskSnoopReservationToken_s2 = Input(new SnoopSlotToken)
     val taskGrantReservationToken_s2 = Flipped(ValidIO(new GrantReservationToken))
+    val taskSequence_s2 = Input(UInt(8.W))
+    val cDecisionDone = ValidIO(new GrantReservationToken)
     /* status from arbiter at stage1  */
     val mshrHintQInfo = Flipped(ValidIO(new TaskBundle))
     val sinkCHintQInfo = Flipped(ValidIO(new TaskBundle))
@@ -61,6 +63,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
 
     /* get dir result at stage 3 */
     val dirResp_s3 = Input(new DirResult())
+    val dirRespValid_s3 = Input(Bool())
     val metaOnHit_s3 = Input(new MetaEntry())
     val errOnSnp_s3 = Input(Bool())
     val dirWayOH_s3 = Input(UInt(cacheParams.ways.W))
@@ -192,6 +195,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val snoopSlotToken_s3_decide = RegEnable(snoopSlotToken_s3_capture, task_s3_capture.valid)
   val grantToken_s3_capture = RegEnable(io.taskGrantReservationToken_s2, task_s2.valid)
   val grantToken_s3_decide = RegEnable(grantToken_s3_capture, task_s3_capture.valid)
+  val taskSequence_s3_capture = RegEnable(io.taskSequence_s2, task_s2.valid)
+  val taskSequence_s3_decide = RegEnable(taskSequence_s3_capture, task_s3_capture.valid)
   when(task_s2.valid && (task_s2.bits.fromA || task_s2.bits.fromC)) {
     assert(io.taskGrantReservationToken_s2.valid &&
       io.taskGrantReservationToken_s2.bits.channel === task_s2.bits.channel,
@@ -298,6 +303,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   }
   class S3Decision extends Bundle {
     val task = new TaskBundle
+    val sequence = UInt(8.W)
     val token = new MainpipeLeaseToken
     val orphanReleaseSequence = UInt(8.W)
     val snoopSlotToken = new SnoopSlotToken
@@ -336,6 +342,14 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val normal = new NormalS3Action
   }
   val s3Decision = RegInit(0.U.asTypeOf(Valid(new S3Decision)))
+  when(task_s3_decide.valid && !task_s3_decide.bits.mshrTask) {
+    assert(io.dirRespValid_s3 && io.dirResp_s3.set === task_s3_decide.bits.set,
+      "each channel decision must retain its own aligned Directory response")
+    when(io.dirResp_s3.hit && !task_s3_decide.bits.cmoAll) {
+      assert(io.dirResp_s3.tag === task_s3_decide.bits.tag,
+        "a channel Directory hit must match its retained task tag")
+    }
+  }
   val retryDecision = io.replResp.bits.validHold &&
     (io.replResp.bits.retry || io.fromMSHRCtl.replRespRetry)
   val normalDecision = decideNormal(task_s3_decide.bits,
@@ -542,6 +556,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   s3Decision.valid := task_s3_decide.valid || orphanApplyBlocked
   when(task_s3_decide.valid) {
     s3Decision.bits.task := task_s3_decide.bits
+    s3Decision.bits.sequence := taskSequence_s3_decide
     s3Decision.bits.token := leaseToken_s3_decide
     s3Decision.bits.orphanReleaseSequence := orphanReleaseSequence
     s3Decision.bits.snoopSlotToken := snoopSlotToken_s3_decide
@@ -583,6 +598,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val task_s3 = Wire(Valid(new TaskBundle))
   task_s3.valid := s3Decision.valid && !orphanApplyBlocked
   task_s3.bits := s3Decision.bits.task
+  val cDecisionDone = WireInit(0.U.asTypeOf(Valid(new GrantReservationToken)))
+  cDecisionDone.valid := task_s3.valid && !task_s3.bits.mshrTask && task_s3.bits.fromC
+  cDecisionDone.bits := s3Decision.bits.grantToken.bits
+  io.cDecisionDone := RegNext(cDecisionDone, 0.U.asTypeOf(cDecisionDone))
   io.toMSHRCtl.orphanReleaseReserveDone.valid := task_s3.valid &&
     s3Decision.bits.cOrphanReleaseData
   io.toMSHRCtl.orphanReleaseReserveDone.bits := io.fromMSHRCtl.orphanReleaseReservation
@@ -604,8 +623,24 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       "S3 decision must retain the normal parent generation")
   }
   val reqWayOH_s3 = UIntToOH(task_s3.bits.way, cacheParams.ways)
-  assert(PopCount(Seq(task_s2.valid, task_s3_capture.valid, task_s3_decide.valid, task_s3.valid)) <= 1.U,
-    "the local Directory/result/apply execution slot must have one owner")
+  val decisionStages = Seq(
+    (task_s2, io.taskSequence_s2),
+    (task_s3_capture, taskSequence_s3_capture),
+    (task_s3_decide, taskSequence_s3_decide),
+    (s3Decision.map(_.task), s3Decision.bits.sequence))
+  decisionStages.indices.foreach { i =>
+    ((i + 1) until decisionStages.size).foreach { j =>
+      val (older, olderSequence) = decisionStages(j)
+      val (younger, youngerSequence) = decisionStages(i)
+      assert(!(older.valid && younger.valid) || olderSequence =/= youngerSequence,
+        "independent pipeline stages must never retain the same transaction")
+    }
+  }
+  assert(PopCount(decisionStages.map { case (task, _) =>
+    task.valid && !task.bits.mshrTask && task.bits.fromC
+  }) <= 1.U, "the retained C decision resource must have one admitted owner")
+  assert(!orphanApplyBlocked || !task_s3_decide.valid,
+    "an orphan wait must never overwrite a retained apply decision")
 
   /* ======== Enchantment ======== */
   val dirResult_s3    = s3Decision.bits.dir
@@ -1445,6 +1480,12 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   // TODO:[Check] it seems that s3 Dir write will naturally block all s1 by dirRead.ready
   //        (an even stronger blocking than set blocking)
   //         so we might not need s3 blocking here
+  // A replacement grant can install tag/meta with metaWen and tagWen both
+  // clear in its source header. Its retained grantInstallEn reserves that
+  // possible write until the aligned decision has applied it.
+  def mayWriteDirectory(s: TaskBundle): Bool =
+    !s.mshrTask || s.metaWen || s.tagWen || s.grantInstallEn
+
   def s23Block(chn: Char, s: TaskBundle): Bool = {
     val s1 = io.fromReqArb.status_s1
     val s1_set = chn match {
@@ -1453,7 +1494,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
       case 'c' => s1.c_set
       case 'g' => s1.g_set
     }
-    s.set === s1_set && !(s.mshrTask && !s.metaWen) // if guaranteed not to write meta, no blocking needed
+    s.set === s1_set && mayWriteDirectory(s)
   }
   def bBlock(s: TaskBundle, tag: Boolean = false): Bool = {
     val s1 = io.fromReqArb.status_s1
@@ -1467,7 +1508,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.toReqBuf(3) := task_s3.valid && s23Block('a', task_s3.bits)
 
   io.toReqArb.blockC_s1 := task_s2.valid && s23Block('c', task_s2.bits) ||
-    preApplyTasks.map(task => task.valid && s23Block('c', task.bits)).reduce(_ || _)
+    preApplyTasks.map(task => task.valid && s23Block('c', task.bits)).reduce(_ || _) ||
+    task_s3.valid && s23Block('c', task_s3.bits)
 
   io.toReqArb.blockB_s1 :=
     task_s2.valid && bBlock(task_s2.bits) ||
@@ -1476,10 +1518,18 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     task_s4.valid && bBlock(task_s4.bits, tag = true) ||
     task_s5.valid && bBlock(task_s5.bits, tag = true)
   
-  io.toReqArb.blockA_s1 := false.B
+  // RequestBuffer's ASet describes ingress and its eligibility is registered.
+  // Before committing the held A owner, compare its actual set with every
+  // older stage Q. This closes the eligibility update/capture window without
+  // revalidating a captured token or reading current ready/retire signals.
+  io.toReqArb.blockA_s1 := VecInit((Seq(task_s2) ++ preApplyTasks ++ Seq(task_s3)).map { task =>
+    task.valid && mayWriteDirectory(task.bits) &&
+      task.bits.set === io.fromReqArb.status_s1.aCandidateSet
+  }).asUInt.orR
 
   io.toReqArb.blockG_s1 := task_s2.valid && s23Block('g', task_s2.bits) ||
-    preApplyTasks.map(task => task.valid && s23Block('g', task.bits)).reduce(_ || _)
+    preApplyTasks.map(task => task.valid && s23Block('g', task.bits)).reduce(_ || _) ||
+    task_s3.valid && s23Block('g', task_s3.bits)
   io.toReqArb.blockAll_s1 := orphanApplyBlocked
 
   /* ======== Pipeline Status ======== */
