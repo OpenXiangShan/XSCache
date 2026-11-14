@@ -518,8 +518,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   io.toDir.REPL_LOCK_RELEASE := io.repl_lock_release
   io.repl_lock_conflict := fromDir_en && io.fromDir.ReplLockConflict
   io.toDir.DirRd := state_dirRead.PreArb
-  val releaseWriteSettling = io.repl_lock_release && (io.meta_modify || io.tag_modify)
-  io.toDir.DirWb := state_dirWrite.PreArb && !io.wb_locked && !releaseWriteSettling
+  io.toDir.DirWb := state_dirWrite.PreArb && !io.wb_locked
   io.toDir.ReplRd := state_dirRead.ReplPreArb
 
   when (io.repl_lock_release && io.toDir.DirWb) {
