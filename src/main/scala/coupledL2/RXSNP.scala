@@ -34,7 +34,7 @@ class RXSNP(
     val task = DecoupledIO(new TaskBundle())
     val admissionEnable = Input(Bool())
     val queued = Output(Bool())
-    val pipeSetStatus = Flipped(Vec(7, ValidIO(new PipeSetStatus)))
+    val pipeSetStatus = Flipped(Vec(8, ValidIO(new PipeSetStatus)))
     val admission = DecoupledIO(new TaskBundle)
     val replaceAdmissionIdle = Input(UInt(mshrsAll.W))
     val sidecarReserve = ValidIO(UInt(mshrBits.W))

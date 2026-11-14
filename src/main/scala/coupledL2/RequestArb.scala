@@ -80,8 +80,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     /* status of each pipeline stage */
     val status_s1 = Output(new PipeEntranceStatus) // set & tag of entrance status
     val status_vec = Vec(2, ValidIO(new PipeStatus))
-    val status_vec_toTX = Vec(2, ValidIO(new PipeStatusWithCHI))
-    val setStatus = Vec(2, ValidIO(new PipeSetStatus))
+    val status_vec_toTX = Vec(3, ValidIO(new PipeStatusWithCHI))
+    val setStatus = Vec(3, ValidIO(new PipeSetStatus))
     val mainPipeSetStatus = Flipped(Vec(5, ValidIO(new PipeSetStatus)))
 
     /* handle set conflict, capacity conflict */
@@ -113,9 +113,11 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
 
   val s0_fire = Wire(Bool())
   val s1_fire = Wire(Bool())
+  val channelCandidateValid = Wire(Bool())
   val s1_cango = Wire(Bool())
   val s2_ready = Wire(Bool())
-  val mshr_task_s1 = RegInit(0.U.asTypeOf(Valid(new TaskBundle())))
+  val mshrIngress = RegInit(0.U.asTypeOf(Valid(new TaskBundle())))
+  val mshr_task_s1 = Wire(Valid(new TaskBundle()))
   val mshrLeaseToken_s1 = Reg(new MainpipeLeaseToken)
   val mshrGrantToken_s1 = RegInit(0.U.asTypeOf(Valid(new GrantReservationToken)))
   val grantReservation = Wire(Valid(new GrantReservationToken))
@@ -124,9 +126,11 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val grantReservationBusy = VecInit(grantReservationOwners.map(_.valid)).asUInt
   val grantReservationAvailable = !grantReservationBusy.andR
   val grantReservationSlotOH = PriorityEncoderOH(~grantReservationBusy)
-  // Capture commits the source owner; payload stays on its Q until the atomic source/Directory fire.
+  // Retain the complete request independently of the upstream head. The source
+  // owner and its data buffer are consumed only with the atomic Directory fire.
   class ChannelDirReadAdmissionToken extends Bundle {
     val valid = Bool()
+    val task = new TaskBundle
     val source = UInt(2.W) // 0=C, 1=B, 2=A (sinkValids priority order)
     val dirRead = new DirRead
     val owner = UInt(mshrBits.W)
@@ -146,6 +150,13 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   }
   val channelDirReadAdmissionToken = RegInit(0.U.asTypeOf(new ChannelDirReadAdmissionToken))
   val channelDirReadAdmissionValid = channelDirReadAdmissionToken.valid
+  // Two independent Q slots can fill while the other executes. Admission uses
+  // only empty Q capacity, never current S1 fire or Directory ready. Preserve
+  // capture order when both slots are occupied.
+  val mshrIngressOlder = RegInit(false.B)
+  mshr_task_s1.valid := mshrIngress.valid &&
+    (!channelDirReadAdmissionValid || mshrIngressOlder)
+  mshr_task_s1.bits := mshrIngress.bits
   val channelDirReadAdmissionFire = Wire(Bool())
   val dirReadAdmissionValid = RegInit(false.B)
   val dirReadAdmissionBits = RegInit(0.U.asTypeOf(new DirRead()))
@@ -165,10 +176,18 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   io.bServiceStart.bits := bPending.bits
   io.reservedB := bPending.valid
   io.sidecarReservationHold := io.sinkB.valid || (bPending.valid && !bServiceReserved) ||
-    (cDecisionAvailable && !admitMshrTurn && !mshr_task_s1.valid && !bPending.valid)
-  when(cDecisionAvailable && !mshr_task_s1.valid && !bPending.valid &&
+    (cDecisionAvailable && !admitMshrTurn && !mshrIngress.valid && !bPending.valid)
+  when(cDecisionAvailable && !mshrIngress.valid && !bPending.valid &&
     !channelDirReadAdmissionValid) {
     admitMshrTurn := !admitMshrTurn
+  }
+  when(s0_fire) {
+    admitMshrTurn := false.B
+    mshrIngressOlder := !channelDirReadAdmissionValid
+  }
+  when(channelCandidateValid) {
+    admitMshrTurn := true.B
+    mshrIngressOlder := mshrIngress.valid
   }
   when(io.cDecisionDone.valid) {
     assert(cDecisionOwner.valid && io.cDecisionDone.bits.asUInt === cDecisionOwner.bits.asUInt,
@@ -208,15 +227,14 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   )
 
   /* ======== Stage 0 ======== */
-  // if mshr_task_s1 is replRead, it might stall and wait for dirRead.ready, so we block new mshrTask from entering
-  // TODO: will cause msTask path vacant for one-cycle after replRead, since not use Flow so as to avoid ready propagation
   val blockAllEntrance = io.fromMSHRCtl.blockAll_s1 || io.fromMainPipe.blockAll_s1
   val pendingSnoopSetConflict = Wire(Bool())
-  val mshrTaskReadyBasic = cDecisionAvailable && admitMshrTurn && !mshr_task_s1.valid && !bPending.valid &&
+  val mshrChannelSetConflict = channelDirReadAdmissionValid &&
+    channelDirReadAdmissionToken.task.set === io.mshrTask.bits.set
+  val mshrTaskReadyBasic = cDecisionAvailable && !mshrIngress.valid && !bPending.valid &&
     !blockAllEntrance &&
-    !io.sinkB.valid &&
-    !pendingSnoopSetConflict &&
-    !channelDirReadAdmissionValid &&
+    !io.sinkB.valid && !io.snoopAdmissionEnable &&
+    !pendingSnoopSetConflict && !mshrChannelSetConflict &&
     !io.fromGrantBuffer.blockMSHRReqEntrance &&
     !io.fromTXDAT.blockMSHRReqEntrance &&
     !io.fromTXRSP.blockMSHRReqEntrance &&
@@ -229,10 +247,10 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   /* latch mshr_task from s0 to s1 */
   val mshr_replRead_stall =
     mshr_task_s1.valid && s1_needs_replRead && !dirReadAdmissionFire
-  mshr_task_s1.valid := mshr_task_s1.valid && !s1_fire || s0_fire
+  mshrIngress.valid := mshrIngress.valid && !(s1_fire && mshr_task_s1.valid) || s0_fire
 
   when(s0_fire) {
-    mshr_task_s1.bits := io.mshrTask.bits
+    mshrIngress.bits := io.mshrTask.bits
     mshrLeaseToken_s1 := io.mshrLeaseToken
     mshrGrantToken_s1 := grantReservation
   }
@@ -269,7 +287,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     io.fromMSHRCtl.blockC_s1 || io.fromMainPipe.blockC_s1 || io.fromGrantBuffer.blockSinkReqEntrance.blockC_s1
 
   io.snoopAdmissionEnable := io.snoopQueued && !admitMshrTurn && resetFinish &&
-    !mshr_task_s1.valid && !bPending.valid && !channelDirReadAdmissionValid &&
+    !bPending.valid && !channelDirReadAdmissionValid &&
     !io.normalReserveAck.valid && !io.sinkC.valid && !io.sinkB.valid && !block_B && !blockAllEntrance
 
 //  val noFreeWay = Wire(Bool())
@@ -284,7 +302,6 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     )
   ).asUInt
 
-  val channelCandidateValid = Wire(Bool())
   val channelCandidateSource = OHToUInt(PriorityEncoderOH(sinkValids))
   io.aCommit := channelCandidateValid && channelCandidateSource === 2.U
   val channelCandidateTask = Wire(new TaskBundle())
@@ -293,10 +310,12 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     channelCandidateTask := normalReservedTask
     channelCandidateTask.mshrId := io.normalReserveAck.bits.id
   }
-  channelCandidateValid := cDecisionAvailable && !blockAllEntrance &&
-    (bPending.valid || !admitMshrTurn) && !mshr_task_s1.valid &&
+  val channelMshrSetConflict = mshrIngress.valid &&
+    mshrIngress.bits.set === channelCandidateTask.set
+  val channelCandidateEligible = cDecisionAvailable && !blockAllEntrance &&
     sinkValids.orR && resetFinish &&
     !channelDirReadAdmissionValid && !io.sinkB.valid &&
+    !channelMshrSetConflict &&
     (!(channelCandidateTask.fromA || channelCandidateTask.fromC) || grantReservationAvailable)
 
   val channelCandidateOwner = Mux(channelCandidateSource === 2.U,
@@ -366,17 +385,18 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     bits
   }
   val channelCandidateDirReadBits = channelDirReadOf(channelCandidateTask)
-  val channelTokenTask = Wire(new TaskBundle())
-  channelTokenTask := MuxLookup(channelDirReadAdmissionToken.source,
+  val channelSourceTask = Wire(new TaskBundle())
+  channelSourceTask := MuxLookup(channelDirReadAdmissionToken.source,
     0.U.asTypeOf(new TaskBundle()))(Seq(
       0.U -> C_task,
       1.U -> B_task,
       2.U -> normalReservedTask
     ))
   when(channelDirReadAdmissionToken.source === 2.U) {
-    channelTokenTask := normalReservedTask
-    channelTokenTask.mshrId := io.normalReserveAck.bits.id
+    channelSourceTask := normalReservedTask
+    channelSourceTask.mshrId := io.normalReserveAck.bits.id
   }
+  val channelTokenTask = channelDirReadAdmissionToken.task
   val channelTokenDirReadBits = channelDirReadOf(channelTokenTask)
   val channelTokenSnoopToken = Mux(channelDirReadAdmissionToken.source === 1.U,
     bServiceToken, 0.U.asTypeOf(new SnoopSlotToken))
@@ -403,6 +423,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     channelTokenTask.snpHitReleaseIdx === channelDirReadAdmissionToken.snpHitReleaseIdx
   // Retained owner comparisons are assertions; they must not revoke the captured Directory command.
   val channelTokenIdentityMatches =
+    channelTokenTask.asUInt === channelSourceTask.asUInt &&
     channelDirReadAdmissionToken.dirRead.asUInt === channelTokenDirReadBits.asUInt &&
     channelDirReadAdmissionToken.owner === channelTokenOwnerCurrent &&
     channelDirReadAdmissionToken.generation === channelTokenGenerationCurrent &&
@@ -414,16 +435,36 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     assert(channelTokenSourceValid && channelTokenIdentityMatches,
       "a channel Directory token must retain its committed source and provenance")
   }
+  when(mshrIngress.valid && channelDirReadAdmissionValid) {
+    assert(mshrIngress.bits.set =/= channelTokenTask.set,
+      "independent ingress descriptors must reserve distinct sets")
+  }
+  when(s0_fire) {
+    assert(!mshrIngress.valid, "MSHR admission must use empty registered capacity")
+  }
+  when(channelCandidateValid) {
+    assert(!channelDirReadAdmissionValid,
+      "channel admission must use empty registered capacity")
+  }
 
   val mshrTaskBgDefer = io.mshrTask.valid && io.mshrTask.bits.qosClass === 4.U && sinkValids.orR
-  io.mshrTask.ready := mshrTaskReadyBasic && !mshrTaskBgDefer
+  val mshrCandidateEligible = mshrTaskReadyBasic && !mshrTaskBgDefer
+  // Arbitration observes source ownership and local Q occupancy, not the
+  // other source's resource/ready cone. Each winner checks its own capacity.
+  val channelSourcePresent = io.sinkC.valid || bPending.valid ||
+    io.sinkA.valid && io.normalReserveAck.valid
+  io.mshrTask.ready := mshrCandidateEligible &&
+    (admitMshrTurn || channelDirReadAdmissionValid || !channelSourcePresent)
+  channelCandidateValid := channelCandidateEligible &&
+    (!admitMshrTurn || mshrIngress.valid || !io.mshrTask.valid || bPending.valid)
   XSPerfAccumulate("reqarb_bg_defer_cnt", mshrTaskBgDefer)
 
 
   val sink_ready_basic = channelDirReadAdmissionFire
 
   io.normalReserveRequest.valid := resetFinish && !blockAllEntrance &&
-    !mshr_task_s1.valid && !bPending.valid && io.sinkA.valid && !block_A &&
+    !bPending.valid && io.sinkA.valid && !block_A &&
+    !(mshrIngress.valid && mshrIngress.bits.set === A_task.set) &&
     !io.normalReserveAck.valid && !sinkValids(0) && !io.sinkB.valid &&
     !channelDirReadAdmissionValid && !io.snoopAdmissionEnable
   io.sinkA.ready := sink_ready_basic && channelDirReadAdmissionToken.source === 2.U
@@ -436,7 +477,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   // RXSNP already captured and reserved this head; its entry may refill while
   // older fixed-latency stages execute. Directory service remains tokenized.
   val bEntryRefillReady = resetFinish &&
-    !mshr_task_s1.valid && !bPending.valid && !channelDirReadAdmissionValid &&
+    !bPending.valid && !channelDirReadAdmissionValid &&
     !normalReserved && !blockReservedB &&
     !io.fromTXDAT.blockSinkBReqEntrance && !io.fromTXRSP.blockSinkBReqEntrance
   io.sinkB.ready := bEntryRefillReady
@@ -554,6 +595,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   }
   when(channelCandidateValid) {
     channelDirReadAdmissionToken.valid := true.B
+    channelDirReadAdmissionToken.task := channelCandidateTask
     channelDirReadAdmissionToken.source := channelCandidateSource
     channelDirReadAdmissionToken.dirRead := channelCandidateDirReadBits
     channelDirReadAdmissionToken.owner := channelCandidateOwner
@@ -618,12 +660,15 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   io.taskSequence_s2 := RegEnable(taskSequence, s1_fire)
 
   io.taskToPipe_s2 := task_s2
-  io.setStatus.zip(Seq(task_s1, task_s2)).foreach { case (status, task) =>
+  val channelIngress = Wire(Valid(new TaskBundle))
+  channelIngress.valid := channelDirReadAdmissionValid
+  channelIngress.bits := channelTokenTask
+  io.setStatus.zip(Seq(mshrIngress, channelIngress, task_s2)).foreach { case (status, task) =>
     status.valid := task.valid
     status.bits.set := task.bits.set
     status.bits.pendingSnoop := !task.bits.mshrTask && task.bits.fromB
   }
-  pendingSnoopSetConflict := (Seq(io.setStatus(1)) ++ io.mainPipeSetStatus).map { status =>
+  pendingSnoopSetConflict := (Seq(io.setStatus(2)) ++ io.mainPipeSetStatus).map { status =>
     status.valid && status.bits.pendingSnoop && status.bits.set === io.mshrTask.bits.set
   }.reduce(_ || _)
   val channelLeaseToken_s1 = Wire(new MainpipeLeaseToken)
@@ -703,8 +748,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
       status.bits.channel := task.bits.channel
   }
 
-  require(io.status_vec_toTX.size == 2)
-  io.status_vec_toTX.zip(Seq(task_s1, task_s2)).foreach {
+  require(io.status_vec_toTX.size == 3)
+  io.status_vec_toTX.zip(Seq(mshrIngress, channelIngress, task_s2)).foreach {
     case (status, task) =>
       status.valid := task.valid
       status.bits.channel := task.bits.channel

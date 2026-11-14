@@ -37,7 +37,7 @@ class TXRSP(implicit p: Parameters) extends CoupledL2Module {
     val mshrRsp = Flipped(DecoupledIO(new CHIRSP()))
     val out = DecoupledIO(new CHIRSP())
 
-    val pipeStatusVec = Flipped(Vec(7, ValidIO(new PipeStatusWithCHI)))
+    val pipeStatusVec = Flipped(Vec(8, ValidIO(new PipeStatusWithCHI)))
     val reservedB = Input(Bool())
     val toReqArb = Output(new TXRSPBlockBundle)
     val done = ValidIO(new TaskBundle)
@@ -54,13 +54,16 @@ class TXRSP(implicit p: Parameters) extends CoupledL2Module {
   val queueCnt = queue.io.count
   // TODO: this may be imprecise, review this later
   val pipeStatus_s1_s5 = io.pipeStatusVec
-  val pipeStatus_s1_s3 = pipeStatus_s1_s5.take(5)
-  val pipeStatus_s2_s3 = pipeStatus_s1_s3.tail
-  val pipeStatus_s4_s5 = pipeStatus_s1_s5.drop(5)
-  // inflightCnt equals the number of reqs on s2~s5 that may flow into TXRSP soon, plus queueCnt.
+  val pipeStatus_s1_s3 = pipeStatus_s1_s5.take(6)
+  val pipeStatus_s2_s3 = pipeStatus_s1_s3.drop(2)
+  val pipeStatus_s4_s5 = pipeStatus_s1_s5.drop(6)
+  val mshrIngress = pipeStatus_s1_s3.head
+  // Include both ingress owners: the MSHR Q below and the B owner once via reservedB.
+  // Later pipeline stages and the queue retain their existing accounting.
   // The calculation of inflightCnt might be imprecise and leads to false positive back pressue.
   val inflightCnt = PopCount(Cat(pipeStatus_s4_s5.map(s => s.valid && s.bits.toTXRSP && (s.bits.fromB || s.bits.mshrTask)))) +
     PopCount(Cat(pipeStatus_s2_s3.map(s => s.valid && Mux(s.bits.mshrTask, s.bits.toTXRSP, s.bits.fromB)))) +
+    (mshrIngress.valid && mshrIngress.bits.toTXRSP).asUInt +
     queueCnt + io.reservedB.asUInt
 
   assert(inflightCnt <= (2 * mshrsAll + 4).U, "in-flight overflow at TXRSP")
