@@ -120,6 +120,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   reqArb.io.mshrTask <> mshrCtl.io.mshrTask
   reqArb.io.mshrLeaseToken := mshrCtl.io.mshrTaskLeaseToken
   mshrCtl.io.bServiceStart := reqArb.io.bServiceStart
+  reqArb.io.snoopReservationToken := mshrCtl.io.snoopReservationToken
   mshrCtl.io.sidecarReservationHold := reqArb.io.sidecarReservationHold
   mshrCtl.io.contextReservation := reqArb.io.contextReservation
   mshrCtl.io.normalReserveRequest <> reqArb.io.normalReserveRequest
@@ -149,6 +150,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
 
   mainPipe.io.taskFromArb_s2 := reqArb.io.taskToPipe_s2
   mainPipe.io.taskLeaseToken_s2 := reqArb.io.taskLeaseToken_s2
+  mainPipe.io.taskSnoopReservationToken_s2 := reqArb.io.taskSnoopReservationToken_s2
   mainPipe.io.mshrHintQInfo := reqArb.io.mshrHintQInfo
   mainPipe.io.sinkCHintQInfo := reqArb.io.sinkCHintQInfo
   reqArb.io.hint_s1QueueFull := mainPipe.io.hint_s1QueueFull

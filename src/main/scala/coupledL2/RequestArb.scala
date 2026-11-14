@@ -43,6 +43,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     val mshrTask = Flipped(DecoupledIO(new TaskBundle))
     val mshrLeaseToken = Input(new MainpipeLeaseToken)
     val taskLeaseToken_s2 = Output(new MainpipeLeaseToken)
+    val snoopReservationToken = Input(new SnoopSlotToken)
+    val taskSnoopReservationToken_s2 = Output(new SnoopSlotToken)
     val bServiceStart = ValidIO(new TaskBundle)
     val sidecarReservationHold = Output(Bool())
     val snoopAdmissionEnable = Output(Bool())
@@ -116,6 +118,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     val owner = UInt(mshrBits.W)
     val generation = UInt(8.W)
     val sequence = UInt(8.W)
+    val snoopSlotToken = new SnoopSlotToken
     val paired = Bool()
     val mshrContext = UInt(2.W)
     val refillToReleaseCopy = Bool()
@@ -139,6 +142,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val admitMshrTurn = RegInit(false.B)
   val bPending = RegInit(0.U.asTypeOf(Valid(new TaskBundle)))
   val bServiceReserved = RegInit(false.B)
+  val bServiceToken = RegInit(0.U.asTypeOf(new SnoopSlotToken))
   val bExecute = Wire(Bool())
   io.bServiceStart.valid := bPending.valid && !bServiceReserved
   io.bServiceStart.bits := bPending.bits
@@ -276,6 +280,8 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     io.normalReserveAck.bits.token.generation, 0.U(8.W))
   val channelCandidateSequence = Mux(channelCandidateSource === 2.U,
     io.normalReserveAck.bits.token.sequence, 0.U(8.W))
+  val channelCandidateSnoopToken = Mux(channelCandidateSource === 1.U,
+    bServiceToken, 0.U.asTypeOf(new SnoopSlotToken))
   val channelCandidatePaired = channelCandidateTask.snpHitRelease ||
     channelCandidateTask.refillToReleaseCopy || channelCandidateTask.mshrContext =/= 0.U
 
@@ -316,9 +322,12 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     channelTokenTask.mshrId := io.normalReserveAck.bits.id
   }
   val channelTokenDirReadBits = channelDirReadOf(channelTokenTask)
+  val channelTokenSnoopToken = Mux(channelDirReadAdmissionToken.source === 1.U,
+    bServiceToken, 0.U.asTypeOf(new SnoopSlotToken))
   val channelTokenSourceValid = Mux(channelDirReadAdmissionToken.source === 0.U,
     io.sinkC.valid, Mux(channelDirReadAdmissionToken.source === 1.U,
-      bPending.valid && bServiceReserved, io.sinkA.valid && io.normalReserveAck.valid))
+      bPending.valid && bServiceReserved && bServiceToken.valid,
+      io.sinkA.valid && io.normalReserveAck.valid))
   val channelTokenOwnerCurrent = Mux(channelDirReadAdmissionToken.source === 2.U,
     io.normalReserveAck.bits.id, channelTokenTask.mshrId)
   val channelTokenGenerationCurrent = Mux(channelDirReadAdmissionToken.source === 2.U,
@@ -343,6 +352,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     channelDirReadAdmissionToken.generation === channelTokenGenerationCurrent &&
     channelDirReadAdmissionToken.sequence === channelTokenSequenceCurrent &&
     channelDirReadAdmissionToken.paired === channelTokenPairedCurrent &&
+    channelDirReadAdmissionToken.snoopSlotToken.asUInt === channelTokenSnoopToken.asUInt &&
     channelTokenProvenanceCurrent
   when(channelDirReadAdmissionValid) {
     assert(channelTokenSourceValid && channelTokenIdentityMatches,
@@ -382,11 +392,20 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     bPending.valid := true.B
     bPending.bits := io.sinkB.bits
     bServiceReserved := false.B
+    bServiceToken.valid := false.B
   }.elsewhen(io.bServiceStart.valid) {
+    assert(io.snoopReservationToken.valid &&
+      io.snoopReservationToken.set === bPending.bits.set &&
+      io.snoopReservationToken.tag === bPending.bits.tag &&
+      io.snoopReservationToken.txnID === bPending.bits.txnID.get &&
+      io.snoopReservationToken.source === bPending.bits.sourceId,
+      "B service must retain its admitted physical slot token")
     bServiceReserved := true.B
+    bServiceToken := io.snoopReservationToken
   }.elsewhen(bExecute) {
     bPending.valid := false.B
     bServiceReserved := false.B
+    bServiceToken.valid := false.B
   }
   assert(!bExecute || bServiceReserved, "B executed before registered service reservation")
 
@@ -479,6 +498,7 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
     channelDirReadAdmissionToken.owner := channelCandidateOwner
     channelDirReadAdmissionToken.generation := channelCandidateGeneration
     channelDirReadAdmissionToken.sequence := channelCandidateSequence
+    channelDirReadAdmissionToken.snoopSlotToken := channelCandidateSnoopToken
     channelDirReadAdmissionToken.paired := channelCandidatePaired
     channelDirReadAdmissionToken.mshrContext := channelCandidateTask.mshrContext
     channelDirReadAdmissionToken.refillToReleaseCopy := channelCandidateTask.refillToReleaseCopy
@@ -538,6 +558,10 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   channelLeaseToken_s1.sequence := channelDirReadAdmissionToken.sequence
   io.taskLeaseToken_s2 := RegEnable(Mux(mshr_task_s1.valid,
     mshrLeaseToken_s1, channelLeaseToken_s1), s1_fire)
+  io.taskSnoopReservationToken_s2 := RegEnable(Mux(
+    !mshr_task_s1.valid && channelDirReadAdmissionToken.source === 1.U,
+    channelDirReadAdmissionToken.snoopSlotToken,
+    0.U.asTypeOf(new SnoopSlotToken)), s1_fire)
 
   // MSHR task
   val mshrTask_s2 = task_s2.valid && task_s2.bits.mshrTask

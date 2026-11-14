@@ -35,6 +35,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     /* receive task from arbiter at stage 2 */
     val taskFromArb_s2 = Flipped(ValidIO(new TaskBundle()))
     val taskLeaseToken_s2 = Input(new MainpipeLeaseToken)
+    val taskSnoopReservationToken_s2 = Input(new SnoopSlotToken)
     /* status from arbiter at stage1  */
     val mshrHintQInfo = Flipped(ValidIO(new TaskBundle))
     val sinkCHintQInfo = Flipped(ValidIO(new TaskBundle))
@@ -70,6 +71,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val toMSHRCtl = new Bundle() {
       val mainpipeLeaseDone = ValidIO(new MainpipeLeaseDone)
       val mshr_alloc_s3 = ValidIO(new MSHRRequest())
+      val snoopReservationDone = ValidIO(new SnoopSlotToken)
       val snoopDirectoryHit = Output(Bool())
       val normalReservationDone = ValidIO(new MainpipeLeaseDone)
       val replaceCaptureWrite = ValidIO(UInt(mshrBits.W))
@@ -181,6 +183,8 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   val task_s3_decide = RegNext(task_s3_capture, 0.U.asTypeOf(task_s3_capture))
   val leaseToken_s3_capture = RegEnable(io.taskLeaseToken_s2, task_s2.valid)
   val leaseToken_s3_decide = RegEnable(leaseToken_s3_capture, task_s3_capture.valid)
+  val snoopSlotToken_s3_capture = RegEnable(io.taskSnoopReservationToken_s2, task_s2.valid)
+  val snoopSlotToken_s3_decide = RegEnable(snoopSlotToken_s3_capture, task_s3_capture.valid)
   // Capture the complete aligned result, decide once, and apply only the retained decision record.
   class NormalS3Action extends Bundle {
     val allocation = new MSHRRequest
@@ -283,6 +287,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   class S3Decision extends Bundle {
     val task = new TaskBundle
     val token = new MainpipeLeaseToken
+    val snoopSlotToken = new SnoopSlotToken
     val dir = new DirResult
     val repl = Valid(new ReplacerResult)
     val metaOnHit = new MetaEntry
@@ -505,6 +510,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   when(task_s3_decide.valid) {
     s3Decision.bits.task := task_s3_decide.bits
     s3Decision.bits.token := leaseToken_s3_decide
+    s3Decision.bits.snoopSlotToken := snoopSlotToken_s3_decide
     s3Decision.bits.dir := io.dirResp_s3
     s3Decision.bits.repl := io.replResp
     s3Decision.bits.metaOnHit := io.metaOnHit_s3
@@ -728,6 +734,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.toMSHRCtl.snoopDirectoryHit := dirResult_s3.hit
   io.toMSHRCtl.mshr_alloc_s3.bits.dirResult := nestable_dirResult_s3
   io.toMSHRCtl.mshr_alloc_s3.bits.state := alloc_state
+  io.toMSHRCtl.mshr_alloc_s3.bits.snoopSlotToken := s3Decision.bits.snoopSlotToken
   io.toMSHRCtl.mshr_alloc_s3.bits.task match { case task =>
     task := req_s3
     task.bufIdx := 0.U(bufIdxBits.W)
@@ -743,6 +750,16 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.toMSHRCtl.normalReservationDone.bits.mshrId := req_s3.mshrId
   io.toMSHRCtl.normalReservationDone.bits.mshrContext := 0.U
   io.toMSHRCtl.normalReservationDone.bits.token := leaseToken_s3
+  io.toMSHRCtl.snoopReservationDone.valid := task_s3.valid && sinkB_req_s3
+  io.toMSHRCtl.snoopReservationDone.bits := s3Decision.bits.snoopSlotToken
+  when(task_s3.valid && sinkB_req_s3) {
+    assert(s3Decision.bits.snoopSlotToken.valid &&
+      s3Decision.bits.snoopSlotToken.set === req_s3.set &&
+      s3Decision.bits.snoopSlotToken.tag === req_s3.tag &&
+      s3Decision.bits.snoopSlotToken.txnID === req_s3.txnID.get &&
+      s3Decision.bits.snoopSlotToken.source === req_s3.sourceId,
+      "MainPipe B task must retain its admitted slot token through apply")
+  }
 
   /* ======== Resps to SinkA/B/C Reqs ======== */
   val sink_resp_s3 = WireInit(0.U.asTypeOf(Valid(new TaskBundle)))

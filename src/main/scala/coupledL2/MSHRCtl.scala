@@ -43,6 +43,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val fromMainPipe = new Bundle() {
       val mainpipeLeaseDone = Flipped(ValidIO(new MainpipeLeaseDone))
       val mshr_alloc_s3 = Flipped(ValidIO(new MSHRRequest()))
+      val snoopReservationDone = Flipped(ValidIO(new SnoopSlotToken))
       val snoopDirectoryHit = Input(Bool())
       val normalReservationDone = Flipped(ValidIO(new MainpipeLeaseDone))
       val replaceCaptureWrite = Flipped(ValidIO(UInt(mshrBits.W)))
@@ -75,6 +76,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val mshrTask = DecoupledIO(new TaskBundle())
     val mshrTaskLeaseToken = Output(new MainpipeLeaseToken)
     val bServiceStart = Flipped(ValidIO(new TaskBundle))
+    val snoopReservationToken = Output(new SnoopSlotToken)
     val snoopAdmission = Flipped(DecoupledIO(new TaskBundle))
     val sidecarSnoopReserve = Flipped(ValidIO(UInt(mshrBits.W)))
     val replaceSnoopAdmissionIdle = Output(UInt(mshrsAll.W))
@@ -182,6 +184,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     Seq(mshrTaskGenerations(0)(i), mshrTaskGenerations(1)(i))) ++ mshrTaskGenerations(2)
   val normalService = RegInit(0.U.asTypeOf(Valid(new NormalSlotReservation)))
   val normalServiceInFlight = RegInit(false.B)
+  val normalPendingSlotOH = RegInit(0.U(mshrsAll.W))
+  val srPendingSlotOH = RegInit(0.U(mshrsAll.W))
   val normalReservationSequence = RegInit(0.U(8.W))
   val normalServiceSlotOH = Mux(normalService.valid,
     UIntToOH(normalService.bits.id, mshrsAll), 0.U(mshrsAll.W))
@@ -490,6 +494,13 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val snoopReservationSequence = RegInit(0.U(8.W))
   val snoopServiceToken = RegInit(0.U.asTypeOf(new SnoopReservationToken))
   val snoopPendingToken = RegInit(0.U.asTypeOf(new SnoopReservationToken))
+  io.snoopReservationToken.valid := snoopServiceToken.valid
+  io.snoopReservationToken.slot := snoopServiceToken.slot
+  io.snoopReservationToken.set := snoopServiceToken.set
+  io.snoopReservationToken.tag := snoopServiceToken.tag
+  io.snoopReservationToken.txnID := snoopServiceToken.txnID
+  io.snoopReservationToken.source := snoopServiceToken.source
+  io.snoopReservationToken.sequence := snoopServiceToken.generation
   val snoopServiceValid = snoopServiceToken.valid
   val snoopServiceTask = Reg(new TaskBundle)
   val snoopServiceSlotOH = Mux(snoopServiceToken.valid,
@@ -500,24 +511,20 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   )
   val snoopStatusValidOH = VecInit(snoopMshrs.map(_.io.status.valid)).asUInt
   val replaceInfoValidOH = VecInit(replaceMshrs.map(_.io.info.valid)).asUInt
+  val normalActiveSlotOH = VecInit(refillMshrs.map(_.io.status.valid)).asUInt
+  val srActiveSlotOH = snoopStatusValidOH | replaceInfoValidOH
+  val normalBusySlotOH = normalActiveSlotOH | normalPendingSlotOH
+  val srBusySlotOH = srActiveSlotOH | srPendingSlotOH
   val refillBlocksSnoopOH = VecInit(refillMshrs.map { refill =>
     refill.io.status.valid && refill.io.status.bits.w_c_resp
   }).asUInt
-  val snoopBaseEligibleOH = ~(
-    snoopStatusValidOH |
-      replaceInfoValidOH |
-      replaceReservedSlotOH |
-      snoopServiceSlotOH |
-      refillBlocksSnoopOH |
-      (normalServiceSlotOH & Fill(mshrsAll, normalServiceCmo))
-  )
+  val snoopBaseEligibleOH = ~(srBusySlotOH | refillBlocksSnoopOH)
   val replaceSlotUnreservedOH = VecInit((0 until mshrsAll).map { i =>
-    !snoopMshrs(i).io.status.valid && !replaceMshrs(i).io.info.valid &&
-      !replaceReservedSlotOH(i) && !snoopServiceSlotOH(i) &&
-      !(normalServiceCmo && normalServiceSlotOH(i))
+    !srBusySlotOH(i)
   }).asUInt
   val snoopAllocRequest = io.fromMainPipe.mshr_alloc_s3.valid &&
     io.fromMainPipe.mshr_alloc_s3.bits.task.fromB
+  val snoopServiceSlot = OHToUInt(PriorityEncoderOH(snoopBaseEligibleOH))
   val snoopCandidateSeen = RegNext(io.fromReqArb.status_s1.bCandidateValid, false.B)
   val snoopEntering_s2 = RegNext(io.fromReqArb.status_s1.bFire, false.B)
   val snoopEntering_s3 = RegNext(snoopEntering_s2, false.B)
@@ -539,20 +546,28 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       snoopPendingToken.source === snoopServiceToken.source &&
       snoopPendingToken.owner === snoopServiceToken.owner,
       "B apply consumed a different reservation token")
+    assert(io.fromMainPipe.snoopReservationDone.valid &&
+      io.fromMainPipe.snoopReservationDone.bits.valid &&
+      io.fromMainPipe.snoopReservationDone.bits.slot === snoopPendingToken.slot &&
+      io.fromMainPipe.snoopReservationDone.bits.sequence === snoopPendingToken.generation &&
+      io.fromMainPipe.snoopReservationDone.bits.set === snoopPendingToken.set &&
+      io.fromMainPipe.snoopReservationDone.bits.tag === snoopPendingToken.tag &&
+      io.fromMainPipe.snoopReservationDone.bits.txnID === snoopPendingToken.txnID &&
+      io.fromMainPipe.snoopReservationDone.bits.source === snoopPendingToken.source,
+      "B apply must return its captured physical slot token")
     snoopPendingToken.valid := false.B
     snoopServiceToken.valid := false.B
   }
   when(io.snoopAdmission.fire) {
     assert(!snoopServiceValid && snoopBaseEligibleOH.orR,
       "B service requires a unique available physical slot")
-    val serviceSlot = OHToUInt(PriorityEncoderOH(snoopBaseEligibleOH))
     snoopServiceToken.valid := true.B
-    snoopServiceToken.slot := serviceSlot
+    snoopServiceToken.slot := snoopServiceSlot
     snoopServiceToken.set := io.snoopAdmission.bits.set
     snoopServiceToken.tag := io.snoopAdmission.bits.tag
     snoopServiceToken.txnID := io.snoopAdmission.bits.txnID.get
     snoopServiceToken.source := io.snoopAdmission.bits.sourceId
-    snoopServiceToken.owner := serviceSlot
+    snoopServiceToken.owner := snoopServiceSlot
     snoopServiceToken.generation := snoopReservationSequence + 1.U
     snoopReservationSequence := snoopReservationSequence + 1.U
     snoopServiceTask := io.snoopAdmission.bits
@@ -590,7 +605,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val replaceReserveGrantParentOH = PriorityEncoderOH(replaceReserveNeedParentOH)
   val replaceReserveGrantSlotOH = PriorityEncoderOH(replaceSlotUnreservedOH)
   val replaceReserveGrant = !snoopAllocRequest && !snoopReservationFence && !io.nestedwb.c_set_dirty &&
-    replaceReserveNeedParentOH.orR && replaceSlotUnreservedOH.orR
+    !io.snoopAdmission.fire && replaceReserveNeedParentOH.orR && replaceSlotUnreservedOH.orR
   assert(
     !(snoopAllocRequest && replaceReserveGrant),
     "a snoop allocation must preempt a new ReplaceMSHR reservation"
@@ -891,7 +906,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   val normalSlotEligibleOH = Mux(normalCmo(io.normalReserveRequest.bits),
     replaceSlotIdle, VecInit(refillMshrs.zipWithIndex.map { case (refill, i) =>
-      !refill.io.status.valid && !(normalServiceSlotOH(i) && !normalServiceCmo)
+      !normalBusySlotOH(i)
     }).asUInt)
   val normalSlotPickOH = PriorityEncoderOH(normalSlotEligibleOH)
   io.normalReserveRequest.ready := !normalService.valid && normalSlotEligibleOH.orR &&
@@ -932,6 +947,57 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     normalAllocTask.fromA && !normalAllocTask.mshrTask &&
     normalAllocTask.sourceId === normalService.bits.task.sourceId
 
+  val normalReservationComplete = normalReservationDone.valid && normalReservationIdentityMatch
+  val normalReservationCancelOH = Mux(io.normalReserveCancel && normalService.valid,
+    normalServiceSlotOH, 0.U(mshrsAll.W))
+  val normalReservationCompleteOH = Mux(normalReservationComplete,
+    normalServiceSlotOH, 0.U(mshrsAll.W))
+  val normalReservationClaimOH = Mux(io.normalReserveRequest.fire &&
+      !normalCmo(io.normalReserveRequest.bits), normalSlotPickOH, 0.U(mshrsAll.W))
+  normalPendingSlotOH := (normalPendingSlotOH &
+    ~(normalReservationCancelOH | normalReservationCompleteOH)) | normalReservationClaimOH
+  assert(normalPendingSlotOH === Mux(normalService.valid && !normalServiceCmo,
+    normalServiceSlotOH, 0.U(mshrsAll.W)),
+    "normal pending slot ledger must match the retained reservation token")
+  assert(!(normalPendingSlotOH & VecInit(refillMshrs.map(_.io.status.valid)).asUInt).orR,
+    "an unfilled normal slot cannot also be active")
+
+  val snoopDoneToken = io.fromMainPipe.snoopReservationDone.bits
+  when(io.fromMainPipe.snoopReservationDone.valid) {
+    assert(snoopDoneToken.valid && snoopServiceValid &&
+      snoopDoneToken.slot === snoopServiceToken.slot &&
+      snoopDoneToken.sequence === snoopServiceToken.generation &&
+      snoopDoneToken.set === snoopServiceToken.set &&
+      snoopDoneToken.tag === snoopServiceToken.tag &&
+      snoopDoneToken.txnID === snoopServiceToken.txnID &&
+      snoopDoneToken.source === snoopServiceToken.source,
+      "B reservation completion must name its current physical slot owner")
+  }
+  val snoopReservationCompleteOH = Mux(io.fromMainPipe.snoopReservationDone.valid &&
+      snoopDoneToken.valid, UIntToOH(snoopDoneToken.slot, mshrsAll), 0.U(mshrsAll.W))
+  val normalCmoCompleteOH = Mux(normalReservationComplete && normalServiceCmo,
+    normalServiceSlotOH, 0.U(mshrsAll.W))
+  val normalCmoCancelOH = normalReservationCancelOH & Fill(mshrsAll, normalServiceCmo)
+  val srPendingClearOH = replaceReserveReleaseSlots |
+    snoopReservationCompleteOH | normalCmoCompleteOH | normalCmoCancelOH
+  val snoopAdmissionClaimOH = Mux(io.snoopAdmission.fire,
+    UIntToOH(snoopServiceSlot, mshrsAll), 0.U(mshrsAll.W))
+  val replaceReserveClaimOH = Mux(replaceReserveGrant,
+    replaceReserveGrantSlotOH, 0.U(mshrsAll.W))
+  val normalCmoClaimOH = Mux(io.normalReserveRequest.fire &&
+      normalCmo(io.normalReserveRequest.bits), normalSlotPickOH, 0.U(mshrsAll.W))
+  srPendingSlotOH := (srPendingSlotOH & ~srPendingClearOH) |
+    snoopAdmissionClaimOH | replaceReserveClaimOH | normalCmoClaimOH
+  val expectedSrPendingSlotOH = replaceReservedSlotOH | snoopServiceSlotOH |
+    (normalServiceSlotOH & Fill(mshrsAll, normalServiceCmo))
+  assert(srPendingSlotOH === expectedSrPendingSlotOH,
+    "the S/R pending bitmap must match each retained reservation token")
+  assert(PopCount(srPendingSlotOH) === PopCount(replaceReserveValid.asUInt) +&
+    snoopServiceValid.asUInt +& normalServiceCmo.asUInt,
+    "the S/R pending ledger must cover sidecars, snoops and CMO reservations")
+  assert(!(srPendingSlotOH & (snoopStatusValidOH | replaceInfoValidOH)).orR,
+    "an unfilled S/R reservation cannot also be active")
+
   io.toMainPipe.normalAllocAdmission := normalService.valid && normalServiceInFlight
   io.toMainPipe.normalAllocToken := normalService.bits.token
   io.toMainPipe.normalAllocOwner := normalService.bits.id
@@ -958,7 +1024,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val snoopMshrFull = snoopCredit === 0.U
   val mshrFull = snoopMshrFull
   val a_mshrFull = normalMshrFull
-  val selectedSnoopSlotOH = snoopServiceSlotOH & ~snoopStatusValidOH & ~replaceInfoValidOH
+  val selectedSnoopSlotOH = Mux(snoopAllocRequest,
+    UIntToOH(io.fromMainPipe.mshr_alloc_s3.bits.snoopSlotToken.slot, mshrsAll),
+    snoopServiceSlotOH) & ~snoopStatusValidOH & ~replaceInfoValidOH
   assert(PopCount(selectedSnoopSlotOH) <= 1.U,
     "the reserved snoop service slot must be one-hot")
   val allocIsSnoop = io.fromMainPipe.mshr_alloc_s3.bits.task.fromB
@@ -1061,7 +1129,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   io.toMainPipe.mshr_alloc_ptr := Mux(allocIsSnoop,
     OHToUInt(selectedMSHROH), normalService.bits.id)
   when(snoopAllocRequest) {
-    assert(snoopServiceValid &&
+    val token = io.fromMainPipe.mshr_alloc_s3.bits.snoopSlotToken
+    assert(token.valid && snoopServiceValid && token.slot === snoopServiceToken.slot &&
+      token.sequence === snoopServiceToken.generation && token.set === snoopServiceToken.set &&
+      token.tag === snoopServiceToken.tag && token.txnID === snoopServiceToken.txnID &&
+      token.source === snoopServiceToken.source &&
       io.fromMainPipe.mshr_alloc_s3.bits.task.set === snoopServiceTask.set &&
       io.fromMainPipe.mshr_alloc_s3.bits.task.tag === snoopServiceTask.tag &&
       io.fromMainPipe.mshr_alloc_s3.bits.task.txnID.get === snoopServiceTask.txnID.get,

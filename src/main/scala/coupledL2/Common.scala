@@ -252,6 +252,7 @@ class MSHRRequest(implicit p: Parameters) extends L2Bundle {
   val dirResult = new DirResult()
   val state = new FSMState()
   val task = new TaskBundle()
+  val snoopSlotToken = new SnoopSlotToken
 }
 
 // MSHR info to ReqBuf and SinkB
