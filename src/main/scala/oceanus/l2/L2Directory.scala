@@ -217,8 +217,9 @@ object PLRU4 {
 // The normal group retains ReplRd > DirRd > DirWb with starvation protection
 // and round-robin within a group. DirRel class priority is configurable:
 // dirrel-high, round-robin, or dirrel-low; high/RR hold the R/W turn.
-// Normal winners enter a 3-stage pipeline: S1 decode + tag/meta/replacement read,
-// S2 latch, S3 hit/way/result/update. RRIP SRAM mode caches active sets in a
+// Normal winners enter a 3-stage pipeline: S1 decode and request registration,
+// S2 SRAM request, S3 hit/way/result/update using the arriving response. RRIP
+// SRAM mode caches active sets in a
 // TSHR-sized CAM; zero-owner entries write back in exclusive Directory slots.
 //
 // ArbComp: DirRd/ReplRd/DirWb completion is asserted at the grant cycle.
@@ -455,6 +456,16 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   }
   val replCAMCommitFire = WireDefault(false.B)
   val directBackingWen = WireDefault(false.B)
+  val readLaunchValid = RegInit(false.B)
+  val readLaunchIsRepl = RegInit(false.B)
+  val readLaunchIsDirRd = RegInit(false.B)
+  val readLaunchSet = RegInit(0.U(setBits.W))
+  val readLaunchReplCAMUse = RegInit(false.B)
+  val readLaunchReplCAMAlloc = RegInit(false.B)
+  val readLaunchReplCAMIndex = RegInit(0.U(idxW.W))
+  val originReadValidLaunch = RegInit(false.B)
+  val originReadResponseValid = RegInit(false.B)
+  val writeLaunchPending = WireDefault(false.B)
   val s2_valid = WireDefault(false.B)
   val s2_replCAMAlloc = WireDefault(false.B)
   val s2_set = Wire(UInt(setBits.W))
@@ -519,6 +530,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     req.PADDR(offsetBits + setBits - 1, offsetBits)
   def replCAMReadBlocked(req: L2Directory.PathToDirectory): Bool = {
     val set = requestSet(req)
+    (readLaunchValid && readLaunchReplCAMAlloc && readLaunchSet === set) ||
     (s2_valid && s2_replCAMAlloc && s2_set === set) ||
     (s3_valid && s3_replCAMAlloc && s3_set === set)
   }
@@ -646,11 +658,11 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   // Grantable describes the normal-group result without the DirRel class gate.
   // It includes final-commit and replacement/backing hazards so reverse-stall
   // counters identify only real grants suppressed by winning/in-flight DirRel.
-  val normalReplRdGrantable = replRdWins && anyReplRd
-  val normalDirWbGrantable = !dirWbCommitBlocked && !replRdWins && anyLevel2 && level2WinIsWb && anyDirWb
+  val normalReplRdGrantable = !writeLaunchPending && replRdWins && anyReplRd
+  val normalDirWbGrantable = !writeLaunchPending && !dirWbCommitBlocked && !replRdWins && anyLevel2 && level2WinIsWb && anyDirWb
   // Full-FF DirRd must also observe every older S3 full-row update. SRAM
   // backends retain their existing CAM/direct interlocks instead of this stall.
-  val normalDirRdGrantable = !replRdWins && anyLevel2 && !level2WinIsWb && anyDirRd &&
+  val normalDirRdGrantable = !writeLaunchPending && !replRdWins && anyLevel2 && !level2WinIsWb && anyDirRd &&
     (useRRIPSram.B || !replStall) && !directBackingWen
   val grantReplRd = !dirRelClassBlock && normalReplRdGrantable
   val grantDirWb  = !dirRelClassBlock && normalDirWbGrantable
@@ -713,7 +725,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     None
   }
   dirRelGrant := dirRelPath.map(_._1).getOrElse(false.B) && useRRIPRelease.B &&
-    !relActive && !anyGrant && !pipelineBusy
+    !relActive && !anyGrant && !pipelineBusy && !writeLaunchPending
   if (paramL2.dirRelArbitration == "rr") {
     when(dirRelGrant) { lastGrantWasRel.get := true.B }
     when(anyGrant) { lastGrantWasRel.get := false.B }
@@ -766,8 +778,16 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val dirRelReplCAMHit = dirRelReplCAMMatch.orR
   val relNeedsOrigin = dirRelGrant && !dirRelReplCAMHit && useOriginSram.B
 
-  val tagReadData_s2 = tagArray.io.r(isRead, reqSet).resp.data
-  val metaReadData_s2 = metaArray.io.r(isRead, reqSet).resp.data
+  readLaunchValid := isRead
+  readLaunchIsRepl := isReplRd
+  readLaunchIsDirRd := isDirRd
+  readLaunchSet := reqSet
+  readLaunchReplCAMUse := s1ReplCAMHit || s1ReplCAMAlloc
+  readLaunchReplCAMAlloc := s1ReplCAMAlloc
+  readLaunchReplCAMIndex := s1ReplCAMIndexOrAlloc
+
+  val tagReadData_s2 = tagArray.io.r(readLaunchValid, readLaunchSet).resp.data
+  val metaReadData_s2 = metaArray.io.r(readLaunchValid, readLaunchSet).resp.data
   val dirReadData_s2 = Wire(Vec(ways, new L2Directory.DirEntry))
   for (w <- 0 until ways) {
     dirReadData_s2(w).tag := tagReadData_s2(w)
@@ -780,12 +800,20 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     replFF.map(_(reqSet)).getOrElse(0.U(replBits.W)))
   val originState_s1 = Mux(s1ReplCAMHit && useOriginSram.B, s1ReplCAMOrigin,
     originFF.map(_(reqSet)).getOrElse(0.U(ways.W)))
-  val replSramRead_s2 = replSRAM.map(_.io.r(isRead && !s1ReplCAMHit, reqSet).resp.data.asUInt)
+  val replReadValidLaunch = RegInit(false.B)
+  replReadValidLaunch := isRead && !s1ReplCAMHit
+  val replSramRead_s2 = replSRAM.map(_.io.r(replReadValidLaunch, readLaunchSet).resp.data.asUInt)
   val originReadSet = Mux(relNeedsOrigin, dirRelSet, reqSet)
+  val originReadSetLaunch = RegInit(0.U(setBits.W))
+  originReadSetLaunch := originReadSet
+  originReadValidLaunch := (isRead && !s1ReplCAMHit) || relNeedsOrigin
+  originReadResponseValid := originReadValidLaunch
   val originSramRead_s2 = originSRAM.map(_.io.r(
-    (isRead && !s1ReplCAMHit) || relNeedsOrigin, originReadSet).resp.data.asUInt)
+    originReadValidLaunch, originReadSetLaunch).resp.data.asUInt)
 
   // ── S1 → S2 ───────────────────────────────────────────────────────
+  // The launch register delays only the SRAM request. Request context retains
+  // its original schedule, so S3 aligns with the registered read's response.
   s2_valid := RegNext(isRead, false.B)
   val s2_isRepl = RegNext(isReplRd, false.B)
   val s2_isDirRd = RegNext(isDirRd, false.B)
@@ -816,8 +844,13 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val s3_tshr = RegNext(s2_tshr, 0.U)
   s3_set := RegNext(s2_set, 0.U)
   val s3_tag = RegNext(s2_tag, 0.U)
-  val s3_repl = RegNext(s2_repl, 0.U)
-  val s3_origin = RegNext(s2_origin, 0.U)
+  val s3_replCAMHit = RegNext(s2_replCAMHit, false.B)
+  val s3_repl_reg = RegNext(s2_repl, 0.U)
+  val s3_origin_reg = RegNext(s2_origin, 0.U)
+  val s3_repl = Mux(s3_replCAMHit, s3_repl_reg,
+    if (useRRIPSram) replSramRead_s2.get else s3_repl_reg)
+  val s3_origin = Mux(s3_replCAMHit, s3_origin_reg,
+    if (useOriginSram) originSramRead_s2.get else s3_origin_reg)
   val s3_replCAMStale = RegNext(s2_replCAMStale, false.B)
   val s3_replCAMUse = RegNext(s2_replCAMUse, false.B) && !s3_replCAMStale
   s3_replCAMAlloc := RegNext(s2_replCAMAlloc, false.B)
@@ -825,7 +858,8 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val s3_rrip_update = RegNext(s2_rrip_update, false.B)
   val s3_rrip_prefetch = RegNext(s2_rrip_prefetch, false.B)
   val s3_rrip_refill_prefetch = RegNext(s2_rrip_refill_prefetch, false.B)
-  pipelineBusy := s2_valid || s3_valid
+  pipelineBusy := readLaunchValid || originReadValidLaunch || originReadResponseValid ||
+    writeLaunchPending || s2_valid || s3_valid
 
   when (dirRelGrant) {
     if (!paramL2.dirRelSingleCycle) {
@@ -842,6 +876,8 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val relReplCAMHitNow = relReplCAMMatchNow.orR
   val relReplCAMIndexNow = PriorityEncoder(relReplCAMMatchNow)
   val relSetConflict = (anyGrant && reqSet === relSet) ||
+    (readLaunchValid && readLaunchSet === relSet) ||
+    (originReadValidLaunch && originReadSetLaunch === relSet) ||
     (s2_valid && s2_set === relSet) || (s3_valid && s3_set === relSet)
   val relReplCAMCommitConflict = relReplCAMHit && !relReplCAMHitNow
   val relConflict = relSetConflict || relReplCAMCommitConflict
@@ -865,13 +901,13 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val relCommitLocalValid = if (paramL2.dirRelSingleCycle) dirRelReq.RRIP_LOCAL_VALID else relLocalValid
   val relCommitPrefetch = if (paramL2.dirRelSingleCycle) dirRelReq.META.prefetch else relPrefetch
 
-  // A full-SRAM R miss returns its origin row in the first W cycle. Immediate W
-  // uses that response directly; a delayed W uses this per-request copy so an
-  // intervening dirrel-low read cannot replace the row before the RMW commit.
+  // A full-SRAM R miss captures its origin row only when the registered read
+  // response is valid. A delayed W uses this per-request copy so an intervening
+  // dirrel-low read cannot replace the row before the RMW commit.
   val relOriginHold = if (useOriginSram) Some(Reg(UInt(ways.W))) else None
   val relOriginHoldValid = if (useOriginSram) Some(RegInit(false.B)) else None
   if (useOriginSram) {
-    when (relActive && !relReplCAMHit && !relOriginHoldValid.get) {
+    when (relActive && !relReplCAMHit && !relOriginHoldValid.get && originReadResponseValid) {
       relOriginHold.get := originSramRead_s2.get
       relOriginHoldValid.get := true.B
     }
@@ -925,18 +961,31 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val dirWriteMetaMask = Mux(initActive, initMetaMask.asUInt,
     Mux(dirRelCommitFire, relMetaMask.asUInt, wbMetaMask.asUInt))
 
+  val tagWriteValidLaunch = RegNext(tagWriteValid, false.B)
+  val metaWriteValidLaunch = RegNext(metaWriteValid, false.B)
+  val tagWriteDataLaunch = RegInit(0.U(tagWidth.W))
+  tagWriteDataLaunch := dirWriteEntry.tag
+  val metaWriteDataLaunch = RegInit(0.U.asTypeOf(new L2Directory.Meta))
+  metaWriteDataLaunch := dirWriteEntry.meta
+  val dirWriteSetLaunch = RegInit(0.U(setBits.W))
+  dirWriteSetLaunch := dirWriteSet
+  val dirWriteWayMaskLaunch = RegInit(0.U(ways.W))
+  dirWriteWayMaskLaunch := dirWriteWayMask
+  val dirWriteMetaMaskLaunch = RegInit(0.U(new L2Directory.Meta().getWidth.W))
+  dirWriteMetaMaskLaunch := dirWriteMetaMask
+
   tagArray.io.w(
-    valid   = tagWriteValid,
-    data    = dirWriteEntry.tag,
-    setIdx  = dirWriteSet,
-    waymask = dirWriteWayMask
+    valid   = tagWriteValidLaunch,
+    data    = tagWriteDataLaunch,
+    setIdx  = dirWriteSetLaunch,
+    waymask = dirWriteWayMaskLaunch
   )
   metaArray.io.w(
-    valid   = metaWriteValid,
-    data    = dirWriteEntry.meta,
-    setIdx  = dirWriteSet,
-    waymask = dirWriteWayMask,
-    bitmask = dirWriteMetaMask
+    valid   = metaWriteValidLaunch,
+    data    = metaWriteDataLaunch,
+    setIdx  = dirWriteSetLaunch,
+    waymask = dirWriteWayMaskLaunch,
+    bitmask = dirWriteMetaMaskLaunch
   )
 
   if (enableDirStateProbe) {
@@ -948,14 +997,16 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     io.debugStateWrite.get.client0 := winReq.META.clients(0)
   }
 
-  // DirWb completion is combinational at the grant cycle: the write lands at the
-  // edge ending that cycle and is observed by any access granted from the next
-  // cycle on (single grant per cycle, latency-1 synchronous SRAM).
+  // DirWb completion remains at the grant cycle. Its complete write bundle is
+  // registered for the following edge, and writeLaunchPending prevents a new
+  // directory admission from bypassing that committed write.
 
   // ══════════════════════════════════════════════════════════════════
   // S3: hit detect, way select, PLRU update
   // ══════════════════════════════════════════════════════════════════
-  val dirData_s3 = RegEnable(dirReadData_s2, 0.U.asTypeOf(dirReadData_s2), s2_valid)
+  // The registered SRAM request is issued in S2 and its response arrives in
+  // S3. Consume it directly instead of adding a second response-data register.
+  val dirData_s3 = dirReadData_s2
 
   val tagMatch = VecInit(dirData_s3.map(_.tag === s3_tag))
   val validVec = VecInit(dirData_s3.map(_.meta.state =/= L2Directory.MetaState.I))
@@ -976,9 +1027,12 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   // FF retains the original global RAW guard. The SRAM backend needs it only
   // for direct backing operations; CAM-resident updates can proceed by set.
   if (useRRIPSram) {
-    replStall := (s2_valid && !s2_replCAMUse) || (s3_valid && !s3_replCAMUse)
+    replStall := (readLaunchValid && !readLaunchReplCAMUse) ||
+      (s2_valid && !s2_replCAMUse) || (s3_valid && !s3_replCAMUse)
   } else {
     replStall :=
+      (readLaunchValid && readLaunchIsRepl) ||
+      (readLaunchValid && readLaunchIsDirRd) ||
       (s2_valid && s2_isRepl) ||
       (s3_valid && s3_isRepl) ||
       (s2_valid && s2_isDirRd) ||
@@ -1115,28 +1169,61 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
       0.U(replBits.W)
     }
   }
+  val replWriteValid = WireDefault(false.B)
+  val replWriteRow = WireDefault(0.U(replBits.W))
+  val replWriteSet = WireDefault(0.U(setBits.W))
+  val replWriteMask = WireDefault(0.U(ways.W))
   def writeReplBacking(valid: Bool, row: UInt, set: UInt, waymask: UInt): Unit = {
     if (useRRIPSram) {
-      val lanes = VecInit((0 until ways).map(w => row(2 * w + 1, 2 * w)))
-      replSRAM.get.io.w(valid, lanes, set, waymask)
+      replWriteValid := valid
+      replWriteRow := row
+      replWriteSet := set
+      replWriteMask := waymask
     }
   }
+  val originWriteValid = WireDefault(false.B)
+  val originWriteRow = WireDefault(0.U(ways.W))
+  val originWriteSet = WireDefault(0.U(setBits.W))
+  val originWriteMask = WireDefault(0.U(ways.W))
   def writeOriginBacking(valid: Bool, row: UInt, set: UInt, waymask: UInt): Unit = {
     if (useOriginSram) {
-      val lanes = VecInit((0 until ways).map(w => row(w)))
-      originSRAM.get.io.w(valid, lanes, set, waymask)
+      originWriteValid := valid
+      originWriteRow := row
+      originWriteSet := set
+      originWriteMask := waymask
     } else {
       when (valid) {
         originFF.get(set) := row
       }
     }
   }
+
+  val replWriteValidLaunch = RegInit(false.B)
+  replWriteValidLaunch := replWriteValid
+  val replWriteRowLaunch = RegInit(0.U(replBits.W))
+  replWriteRowLaunch := replWriteRow
+  val replWriteSetLaunch = RegInit(0.U(setBits.W))
+  replWriteSetLaunch := replWriteSet
+  val replWriteMaskLaunch = RegInit(0.U(ways.W))
+  replWriteMaskLaunch := replWriteMask
+  val originWriteValidLaunch = RegInit(false.B)
+  originWriteValidLaunch := originWriteValid
+  val originWriteRowLaunch = RegInit(0.U(ways.W))
+  originWriteRowLaunch := originWriteRow
+  val originWriteSetLaunch = RegInit(0.U(setBits.W))
+  originWriteSetLaunch := originWriteSet
+  val originWriteMaskLaunch = RegInit(0.U(ways.W))
+  originWriteMaskLaunch := originWriteMask
   if (useRRIPSram) {
-    replSRAM.get.io.w(false.B, VecInit(Seq.fill(ways)(0.U(2.W))), 0.U(setBits.W), 0.U(ways.W))
+    val lanes = VecInit((0 until ways).map(w => replWriteRowLaunch(2 * w + 1, 2 * w)))
+    replSRAM.get.io.w(replWriteValidLaunch, lanes, replWriteSetLaunch, replWriteMaskLaunch)
   }
   if (useOriginSram) {
-    originSRAM.get.io.w(false.B, VecInit(Seq.fill(ways)(false.B)), 0.U(setBits.W), 0.U(ways.W))
+    val lanes = VecInit((0 until ways).map(w => originWriteRowLaunch(w)))
+    originSRAM.get.io.w(originWriteValidLaunch, lanes, originWriteSetLaunch, originWriteMaskLaunch)
   }
+  writeLaunchPending := tagWriteValidLaunch || metaWriteValidLaunch ||
+    replWriteValidLaunch || originWriteValidLaunch
 
   val replNextState = Wire(UInt(replBits.W))
   if (useDRRIP) {
@@ -1235,10 +1322,14 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
 
   if (useRRIPSram) {
     def allocInFlight(index: UInt): Bool =
+      (readLaunchValid && readLaunchReplCAMAlloc && readLaunchReplCAMIndex === index) ||
       (s2_valid && s2_replCAMAlloc && s2_replCAMIndex === index) ||
       (s3_valid && s3_replCAMAlloc && s3_replCAMIndex === index)
     def commitSafe(index: UInt, set: UInt): Bool =
-      !directBackingWen && !allocInFlight(index) &&
+      !directBackingWen && !writeLaunchPending && !allocInFlight(index) &&
+        !(readLaunchValid && readLaunchSet === set) &&
+        !(originReadValidLaunch && originReadSetLaunch === set) &&
+        !(originReadResponseValid && originReadSetLaunch === set) &&
         !(s2_valid && s2_set === set) && !(s3_valid && s3_set === set) && !relActive
 
     val finalCandidateIndex = dirWbReplCAMIndexVec(winDirWb)
@@ -1355,11 +1446,9 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   }
 
   // Release at the owner's fill-commit DirWb grant: ownership is structural
-  // per TSHR and exact set/way. The tag/meta commit is visible from the next
-  // cycle, so the way can be released at this same edge without a clear/idle
-  // race. A non-owner or meta-only write never releases. An older refill may
-  // still retire replCAM ownership after a same-slot hit-hold handoff, but
-  // must not clear the new hold.
+  // per TSHR and exact set/way. A non-owner or meta-only write never releases.
+  // An older refill may still retire replCAM ownership after a same-slot
+  // hit-hold handoff, but must not clear the new hold.
   val dirWbHitLockReleaseVec = VecInit(io.toDir.zipWithIndex.map { case (req, i) =>
     val lock = lockTable(i)
     req.REPL_LOCK_RELEASE && lock.valid && lock.hitHold &&
