@@ -515,7 +515,7 @@ class L2TSHRDirectoryProxy(val id: Int)(implicit val p: Parameters) extends Modu
   io.toDir.RRIP_PREFETCH := io.rrip_prefetch
   io.toDir.RRIP_REFILL_PREFETCH := io.rrip_refill_prefetch
   io.toDir.ReplLock := io.repl_lock_req
-  io.toDir.REPL_LOCK_CANDIDATE := io.repl_lock_candidate
+  io.toDir.ReplLockCandidate := io.repl_lock_candidate
   io.toDir.REPL_LOCK_WAY := io.repl_lock_way
   io.toDir.REPL_LOCK_RELEASE := io.repl_lock_release
   io.repl_lock_conflict := fromDir_en && io.fromDir.ReplLockConflict

@@ -143,6 +143,7 @@ object L2Directory {
     val ReplRd = Bool()
     val DirRel = Bool() // DRRIP release-type update, issued at EVT vPipe acceptance
     val ReplLock = Bool() // Fire-and-forget hit-way reservation, outside normal arbitration
+    val ReplLockCandidate = Bool()
   }
 
   class PathToDirectory(implicit val p: Parameters) extends PathToDirectoryUOPs with HasL2Params {
@@ -156,7 +157,6 @@ object L2Directory {
     val RRIP_PREFETCH = Bool()
     val RRIP_REFILL_PREFETCH = Bool()
     val RRIP_LOCAL_VALID = Bool() // DirRel: use META.prefetch from the latest TSHR-local copy
-    val REPL_LOCK_CANDIDATE = Bool()
     val REPL_LOCK_WAY = UInt(wayBits.W)
     val REPL_LOCK_RELEASE = Bool()
   }
@@ -977,7 +977,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   })
 
   val eligibleVec = VecInit(io.toDir.zipWithIndex.map { case (req, i) =>
-    req.REPL_LOCK_CANDIDATE && !storedConflictVec(i)
+    req.ReplLockCandidate && !storedConflictVec(i)
   })
 
   val sameCycleConflictVec = VecInit(io.toDir.zipWithIndex.map { case (req, i) =>
