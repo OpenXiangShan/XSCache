@@ -658,11 +658,14 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   // Grantable describes the normal-group result without the DirRel class gate.
   // It includes final-commit and replacement/backing hazards so reverse-stall
   // counters identify only real grants suppressed by winning/in-flight DirRel.
-  val normalReplRdGrantable = !writeLaunchPending && replRdWins && anyReplRd
-  val normalDirWbGrantable = !writeLaunchPending && !dirWbCommitBlocked && !replRdWins && anyLevel2 && level2WinIsWb && anyDirWb
+  // A request admitted during a registered write cycle reaches the array in the
+  // following cycle. Normal traffic can be pipelined without a blanket
+  // writeLaunchPending admission bubble; current-cycle backing hazards still apply.
+  val normalReplRdGrantable = replRdWins && anyReplRd
+  val normalDirWbGrantable = !dirWbCommitBlocked && !replRdWins && anyLevel2 && level2WinIsWb && anyDirWb
   // Full-FF DirRd must also observe every older S3 full-row update. SRAM
   // backends retain their existing CAM/direct interlocks instead of this stall.
-  val normalDirRdGrantable = !writeLaunchPending && !replRdWins && anyLevel2 && !level2WinIsWb && anyDirRd &&
+  val normalDirRdGrantable = !replRdWins && anyLevel2 && !level2WinIsWb && anyDirRd &&
     (useRRIPSram.B || !replStall) && !directBackingWen
   val grantReplRd = !dirRelClassBlock && normalReplRdGrantable
   val grantDirWb  = !dirRelClassBlock && normalDirWbGrantable
@@ -998,8 +1001,8 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   }
 
   // DirWb completion remains at the grant cycle. Its complete write bundle is
-  // registered for the following edge, and writeLaunchPending prevents a new
-  // directory admission from bypassing that committed write.
+  // registered for the following edge. Normal admissions pipeline behind that
+  // write, while writeLaunchPending retains the CAM/DirRel visibility hazards.
 
   // ══════════════════════════════════════════════════════════════════
   // S3: hit detect, way select, PLRU update
@@ -1224,6 +1227,17 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   }
   writeLaunchPending := tagWriteValidLaunch_s1 || metaWriteValidLaunch_s1 ||
     replWriteValidLaunch_s1 || originWriteValidLaunch_s1
+
+  assert(!(readLaunchValid_s1 && (tagWriteValidLaunch_s1 || metaWriteValidLaunch_s1)),
+    "Directory: single-port tag/meta read/write launch overlap")
+  if (useRRIPSram) {
+    assert(!(replReadValidLaunch_s1 && replWriteValidLaunch_s1),
+      "Directory: single-port replacement read/write launch overlap")
+  }
+  if (useOriginSram) {
+    assert(!(originReadValidLaunch_s1 && originWriteValidLaunch_s1),
+      "Directory: single-port origin read/write launch overlap")
+  }
 
   val replNextState = Wire(UInt(replBits.W))
   if (useDRRIP) {
