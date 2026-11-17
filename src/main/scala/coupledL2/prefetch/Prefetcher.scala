@@ -504,7 +504,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   for ((reqOpt, j) <- reqs.zipWithIndex) {
     reqOpt.foreach { req =>
-      req.ready := (0 until banks).map(i => selectOH(i)(j) && pftQueue(i).io.enq.ready).reduce(_ || _)
+      req.ready := (0 until banks).map(i => selectOH(i)(j)).reduce(_ || _)
     }
   }
 
