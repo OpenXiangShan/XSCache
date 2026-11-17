@@ -34,7 +34,8 @@ import chisel3.util._
 class OverwriteQueue[T <: Data](
   gen: T, 
   entries: Int, //Must be a power of 2
-  hasFlow: Boolean = true
+  hasFlow: Boolean = true,
+  allowOverwrite: Boolean = true
 ) extends Module {
   val io = IO(new Bundle {
     val enq = Flipped(DecoupledIO(gen))
@@ -53,7 +54,7 @@ class OverwriteQueue[T <: Data](
   val empty = headPtr === tailPtr && !maybe_full
   
   // Decide enq ready depending on hasOverWrite (elaboration-time constant)
-  io.enq.ready := true.B 
+  io.enq.ready := (if (allowOverwrite) true.B else !full || io.deq.ready)
 
   // Compute deq.valid according to modes (use Scala if for param-time branching)
   val deq_valid = if (hasFlow) {

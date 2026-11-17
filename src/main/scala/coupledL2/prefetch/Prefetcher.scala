@@ -475,7 +475,8 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
     Module(new OverwriteQueue(
       gen = new PrefetchReq,
       entries = inflightEntries,
-      hasFlow = true
+      hasFlow = true,
+      allowOverwrite = false
     ))
   }
   val pipe = Seq.tabulate(banks) { _ => Module(new Pipeline(new PrefetchReq, 1)) }
@@ -503,7 +504,7 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
 
   for ((reqOpt, j) <- reqs.zipWithIndex) {
     reqOpt.foreach { req =>
-      req.ready := (0 until banks).map(i => selectOH(i)(j)).reduce(_ || _)
+      req.ready := (0 until banks).map(i => selectOH(i)(j) && pftQueue(i).io.enq.ready).reduce(_ || _)
     }
   }
 
