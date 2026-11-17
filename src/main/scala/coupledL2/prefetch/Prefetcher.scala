@@ -471,12 +471,17 @@ class Prefetcher(implicit p: Parameters) extends PrefetchModule {
   val reqsValid = reqs.map(_.map(_.valid).getOrElse(false.B))
   val reqsBits = reqs.map(_.map(_.bits).getOrElse(0.U.asTypeOf(new PrefetchReq)))
   val reqsSetAddr = reqsBits.map(_.setaddr)
+  def generatedInL2(req: PrefetchReq): Bool =
+    req.isBOP || req.isPBOP || req.isTP || req.isNL || req.isCDP
   val pftQueue = Seq.tabulate(banks) { _ =>
     Module(new OverwriteQueue(
       gen = new PrefetchReq,
       entries = inflightEntries,
       hasFlow = true,
-      allowOverwrite = false
+      allowOverwrite = true,
+      overwriteWhen = Some((incoming: PrefetchReq, oldest: PrefetchReq) =>
+        !generatedInL2(incoming) && generatedInL2(oldest)
+      )
     ))
   }
   val pipe = Seq.tabulate(banks) { _ => Module(new Pipeline(new PrefetchReq, 1)) }
