@@ -2223,35 +2223,44 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val group = UInt(log2Up(nMshrTaskGroups).W)
     val source = UInt(log2Up(mshrTaskGroupSize).W)
     val qosClass = UInt(3.W)
+    val token = new MainpipeLeaseToken
   }
-  val mshrTaskPreparedValid = Seq.fill(nMshrTaskGroups)(RegInit(false.B))
-  val mshrTaskPrepared = Seq.fill(nMshrTaskGroups)(
-    RegInit(0.U.asTypeOf(new MSHRPreparedTask)))
-  val mshrTaskLeaseValid = Seq.fill(nMshrTaskGroups)(RegInit(false.B))
-  val mshrTaskWinners = Seq.fill(nMshrTaskGroups)(RegInit(0.U.asTypeOf(new MSHRTaskWinner)))
-  val mshrTaskLeaseReturning = Seq.fill(nMshrTaskGroups)(RegInit(false.B))
-  val mshrTaskLeaseReturnSent = Seq.fill(nMshrTaskGroups)(RegInit(false.B))
-  val mshrTaskLeaseAwaitPipe = Seq.fill(nMshrTaskGroups)(RegInit(false.B))
+  // A lease belongs to one source, independently of the group's preparation
+  // capacity. Issued sources retain their own snapshot until terminal + return.
+  val mshrTaskLeaseValid = Seq.fill(nMshrTaskGroups)(
+    Seq.fill(mshrTaskGroupSize)(RegInit(false.B)))
+  val mshrTaskLeaseBindings = Seq.fill(nMshrTaskGroups)(
+    Seq.fill(mshrTaskGroupSize)(RegInit(0.U.asTypeOf(new MSHRTaskWinner))))
+  val mshrTaskLeaseReturning = Seq.fill(nMshrTaskGroups)(
+    Seq.fill(mshrTaskGroupSize)(RegInit(false.B)))
+  val mshrTaskLeaseReturnSent = Seq.fill(nMshrTaskGroups)(
+    Seq.fill(mshrTaskGroupSize)(RegInit(false.B)))
+  val mshrTaskLeaseAwaitPipe = Seq.fill(nMshrTaskGroups)(
+    Seq.fill(mshrTaskGroupSize)(RegInit(false.B)))
+  val mshrTaskSchedulerPending = Seq.fill(nMshrTaskGroups)(
+    Seq.fill(mshrTaskGroupSize)(RegInit(false.B)))
   val mshrTaskLeaseSequence = Seq.fill(nMshrTaskGroups)(RegInit(0.U(8.W)))
+  // Both queues use occupancy Q for admission; neither flows through nor
+  // borrows a slot from a same-cycle dequeue/terminal event.
+  val mshrTaskWinnerQueues = Seq.fill(nMshrTaskGroups)(
+    Module(new Queue(new MSHRTaskWinner, 2, pipe = false, flow = false)))
+  val mshrTaskPreparedQueues = Seq.fill(nMshrTaskGroups)(
+    Module(new Queue(new MSHRPreparedTask, 2, pipe = false, flow = false)))
+  val mshrTaskPrepared = mshrTaskPreparedQueues.map(_.io.deq.bits)
+  val mshrTaskPreparedValid = mshrTaskPreparedQueues.map(_.io.deq.valid)
   val mshrTaskGroupWait = Seq.fill(nMshrTaskGroups)(RegInit(0.U(6.W)))
   val mshrTaskGroupClassEff = (0 until nMshrTaskGroups).map { g =>
     Mux(mshrTaskGroupWait(g) === 63.U, 0.U(3.W), mshrTaskPrepared(g).qosClass)
   }
-  val mshrTaskGroupCancel = (0 until nMshrTaskGroups).map { g =>
-    val sourceOH = UIntToOH(mshrTaskWinners(g).source, mshrTaskGroupSize)
-    Mux1H(sourceOH, mshrTaskLeasePorts(g).map(_.cancel))
+  val mshrTaskSourceCanceled = (0 until nMshrTaskGroups).map { g =>
+    VecInit(mshrTaskLeasePorts(g).zipWithIndex.map { case (lease, i) =>
+      mshrTaskLeaseReturning(g)(i) || lease.cancel.valid
+    }).asUInt
   }
-  val mshrTaskWinnerStale = (0 until nMshrTaskGroups).map { g =>
-    val winner = mshrTaskWinners(g)
-    val sourceReallocated =
-      VecInit(mshrTaskGenerations(g))(winner.source) =/= winner.token.generation
-    val pairedOwnerReallocated = if (g == 1) {
-      winner.completion.valid && !pairedCompletionCurrent(winner.completion.bits)
-    } else false.B
-    sourceReallocated || pairedOwnerReallocated
-  }
+  def selectedTaskCanceled(g: Int, source: UInt): Bool =
+    (UIntToOH(source, mshrTaskGroupSize) & mshrTaskSourceCanceled(g)).orR
   val mshrTaskGroupReady = (0 until nMshrTaskGroups).map { g =>
-    mshrTaskPreparedValid(g) && mshrTaskLeaseValid(g) && !mshrTaskLeaseReturning(g)
+    mshrTaskPreparedValid(g) && !selectedTaskCanceled(g, mshrTaskPrepared(g).source)
   }
 
   val mshrTaskTicketValid = RegInit(false.B)
@@ -2267,38 +2276,36 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val mshrTaskTicketInputs = (0 until nMshrTaskGroups).map { g =>
     val ticket = Wire(Decoupled(new MSHRTaskTicket))
     ticket.valid := mshrTaskGroupReady(g) &&
-      !mshrTaskGroupCancel(g).valid &&
       mshrTaskGroupClassEff(g) === mshrTaskFinalBestClass
     ticket.bits.group := g.U
     ticket.bits.source := mshrTaskPrepared(g).source
     ticket.bits.qosClass := mshrTaskGroupClassEff(g)
+    ticket.bits.token := mshrTaskPrepared(g).token
     ticket
   }
   ArbPerf(twoLevelArb(mshrTaskTicketInputs, mshrTaskTicketOut, Some("mshr_task_ticket")),
     "mshr_task_ticket_arb")
-  mshrTaskTicketOut.ready := !mshrTaskTicketValid && !mshrTaskIssuePermitValid
+  // The next head may reserve its ticket while the preceding permit is busy.
+  mshrTaskTicketOut.ready := !mshrTaskTicketValid
   val mshrTaskTicketGroupOH = UIntToOH(mshrTaskTicket.group, nMshrTaskGroups)
   val mshrTaskTicketReady = Mux1H(mshrTaskTicketGroupOH, (0 until nMshrTaskGroups).map { g =>
     mshrTaskGroupReady(g) && mshrTaskPrepared(g).source === mshrTaskTicket.source &&
-      !mshrTaskGroupCancel(g).valid
+      mshrTaskPrepared(g).token.asUInt === mshrTaskTicket.token.asUInt
   })
   val mshrTaskIssuePermitGroupOH = UIntToOH(mshrTaskIssuePermit.group, nMshrTaskGroups)
-  val mshrTaskIssuePermitReady = mshrTaskIssuePermitValid && Mux1H(
-    mshrTaskIssuePermitGroupOH,
-    (0 until nMshrTaskGroups).map { g =>
-      mshrTaskGroupReady(g) &&
-        mshrTaskPrepared(g).source === mshrTaskIssuePermit.source &&
-        mshrTaskPrepared(g).token.asUInt === mshrTaskIssuePermit.token.asUInt &&
-        !mshrTaskGroupCancel(g).valid
-    }
-  )
+  val mshrTaskIssuePermitReady = mshrTaskIssuePermitValid && !Mux1H(
+    mshrTaskIssuePermitGroupOH, (0 until nMshrTaskGroups).map { g =>
+      selectedTaskCanceled(g, mshrTaskIssuePermit.source)
+    })
   val mshrTaskIssuePermitTake = mshrTaskTicketValid && mshrTaskTicketReady &&
     !mshrTaskIssuePermitValid
+  val mshrTaskIssuePermitAbort = mshrTaskIssuePermitValid && !mshrTaskIssuePermitReady
   when(mshrTaskIssuePermitTake) {
     mshrTaskIssuePermitValid := true.B
     mshrTaskIssuePermit := Mux1H(mshrTaskTicketGroupOH, mshrTaskPrepared)
+    mshrTaskIssuePermit.qosClass := mshrTaskTicket.qosClass
     mshrTaskTicketValid := false.B
-  }.elsewhen(mshrTaskIssuePermitValid && (!mshrTaskIssuePermitReady || mshrTask.fire)) {
+  }.elsewhen(mshrTaskIssuePermitAbort || mshrTask.fire) {
     mshrTaskIssuePermitValid := false.B
   }
   mshrTask.valid := mshrTaskIssuePermitReady
@@ -2313,7 +2320,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     mshrTaskTicket := mshrTaskTicketOut.bits
     assert(mshrTaskTicketOut.bits.qosClass === mshrTaskFinalBestClass,
       "selected ticket must belong to the best effective QoS class")
-  }.elsewhen(mshrTaskTicketValid && !mshrTaskTicketReady && !mshrTaskIssuePermitTake) {
+  }.elsewhen(mshrTaskTicketValid && !mshrTaskTicketReady) {
     mshrTaskTicketValid := false.B
   }.elsewhen(mshrTaskTicketValid &&
     Mux1H(mshrTaskTicketGroupOH, mshrTaskGroupWait.map(_ === 63.U))) {
@@ -2322,7 +2329,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
 
   (0 until nMshrTaskGroups).foreach { g =>
     val winnerOut = Wire(Decoupled(new MSHRTaskWinner))
-    val candidates = groupCandidates(g, groupValids(g))
+    val unleased = ~VecInit(mshrTaskLeaseValid(g)).asUInt
+    val candidates = groupCandidates(g, groupValids(g) & unleased)
     val winnerInputs = mshrTaskLeasePorts(g).zipWithIndex.map { case (lease, i) =>
       val in = Wire(Decoupled(new MSHRTaskWinner))
       in.valid := candidates(i)
@@ -2351,112 +2359,140 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       in
     }
     ArbPerf(twoLevelArb(winnerInputs, winnerOut, Some(s"mshr_task_group_$g")),
-      s"mshr_task_group_${g}_arb")
-    winnerOut.ready := !mshrTaskLeaseValid(g)
-    val winner = mshrTaskWinners(g)
+      s"mshr_task_group_$g" + "_arb")
+    val winnerQueue = mshrTaskWinnerQueues(g).io
+    val preparedQueue = mshrTaskPreparedQueues(g).io
+    winnerQueue.enq <> winnerOut
+    val winner = winnerQueue.deq.bits
     val sourceOH = UIntToOH(winner.source, mshrTaskGroupSize)
     val payload = Mux1H(sourceOH, groupOf(g).map(_.bits))
     val payloadValid = Mux1H(sourceOH, groupOf(g).map(_.valid))
     val payloadOperation = Mux1H(sourceOH, mshrTaskLeasePorts(g).map(_.candidate.bits.operation))
-    val preparePayload = mshrTaskLeaseValid(g) && !mshrTaskLeaseReturning(g) &&
-      !mshrTaskPreparedValid(g) && payloadValid && payloadOperation === winner.operation
-    val granted = mshrTask.fire && mshrTaskIssuePermitGroupOH(g)
-    val returnRequest = mshrTaskLeaseValid(g) && mshrTaskLeaseReturning(g) &&
-      !mshrTaskLeaseAwaitPipe(g) && !mshrTaskLeaseReturnSent(g)
-    mshrTaskLeasePorts(g).zipWithIndex.foreach { case (lease, i) =>
-      lease.prepare.valid := winnerOut.fire && winnerOut.bits.source === i.U
-      lease.prepare.bits := winnerOut.bits.token
-      lease.held.valid := mshrTaskLeaseValid(g) && sourceOH(i)
-      lease.held.bits := winner.token
-      lease.release.valid := returnRequest && sourceOH(i)
-      lease.release.bits := winner.token
-    }
-    when(preparePayload) {
-      mshrTaskPreparedValid(g) := true.B
-      mshrTaskPrepared(g).task := payload
-      mshrTaskPrepared(g).group := winner.group
-      mshrTaskPrepared(g).source := winner.source
-      mshrTaskPrepared(g).operation := winner.operation
-      mshrTaskPrepared(g).qosClass := winner.qosClass
-      mshrTaskPrepared(g).token := winner.token
-      mshrTaskPrepared(g).completion := winner.completion
-      if (g == 1) {
-        val outcome = Mux(payload.meta.state === INVALID, 1.U,
-          Mux(payload.meta.state === BRANCH, 2.U, Mux(!payload.meta.dirty, 3.U, 0.U)))
-        mshrTaskPrepared(g).completion.valid := winner.completion.valid && outcome.orR
-        mshrTaskPrepared(g).completion.bits.outcome := outcome
-        when(winner.completion.valid) {
-          assert(payload.set === winner.completion.bits.targetSet &&
-            payload.tag === winner.completion.bits.targetTag &&
-            pairedCompletionCurrent(winner.completion.bits),
-            "paired payload must retain the winner's normal owner and line")
-        }
+    val winnerCanceled = selectedTaskCanceled(g, winner.source)
+    preparedQueue.enq.valid := winnerQueue.deq.valid && !winnerCanceled &&
+      payloadValid && payloadOperation === winner.operation
+    preparedQueue.enq.bits := 0.U.asTypeOf(new MSHRPreparedTask)
+    preparedQueue.enq.bits.task := payload
+    preparedQueue.enq.bits.group := winner.group
+    preparedQueue.enq.bits.source := winner.source
+    preparedQueue.enq.bits.operation := winner.operation
+    preparedQueue.enq.bits.qosClass := winner.qosClass
+    preparedQueue.enq.bits.token := winner.token
+    preparedQueue.enq.bits.completion := winner.completion
+    if (g == 1) {
+      val outcome = Mux(payload.meta.state === INVALID, 1.U,
+        Mux(payload.meta.state === BRANCH, 2.U, Mux(!payload.meta.dirty, 3.U, 0.U)))
+      preparedQueue.enq.bits.completion.valid := winner.completion.valid && outcome.orR
+      preparedQueue.enq.bits.completion.bits.outcome := outcome
+      when(preparedQueue.enq.fire && winner.completion.valid) {
+        assert(payload.set === winner.completion.bits.targetSet &&
+          payload.tag === winner.completion.bits.targetTag &&
+          pairedCompletionCurrent(winner.completion.bits),
+          "paired payload must retain the winner's normal owner and line")
       }
+    }
+    winnerQueue.deq.ready := winnerCanceled ||
+      preparedQueue.enq.ready && payloadValid && payloadOperation === winner.operation
+    when(preparedQueue.enq.fire) {
       assert(payload.mshrId === winner.source && payload.mshrContext === g.U,
         "materialized payload must belong to the registered group winner")
     }
-    val returnAck = Mux1H(sourceOH, mshrTaskLeasePorts(g).map(_.released))
+    val winnerAbort = winnerQueue.deq.fire && winnerCanceled
+    val ticketOwnsHead = mshrTaskTicketValid && mshrTaskTicketGroupOH(g)
+    val preparedCanceled = selectedTaskCanceled(g, preparedQueue.deq.bits.source)
+    preparedQueue.deq.ready := mshrTaskIssuePermitTake && mshrTaskTicketGroupOH(g) ||
+      preparedCanceled && !ticketOwnsHead
+    val preparedAbort = preparedQueue.deq.fire && preparedCanceled && !ticketOwnsHead
+    val granted = mshrTask.fire && mshrTaskIssuePermitGroupOH(g)
+    val permitAbort = mshrTaskIssuePermitAbort && mshrTaskIssuePermitGroupOH(g)
     when(winnerOut.fire) {
-      mshrTaskLeaseValid(g) := true.B
-      mshrTaskWinners(g) := winnerOut.bits
-      mshrTaskPreparedValid(g) := false.B
-      mshrTaskLeaseReturning(g) := false.B
-      mshrTaskLeaseReturnSent(g) := false.B
-      mshrTaskLeaseAwaitPipe(g) := false.B
       mshrTaskLeaseSequence(g) := mshrTaskLeaseSequence(g) + 1.U
-      mshrTaskGroupWait(g) := 0.U
-    }.elsewhen(returnAck.valid) {
-      assert(mshrTaskLeaseValid(g) && mshrTaskLeaseReturning(g) &&
-        mshrTaskLeaseReturnSent(g) && !mshrTaskLeaseAwaitPipe(g) &&
-        returnAck.bits.asUInt === winner.token.asUInt,
-        "winner lease acknowledgment must match its outstanding return")
-      assert(!mshrTaskTicketValid || !mshrTaskTicketGroupOH(g),
-        "ticket must drain before the source lifetime lease is released")
-      mshrTaskLeaseValid(g) := false.B
-      mshrTaskPreparedValid(g) := false.B
-      mshrTaskLeaseReturning(g) := false.B
-      mshrTaskLeaseReturnSent(g) := false.B
-      mshrTaskGroupWait(g) := 0.U
-    }.elsewhen(mshrTaskLeaseValid(g) && !mshrTaskLeaseReturning(g) &&
-      (granted || mshrTaskGroupCancel(g).valid || mshrTaskWinnerStale(g))) {
-      mshrTaskLeaseReturning(g) := true.B
-      mshrTaskLeaseAwaitPipe(g) := granted
-      mshrTaskGroupWait(g) := 0.U
-    }.elsewhen(mshrTaskLeaseReturning(g)) {
-      mshrTaskGroupWait(g) := 0.U
-    }.elsewhen(mshrTaskLeaseValid(g)) {
-      mshrTaskGroupWait(g) := Mux(mshrTaskGroupWait(g) === 63.U, 63.U, mshrTaskGroupWait(g) + 1.U)
     }
-    when(mshrTaskGroupCancel(g).valid) {
-      assert(mshrTaskLeaseValid(g) && !mshrTaskLeaseAwaitPipe(g) &&
-        mshrTaskGroupCancel(g).bits.asUInt === winner.token.asUInt,
-        "source cancellation must name its unissued winning version")
-      assert(!granted, "canceled winning operation must never issue")
+    when(!preparedQueue.deq.valid || preparedQueue.deq.fire) {
+      mshrTaskGroupWait(g) := 0.U
+    }.otherwise {
+      mshrTaskGroupWait(g) := Mux(mshrTaskGroupWait(g) === 63.U, 63.U,
+        mshrTaskGroupWait(g) + 1.U)
     }
-    when(returnRequest) { mshrTaskLeaseReturnSent(g) := true.B }
-    val localDone = io.fromMainPipe.mainpipeLeaseDone
-    val localDoneForGroup = localDone.map(done => done.valid && done.bits.mshrContext === g.U)
-    assert(PopCount(localDoneForGroup) <= 1.U,
-      "one source group cannot complete two leased tasks in the same cycle")
-    localDone.zip(localDoneForGroup).foreach { case (done, doneForGroup) =>
-      when(doneForGroup) {
-        assert(mshrTaskLeaseValid(g) && mshrTaskPreparedValid(g) && mshrTaskLeaseReturning(g) &&
-          mshrTaskLeaseAwaitPipe(g) && done.bits.mshrId === winner.source &&
-          done.bits.token.asUInt === winner.token.asUInt,
-          "MainPipe terminal event must match the issued source lease version")
-        mshrTaskLeaseAwaitPipe(g) := false.B
+
+    mshrTaskLeasePorts(g).zipWithIndex.foreach { case (lease, i) =>
+      val acquired = winnerOut.fire && winnerOut.bits.source === i.U
+      val binding = mshrTaskLeaseBindings(g)(i)
+      val leased = mshrTaskLeaseValid(g)(i)
+      val returning = mshrTaskLeaseReturning(g)(i)
+      val awaitPipe = mshrTaskLeaseAwaitPipe(g)(i)
+      val schedulerPending = mshrTaskSchedulerPending(g)(i)
+      val returnSent = mshrTaskLeaseReturnSent(g)(i)
+      val issued = granted && mshrTaskIssuePermit.source === i.U
+      val dropped = winnerAbort && winner.source === i.U ||
+        preparedAbort && preparedQueue.deq.bits.source === i.U ||
+        permitAbort && mshrTaskIssuePermit.source === i.U
+      val sourceReallocated = mshrTaskGenerations(g)(i) =/= binding.token.generation
+      val pairedOwnerReallocated = if (g == 1) {
+        binding.completion.valid && !pairedCompletionCurrent(binding.completion.bits)
+      } else false.B
+      val stale = sourceReallocated || pairedOwnerReallocated
+      val returnRequest = leased && returning && !awaitPipe &&
+        !schedulerPending && !returnSent
+      lease.prepare.valid := acquired
+      lease.prepare.bits := winnerOut.bits.token
+      lease.held.valid := leased
+      lease.held.bits := binding.token
+      lease.release.valid := returnRequest
+      lease.release.bits := binding.token
+      groupOf(g)(i).ready := issued
+      when(acquired) {
+        assert(!leased, "source preparation must acquire idle lifetime capacity")
+        mshrTaskLeaseValid(g)(i) := true.B
+        binding := winnerOut.bits
+        mshrTaskLeaseReturning(g)(i) := false.B
+        mshrTaskLeaseReturnSent(g)(i) := false.B
+        mshrTaskLeaseAwaitPipe(g)(i) := false.B
+        mshrTaskSchedulerPending(g)(i) := true.B
+      }.elsewhen(lease.released.valid) {
+        assert(leased && returning && returnSent && !awaitPipe && !schedulerPending &&
+          lease.released.bits.asUInt === binding.token.asUInt,
+          "source lease acknowledgment must match its outstanding return")
+        mshrTaskLeaseValid(g)(i) := false.B
+        mshrTaskLeaseReturning(g)(i) := false.B
+        mshrTaskLeaseReturnSent(g)(i) := false.B
+      }.elsewhen(leased && !returning && (issued || lease.cancel.valid || stale)) {
+        mshrTaskLeaseReturning(g)(i) := true.B
+        mshrTaskLeaseAwaitPipe(g)(i) := issued
+      }
+      when(issued || dropped) {
+        assert(leased && schedulerPending,
+          "scheduler departure must consume one retained source transaction")
+        mshrTaskSchedulerPending(g)(i) := false.B
+      }
+      when(issued) {
+        assert(!lease.cancel.valid && mshrTaskIssuePermit.token.asUInt === binding.token.asUInt,
+          "issue permit must retain its uncanceled source lease version")
+      }
+      when(lease.cancel.valid) {
+        assert(leased && !awaitPipe && lease.cancel.bits.asUInt === binding.token.asUInt,
+          "source cancellation must name its unissued leased version")
+        assert(!issued, "canceled operation must never issue")
+      }
+      when(returnRequest) { mshrTaskLeaseReturnSent(g)(i) := true.B }
+      val localDone = io.fromMainPipe.mainpipeLeaseDone
+      val localDoneForSource = localDone.map(done => done.valid &&
+        done.bits.mshrContext === g.U && done.bits.mshrId === i.U)
+      assert(PopCount(localDoneForSource) <= 1.U,
+        "one leased source cannot complete twice in the same cycle")
+      localDone.zip(localDoneForSource).foreach { case (done, matches) =>
+        when(matches) {
+          assert(leased && returning && awaitPipe && !schedulerPending &&
+            done.bits.token.asUInt === binding.token.asUInt,
+            "MainPipe terminal event must match the issued source lease version")
+          mshrTaskLeaseAwaitPipe(g)(i) := false.B
+        }
       }
     }
-    groupOf(g).zipWithIndex.foreach { case (s, i) =>
-      s.ready := granted && mshrTaskIssuePermit.source === i.U
-    }
-    assert(!winnerOut.fire || !mshrTaskLeaseValid(g),
-      "a winning lease must drain or cancel before the group can reload")
-    when(mshrTaskPreparedValid(g)) {
-      assert(mshrTaskLeaseValid(g) && mshrTaskPrepared(g).source === winner.source &&
-        mshrTaskPrepared(g).token.asUInt === winner.token.asUInt,
-        "prepared payload must retain its winner and token")
-    }
+    XSPerfAccumulate(s"mshr_task_group_$g" + "_prepare_overlap_cnt",
+      winnerOut.fire && VecInit(mshrTaskLeaseAwaitPipe(g)).asUInt.orR)
+    XSPerfAccumulate(s"mshr_task_group_$g" + "_issue_overlap_cnt",
+      granted && VecInit(mshrTaskLeaseAwaitPipe(g)).asUInt.orR)
   }
   val mshrTaskGrantSrc = VecInit((0 until nMshrTaskGroups).map { g =>
     Mux(mshrTask.fire && mshrTaskIssuePermitGroupOH(g),
