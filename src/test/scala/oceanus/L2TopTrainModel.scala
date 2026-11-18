@@ -102,6 +102,10 @@ object L2TopTrainStimulus extends ChiselSim {
 class L2TopTrainChecker(dut: TestTop_L2Top) extends ChiselSim {
   case class Expected(addr: BigInt, src: BigInt, txn: BigInt, vpn: BigInt, source: BigInt, enable: Boolean, at: Int, late: Boolean, opcode: BigInt)
   private val waiting = mutable.Map.empty[(Int, Int), Expected]
+  // Intent (zy-pf-obs): the source port may precede the allocator by a real
+  // FIFO. Keep the independently sampled context/opcode until RBE admission.
+  private val accepted = mutable.Map.empty[(BigInt, BigInt, BigInt), (BigInt, BigInt, Boolean)]
+  private val acceptedOpcodes = mutable.Map.empty[(BigInt, BigInt, BigInt), BigInt]
   var accepts = 0; var executions = 0; var misses = 0; var hits = 0
   var disabled = 0; var internal = 0; var lateHits = 0; var simultaneousAccepts = 0; var simultaneousTrains = 0
   // Count disabled raw inputs before arbitration, and actual enabled BOP fires.
@@ -114,21 +118,24 @@ class L2TopTrainChecker(dut: TestTop_L2Top) extends ChiselSim {
     (value(e.paddr), value(e.vaddr.get), value(e.reqSource.get), flag(e.trainEnable.get))
   def pending: Int = waiting.size
   def sample(cycle: Int): Unit = dut.trainObservation.foreach { obs =>
-    if (dut.reset.peek().litValue != 0) waiting.clear()
+    if (dut.reset.peek().litValue != 0) {
+      waiting.clear(); accepted.clear(); acceptedOpcodes.clear()
+    }
     else {
-      val accepted = dut.io.t1p.zipWithIndex.flatMap { case (port, index) =>
+      val acceptedNow = dut.io.t1p.zipWithIndex.flatMap { case (port, index) =>
         if (flag(port.UpREQ.valid) && flag(port.UpREQ.ready)) {
           val train = dut.io.pfTrain.get(index)
           Some((value(port.UpREQ.bits.SrcID), value(port.UpREQ.bits.TxnID), value(port.UpREQ.bits.Addr)) ->
             (value(train.vaddrBlock) >> 6, value(train.reqSource), flag(train.trainEnable)))
         } else None
       }.toMap
-      val acceptedOpcodes = dut.io.t1p.flatMap { port =>
+      accepted ++= acceptedNow
+      acceptedOpcodes ++= dut.io.t1p.flatMap { port =>
         if(flag(port.UpREQ.valid) && flag(port.UpREQ.ready))
           Some((value(port.UpREQ.bits.SrcID), value(port.UpREQ.bits.TxnID), value(port.UpREQ.bits.Addr)) -> value(port.UpREQ.bits.Opcode))
         else None
       }.toMap
-      if (accepted.size > 1) simultaneousAccepts += 1
+      if (acceptedNow.size > 1) simultaneousAccepts += 1
       val local = mutable.ArrayBuffer.empty[(BigInt, BigInt, BigInt, Boolean)]
       obs.req.zipWithIndex.foreach { case (row, s) =>
         val trained = mutable.ArrayBuffer.empty[(BigInt, BigInt, BigInt, Boolean)]
@@ -159,8 +166,8 @@ class L2TopTrainChecker(dut: TestTop_L2Top) extends ChiselSim {
           }
           if (flag(r.accept)) {
             val addr = value(r.inAddr); val src = value(r.inSrc); val txn = value(r.inTxn)
-            val expected = accepted.getOrElse((src, txn, addr), (BigInt(0), BigInt(0), false))
-            acceptedOpcodes.get((src, txn, addr)).foreach(op => assert(value(r.inOpcode) == op))
+            val expected = accepted.remove((src, txn, addr)).getOrElse((BigInt(0), BigInt(0), false))
+            acceptedOpcodes.remove((src, txn, addr)).foreach(op => assert(value(r.inOpcode) == op))
             assert(context(r.inContext) == expected, s"upstream-to-RBE mismatch src=$src txn=$txn addr=$addr cycle=$cycle")
             assert(!waiting.contains((s, t)), s"occupied REQ RBE overwritten slice=$s tshr=$t")
             waiting((s, t)) = Expected(addr, src, txn, expected._1, expected._2, expected._3, cycle, flag(r.activePrefetch) && src != dut.l2cfg.pfSrcID, value(r.inOpcode))

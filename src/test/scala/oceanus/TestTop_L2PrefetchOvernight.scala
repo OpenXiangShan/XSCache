@@ -71,11 +71,12 @@ class TestTopOvernight(cfg: L2Configuration)(implicit p: Parameters) extends Tes
   }
   for(s <- 0 until cfg.sliceNum) {
     val v = module.vbopStub.get.io.req
-    val b = module.bop.io.req
+    // Intent (zy-pf-obs): tolerate the baseline optional PBOP in observation-only test code.
+    val b = module.bop.map(_.io.req)
     val c = module.cdp.get.io.req
     probe.produced(s) := Cat(
       read(c.valid) && read(c.ready) && bank(read(c.bits.paddr))===s.U,
-      read(b.valid) && read(module.bopControlEnable) && bank(read(b.bits))===s.U,
+      b.map(x => read(x.valid) && read(module.bopControlEnable) && bank(read(x.bits))===s.U).getOrElse(false.B),
       read(v.valid) && read(v.ready) && bank(read(v.bits.paddr))===s.U,
       read(module.pfRecvReqs(s).valid))
     val req=module.slices(s).io.UpRXREQ

@@ -406,7 +406,9 @@ object L2TopObservation {
   }
 
   private val slice0 = privateField[Seq[L2TSHRCtrl]](module, "slices").head
-  private val bop = privateField[OceanusBOP](module, "bop")
+  // Intent (zy-pf-obs): PBOP is optional in this baseline; absent probes
+  // represent an inactive producer in directed observation tests.
+  private val bop = module.bop
   private val slices = privateField[Seq[L2TSHRCtrl]](module, "slices")
   private val pfQueues = privateField[Seq[DecoupledIO[FlitREQ]]](module, "pfQueues")
   private val pfQueueOverwriteBySource = privateField[Vec[Vec[Bool]]](module, "pfQueueOverwriteBySource")
@@ -957,22 +959,22 @@ object L2TopObservation {
     count
   }
 
-  io.bopTrainFire := boreRead(bop.io.train.valid) && boreRead(bop.io.train.ready)
+  io.bopTrainFire := bop.map(b => boreRead(b.io.train.valid)).getOrElse(false.B) && bop.map(b => boreRead(b.io.train.ready)).getOrElse(false.B)
   io.bopTrainFireCount := accumulate(io.bopTrainFire)
   io.bopTrainReceiveCount := io.bopTrainFireCount
   slices.zipWithIndex.foreach { case (slice, sliceIdx) =>
     io.sliceTrainPulseCount(sliceIdx) := accumulate(boreRead(slice.io.bopTrain.valid))
     io.sliceEvictBackFireCount(sliceIdx) := accumulate(io.sliceEvictBackFire(sliceIdx))
   }
-  io.bopTrainAddr := boreRead(bop.io.train.bits)
-  io.bopReqAddr := boreRead(bop.io.req.bits)
+  io.bopTrainAddr := bop.map(b => boreRead(b.io.train.bits)).getOrElse(0.U)
+  io.bopReqAddr := bop.map(b => boreRead(b.io.req.bits)).getOrElse(0.U)
   // Drop pulses qualify the current training attempt before the edge. req.bits
   // still contains the preceding attempt until that edge updates the register.
-  io.bopDropAddr := boreRead(privateField[UInt](bop, "newAddress"))
-  val bopReqValid = boreRead(bop.io.req.valid)
-  val bopReqReady = boreRead(bop.io.req.ready)
-  val bopTrainValid = boreRead(bop.io.train.valid)
-  val bopTrainReady = boreRead(bop.io.train.ready)
+  io.bopDropAddr := bop.map(b => boreRead(privateField[UInt](b, "newAddress"))).getOrElse(0.U)
+  val bopReqValid = bop.map(b => boreRead(b.io.req.valid)).getOrElse(false.B)
+  val bopReqReady = bop.map(b => boreRead(b.io.req.ready)).getOrElse(false.B)
+  val bopTrainValid = bop.map(b => boreRead(b.io.train.valid)).getOrElse(false.B)
+  val bopTrainReady = bop.map(b => boreRead(b.io.train.ready)).getOrElse(false.B)
   io.bopReqValid := bopReqValid
   io.bopReqReady := bopReqReady
   io.bopReqEnqReady := bopReqReady
@@ -1065,9 +1067,9 @@ object L2TopObservation {
   }
   io.bopPrefetchIssue := io.bopPrefetchIssueBySlice.asUInt.orR
   io.bopPrefetchIssueAddr := Mux1H(io.bopPrefetchIssueBySlice.zip(io.bopPrefetchIssueAddrBySlice))
-  io.bopCrossPageDrop := boreRead(bop.io.crossPageDrop)
-  io.bopDisabledDrop := boreRead(bop.io.disabledDrop)
-  io.bopDelayQueueFullDrop := boreRead(bop.io.delayQueueFullDrop)
+  io.bopCrossPageDrop := bop.map(b => boreRead(b.io.crossPageDrop)).getOrElse(false.B)
+  io.bopDisabledDrop := bop.map(b => boreRead(b.io.disabledDrop)).getOrElse(false.B)
+  io.bopDelayQueueFullDrop := bop.map(b => boreRead(b.io.delayQueueFullDrop)).getOrElse(false.B)
   io.bopTrainStall := bopTrainValid && !bopTrainReady
 
   io.tshr0Counts.wUnlockDs := accumulate(wUnlockDs0)

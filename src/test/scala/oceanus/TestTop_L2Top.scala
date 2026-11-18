@@ -109,6 +109,10 @@ class TestTop_L2Top(val l2cfg: L2Configuration)(implicit val p: Parameters) exte
   dontTouch(clean)
   dontTouch(dump)
 
+  // Intent (zy-pf-obs): let directed observation tests register their taps
+  // before the existing endpoint collects deferred XSPerf counters.
+  protected def attachExtraObservations(): Unit = ()
+  attachExtraObservations()
   XSLog.collect(timer, logEnable, clean, dump)
 }
 

@@ -1,3 +1,4 @@
+// Intent (zy-pf-obs): keep test observation compatible with optional PBOP.
 package oceanus
 
 // Overnight-only test code: real requests, refills, training and source queues.
@@ -79,7 +80,7 @@ class TestTopStress(cfg: L2Configuration)(implicit p: Parameters) extends Stress
     val f=owner.getClass.getDeclaredField(name); f.setAccessible(true); f.get(owner).asInstanceOf[T]
   }
   add("pbop.delay",PopCount(read(field[Vec[Bool]](field[AnyRef](module.bop,"delayQueue"),"valid"))),16)
-  add("pbop.output",module.bop.io.req.valid)
+  add("pbop.output",module.bop.map(_.io.req.valid).getOrElse(false.B))
   val cdp=module.cdp.get;val send=cdp.sentUnit.get
   add("cdp.entries",PopCount(read(send.valids)),16)
   add("cdp.tlbHeld",send.tlbHeld);add("cdp.query1",send.pftS1);add("cdp.query2",send.pftS2)

@@ -482,6 +482,10 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
   // Source order is the policy boundary: receiver encodings precede PBOP/BOP,
   // and remaining slots leave room for VBOP/CDP. A later aging policy can
   // replace this order without changing queue or slice wiring.
+  // Intent (zy-pf-obs): retain Scala queue handles for observation; no extra ports or storage.
+  val pfObservationQueues = scala.collection.mutable.ArrayBuffer.empty[(Int, Int, OverwriteQueue[FlitREQ])]
+  // Intent (zy-pf-obs): retain eligible-offer handles after existing gates.
+  val pfObservationOffers = scala.collection.mutable.ArrayBuffer.empty[(Int, Int, Bool)]
   val pfSourceSlots = Seq(L2PfSource.SMS, L2PfSource.BOP, L2PfSource.PBOP,
     L2PfSource.Stream, L2PfSource.Stride, L2PfSource.TP, L2PfSource.Berti,
     L2PfSource.NL, L2PfSource.CDP)
@@ -514,6 +518,7 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
           config.pfBopQueueEntries else config.pfRecvQueueEntries
         val queue = Module(new OverwriteQueue(new FlitREQ, entries = entries))
         queue.suggestName(s"pfQueue_${i}_src${source}")
+        pfObservationQueues += ((i, source, queue))
         pfQueueOverwriteBySource(i)(sourceIdx) := queue.io.overwrite
         val fromBop = (source == L2PfSource.PBOP).B && bopReqValid && prefetchTarget === config.slices(i).U &&
           config.bopEnable.B && (if (config.stubMode) bopControlEnable else true.B)
@@ -570,6 +575,9 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
         hit -> sourceQueues.find(_._1 == source).get._2.io.deq.bits
       })
       val chosenFire = issued.valid && issued.ready
+      if (L2PrefetchObservation.enabled) pfSourcePriority.zipWithIndex.foreach { case (source, idx) =>
+        pfObservationOffers += ((i, source, issued.valid && candidates(idx)))
+      }
       sourceQueues.foreach { case (source, queue) =>
         val idx = pfSourcePriority.indexOf(source)
         val isChosen = if (idx >= 0) chosen.asBools(idx) else false.B
