@@ -1734,8 +1734,25 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     w_s_rd_up_compdata2 := true.B
   }
 
-  val issue_up_rd_compdata0 = w_s_rd_up_compdata0 && allow_up_rd_compdata0
-  val issue_up_rd_compdata2 = w_s_rd_up_compdata2 && allow_up_rd_compdata2
+  val issue_up_rd_compdata0 = Wire(Bool())
+  val issue_up_rd_compdata2 = Wire(Bool())
+
+  if (paramL2.enableCustomL1Hint || paramL2.enableStickyData) {
+    val up_rd_compdata_pair_ready =
+      w_s_rd_up_compdata0 && w_s_rd_up_compdata2 &&
+      allow_up_rd_compdata0 && allow_up_rd_compdata2
+
+    issue_up_rd_compdata0 := up_rd_compdata_pair_ready
+    issue_up_rd_compdata2 := up_rd_compdata_pair_ready
+
+    assert(issue_up_rd_compdata0 === issue_up_rd_compdata2,
+      "pair-ready CompData issue became non-atomic")
+    assert(!(issue_up_rd_compdata0 && !up_rd_compdata_pair_ready),
+      "CompData pair issued without both halves ready")
+  } else {
+    issue_up_rd_compdata0 := w_s_rd_up_compdata0 && allow_up_rd_compdata0
+    issue_up_rd_compdata2 := w_s_rd_up_compdata2 && allow_up_rd_compdata2
+  }
 
   issue_up_rd_compdata_first := (issue_up_rd_compdata0 || issue_up_rd_compdata2) &&
                                 (w_s_rd_up_compdata0 && w_s_rd_up_compdata2)
