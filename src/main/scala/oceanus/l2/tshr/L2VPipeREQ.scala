@@ -58,6 +58,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
     val tshr_paddr = Input(UInt(paramL2.physicalAddrWidth.W))
 
+    val tshr_dirResult_flowable = Input(new L2Directory.MetaReadResult)
     val tshr_dirResult = Input(new L2Directory.MetaReadResult)
 
     // Pulses when this TSHR deallocates; per-life bookkeeping registers that
@@ -142,6 +143,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     val L2EVT_opcode = Valid(UInt(paramCHI.reqOpcodeWidth.W))
   })
 
+  val dirResult_flowable = io.tshr_dirResult_flowable
   val dirResult = io.tshr_dirResult
 
   val dnTxnID = (io.consts.tshrId << log2Ceil(sliceNum)) | io.consts.sliceIdx
@@ -214,8 +216,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val rxevb_evictback = io.UpRXEVB.fire
 
   def satisfied(valid: Bool, state: UInt): (Bool, Bool) = (
-    valid && (dirResult.state >= state && dirResult.hit), 
-    valid && (dirResult.state < state || !dirResult.hit))
+    valid && (dirResult_flowable.state >= state && dirResult_flowable.hit),
+    valid && (dirResult_flowable.state < state || !dirResult_flowable.hit))
 
   def satisfied(opcode: CCHIOpcode, state: UInt): (Bool, Bool) =
     satisfied(rxreq_opcode.is(opcode), state)
@@ -234,12 +236,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                  rxreq_unsatisfied_stashunique
 
   val rxreq_hit_lock_conflict = rxreq_unsatisfied_unique &&
-                                dirResult.hit && io.repl_lock_conflict
+                                dirResult_flowable.hit && io.repl_lock_conflict
 
-  val rxreq_hit_lock_candidate = rxreq_unsatisfied_unique && dirResult.hit
+  val rxreq_hit_lock_candidate = rxreq_unsatisfied_unique && dirResult_flowable.hit
 
   val rxreq_hit_lock_accept = rxreq_unsatisfied_unique &&
-                              dirResult.hit && !io.repl_lock_conflict
+                              dirResult_flowable.hit && !io.repl_lock_conflict
 
   val p_hit_lock_way = Reg(UInt(wayBits.W))
 
@@ -347,10 +349,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val rxreq_client = io.fromClientTable
   val p_rxreq_client = io.fromClientTable
 
-  val rxreq_client_present = (rxreq_client.asUInt & dirResult.clients.asUInt).orR
+  val rxreq_client_present = (rxreq_client.asUInt & dirResult_flowable.clients.asUInt).orR
   val p_rxreq_client_present = (p_rxreq_client.asUInt & dirResult.clients.asUInt).orR
 
-  val rxreq_peer_present = (~rxreq_client.asUInt & dirResult.clients.asUInt).orR
+  val rxreq_peer_present = (~rxreq_client.asUInt & dirResult_flowable.clients.asUInt).orR
   val p_rxreq_peer_present = (~p_rxreq_client.asUInt & dirResult.clients.asUInt).orR
   // ----------------------------------------------------------------
 
@@ -507,7 +509,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     CCHIOpcode.MakeUnique
   )
   val rxreq_aliasable = rxreq_readunique || rxreq_readshared || rxreq_makeunique
-  io.toSA.ALIAS := Mux(rxreq_aliasable, rxreq.TagAlias, dirResult.alias)
+  io.toSA.ALIAS := Mux(rxreq_aliasable, rxreq.TagAlias, dirResult_flowable.alias)
 
   io.toSA.IS_L2_EVICT := rxevb_evictback
 
@@ -1545,7 +1547,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                     dn_rxrsp_comp
 
   val ds_rd_readunique_unsat_early = rxreq_unsatisfied_readunique &&
-                                     dirResult.hit &&
+                                     dirResult_flowable.hit &&
                                      (rxreq.ExpCompData || !rxreq_client_present)
 
   val ds_rd_readunique_unsat = Mux(configReadUniqueHitSPreferReadDS,
@@ -1554,8 +1556,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val ds_rd_readunique = ds_rd_readunique_sat || ds_rd_readunique_unsat
 
-  val ds_rd_readshared = rxreq_readshared && dirResult.hit
-  val ds_rd_readonce = rxreq_readonce && dirResult.hit
+  val ds_rd_readshared = rxreq_readshared && dirResult_flowable.hit
+  val ds_rd_readonce = rxreq_readonce && dirResult_flowable.hit
 
   // *NOTE: If SA received SnpRespData from upstream, the DS Read would be dropped by Data Storage Proxy.
   val ds_rd_evictback = p_rxreq_evictback &&
@@ -1791,7 +1793,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val expect_replace_readonce = if (configInclusiveReadOnce) rxreq_readonce else false.B
 
-  val expect_miss_replace = !dirResult.hit && (
+  val expect_miss_replace = !dirResult_flowable.hit && (
                               rxreq_readunique ||
                               rxreq_readshared ||
                               expect_replace_readonce ||
@@ -1895,13 +1897,13 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   io.repl_lock_candidate := rxreq_fire && rxreq_hit_lock_candidate
   io.repl_lock_req := rxreq_fire && rxreq_hit_lock_accept
-  io.repl_lock_way := Mux(rxreq_fire, dirResult.way, p_hit_lock_way)
+  io.repl_lock_way := Mux(rxreq_fire, dirResult_flowable.way, p_hit_lock_way)
 
   io.repl_lock_release := s_hit_lock_release
 
   when (rxreq_fire) {
     when (rxreq_hit_lock_accept) {
-      p_hit_lock_way := dirResult.way
+      p_hit_lock_way := dirResult_flowable.way
     }
   }
 
