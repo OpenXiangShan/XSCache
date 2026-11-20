@@ -320,8 +320,13 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     !snoopInFlight && !io.snoopStarted && !io.txreqPending &&
     !releaseDataPending && !io.releaseDataSeen && !io.nestedReleaseWritePending &&
     !io.sourceBHold && !io.sinkCOwnerHold
-  when(valid && isCmo && localTransportDone && !io.localReservationHold &&
-    !io.tasks.preparedLease.held.valid && !io.tasks.preparedLease.proposalHeld) {
+  // Close admission for one registered cycle before a CMO gives up its
+  // ReleaseBuf ownership. A snoop captured on the closing edge reaches
+  // snoopStarted through its existing FF and must drain before completion.
+  val localDrainEligible = valid && isCmo && !cmoLocalDone && localTransportDone &&
+    !io.tasks.preparedLease.held.valid && !io.tasks.preparedLease.proposalHeld
+  val localDrainPending = RegNext(localDrainEligible, false.B)
+  when(localDrainPending && localDrainEligible && !io.localReservationHold) {
     cmoLocalDone := true.B
   }
   // Unrelated C reservations may arrive after the local phase has drained.
@@ -547,7 +552,7 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     donePulse := true.B
   }
 
-  io.snoopAdmissionIdle := !snoopInFlight && !releaseDataPending &&
+  io.snoopAdmissionIdle := !snoopInFlight && !localDrainPending && !releaseDataPending &&
     !io.releaseDataSeen && !io.sinkC.valid && !io.victimDataCaptured &&
     !io.victimDataNeedsWriteback && !io.snoopMeta.valid && !io.snoopDoneCount.orR
   io.info.valid := valid
