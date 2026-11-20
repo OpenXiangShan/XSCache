@@ -27,6 +27,13 @@ import xscache.coupledL2.prefetch.PrefetchReq
 import utility.{MemReqSource, XSPerfAccumulate}
 import xscache.common.{AliasKey, PrefetchKey}
 
+// Per-bank lookahead for the head already driving TL A.bits. A.valid still
+// denotes a committed transfer and supplies the verdict registered for S2.
+class SpecMissAPreview extends Bundle {
+  val present = Bool()
+  val pending = Bool()
+}
+
 class SinkA(implicit p: Parameters) extends L2Module {
   val io = IO(new Bundle() {
     val a = Flipped(DecoupledIO(new TLBundleA(edgeIn.bundle)))

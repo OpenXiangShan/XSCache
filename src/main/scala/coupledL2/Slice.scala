@@ -36,6 +36,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
     override val out: OuterBundle = new OuterBundle
   })
   val io_pCrd = IO(Vec(mshrsAll, new PCrdQueryBundle))
+  val specPreview = Option.when(cacheParams.specMissPreview)(IO(Input(new SpecMissAPreview)))
 
   val io_cdp_triggers = Option.when(hasCDP) (IO(ValidIO(new CDPDetectTask(dataBits=blockBits))))
 
@@ -108,6 +109,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   reqArb.io.msInfo := mshrCtl.io.msInfo
 
   reqBuf.io.in <> sinkA.io.task
+  require(!cacheParams.specMissPreview || cacheParams.innerBuf.a.depth == 0)
   reqBuf.io.mshrInfo := mshrCtl.io.msInfo
   reqBuf.io.mainPipeBlock := mainPipe.io.toReqBuf
   reqBuf.io.pipeStatusVec(0) := reqArb.io.status_vec(1) // s2 status

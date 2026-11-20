@@ -424,6 +424,7 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
 
   class CoupledL2Imp(wrapper: LazyModule) extends LazyModuleImp(wrapper) with HasPerfEvents with HasCHIOpcodes {
     val banks = node.in.size
+    val specPreview = Option.when(cacheParams.specMissPreview)(IO(Input(Vec(banks, new SpecMissAPreview))))
     val bankBits = log2Ceil(banks)
     val l2TlbParams: Parameters = p.alterPartial {
       case EdgeInKey => node.in.head._2
@@ -662,6 +663,7 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
           }))
         }
         slice.io.in <> in
+        slice.specPreview.foreach(_ := specPreview.get(i))
         if (enableHintGuidedGrant) {
           // If the hint of slice X is selected at cycle T, then at cycle (T + 3) & (T + 4)
           // we will try our best to select the grant of slice X.
