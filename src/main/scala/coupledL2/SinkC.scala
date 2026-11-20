@@ -210,7 +210,15 @@ class SinkC(implicit p: Parameters) extends L2Module {
     dataBuf(releaseDataWriteBufIdx).asUInt)
   io.refillBufWrite.bits.beatMask := Fill(beatSize, true.B)
 
-  io.c.ready := Mux(isRelease, !first || !full, io.probeRouteReady)
+  // A registered ReleaseData write already owns the single refill write port.
+  // Hold a data-bearing ProbeAck's last beat until that write has applied.
+  // Do not use refillBufWriteId here: its route is qualified by C.fire and
+  // would feed the ready decision back through the controller's response path.
+  val probeDataWriteBlocked = releaseDataWritePending && hasData && last
+  io.c.ready := Mux(isRelease, !first || !full,
+    io.probeRouteReady && !probeDataWriteBlocked)
+  assert(!(probeAckDataForRefill && releaseDataWritePending),
+    "ProbeAckData and a retained ReleaseData must not share one refill write slot")
 
   val taskBufIdxAtFire = RegEnable(io.task.bits.bufIdx, io.task.fire)
   io.bufResp.data := RegNext(RegEnable(dataBuf(io.task.bits.bufIdx), io.task.fire))
