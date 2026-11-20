@@ -172,7 +172,7 @@ class Directory(implicit p: Parameters) extends L2Module {
     val info = io.read.bits.replacerInfo
     predictor.io.read.bits.candidate := io.read.bits.refill || info.channel(0) &&
       (info.opcode === AcquireBlock || info.opcode === AcquirePerm || info.opcode === Get || info.opcode === Hint)
-    predictor.io.read.bits.prefetch := info.sdbpPrefetch
+    predictor.io.read.bits.source := info.sdbpSource
     predictor.io.read.bits.signatureValid := info.pcValid
     predictor.io.read.bits.signature := info.signature
     predictor.io.read.bits.indices := info.indices

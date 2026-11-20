@@ -184,7 +184,7 @@ class RequestArb(implicit p: Parameters) extends L2Module
   io.dirRead_s1.bits.replacerInfo.reqSource := task_s1.bits.reqSource
   io.dirRead_s1.bits.replacerInfo.pcValid := task_s1.bits.pcValid
   io.dirRead_s1.bits.replacerInfo.signature := task_s1.bits.signature
-  io.dirRead_s1.bits.replacerInfo.sdbpPrefetch := task_s1.bits.sdbpPrefetch
+  io.dirRead_s1.bits.replacerInfo.sdbpSource := task_s1.bits.sdbpSource
   io.dirRead_s1.bits.replacerInfo.indices := task_s1.bits.indices
   io.dirRead_s1.bits.replacerInfo.refill_prefetch := s1_needs_replRead && (mshr_task_s1.bits.opcode === HintAck && mshr_task_s1.bits.dsWen && !mshr_task_s1.bits.mergeA)
   io.dirRead_s1.bits.refill := s1_needs_replRead

@@ -51,6 +51,8 @@ class PrefetchReceiver()(implicit p: Parameters) extends PrefetchModule {
   io.req.bits.needT := false.B
   io.req.bits.source := 0.U // TODO: ensure source 0 is dcache
   io.req.bits.pfSource := io.recv_addr.bits.pfSource
+  io.req.bits.sdbpSignature := io.recv_addr.bits.sdbpSignature
+  io.req.bits.sdbpSource := io.recv_addr.bits.sdbpSource
   io.req.valid := enable && io.recv_addr.valid
 
   io.tlb_req.req.valid := false.B

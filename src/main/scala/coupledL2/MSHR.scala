@@ -808,7 +808,7 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     mp_grant.pcValid := req.pcValid
     mp_grant.signature := req.signature
     mp_grant.indices := req.indices
-    mp_grant.sdbpPrefetch := req.sdbpPrefetch
+    mp_grant.sdbpSource := req.sdbpSource
 
     // Add merge grant task for Acquire and late Prefetch
     mp_grant.mergeA := mergeA
@@ -846,14 +846,16 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     mp_grant.aMergeTask.pcValid := merge_task.pcValid
     mp_grant.aMergeTask.signature := merge_task.signature
     mp_grant.aMergeTask.indices := merge_task.indices
-    mp_grant.aMergeTask.sdbpPrefetch := merge_task.sdbpPrefetch
+    mp_grant.aMergeTask.sdbpSource := merge_task.sdbpSource
     when(mergeA) {
       mp_grant.reqSource := merge_task.reqSource
+    }
+    when(mergeA && merge_task.sdbpSource === SDBPSource.Demand) {
       mp_grant.pc.foreach(_ := merge_task.pc.getOrElse(0.U))
       mp_grant.pcValid := merge_task.pcValid
       mp_grant.signature := merge_task.signature
       mp_grant.indices := merge_task.indices
-      mp_grant.sdbpPrefetch := merge_task.sdbpPrefetch
+      mp_grant.sdbpSource := merge_task.sdbpSource
     }
 
     mp_grant

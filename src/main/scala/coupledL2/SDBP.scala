@@ -10,7 +10,8 @@ case class SDBPParams(
   samplerSets: Int = 128,
   samplerWays: Option[Int] = None,
   predictorEntries: Int = 4096,
-  deadThreshold: Int = 8
+  deadThreshold: Int = 8,
+  splitPrefetchSources: Boolean = true
 ) {
   require(isPow2(samplerSets) && samplerSets >= 2)
   require(samplerWays.forall(_ > 0))
@@ -57,24 +58,54 @@ object SDBPHash {
   }
 }
 
+object SDBPSource extends ChiselEnum {
+  // GEM5 bank IDs: 0 for demand, then 1 + level * NUM_PF_SOURCES + algorithm.
+  // Only allocate banks for sources the RTL can emit. Both BOP instances share HWP_BOP.
+  val Demand = Value(0.U)
+  val L1None = Value(1.U)
+  val L1Stream = Value(2.U)
+  val L1Stride = Value(3.U)
+  val L1Berti = Value(11.U)
+  val L1StoreStream = Value(12.U)
+  val L2None = Value(18.U)
+  val L2Stream = Value(19.U)
+  val L2Stride = Value(20.U)
+  val L2Pht = Value(21.U)
+  val L2Bop = Value(22.U)
+  val L2Berti = Value(28.U)
+  val L2SmsAgt = Value(34.U)
+  val Other = Value(35.U)
+
+  private val l1Banks = Seq(L1None, L1Stream, L1Stride, L1Berti, L1StoreStream)
+  private val l2Banks = Seq(L2None, L2Stream, L2Stride, L2Pht, L2Bop, L2Berti, L2SmsAgt)
+
+  def predictorSources(split: Boolean): Seq[Type] =
+    if (split) Demand +: (l1Banks ++ l2Banks) else Seq(Demand, L1None, L2None)
+
+  def prefetchBank(source: Type, l2: Boolean, split: Boolean): Type = {
+    val banks = if (l2) l2Banks else l1Banks
+    if (split) Mux(banks.map(_ === source).reduce(_ || _), source, banks.head) else banks.head
+  }
+}
+
 class SDBPTraining(entries: Int) extends Bundle {
   val indices = Vec(3, UInt(log2Ceil(entries).W))
   val dead = Bool()
+  val source = SDBPSource()
 }
 
 class SDBPSamplerEntry extends Bundle {
   val valid = Bool()
   val tag = UInt(15.W)
   val signature = UInt(15.W)
-  val signatureValid = Bool()
+  val source = SDBPSource()
   val dead = Bool()
 }
 
 class SDBPSamplerCommit extends Bundle {
   val signature = UInt(15.W)
-  val signatureValid = Bool()
+  val source = SDBPSource()
   val dead = Bool()
-  val prefetch = Bool()
 }
 
 /** Register sampler: s1 snapshot, s2 lookup, s3 one-way commit. No event queue. */
@@ -118,23 +149,24 @@ class SDBPSampler(localSets: Int, l2Ways: Int, params: SDBPParams) extends Modul
   val old_s3 = RegEnable(if (ways == 1) entries_s2(0) else entries_s2(selected_s2), valid_s2)
   val hit_s3 = RegEnable(hits.asUInt.orR, valid_s2)
   val state_s3 = state_s2.map(state => RegEnable(state, valid_s2))
-  val update = io.commit.valid && valid_s3 && !(io.commit.bits.prefetch && hit_s3)
+  val update = io.commit.valid && valid_s3
   io.writeEnable := update
   io.hit := valid_s3 && hit_s3
   io.selectedWay := selected_s3
   io.previousDead := old_s3.dead
-  io.training.valid := update && old_s3.valid && old_s3.signatureValid
+  io.training.valid := update && old_s3.valid
   io.training.bits.indices := RegEnable(
     SDBPHash.indices((if (ways == 1) entries_s2(0) else entries_s2(selected_s2)).signature,
       params.predictorEntries), valid_s2)
   io.training.bits.dead := !hit_s3
+  io.training.bits.source := old_s3.source
   when(update) {
     val entry = if (ways == 1) entries(index_s3)(0) else entries(index_s3)(selected_s3)
     entry.valid := true.B
     entry.tag := tag_s3
     entry.signature := io.commit.bits.signature
-    entry.signatureValid := io.commit.bits.signatureValid && !io.commit.bits.prefetch
-    entry.dead := io.commit.bits.dead && io.commit.bits.signatureValid && !io.commit.bits.prefetch
+    entry.source := io.commit.bits.source
+    entry.dead := io.commit.bits.dead
     lruState.foreach(state => state(index_s3) := lru.get.get_next_state(state_s3.get, selected_s3))
     assert(selected_s3 < ways.U)
   }
@@ -146,7 +178,7 @@ class SDBPRead(localSets: Int, params: SDBPParams) extends Bundle {
   val set = UInt(log2Ceil(localSets).W)
   val tag = UInt(15.W)
   val candidate = Bool()
-  val prefetch = Bool()
+  val source = SDBPSource()
   val signatureValid = Bool()
   val signature = UInt(15.W)
   val indices = Vec(3, UInt(log2Ceil(params.predictorEntries).W))
@@ -175,13 +207,14 @@ class SDBP(localSets: Int, l2Ways: Int, params: SDBPParams) extends Module {
   val sampler = Module(new SDBPSampler(localSets, l2Ways, params))
   val predictor = Module(new SCArray(params))
   val candidate = io.read.bits.candidate
-  val needsPrediction = candidate && io.read.bits.signatureValid && !io.read.bits.prefetch
+  val needsPrediction = candidate && io.read.bits.signatureValid && io.read.bits.source =/= SDBPSource.Other
   val read = io.read.valid && candidate
-  sampler.io.read.valid := read
+  sampler.io.read.valid := io.read.valid && needsPrediction
   sampler.io.read.bits.set := io.read.bits.set
   sampler.io.read.bits.tag := io.read.bits.tag
   predictor.io.query.valid := io.read.valid && needsPrediction
-  predictor.io.query.bits := io.read.bits.indices
+  predictor.io.query.bits.indices := io.read.bits.indices
+  predictor.io.query.bits.source := io.read.bits.source
   val read_s2 = RegNext(read, false.B)
   val read_s3 = RegNext(read_s2, false.B)
   val metadata_s2 = RegEnable(io.read.bits, read)
@@ -189,14 +222,14 @@ class SDBP(localSets: Int, l2Ways: Int, params: SDBPParams) extends Module {
   val predictedDead_s3 = RegEnable(predictor.io.response.bits.reduce(_ +& _) >= params.deadThreshold.U,
     false.B, predictor.io.response.valid)
   val predictionValid_s3 = RegNext(predictor.io.response.valid, false.B)
-  val dead = predictionValid_s3 && predictedDead_s3 && metadata_s3.signatureValid && !metadata_s3.prefetch
-  sampler.io.commit.valid := io.commit.valid
+  val dead = predictionValid_s3 && predictedDead_s3
+  sampler.io.commit.valid := io.commit.valid && predictionValid_s3
   sampler.io.commit.bits.signature := metadata_s3.signature
-  sampler.io.commit.bits.signatureValid := metadata_s3.signatureValid
+  sampler.io.commit.bits.source := metadata_s3.source
   sampler.io.commit.bits.dead := dead
-  sampler.io.commit.bits.prefetch := metadata_s3.prefetch
   predictor.io.training := sampler.io.training
-  io.deadWrite.valid := io.commit.valid && (io.commit.bits.refill || !metadata_s3.prefetch)
+  io.deadWrite.valid := io.commit.valid &&
+    (io.commit.bits.refill || predictionValid_s3 || metadata_s3.source === SDBPSource.Demand)
   io.deadWrite.bits.set := io.commit.bits.set
   io.deadWrite.bits.way := io.commit.bits.way
   io.deadWrite.bits.dead := dead

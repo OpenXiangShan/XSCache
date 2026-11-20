@@ -34,7 +34,7 @@ class ReplacerInfo(implicit p: Parameters) extends L2Bundle {
   val refill_prefetch = Bool()
   val pcValid = Bool()
   val signature = UInt(15.W)
-  val sdbpPrefetch = Bool()
+  val sdbpSource = SDBPSource()
   val indices = Vec(3, UInt(log2Ceil(cacheParams.sdbp.predictorEntries).W))
 }
 
@@ -57,7 +57,7 @@ class MergeTaskBundle(implicit p: Parameters) extends L2Bundle {
   val pcValid = Bool()
   val signature = UInt(15.W)
   val indices = Vec(3, UInt(log2Ceil(cacheParams.sdbp.predictorEntries).W))
-  val sdbpPrefetch = Bool()
+  val sdbpSource = SDBPSource()
   val pc = pcBitOpt.map(_ => UInt(pcBitOpt.get.W))    // pc of demand req 
 }
 
@@ -75,7 +75,7 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   val pcValid = Bool()
   val signature = UInt(15.W)
   val indices = Vec(3, UInt(log2Ceil(cacheParams.sdbp.predictorEntries).W))
-  val sdbpPrefetch = Bool()
+  val sdbpSource = SDBPSource()
   val pc = pcBitOpt.map(_ => UInt(pcBitOpt.get.W))    // PC (Program Counter) passed by client cache
   // from L1 load miss require 
   val isKeyword = isKeywordBitsOpt.map(_ => Bool())
@@ -408,6 +408,8 @@ class PrefetchCtrlFromCore extends Bundle {
 class PrefetchRecv extends Bundle {
   val addr = UInt(64.W)
   val pf_source = UInt(MemReqSource.reqSourceBits.W)
+  val sdbpSignature = Valid(UInt(SDBPHash.signatureBits.W))
+  val sdbpSource = SDBPSource()
   val addr_valid = Bool()
   val l2_pf_en = Bool()
 }

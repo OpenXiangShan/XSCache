@@ -118,6 +118,8 @@ class PrefetchReq(implicit p: Parameters) extends PrefetchBundle {
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
   val pfSource = UInt(MemReqSource.reqSourceBits.W)
+  val sdbpSignature = Valid(UInt(SDBPHash.signatureBits.W))
+  val sdbpSource = SDBPSource()
 
   def addr: UInt = Cat(tag, set, 0.U(offsetBits.W))
   def setaddr: UInt = Cat(tag, set)
@@ -163,6 +165,7 @@ class PrefetchTrain(implicit p: Parameters) extends PrefetchBundle {
   val source = UInt(sourceIdBits.W)
   val vaddr = vaddrBitsOpt.map(_ => UInt(vaddrBitsOpt.get.W))
   val pc = pcBitOpt.map(_ => UInt(pcBitOpt.get.W))
+  val sdbpSignature = Valid(UInt(SDBPHash.signatureBits.W))
   val hit = Bool()
   val prefetched = Bool()
   val pfsource = UInt(PfSource.pfSourceBits.W)
@@ -179,6 +182,8 @@ class PrefetchIO(implicit p: Parameters) extends PrefetchBundle {
   val recv_addr = Flipped(ValidIO(new Bundle() {
     val addr = UInt(64.W)
     val pfSource = UInt(MemReqSource.reqSourceBits.W)
+    val sdbpSignature = Valid(UInt(SDBPHash.signatureBits.W))
+    val sdbpSource = SDBPSource()
   }))
 }
 
@@ -191,6 +196,8 @@ class PrefetchTopIO(implicit p: Parameters) extends PrefetchBundle {
   val recv_addr = Flipped(ValidIO(new Bundle() {
     val addr = UInt(64.W)
     val pfSource = UInt(MemReqSource.reqSourceBits.W)
+    val sdbpSignature = Valid(UInt(SDBPHash.signatureBits.W))
+    val sdbpSource = SDBPSource()
   }))
 }
 

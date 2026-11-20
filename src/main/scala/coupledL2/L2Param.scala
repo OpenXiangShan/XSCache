@@ -67,6 +67,9 @@ case object PCKey extends ControlKey[UInt]("pc")
 case class PCField(width: Int) extends BundleField[UInt](PCKey, Output(UInt(width.W)), _ := 0.U(width.W))
 case object PCValidKey extends ControlKey[Bool]("pcValid")
 case class PCValidField() extends BundleField[Bool](PCValidKey, Output(Bool()), _ := false.B)
+case object SDBPSourceKey extends ControlKey[SDBPSource.Type]("sdbpSource")
+case class SDBPSourceField() extends BundleField[SDBPSource.Type](
+  SDBPSourceKey, Output(SDBPSource()), _ := SDBPSource.L1None)
 
 case class L2Param(
   name: String = "L2",
@@ -92,7 +95,7 @@ case class L2Param(
   echoField: Seq[BundleFieldBase] = Nil,
   reqField: Seq[BundleFieldBase] = Nil,
   respKey: Seq[BundleKeyBase] = Seq(IsHitKey),
-  reqKey: Seq[BundleKeyBase] = Seq(AliasKey, VaddrKey, PrefetchKey, ReqSourceKey, PCKey, PCValidKey),
+  reqKey: Seq[BundleKeyBase] = Seq(AliasKey, VaddrKey, PrefetchKey, ReqSourceKey, PCKey, PCValidKey, SDBPSourceKey),
   respField: Seq[BundleFieldBase] = Nil,
 
   innerBuf: TLBufferParams = TLBufferParams(),

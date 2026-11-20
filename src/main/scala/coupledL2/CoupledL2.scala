@@ -463,6 +463,8 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
         prefetcher.get.io.recv_addr.valid := x.in.head._1.addr_valid
         prefetcher.get.io.recv_addr.bits.addr := x.in.head._1.addr
         prefetcher.get.io.recv_addr.bits.pfSource := x.in.head._1.pf_source
+        prefetcher.get.io.recv_addr.bits.sdbpSignature := x.in.head._1.sdbpSignature
+        prefetcher.get.io.recv_addr.bits.sdbpSource := x.in.head._1.sdbpSource
       case None =>
         prefetcher.foreach{
           p =>

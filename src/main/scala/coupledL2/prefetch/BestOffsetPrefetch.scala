@@ -32,7 +32,7 @@ import org.chipsalliance.cde.config.Parameters
 import chisel3.DontCare.:=
 import chisel3._
 import chisel3.util._
-import xscache.coupledL2.{HasCoupledL2Parameters, L2TlbReq, L2ToL1TlbIO, TlbCmd, Pbmt}
+import xscache.coupledL2.{HasCoupledL2Parameters, L2TlbReq, L2ToL1TlbIO, TlbCmd, Pbmt, SDBPHash, SDBPSource}
 import xscache.coupledL2.utils.ReplacementPolicy
 import scopt.Read
 import freechips.rocketchip.util.SeqToAugmentedSeq
@@ -354,6 +354,7 @@ class BopReqBundle(implicit p: Parameters) extends BOPBundle{
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
   val isBOP = Bool()
+  val sdbpSignature = Valid(UInt(SDBPHash.signatureBits.W))
 }
 
 class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
@@ -367,6 +368,7 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
   // for pf req
   val needT = Bool()
   val source = UInt(sourceIdBits.W)
+  val sdbpSignature = Valid(UInt(SDBPHash.signatureBits.W))
 
   def fromBopReqBundle(req: BopReqBundle) = {
     paddrValid := false.B
@@ -377,6 +379,7 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
     paddrNoOffset := 0.U
     needT := req.needT
     source := req.source
+    sdbpSignature := req.sdbpSignature
   }
 
   def toPrefetchReq(): PrefetchReq = {
@@ -387,6 +390,8 @@ class BopReqBufferEntry(implicit p: Parameters) extends BOPBundle {
     req.needT := needT
     req.source := source
     req.pfSource := MemReqSource.Prefetch2L2BOP.id.U
+    req.sdbpSignature := sdbpSignature
+    req.sdbpSource := SDBPSource.L2Bop
     req
   }
 
@@ -725,6 +730,7 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   val s1_req_valid = RegInit(false.B)
   val s1_needT = RegEnable(io.train.bits.needT, s0_fire)
   val s1_source = RegEnable(io.train.bits.source, s0_fire)
+  val s1_sdbpSignature = RegEnable(io.train.bits.sdbpSignature, s0_fire)
   val s1_newFullAddr = RegEnable(s0_newFullAddr, s0_fire)
   val s1_reqVaddr = RegEnable(s0_reqVaddr, s0_fire)
   // val out_req = Wire(new PrefetchReq)
@@ -767,6 +773,7 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     reqFilter.io.in_req.bits.needT := s1_needT
     reqFilter.io.in_req.bits.source := s1_source
     reqFilter.io.in_req.bits.isBOP := true.B
+    reqFilter.io.in_req.bits.sdbpSignature := s1_sdbpSignature
   }
 
   if(virtualTrain){
@@ -786,6 +793,8 @@ class VBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     io.req.bits.needT := s1_needT
     io.req.bits.source := s1_source
     io.req.bits.pfSource := MemReqSource.Prefetch2L2BOP.id.U
+    io.req.bits.sdbpSignature := s1_sdbpSignature
+    io.req.bits.sdbpSource := SDBPSource.L2Bop
     io.req.bits.isBOP := true.B
   }
 
@@ -852,6 +861,7 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
     req.set := parseFullAddress(newAddr)._2
     req.needT := io.train.bits.needT
     req.source := io.train.bits.source
+    req.sdbpSignature := io.train.bits.sdbpSignature
     req_valid := !crossPage && !prefetchDisable // stop prefetch when prefetch req crosses pages
   }
 
@@ -859,6 +869,7 @@ class PBestOffsetPrefetch(implicit p: Parameters) extends BOPModule {
   io.req.valid := enable && req_valid
   io.req.bits := req
   io.req.bits.pfSource := MemReqSource.Prefetch2L2PBOP.id.U
+  io.req.bits.sdbpSource := SDBPSource.L2Bop
   io.train.ready := delayQueue.io.in.ready && scoreTable.io.req.ready && (!req_valid || io.req.ready)
   io.resp.ready := rrTable.io.w.ready
 

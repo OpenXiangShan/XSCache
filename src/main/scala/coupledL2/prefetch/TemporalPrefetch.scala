@@ -33,7 +33,7 @@ import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
 import utility.{ChiselDB, Constantin, MemReqSource}
 import utility.sram.SRAMTemplate
-import xscache.coupledL2.HasCoupledL2Parameters
+import xscache.coupledL2.{HasCoupledL2Parameters, SDBPSource}
 import xscache.coupledL2.utils.ReplacementPolicy
 
 case class TPParameters(
@@ -395,6 +395,9 @@ class TemporalPrefetch(implicit p: Parameters) extends TPModule {
   io.req.bits.needT := true.B
   io.req.bits.source := 0.U // TODO: ensure source 0 is dcache
   io.req.bits.pfSource := MemReqSource.Prefetch2L2TP.id.U
+  // A replayed temporal sequence has no trigger PC on the metadata response.
+  io.req.bits.sdbpSignature := 0.U.asTypeOf(io.req.bits.sdbpSignature)
+  io.req.bits.sdbpSource := SDBPSource.L2None
 
   io.resp.ready := true.B
   io.train.ready := resetFinish

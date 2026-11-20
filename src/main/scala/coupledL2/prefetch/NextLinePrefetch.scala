@@ -20,7 +20,7 @@ package xscache.coupledL2.prefetch
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
-import xscache.coupledL2.HasCoupledL2Parameters
+import xscache.coupledL2.{HasCoupledL2Parameters, SDBPHash, SDBPSource}
 import xscache.coupledL2.utils.{OverwriteQueue, ReplacementPolicy, SetAssocReplacer}
 import utility.{ChiselDB, MemReqSource, XSPerfAccumulate, XSPerfHistogram}
 
@@ -315,10 +315,12 @@ class PatternTrain(implicit p: Parameters) extends NLBundle {
 class PatternReq(implicit p: Parameters) extends NLBundle {
   val pc = UInt(pcBits.W)    
   val addr = UInt(blockAddrBits.W) 
+  val sdbpSignature = Valid(UInt(SDBPHash.signatureBits.W))
 }
 
 class PatternResp(implicit p: Parameters) extends NLBundle {
   val nextAddr = UInt(blockAddrBits.W)  
+  val sdbpSignature = Valid(UInt(SDBPHash.signatureBits.W))
 }
 
 class PatternDb(implicit p: Parameters) extends NLBundle {
@@ -557,6 +559,7 @@ class NextLinePattern(implicit p: Parameters) extends NLModule {
   // Output
   io.resp.valid := s1_needPrefetch
   io.resp.bits.nextAddr := s1_prefetchAddr
+  io.resp.bits.sdbpSignature := RegEnable(io.req.bits.sdbpSignature, s0_reqValid)
 
   // ==================== Stage 2: Writeback ====================
   pt.io.w(ptWPort).req := RegNext(s1_writeReq)
@@ -631,6 +634,7 @@ class NextLinePrefetch(implicit p: Parameters) extends NLModule {
   prefetcherPattern.io.req.valid := shouldQuery
   prefetcherPattern.io.req.bits.addr := getBlockAddr(io.train.bits.addr)
   prefetcherPattern.io.req.bits.pc := io.train.bits.pc.getOrElse(0.U)
+  prefetcherPattern.io.req.bits.sdbpSignature := io.train.bits.sdbpSignature
 
   // pattern.resp ---> prefetchQueue.in
   prefetchQueue.io.enq <> prefetcherPattern.io.resp
@@ -650,6 +654,8 @@ class NextLinePrefetch(implicit p: Parameters) extends NLModule {
   io.req.bits.needT := true.B  
   io.req.bits.source := 0.U  
   io.req.bits.pfSource := MemReqSource.Prefetch2L2NL.id.U  
+  io.req.bits.sdbpSignature := prefetchQueue.io.deq.bits.sdbpSignature
+  io.req.bits.sdbpSource := SDBPSource.L2None
 
   // ========== performance counter==========
   XSPerfAccumulate("nlTotalTrainTimes", io.enable && io.train.fire)//nl accept req times
