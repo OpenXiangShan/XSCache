@@ -295,7 +295,10 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
   copyBackTask.useProbeData := true.B
   copyBackTask.metaWen := false.B
   copyBackTask.dsWen := false.B
-  val victimWritebackDirty = victim.meta.dirty || probeAckDataRecv
+  // ProbeAckData records payload provenance, not perpetual dirty ownership.
+  // A completed nested snoop can pass dirty and install clean victim metadata
+  // while the accepted lower copyback transport must still complete.
+  val victimWritebackDirty = victim.meta.dirty
   val victimWritebackState = Mux(victim.meta.state === BRANCH,
     Mux(victimWritebackDirty, SD, SC),
     Mux(victimWritebackDirty, UD, UC))
@@ -419,6 +422,8 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
     compAckPending := false.B
   }
   when (io.tasks.txdat.fire) {
+    assert(!io.tasks.txdat.bits.resp.get(2) || victim.meta.dirty,
+      "CopyBackWrData must not pass dirty after nested snoop relinquished it")
     copyBackSent := true.B
   }
   when (io.tasks.mainpipe.fire) {
@@ -433,6 +438,8 @@ class ReplaceMSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpc
       assert(!responseIssued, "a standalone CMO must issue its completion exactly once")
       responseIssued := true.B
     }.elsewhen (mainpipeIssuedVariant === 1.U) {
+      assert(!io.tasks.mainpipe.bits.resp.get(2) || victim.meta.dirty,
+        "CMO CopyBackWrData must retain current dirty ownership at issue")
       copyBackSent := true.B
     }
   }
