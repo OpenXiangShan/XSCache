@@ -2358,9 +2358,74 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   class MSHRTaskTicket extends Bundle {
     val group = UInt(log2Up(nMshrTaskGroups).W)
+    val slot = UInt(2.W)
     val source = UInt(log2Up(mshrTaskGroupSize).W)
+    val operation = UInt(4.W)
     val qosClass = UInt(3.W)
     val token = new MainpipeLeaseToken
+  }
+  // Booking transfers only a narrow reference. Payload storage survives until
+  // that exact ticket copies it into a registered permit or cancels. Released
+  // entries retire in order; a younger tombstone cannot expose a reused slot.
+  class MSHRPreparedQueue extends Module {
+    val io = IO(new Bundle {
+      val enq = Flipped(Decoupled(new MSHRPreparedTask))
+      val deq = Decoupled(new MSHRPreparedTask) // oldest unbooked payload
+      val slot = Output(UInt(2.W))
+      val discard = Input(Bool())
+      val readSlot = Input(UInt(2.W))
+      val read = Output(new MSHRPreparedTask)
+      val readValid = Output(Bool())
+      val release = Flipped(Valid(new MSHRTaskTicket))
+      val count = Output(UInt(2.W))
+    })
+    val entries = Reg(Vec(3, new MSHRPreparedTask))
+    val valid = RegInit(VecInit(Seq.fill(3)(false.B)))
+    val booked = RegInit(VecInit(Seq.fill(3)(false.B)))
+    val released = RegInit(VecInit(Seq.fill(3)(false.B)))
+    val allocate = RegInit(0.U(2.W))
+    val book = RegInit(0.U(2.W))
+    val retire = RegInit(0.U(2.W))
+    def next(slot: UInt): UInt = Mux(slot === 2.U, 0.U, slot + 1.U)
+    // Capacity observes only Q. In particular release/retire never feeds ready.
+    io.enq.ready := !valid(allocate)
+    io.deq.valid := valid(book) && !booked(book)
+    io.deq.bits := entries(book)
+    io.slot := book
+    io.read := entries(io.readSlot)
+    io.readValid := valid(io.readSlot) && booked(io.readSlot) && !released(io.readSlot)
+    io.count := PopCount(valid)
+    when(io.enq.fire) {
+      assert(!valid(allocate), "prepared allocation must use an empty Q slot")
+      entries(allocate) := io.enq.bits
+      valid(allocate) := true.B
+      booked(allocate) := false.B
+      released(allocate) := false.B
+      allocate := next(allocate)
+    }
+    when(io.deq.fire) {
+      booked(book) := true.B
+      released(book) := io.discard
+      book := next(book)
+    }
+    when(io.release.valid) {
+      val slot = io.release.bits.slot
+      val entry = entries(slot)
+      assert(slot < 3.U && valid(slot) && booked(slot) && !released(slot) &&
+        entry.group === io.release.bits.group && entry.source === io.release.bits.source &&
+        entry.operation === io.release.bits.operation &&
+        entry.token.asUInt === io.release.bits.token.asUInt,
+        "prepared release must name its exact booked slot and source version")
+      released(slot) := true.B
+    }
+    val releaseOldest = io.release.valid && io.release.bits.slot === retire
+    val discardOldest = io.deq.fire && io.discard && book === retire
+    when(valid(retire) && (released(retire) || releaseOldest || discardOldest)) {
+      valid(retire) := false.B
+      booked(retire) := false.B
+      released(retire) := false.B
+      retire := next(retire)
+    }
   }
   // A lease belongs to one source, independently of the group's preparation
   // capacity. Issued sources retain their own snapshot until terminal + return.
@@ -2381,8 +2446,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // borrows a slot from a same-cycle dequeue/terminal event.
   val mshrTaskWinnerQueues = Seq.fill(nMshrTaskGroups)(
     Module(new Queue(new MSHRTaskWinner, 2, pipe = false, flow = false)))
+  // Keep one registered payload slot free while ticket and permit each hold a
+  // descriptor across their own FF boundary; never borrow same-cycle dequeue.
   val mshrTaskPreparedQueues = Seq.fill(nMshrTaskGroups)(
-    Module(new Queue(new MSHRPreparedTask, 2, pipe = false, flow = false)))
+    Module(new MSHRPreparedQueue))
   val mshrTaskPrepared = mshrTaskPreparedQueues.map(_.io.deq.bits)
   val mshrTaskPreparedValid = mshrTaskPreparedQueues.map(_.io.deq.valid)
   val mshrTaskGroupWait = Seq.fill(nMshrTaskGroups)(RegInit(0.U(6.W)))
@@ -2400,10 +2467,14 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     mshrTaskPreparedValid(g) && !selectedTaskCanceled(g, mshrTaskPrepared(g).source)
   }
 
-  val mshrTaskTicketValid = RegInit(false.B)
-  val mshrTaskTicket = RegInit(0.U.asTypeOf(new MSHRTaskTicket))
-  val mshrTaskIssuePermitValid = RegInit(false.B)
-  val mshrTaskIssuePermit = RegInit(0.U.asTypeOf(new MSHRPreparedTask))
+  val mshrTaskTicketQueue = Module(new Queue(new MSHRTaskTicket, 2,
+    pipe = false, flow = false))
+  val mshrTaskIssuePermitQueue = Module(new Queue(new MSHRPreparedTask, 2,
+    pipe = false, flow = false))
+  val mshrTaskTicketValid = mshrTaskTicketQueue.io.deq.valid
+  val mshrTaskTicket = mshrTaskTicketQueue.io.deq.bits
+  val mshrTaskIssuePermitValid = mshrTaskIssuePermitQueue.io.deq.valid
+  val mshrTaskIssuePermit = mshrTaskIssuePermitQueue.io.deq.bits
   val mshrTaskTicketOut = Wire(Decoupled(new MSHRTaskTicket))
   val mshrTaskFinalBestClass = PriorityEncoder(VecInit((0 until 5).map { c =>
     VecInit((0 until nMshrTaskGroups).map { g =>
@@ -2415,36 +2486,47 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     ticket.valid := mshrTaskGroupReady(g) &&
       mshrTaskGroupClassEff(g) === mshrTaskFinalBestClass
     ticket.bits.group := g.U
+    ticket.bits.slot := mshrTaskPreparedQueues(g).io.slot
     ticket.bits.source := mshrTaskPrepared(g).source
+    ticket.bits.operation := mshrTaskPrepared(g).operation
     ticket.bits.qosClass := mshrTaskGroupClassEff(g)
     ticket.bits.token := mshrTaskPrepared(g).token
     ticket
   }
   ArbPerf(twoLevelArb(mshrTaskTicketInputs, mshrTaskTicketOut, Some("mshr_task_ticket")),
     "mshr_task_ticket_arb")
-  // The next head may reserve its ticket while the preceding permit is busy.
-  mshrTaskTicketOut.ready := !mshrTaskTicketValid
+  mshrTaskTicketQueue.io.enq <> mshrTaskTicketOut
   val mshrTaskTicketGroupOH = UIntToOH(mshrTaskTicket.group, nMshrTaskGroups)
-  val mshrTaskTicketReady = Mux1H(mshrTaskTicketGroupOH, (0 until nMshrTaskGroups).map { g =>
-    mshrTaskGroupReady(g) && mshrTaskPrepared(g).source === mshrTaskTicket.source &&
-      mshrTaskPrepared(g).token.asUInt === mshrTaskTicket.token.asUInt
-  })
+  mshrTaskPreparedQueues.foreach(_.io.readSlot := mshrTaskTicket.slot)
+  val mshrTaskTicketPayload = Mux1H(mshrTaskTicketGroupOH,
+    mshrTaskPreparedQueues.map(_.io.read))
+  val mshrTaskTicketVersionMatches = Mux1H(mshrTaskTicketGroupOH,
+    mshrTaskPreparedQueues.map(_.io.readValid)) &&
+    mshrTaskTicketPayload.group === mshrTaskTicket.group &&
+    mshrTaskTicketPayload.source === mshrTaskTicket.source &&
+    mshrTaskTicketPayload.operation === mshrTaskTicket.operation &&
+    mshrTaskTicketPayload.token.asUInt === mshrTaskTicket.token.asUInt
+  val mshrTaskTicketCanceled = Mux1H(mshrTaskTicketGroupOH,
+    (0 until nMshrTaskGroups).map(g => selectedTaskCanceled(g, mshrTaskTicket.source)))
+  val mshrTaskTicketReady = mshrTaskTicketVersionMatches && !mshrTaskTicketCanceled
+  when(mshrTaskTicketValid) {
+    assert(mshrTaskTicketVersionMatches,
+      "ticket must retain its exact booked payload slot until permit transfer or cancel")
+  }
+  mshrTaskIssuePermitQueue.io.enq.valid := mshrTaskTicketValid && mshrTaskTicketReady
+  mshrTaskIssuePermitQueue.io.enq.bits := mshrTaskTicketPayload
+  mshrTaskIssuePermitQueue.io.enq.bits.qosClass := Mux(Mux1H(mshrTaskTicketGroupOH,
+    mshrTaskGroupWait.map(_ === 63.U)), 0.U, mshrTaskTicket.qosClass)
+  mshrTaskTicketQueue.io.deq.ready := !mshrTaskTicketReady || mshrTaskIssuePermitQueue.io.enq.ready
+  val mshrTaskIssuePermitTake = mshrTaskIssuePermitQueue.io.enq.fire
+  val mshrTaskTicketAbort = mshrTaskTicketQueue.io.deq.fire && !mshrTaskTicketReady
   val mshrTaskIssuePermitGroupOH = UIntToOH(mshrTaskIssuePermit.group, nMshrTaskGroups)
   val mshrTaskIssuePermitReady = mshrTaskIssuePermitValid && !Mux1H(
     mshrTaskIssuePermitGroupOH, (0 until nMshrTaskGroups).map { g =>
       selectedTaskCanceled(g, mshrTaskIssuePermit.source)
     })
-  val mshrTaskIssuePermitTake = mshrTaskTicketValid && mshrTaskTicketReady &&
-    !mshrTaskIssuePermitValid
   val mshrTaskIssuePermitAbort = mshrTaskIssuePermitValid && !mshrTaskIssuePermitReady
-  when(mshrTaskIssuePermitTake) {
-    mshrTaskIssuePermitValid := true.B
-    mshrTaskIssuePermit := Mux1H(mshrTaskTicketGroupOH, mshrTaskPrepared)
-    mshrTaskIssuePermit.qosClass := mshrTaskTicket.qosClass
-    mshrTaskTicketValid := false.B
-  }.elsewhen(mshrTaskIssuePermitAbort || mshrTask.fire) {
-    mshrTaskIssuePermitValid := false.B
-  }
+  mshrTaskIssuePermitQueue.io.deq.ready := mshrTaskIssuePermitAbort || mshrTask.ready
   mshrTask.valid := mshrTaskIssuePermitReady
   mshrTask.bits := mshrTaskIssuePermit.task
   mshrTask.bits.mshrId := mshrTaskIssuePermit.source
@@ -2453,15 +2535,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   selectedIssueCompletion.valid := mshrTask.fire && mshrTaskIssuePermit.completion.valid
   selectedIssueCompletion.bits := mshrTaskIssuePermit.completion.bits
   when(mshrTaskTicketOut.fire) {
-    mshrTaskTicketValid := true.B
-    mshrTaskTicket := mshrTaskTicketOut.bits
     assert(mshrTaskTicketOut.bits.qosClass === mshrTaskFinalBestClass,
       "selected ticket must belong to the best effective QoS class")
-  }.elsewhen(mshrTaskTicketValid && !mshrTaskTicketReady) {
-    mshrTaskTicketValid := false.B
-  }.elsewhen(mshrTaskTicketValid &&
-    Mux1H(mshrTaskTicketGroupOH, mshrTaskGroupWait.map(_ === 63.U))) {
-    mshrTaskTicket.qosClass := 0.U
   }
 
   (0 until nMshrTaskGroups).foreach { g =>
@@ -2535,11 +2610,13 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         "materialized payload must belong to the registered group winner")
     }
     val winnerAbort = winnerQueue.deq.fire && winnerCanceled
-    val ticketOwnsHead = mshrTaskTicketValid && mshrTaskTicketGroupOH(g)
     val preparedCanceled = selectedTaskCanceled(g, preparedQueue.deq.bits.source)
-    preparedQueue.deq.ready := mshrTaskIssuePermitTake && mshrTaskTicketGroupOH(g) ||
-      preparedCanceled && !ticketOwnsHead
-    val preparedAbort = preparedQueue.deq.fire && preparedCanceled && !ticketOwnsHead
+    preparedQueue.deq.ready := mshrTaskTicketInputs(g).fire || preparedCanceled
+    preparedQueue.discard := preparedCanceled
+    preparedQueue.release.valid := mshrTaskTicketQueue.io.deq.fire && mshrTaskTicketGroupOH(g)
+    preparedQueue.release.bits := mshrTaskTicket
+    val preparedAbort = preparedQueue.deq.fire && preparedCanceled
+    val ticketAbort = mshrTaskTicketAbort && mshrTaskTicketGroupOH(g)
     val granted = mshrTask.fire && mshrTaskIssuePermitGroupOH(g)
     val permitAbort = mshrTaskIssuePermitAbort && mshrTaskIssuePermitGroupOH(g)
     when(winnerOut.fire) {
@@ -2563,6 +2640,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       val issued = granted && mshrTaskIssuePermit.source === i.U
       val dropped = winnerAbort && winner.source === i.U ||
         preparedAbort && preparedQueue.deq.bits.source === i.U ||
+        ticketAbort && mshrTaskTicket.source === i.U ||
         permitAbort && mshrTaskIssuePermit.source === i.U
       val sourceReallocated = mshrTaskGenerations(g)(i) =/= binding.token.generation
       val pairedOwnerReallocated = if (g == 1) {
