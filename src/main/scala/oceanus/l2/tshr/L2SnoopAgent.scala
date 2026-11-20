@@ -81,6 +81,7 @@ object L2SnoopAgent {
     val SnpResp = Bool()
     val SnpRespData0 = Bool()
     val SnpRespData2 = Bool()
+    val SnpNone = Bool()
   }
 
   class PathToSnoopAgent extends PathToSnoopAgentUOPs {
@@ -240,8 +241,8 @@ class L2SnoopAgent(val sliceNum: Int)(implicit val p: Parameters) extends Module
   val directDone = startService && !startNeedSnoop
   val doneForSNP = serviceFromSNP
   val doneForREQ = serviceFromREQ
-  val directForSNP = directDone && startFromSNP
-  val directForREQ = directDone && startFromREQ
+  val snpNoneSNP = directDone && startFromSNP
+  val snpNoneREQ = directDone && startFromREQ
   val dataPassDirty = io.UpRXDAT.bits.Resp(2)
   val pdValid = rspMatch || datBeat0 || datBeat2
 
@@ -254,23 +255,37 @@ class L2SnoopAgent(val sliceNum: Int)(implicit val p: Parameters) extends Module
   val sa_resp = Mux(rspMatch, io.UpRXRSP.bits.Resp,
                 Mux(datBeat0 || datBeat2, io.UpRXDAT.bits.Resp, CCHIResp.I.U))
 
-  io.fromSAForSNP.SnpResp := (rspMatch && doneForSNP) || directForSNP
+  io.fromSAForSNP.SnpResp := rspMatch && doneForSNP
+  io.fromSAForSNP.SnpNone := snpNoneSNP
   io.fromSAForSNP.SnpRespData0 := datBeat0 && serviceFromSNP
   io.fromSAForSNP.SnpRespData2 := datBeat2 && serviceFromSNP
   io.fromSAForSNP.PASSDIRTY := doneForSNP && pdValid && passDirty
   io.fromSAForSNP.RESP := sa_resp
 
-  io.fromSAForREQ.SnpResp := (rspMatch && doneForREQ) || directForREQ
+  io.fromSAForREQ.SnpResp := rspMatch && doneForREQ
+  io.fromSAForREQ.SnpNone := snpNoneREQ
   io.fromSAForREQ.SnpRespData0 := datBeat0 && serviceFromREQ
   io.fromSAForREQ.SnpRespData2 := datBeat2 && serviceFromREQ
   io.fromSAForREQ.PASSDIRTY := doneForREQ && pdValid && passDirty
   io.fromSAForREQ.RESP := sa_resp
 
   io.fromSA.SnpResp := io.fromSAForSNP.SnpResp || io.fromSAForREQ.SnpResp
+  io.fromSA.SnpNone := io.fromSAForSNP.SnpNone || io.fromSAForREQ.SnpNone
   io.fromSA.SnpRespData0 := io.fromSAForSNP.SnpRespData0 || io.fromSAForREQ.SnpRespData0
   io.fromSA.SnpRespData2 := io.fromSAForSNP.SnpRespData2 || io.fromSAForREQ.SnpRespData2
   io.fromSA.PASSDIRTY := io.fromSAForSNP.PASSDIRTY || io.fromSAForREQ.PASSDIRTY
   io.fromSA.RESP := sa_resp
+
+  assert(!(io.fromSAForREQ.SnpResp && io.fromSAForREQ.SnpNone),
+    "Snoop Agent SnpResp and SnpNone collided for REQ")
+  assert(!(io.fromSAForSNP.SnpResp && io.fromSAForSNP.SnpNone),
+    "Snoop Agent SnpResp and SnpNone collided for SNP")
+  assert(!(io.fromSAForREQ.SnpNone &&
+           (io.fromSAForREQ.SnpRespData0 || io.fromSAForREQ.SnpRespData2)),
+    "Snoop Agent SnpNone and SnpRespData collided for REQ")
+  assert(!(io.fromSAForSNP.SnpNone &&
+           (io.fromSAForSNP.SnpRespData0 || io.fromSAForSNP.SnpRespData2)),
+    "Snoop Agent SnpNone and SnpRespData collided for SNP")
 
   io.dbg.slotSNPValid := slotSNPValid
   io.dbg.slotREQValid := slotREQValid

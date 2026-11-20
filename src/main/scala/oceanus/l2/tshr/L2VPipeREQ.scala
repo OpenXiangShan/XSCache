@@ -450,14 +450,21 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // -- Interactions with Snoop Agent
   // decode upstream REQ opcodes to upstream SNP opcodes
   val sa_snpresp = io.fromSA.SnpResp
+  val sa_snpnone = io.fromSA.SnpNone
   val sa_snprespdata0 = io.fromSA.SnpRespData0
   val sa_snprespdata2 = io.fromSA.SnpRespData2
 
-  val sa_resp_decision = sa_snpresp ||
+  val sa_resp_decision = sa_snpresp || sa_snpnone ||
                          sa_snprespdata0 && w_snpresp0 && w_snpresp2 ||
                          sa_snprespdata2 && w_snpresp0 && w_snpresp2
 
-  val sa_resp_last = sa_snpresp ||
+  assert(!(io.fromSA.SnpResp && io.fromSA.SnpNone),
+    "TSHR @ %m REQ vPipe received SnpResp and SnpNone together")
+  assert(!(io.fromSA.SnpNone &&
+           (io.fromSA.SnpRespData0 || io.fromSA.SnpRespData2)),
+    "TSHR @ %m REQ vPipe received SnpNone and SnpRespData together")
+
+  val sa_resp_last = sa_snpresp || sa_snpnone ||
                      sa_snprespdata0 && w_snpresp0 && !w_snpresp2 ||
                      sa_snprespdata2 && !w_snpresp0 && w_snpresp2
 
@@ -520,11 +527,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     w_snpresp2 := true.B
   }
 
-  when (sa_snpresp || sa_snprespdata0) {
+  when (sa_snpresp || sa_snpnone || sa_snprespdata0) {
     w_snpresp0 := false.B
   }
 
-  when (sa_snpresp || sa_snprespdata2) {
+  when (sa_snpresp || sa_snpnone || sa_snprespdata2) {
     w_snpresp2 := false.B
   }
   // ----------------------------------------------------------------
