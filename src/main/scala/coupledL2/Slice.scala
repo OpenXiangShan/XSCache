@@ -114,7 +114,9 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   // strobes at this edge identify the only request this verdict may kill.
   require(!cacheParams.specMissPreview || cacheParams.innerBuf.a.depth == 0)
   val specCommitS2 = if (cacheParams.specMissPreview) RegNext(io.in.a.valid, false.B) else true.B
-  reqArb.io.sinkAPending := false.B
+  reqBuf.io.inPending := false.B
+  reqBuf.io.specCommitS2 := specCommitS2
+  reqArb.io.sinkAPending := reqBuf.io.outPending
   reqArb.io.specCommitS2 := specCommitS2
   reqBuf.io.mshrInfo := mshrCtl.io.msInfo
   reqBuf.io.mainPipeBlock := mainPipe.io.toReqBuf

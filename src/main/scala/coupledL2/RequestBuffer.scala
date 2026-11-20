@@ -74,6 +74,9 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   val io = IO(new Bundle() {
     val in          = Flipped(DecoupledIO(new TaskBundle))
     val out         = DecoupledIO(new TaskBundle)
+    val inPending   = Input(Bool())
+    val specCommitS2 = Input(Bool())
+    val outPending  = Output(Bool())
     val mshrInfo  = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo)))
     val aMergeTask = ValidIO(new AMergeTask)
     val mainPipeBlock = Input(Vec(2, Bool()))
@@ -101,6 +104,8 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   io.ASet := io.in.bits.set
 
   val buffer = RegInit(VecInit(Seq.fill(entries)(0.U.asTypeOf(new ReqEntry))))
+  val pendingInsertS2 = RegInit(0.U(entries.W))
+  val cancelSlot = Mux(io.specCommitS2, 0.U(entries.W), pendingInsertS2)
   val issueArb = Module(new TwoLevelRRArbiter(new ReqEntry, entries))
   ArbPerf(issueArb, "issueArb")
   val chosenQ = Module(new Queue(new ChosenQBundle(entries), entries = 1, pipe = true, flow = false))
@@ -194,6 +199,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   // flow not allowed when full, or entries might starve
   val canFlow = flow.B && !full && !conflict(in) && !chosenQValid && !Cat(io.mainPipeBlock).orR && !noFreeWay(in) && !prefetchBlocked(in)
   val doFlow  = canFlow && io.out.ready
+  io.outPending := canFlow && io.inPending
 
   //  val depMask    = buffer.map(e => e.valid && sameAddr(io.in.bits, e.task))
   // remove duplicate prefetch if same-addr A req in MSHR or ReqBuf
@@ -201,9 +207,9 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   val dupMask    = VecInit(
     io.mshrInfo.map(s =>
       s.valid && s.bits.isAcqOrPrefetch && sameAddr(in, s.bits)) ++
-    buffer.map(e =>
-      e.valid && sameAddr(in, e.task)
-    )
+    buffer.zipWithIndex.map { case (e, i) =>
+      e.valid && !cancelSlot(i) && sameAddr(in, e.task)
+    }
   )
   val dup        = isPrefetch && dupMask.asUInt.orR
   val dupHitSrc = ParallelPriorityMux(dupMask,
@@ -227,6 +233,9 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
 
   val insertOH = MaskToOH(buffer.map(!_.valid))
   val alloc = !full && io.in.valid && !prefetchBlocked(in) && !doFlow && !dup && !mergeA
+  // An allocated slot is visible to issue for the first time in S2.
+  // Remember only this cycle's slot, even on back-to-back owner/ID reuse.
+  pendingInsertS2 := Mux(alloc && io.inPending, insertOH, 0.U)
   buffer.zip(insertOH.asBools).foreach { case (entry, sel) =>
     when(alloc && sel){
       val mpBlock = Cat(io.mainPipeBlock).orR
@@ -250,10 +259,10 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   }
 
   /* ======== Issue ======== */
-  issueArb.io.in zip buffer foreach {
-    case(in, e) =>
-      in.valid := e.valid && e.rdy && !prefetchBlockedByMSHR(e.task)
-      in.bits  := e
+  (issueArb.io.in zip buffer).zipWithIndex.foreach { case ((in, e), i) =>
+    in.valid := e.valid && !cancelSlot(i) && e.rdy && !prefetchBlockedByMSHR(e.task)
+    in.bits  := e
+    when(cancelSlot(i)) { e.valid := false.B }
   }
 
   /* ======== chosenQ enq ======== */
