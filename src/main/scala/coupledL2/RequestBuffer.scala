@@ -162,8 +162,12 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
       in.fromA && (in.opcode === AcquireBlock || in.opcode === AcquirePerm) && !s.bits.mergeA && !(in.param === NtoT && s.bits.param === NtoB)
   }).asUInt
   val mergeA = mergeAMask.orR
+  // A merge updates a live prefetch MSHR immediately. Hold an unresolved
+  // matching head at the fabric; a committed head is retried next cycle
+  // against the then-current MSHR (which may already have completed).
+  val deferMerge = io.inPending && mergeA
   assert(!mergeA || PopCount(mergeAMask) <= 1.U, "RequestBuffer: mergeAMask must be one-hot when mergeA is asserted")
-  io.aMergeTask.valid := io.in.valid && mergeA
+  io.aMergeTask.valid := io.in.valid && mergeA && !io.inPending
   io.aMergeTask.bits.idOH := mergeAMask
   io.aMergeTask.bits.task := in
 
@@ -197,7 +201,8 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   def prefetchBlockedByMSHR(task: TaskBundle): Bool = isPrefetchTask(task) && pfThrottleByMSHR
 
   // flow not allowed when full, or entries might starve
-  val canFlow = flow.B && !full && !conflict(in) && !chosenQValid && !Cat(io.mainPipeBlock).orR && !noFreeWay(in) && !prefetchBlocked(in)
+  val canFlow = flow.B && !full && !conflict(in) && !chosenQValid && !Cat(io.mainPipeBlock).orR &&
+    !noFreeWay(in) && !prefetchBlocked(in) && !deferMerge
   val doFlow  = canFlow && io.out.ready
   io.outPending := canFlow && io.inPending
 
@@ -229,7 +234,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   //!! TODO: we can also remove those that duplicate with mainPipe
 
   /* ======== Alloc ======== */
-  io.in.ready   := !prefetchBlocked(in) && (!full || doFlow) || mergeA || dup
+  io.in.ready   := (!prefetchBlocked(in) && (!full || doFlow) || mergeA || dup) && !deferMerge
 
   val insertOH = MaskToOH(buffer.map(!_.valid))
   val alloc = !full && io.in.valid && !prefetchBlocked(in) && !doFlow && !dup && !mergeA
