@@ -458,6 +458,15 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                          sa_snprespdata0 && w_snpresp0 && w_snpresp2 ||
                          sa_snprespdata2 && w_snpresp0 && w_snpresp2
 
+  val sa_resp_decision_nonflow = if (paramL2.hitFastPathDirRespFlow) {
+    sa_snpresp ||
+    RegNext(sa_snpnone, false.B) ||
+    sa_snprespdata0 && w_snpresp0 && w_snpresp2 ||
+    sa_snprespdata2 && w_snpresp0 && w_snpresp2
+  } else {
+    sa_resp_decision
+  }
+
   assert(!(io.fromSA.SnpResp && io.fromSA.SnpNone),
     "TSHR @ %m REQ vPipe received SnpResp and SnpNone together")
   assert(!(io.fromSA.SnpNone &&
@@ -1150,7 +1159,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // - MakeUnique related meta/tag updates
   val meta_wr_state_makeunique_UU_sat = active && p_rxreq_makeunique &&
-                                        sa_resp_decision &&
+                                        sa_resp_decision_nonflow &&
                                         dirResult.state === MetaState.US
 
   val meta_wr_state_makeunique_UU_unsat = active && p_rxreq_makeunique &&
@@ -1169,7 +1178,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // - ReadUnique related meta/tag updates
   val meta_wr_state_readunique_UU_sat = active && p_rxreq_readunique &&
-                                        sa_resp_decision &&
+                                        sa_resp_decision_nonflow &&
                                         dirResult.state === MetaState.US
 
   // 'Resp' not checked for this, because it was already constrained by CHI specification, and only goes to UU
@@ -1199,13 +1208,13 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // - ReadShared related meta/tag updates
   val meta_wr_state_readshared_UU_sat = active && p_rxreq_readshared &&
-                                        sa_resp_decision &&
+                                        sa_resp_decision_nonflow &&
                                         dirResult.state === MetaState.US &&
                                         !p_rxreq_peer_present &&
                                         configReadSharedPromotionFromUS
 
   val meta_wr_state_readshared_US_sat = active && p_rxreq_readshared &&
-                                        sa_resp_decision &&
+                                        sa_resp_decision_nonflow &&
                                         dirResult.state === MetaState.UU &&
                                         (configReadSharedDemotionFromUU || p_rxreq_peer_present)
 
@@ -1248,7 +1257,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                        io.fromSA.RESP === CCHIResp.UC_PD.U
 
   val meta_wr_state_readonce_US_sat = active && p_rxreq_readonce &&
-                                      sa_resp_decision &&
+                                      sa_resp_decision_nonflow &&
                                       dirResult.state === MetaState.UU &&
                                       dirResult.clients.asUInt.orR &&
                                       !sa_resp_unique
@@ -1374,7 +1383,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val meta_wr_dirty_evictback_clr = meta_wr_state_evictback_I
   // --------------------------------
 
-  val meta_wr_dirty_sa_set = sa_resp_decision && io.fromSA.PASSDIRTY
+  val meta_wr_dirty_sa_set = sa_resp_decision_nonflow && io.fromSA.PASSDIRTY
   // --------------------------------
 
   val meta_wr_state_UU = meta_wr_state_readunique_UU ||
