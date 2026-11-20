@@ -481,7 +481,9 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   val nestedReleaseDirtyThisCycle = nestedReleaseTargetsRefill && io.nestedwb.c_set_dirty
   val releaseDataBlocksGrant = io.releaseDataBeforeProbeAck || releaseDataBeforeProbeAckPending
   when(!io.alloc.valid && nestedReleaseTargetsRefill) {
-    refillPayloadFromProbeAck := false.B
+    when(io.nestedwb.c_set_dirty) {
+      refillPayloadFromProbeAck := false.B
+    }
     when(io.nestedwb.c_set_tip) {
       postGrantCleanReleaseSeen := true.B
     }

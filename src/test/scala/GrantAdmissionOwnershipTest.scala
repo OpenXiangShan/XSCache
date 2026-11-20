@@ -159,3 +159,92 @@ object TestGrantAdmissionOwnership extends App with ChiselSim {
     println("PASS: actual MSHR Grant admission, stalled SourceD, same-line RXSNP block, retry replay, commit hold, retire/reuse and Get qualification")
   }
 }
+
+// ProbeAckData remains the refill payload's origin until a newer data event
+// replaces it. MainPipe drives nestedwb addresses even when every event is low.
+class ProbePayloadPersistenceHarness(implicit p: Parameters) extends Module {
+  val io = IO(new Bundle {
+    val allocate = Input(Bool())
+    val probeAccepted = Input(Bool())
+    val probeData = Input(Bool())
+    val last = Input(Bool())
+    val sameAddress = Input(Bool())
+    val releaseData = Input(Bool())
+    val cleanRelease = Input(Bool())
+    val probe = Output(Bool())
+    val live = Output(Bool())
+    val payloadFromProbe = Output(Bool())
+  })
+  def zeroInputs(data: Data): Unit = data match {
+    case r: Record => r.elements.values.foreach(zeroInputs)
+    case v: Vec[_] => v.foreach(zeroInputs)
+    case leaf if DataMirror.directionOf(leaf) == ActualDirection.Input => leaf := 0.U.asTypeOf(leaf)
+    case _ =>
+  }
+  val m = Module(new MSHR)
+  zeroInputs(m.io)
+  m.io.alloc.valid := io.allocate
+  m.io.alloc.bits.state.elements.foreach(_._2 := true.B)
+  m.io.alloc.bits.state.s_refill := false.B
+  m.io.alloc.bits.state.s_rprobe := false.B
+  m.io.alloc.bits.state.w_rprobeacklast := false.B
+  m.io.alloc.bits.task.channel := 1.U
+  m.io.alloc.bits.task.opcode := Get
+  m.io.alloc.bits.task.param := NtoB
+  m.io.alloc.bits.task.set := 2.U
+  m.io.alloc.bits.task.tag := 3.U
+  m.io.alloc.bits.dirResult.hit := true.B
+  m.io.alloc.bits.dirResult.set := 2.U
+  m.io.alloc.bits.dirResult.tag := 3.U
+  m.io.alloc.bits.dirResult.way := 1.U
+  m.io.alloc.bits.dirResult.meta.state := MetaData.TRUNK
+  m.io.alloc.bits.dirResult.meta.clients := 1.U
+  m.io.sourceBAccepted := io.probeAccepted
+  m.io.sourceBHold := io.probeAccepted
+  m.io.resps.sinkC.valid := io.probeData
+  m.io.resps.sinkC.bits.opcode := ProbeAckData
+  m.io.resps.sinkC.bits.param := TtoB
+  m.io.resps.sinkC.bits.last := io.last
+  m.io.nestedwb.set := 2.U
+  m.io.nestedwb.tag := Mux(io.sameAddress, 3.U, 4.U)
+  m.io.nestedwb.c_set_dirty := io.releaseData
+  m.io.nestedwb.c_set_tip := io.cleanRelease
+  io.probe := m.io.tasks.source_b.valid
+  io.live := m.io.status.valid
+  io.payloadFromProbe := m.io.refillPayloadFromProbeAck
+}
+
+object TestProbePayloadPersistence extends App with ChiselSim {
+  import PairMiterParameters._
+  simulate(new ProbePayloadPersistenceHarness) { d =>
+    d.io.allocate.poke(false.B); d.io.probeAccepted.poke(false.B)
+    d.io.probeData.poke(false.B); d.io.last.poke(false.B)
+    d.io.sameAddress.poke(false.B); d.io.releaseData.poke(false.B)
+    d.io.cleanRelease.poke(false.B)
+    d.clock.step(3)
+    d.io.allocate.poke(true.B); d.clock.step(); d.io.allocate.poke(false.B)
+    d.io.live.expect(true.B); d.io.probe.expect(true.B)
+    d.io.probeAccepted.poke(true.B); d.clock.step(); d.io.probeAccepted.poke(false.B)
+    d.io.probeData.poke(true.B); d.clock.step()
+    d.io.payloadFromProbe.expect(false.B)
+    d.io.last.poke(true.B); d.clock.step(); d.io.probeData.poke(false.B)
+    d.io.payloadFromProbe.expect(true.B)
+    println("ProbeAckData completed: live payload origin is ProbeAckData")
+
+    // A valid address is not an event: idle or another MainPipe operation may
+    // retain this line's set/tag while all nested writeback enables are false.
+    d.io.sameAddress.poke(true.B)
+    for (_ <- 0 until 4) {
+      d.clock.step(); d.io.live.expect(true.B); d.io.payloadFromProbe.expect(true.B)
+    }
+    println("Same-address cycles without a nested event preserve the payload origin")
+
+    d.io.sameAddress.poke(false.B); d.io.releaseData.poke(true.B); d.clock.step()
+    d.io.releaseData.poke(false.B); d.io.payloadFromProbe.expect(true.B)
+    d.io.sameAddress.poke(true.B); d.io.cleanRelease.poke(true.B); d.clock.step()
+    d.io.cleanRelease.poke(false.B); d.io.payloadFromProbe.expect(true.B)
+    d.io.releaseData.poke(true.B); d.clock.step(); d.io.releaseData.poke(false.B)
+    d.io.payloadFromProbe.expect(false.B)
+    println("Only a newer same-address ReleaseData replaces this payload origin")
+  }
+}
