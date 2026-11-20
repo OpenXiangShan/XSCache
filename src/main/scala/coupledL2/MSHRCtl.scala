@@ -531,14 +531,22 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val refillBlocksSnoopOH = VecInit(refillMshrs.map { refill =>
     refill.io.status.valid && refill.io.status.bits.w_c_resp
   }).asUInt
-  val snoopBaseEligibleOH = ~(srBusySlotOH | refillBlocksSnoopOH)
-  val replaceSlotUnreservedOH = VecInit((0 until mshrsAll).map { i =>
-    !srBusySlotOH(i)
-  }).asUInt
-  // Keep one physical escape slot for a C miss whose owner is known only after
-  // Directory capture. Its retained decision must not wait for a MainPipe user
-  // to retire before it can apply and release the shared pipeline.
-  val srNonCSlotAvailable = PopCount(replaceSlotUnreservedOH) > 1.U
+  // Ordinary sidecars can wait for a home node that is itself waiting for a
+  // queued B response. Give B and C distinct physical escape reservations;
+  // neither class can consume the other's last slot. All eligibility comes
+  // from the registered active/pending ledger, including unfilled claims.
+  require(mshrsAll >= 3, "S/R contexts require ordinary, B progress and C escape slots")
+  val srBProgressSlotOH = (BigInt(1) << (mshrsAll - 1)).U(mshrsAll.W)
+  val srCEscapeSlotOH = (BigInt(1) << (mshrsAll - 2)).U(mshrsAll.W)
+  val srOrdinarySlotOH = ~(srBProgressSlotOH | srCEscapeSlotOH)
+  val replaceSlotUnreservedOH = ~srBusySlotOH
+  val replaceOrdinarySlotOH = replaceSlotUnreservedOH & srOrdinarySlotOH
+  val cReleaseSlotEligibleOH = replaceSlotUnreservedOH & ~srBProgressSlotOH
+  val snoopBaseEligibleOH = ~(srBusySlotOH | refillBlocksSnoopOH | srCEscapeSlotOH)
+  assert(!(replaceInfoValidOH & srBProgressSlotOH).orR,
+    "the B progress slot must not be occupied by a replacement or CMO")
+  assert(!(snoopStatusValidOH & srCEscapeSlotOH).orR,
+    "the C escape slot must not be occupied by a snoop")
   val snoopAllocRequest = io.fromMainPipe.mshr_alloc_s3.valid &&
     io.fromMainPipe.mshr_alloc_s3.bits.task.fromB
   val snoopServiceSlot = OHToUInt(PriorityEncoderOH(snoopBaseEligibleOH))
@@ -596,11 +604,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     case (refill, i) => refill.io.replReadWanted && !replaceReserveValid(i)
   }).asUInt
   val replaceReserveGrantParentOH = PriorityEncoderOH(replaceReserveNeedParentOH)
-  val replaceReserveGrantSlotOH = PriorityEncoderOH(replaceSlotUnreservedOH)
+  val replaceReserveGrantSlotOH = PriorityEncoderOH(replaceOrdinarySlotOH)
   val replaceReserveGrant = !snoopAllocRequest && !snoopReservationFence && !io.nestedwb.c_set_dirty &&
     !io.snoopAdmission.fire &&
     !(io.fromMainPipe.orphanReleaseReserveRequest.valid && orphanReservationTurn) &&
-    replaceReserveNeedParentOH.orR && srNonCSlotAvailable
+    replaceReserveNeedParentOH.orR && replaceOrdinarySlotOH.orR
   assert(
     !(snoopAllocRequest && replaceReserveGrant),
     "a snoop allocation must preempt a new ReplaceMSHR reservation"
@@ -725,6 +733,8 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val orphanReleaseData = orphanReleaseCandidate && !orphanReleaseTargetsReplace
   val replaceSlotIdle = replaceSlotUnreservedOH &
     ~Mux(replaceReserveGrant, replaceReserveGrantSlotOH, 0.U(mshrsAll.W))
+  val replaceOrdinaryIdleOH = replaceSlotIdle & srOrdinarySlotOH
+  val cReleaseSlotIdleOH = replaceSlotIdle & ~srBProgressSlotOH
   val orphanReserveRequest = io.fromMainPipe.orphanReleaseReserveRequest
   val orphanReserveTargetOH = VecInit(replaceMshrs.map { m =>
     orphanReserveRequest.valid && m.io.info.valid &&
@@ -773,7 +783,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     orphanReleaseData || cmoAlloc
   val orphanReserveExisting = orphanReserveTargetOH.orR
   val orphanReserveNeedsCapture = orphanReserveRequest.valid && !orphanClaimCurrent
-  val orphanReserveSlotPickOH = PriorityEncoderOH(replaceSlotIdle)
+  val orphanReserveSlotPickOH = PriorityEncoderOH(cReleaseSlotIdleOH)
   val orphanReserveGrant = orphanReserveNeedsCapture &&
     (orphanReserveExisting ||
       (!orphanReserveTransportPending && orphanReserveSlotPickOH.orR &&
@@ -902,7 +912,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         io.fromMainPipe.orphanReleaseReserveDone.bits.asUInt === orphanReleaseSlotClaim.bits.asUInt,
         orphanClaimSlotOH, 0.U(mshrsAll.W)),
         Mux(nestedReleaseNeedsReplace && cClaimedAllocationOH.orR,
-          cClaimedAllocationOH, PriorityEncoderOH(replaceSlotIdle))))
+          cClaimedAllocationOH, PriorityEncoderOH(cReleaseSlotIdleOH))))
   )
 
   (0 until mshrsAll).foreach { i =>
@@ -927,7 +937,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   }
   val replaceNestedAllocParentOH = Mux(nestedReleaseNeedsReplace, nestedReleaseParentOH, 0.U(mshrsAll.W))
   val replaceNestedSlotOH = Mux(cClaimedAllocationOH.orR,
-    cClaimedAllocationOH, PriorityEncoderOH(replaceSlotIdle))
+    cClaimedAllocationOH, PriorityEncoderOH(cReleaseSlotIdleOH))
   val replaceNestedTargetMatches = Seq.tabulate(mshrsAll) { parent =>
     replaceParentMatches(parent) |
       Mux(replaceNestedAllocParentOH(parent), replaceNestedSlotOH, 0.U(mshrsAll.W))
@@ -1128,6 +1138,21 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     replaceReserveGrantSlotOH, 0.U(mshrsAll.W))
   srPendingSlotOH := (srPendingSlotOH & ~srPendingClearOH) |
     snoopAdmissionClaimOH | replaceReserveClaimOH | normalCmoClaimOH | orphanReserveClaimOH
+  assert(!((replaceReserveClaimOH | normalCmoClaimOH) &
+    (srBProgressSlotOH | srCEscapeSlotOH)).orR,
+    "ordinary reservations must preserve both progress slots")
+  assert(!(orphanReserveClaimOH & srBProgressSlotOH).orR,
+    "C claims must preserve the B progress slot")
+  assert(!(snoopAdmissionClaimOH & srCEscapeSlotOH).orR,
+    "B claims must preserve the C escape slot")
+  when(replaceAllocValid) {
+    assert(!(selectedReplaceSlotOH & srBProgressSlotOH).orR,
+      "replacement allocations must preserve the B progress slot")
+    when(cmoAlloc || replRespNeedsReplace) {
+      assert(!(selectedReplaceSlotOH & srCEscapeSlotOH).orR,
+        "CMO and ordinary sidecars must preserve the C escape slot")
+    }
+  }
   val expectedSrPendingSlotOH = replaceReservedSlotOH | snoopClaimSlotOH | cmoClaimSlotOH |
     orphanReleaseClaimSlotOH
   assert(srPendingSlotOH === expectedSrPendingSlotOH,
@@ -1239,7 +1264,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   val bToNFire = io.bServiceStart.valid && isSnpToN(io.bServiceStart.bits.chiOpcode.get)
   val pendingToNFreeOH = PriorityEncoderOH(VecInit(pendingToNValid.map(x => !x)).asUInt)
   val pendingToNFull = !pendingToNFreeOH.orR
-  io.snoopAdmission.ready := !snoopServiceValid && snoopBaseEligibleOH.orR && srNonCSlotAvailable &&
+  io.snoopAdmission.ready := !snoopServiceValid && snoopBaseEligibleOH.orR &&
     !pendingASetConflict(io.snoopAdmission.bits.set) &&
     !VecInit(snoopSlotClaims.map(claim => claim.valid &&
       claim.bits.token.set === io.snoopAdmission.bits.set)).asUInt.orR && !nestedReleaseNeedsReplace && !orphanReleaseData &&
@@ -1905,7 +1930,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   // use. MainPipe users can then drain while C stays outside the retained S3
   // decision. This reads only active/pending busy Q, never a retiring owner.
   io.toReqArb.blockC_s1 := io.fromReqArb.status_s1.cReleaseData &&
-    (cReleaseConflictsReplacer || !replaceSlotUnreservedOH.orR)
+    (cReleaseConflictsReplacer || !cReleaseSlotEligibleOH.orR)
   io.toReqArb.blockB_s1 := mshrFull ||
     (io.fromReqArb.status_s1.bToN && pendingToNFull) ||
     (io.fromReqArb.status_s1.bCandidateValid &&
