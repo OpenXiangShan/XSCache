@@ -86,6 +86,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   rxsnp.io.msInfo := mshrCtl.io.msInfo
 
   directory.io.read <> reqArb.io.dirRead_s1
+  directory.io.cancelReadS2 := reqArb.io.cancelS2
   directory.io.metaWReq := mainPipe.io.metaWReq
   directory.io.tagWReq := mainPipe.io.tagWReq
   directory.io.msInfo := mshrCtl.io.msInfo
@@ -109,7 +110,12 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   reqArb.io.msInfo := mshrCtl.io.msInfo
 
   reqBuf.io.in <> sinkA.io.task
+  // Each slice has exactly one A head in a cycle. The flow/slot capture
+  // strobes at this edge identify the only request this verdict may kill.
   require(!cacheParams.specMissPreview || cacheParams.innerBuf.a.depth == 0)
+  val specCommitS2 = if (cacheParams.specMissPreview) RegNext(io.in.a.valid, false.B) else true.B
+  reqArb.io.sinkAPending := false.B
+  reqArb.io.specCommitS2 := specCommitS2
   reqBuf.io.mshrInfo := mshrCtl.io.msInfo
   reqBuf.io.mainPipeBlock := mainPipe.io.toReqBuf
   reqBuf.io.pipeStatusVec(0) := reqArb.io.status_vec(1) // s2 status

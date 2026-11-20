@@ -32,6 +32,9 @@ class RequestArb(implicit p: Parameters) extends L2Module
   val io = IO(new Bundle() {
     /* receive incoming tasks */
     val sinkA    = Flipped(DecoupledIO(new TaskBundle))
+    val sinkAPending = Input(Bool())
+    val specCommitS2 = Input(Bool())
+    val cancelS2 = Output(Bool())
     val ATag     = Input(UInt(tagBits.W)) // !TODO: very dirty, consider optimize structure
     val ASet     = Input(UInt(setBits.W)) // To pass A entrance status to MP for blockA-info of ReqBuf
     val s1Entrance = ValidIO(new L2Bundle {
@@ -230,9 +233,13 @@ class RequestArb(implicit p: Parameters) extends L2Module
 
   s2_ready  := !ds_mcp2_stall && !hint_stall
 
-  val task_s2 = RegInit(0.U.asTypeOf(task_s1))
-  task_s2.valid := s1_fire
-  when(s1_fire) { task_s2.bits := task_s1.bits }
+  val task_s2_reg = RegInit(0.U.asTypeOf(task_s1))
+  task_s2_reg.valid := s1_fire
+  when(s1_fire) { task_s2_reg.bits := task_s1.bits }
+  val pendingA_s2 = RegNext(io.sinkA.fire && io.sinkAPending, false.B)
+  io.cancelS2 := pendingA_s2 && !io.specCommitS2
+  val task_s2 = WireInit(task_s2_reg)
+  task_s2.valid := task_s2_reg.valid && !io.cancelS2
 
 /*  val sameSet_s2 = task_s2.valid && task_s2.bits.fromA && !task_s2.bits.mshrTask && task_s2.bits.set === A_task.set
   val sameSet_s3 = RegNext(task_s2.valid && task_s2.bits.fromA && !task_s2.bits.mshrTask) &&

@@ -134,6 +134,7 @@ class Directory(implicit p: Parameters) extends L2Module {
 
   val io = IO(new Bundle() {
     val read = Flipped(DecoupledIO(new DirRead))
+    val cancelReadS2 = Input(Bool())
     val resp = ValidIO(new DirResult)
     val metaWReq = Flipped(ValidIO(new MetaWrite))
     val tagWReq = Flipped(ValidIO(new TagWrite))
@@ -236,7 +237,7 @@ class Directory(implicit p: Parameters) extends L2Module {
      stage 2: get Tag/Meta, latch
      stage 3: calculate hit/way and chosen meta/tag by way
   */
-  val reqValid_s2 = RegNext(io.read.fire, false.B)
+  val reqValid_s2 = RegNext(io.read.fire, false.B) && !io.cancelReadS2
   val reqValid_s3 = RegNext(reqValid_s2, false.B)
   val req_s1 = io.read.bits
   val req_s2 = RegEnable(req_s1, io.read.fire)
