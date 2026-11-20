@@ -117,7 +117,6 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   reqArb.io.ATag := reqBuf.io.ATag
   reqArb.io.ASet := reqBuf.io.ASet
   reqArb.io.sinkA <> reqBuf.io.out
-  reqBuf.io.issueCommit := reqArb.io.aCommit
   reqArb.io.sinkB <> rxsnp.io.task
   reqArb.io.sinkC <> sinkC.io.task
   reqArb.io.mshrTask <> mshrCtl.io.mshrTask
@@ -131,6 +130,9 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   reqArb.io.normalReserveAck := mshrCtl.io.normalReserveAck
   mshrCtl.io.normalReserveConsume := reqArb.io.normalReserveConsume
   mshrCtl.io.normalReserveCancel := reqArb.io.normalReserveCancel
+  mshrCtl.io.normalRetryEnable := reqArb.io.normalRetryEnable
+  mshrCtl.io.normalReserveDrain := reqArb.io.normalReserveDrain
+  reqArb.io.normalClaimOwners := mshrCtl.io.normalClaimOwners
   txdat.io.reservedB := reqArb.io.reservedB
   txrsp.io.reservedB := reqArb.io.reservedB
   reqArb.io.fromMSHRCtl := mshrCtl.io.toReqArb

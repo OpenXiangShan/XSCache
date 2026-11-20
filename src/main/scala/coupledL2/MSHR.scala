@@ -62,6 +62,14 @@ class NormalSlotReservation(implicit p: Parameters) extends CoupledL2Bundle {
   val token = new MainpipeLeaseToken
   val task = new TaskBundle
 }
+class NormalSlotOwner(implicit p: Parameters) extends CoupledL2Bundle {
+  val token = new MainpipeLeaseToken
+  val requestIdentity = new ARequestIdentity
+  val set = UInt(setBits.W)
+  val tag = UInt(tagBits.W)
+  val source = UInt(sourceIdBits.W)
+  val inFlight = Bool()
+}
 class SnoopSlotToken(implicit p: Parameters) extends CoupledL2Bundle {
   val valid = Bool()
   val slot = UInt(mshrBits.W)

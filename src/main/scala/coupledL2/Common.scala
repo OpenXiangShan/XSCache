@@ -55,10 +55,18 @@ class MergeTaskBundle(implicit p: Parameters) extends L2Bundle {
 
 // We generate a Task for every TL request
 // this is the info that flows in Mainpipe
+// Identity survives RequestBuffer entry reuse after a concrete slot claim.
+class ARequestIdentity extends Bundle {
+  val entry = UInt(8.W)
+  val version = UInt(8.W)
+  val sequence = UInt(16.W)
+}
+
 class TaskBundle(implicit p: Parameters) extends L2Bundle
   with HasTLChannelBits
   with HasCHIMsgParameters
   with HasCHIChannelBits {
+  val aRequestIdentity = new ARequestIdentity
   val set = UInt(setBits.W)
   val tag = UInt(tagBits.W)
   val off = UInt(offsetBits.W)

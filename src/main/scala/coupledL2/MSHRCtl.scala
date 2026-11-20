@@ -88,8 +88,11 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     val contextReservation = Input(Bool())
     val normalReserveRequest = Flipped(DecoupledIO(new TaskBundle))
     val normalReserveAck = ValidIO(new NormalSlotReservation)
-    val normalReserveConsume = Input(Bool())
-    val normalReserveCancel = Input(Bool())
+    val normalReserveConsume = Flipped(ValidIO(new NormalSlotReservation))
+    val normalReserveCancel = Flipped(ValidIO(new NormalSlotReservation))
+    val normalRetryEnable = Input(Bool())
+    val normalReserveDrain = Input(Bool())
+    val normalClaimOwners = Output(Vec(2, Vec(mshrsAll, Valid(new NormalSlotOwner))))
 
     /* status of s2 and s3 */
     val pipeStatusVec = Flipped(Vec(4, ValidIO(new PipeStatus)))
@@ -186,18 +189,34 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     Seq.fill(3 * mshrsAll)(0.U.asTypeOf(new SourceBProbeClaim))))
   val sourceBGenerations = (0 until mshrsAll).flatMap(i =>
     Seq(mshrTaskGenerations(0)(i), mshrTaskGenerations(1)(i))) ++ mshrTaskGenerations(2)
-  val normalService = RegInit(0.U.asTypeOf(Valid(new NormalSlotReservation)))
-  class NormalSlotClaim extends Bundle {
-    val token = new MainpipeLeaseToken
-    val set = UInt(setBits.W)
-    val tag = UInt(tagBits.W)
-    val source = UInt(sourceIdBits.W)
-    val inFlight = Bool()
+  class NormalServiceEntry extends Bundle {
+    val reservation = new NormalSlotReservation
+    val claimed = Bool()
   }
+  val normalServiceSlots = RegInit(VecInit(Seq.fill(2)(
+    0.U.asTypeOf(Valid(new NormalServiceEntry)))))
+  val normalServiceAllocate = RegInit(false.B)
+  val normalServiceRetire = RegInit(false.B)
+  val normalServiceAvailable = !normalServiceSlots(normalServiceAllocate).valid
+  val normalServiceHead = normalServiceSlots(normalServiceRetire)
+  // B may be waiting on either unconsumed A claim. Once the head has
+  // returned its claim, expose the other registered descriptor for cancel
+  // without advancing the FIFO or allowing it to execute out of order.
+  val normalServiceSelect = Mux(io.normalReserveDrain &&
+    !(normalServiceHead.valid && normalServiceHead.bits.claimed),
+    !normalServiceRetire, normalServiceRetire)
+  val normalServiceSelected = normalServiceSlots(normalServiceSelect)
+  val normalService = Wire(Valid(new NormalSlotReservation))
+  normalService.valid := normalServiceSelected.valid && normalServiceSelected.bits.claimed
+  normalService.bits := normalServiceSelected.bits.reservation
+  val normalCancelAck = RegNext(io.normalReserveCancel,
+    0.U.asTypeOf(io.normalReserveCancel))
   val normalSlotClaims = RegInit(VecInit(Seq.fill(mshrsAll)(
-    0.U.asTypeOf(Valid(new NormalSlotClaim)))))
+    0.U.asTypeOf(Valid(new NormalSlotOwner)))))
   val cmoSlotClaims = RegInit(VecInit(Seq.fill(mshrsAll)(
-    0.U.asTypeOf(Valid(new NormalSlotClaim)))))
+    0.U.asTypeOf(Valid(new NormalSlotOwner)))))
+  io.normalClaimOwners(0) := normalSlotClaims
+  io.normalClaimOwners(1) := cmoSlotClaims
   val orphanReleaseSlotClaim = RegInit(0.U.asTypeOf(Valid(new OrphanReleaseSlotClaim)))
   val orphanReservationTurn = RegInit(false.B)
   val normalClaimSlotOH = VecInit(normalSlotClaims.map(_.valid)).asUInt
@@ -1037,43 +1056,86 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     credit := Mux(used >= mshrsAll.U, 0.U, mshrsAll.U - used)
     credit
   }
-  val normalSlotEligibleOH = Mux(normalCmo(io.normalReserveRequest.bits),
-    replaceSlotIdle, VecInit(refillMshrs.zipWithIndex.map { case (refill, i) =>
+  // A canceled claim retains its descriptor. A registered exact return ack
+  // precedes retry; old free-slot Q, never the cancel edge, supplies capacity.
+  val normalRetryPending = normalServiceHead.valid && !normalServiceHead.bits.claimed
+  val normalRetryRequest = normalRetryPending && io.normalRetryEnable &&
+    !io.normalReserveDrain && !normalCancelAck.valid
+  val normalClaimTask = Mux(normalRetryRequest,
+    normalServiceHead.bits.reservation.task, io.normalReserveRequest.bits)
+  val normalSlotEligibleOH = Mux(normalCmo(normalClaimTask),
+    replaceOrdinaryIdleOH, VecInit(refillMshrs.zipWithIndex.map { case (refill, i) =>
       !normalBusySlotOH(i)
     }).asUInt)
   val normalSlotPickOH = PriorityEncoderOH(normalSlotEligibleOH)
   def pendingASetConflict(set: UInt): Bool = VecInit(
     (normalSlotClaims ++ cmoSlotClaims).map(claim => claim.valid && claim.bits.set === set)
   ).asUInt.orR
-  val normalPendingSetConflict = pendingASetConflict(io.normalReserveRequest.bits.set)
+  val normalPendingSetConflict = pendingASetConflict(normalClaimTask.set)
   val normalPendingSnoopConflict = VecInit(snoopSlotClaims.map(claim =>
-    claim.valid && claim.bits.token.set === io.normalReserveRequest.bits.set)).asUInt.orR
-  io.normalReserveRequest.ready := !normalService.valid && normalSlotEligibleOH.orR &&
+    claim.valid && claim.bits.token.set === normalClaimTask.set)).asUInt.orR
+  val normalClaimEligible = normalSlotEligibleOH.orR &&
     !normalPendingSetConflict && !normalPendingSnoopConflict &&
-    (!normalCmo(io.normalReserveRequest.bits) ||
-      (PopCount(replaceSlotIdle) > 1.U && !snoopReservationFence &&
+    (!normalCmo(normalClaimTask) ||
+      (replaceOrdinaryIdleOH.orR && !snoopReservationFence &&
         !replaceNeedsAlloc && !io.snoopAdmission.fire &&
         (!orphanReserveRequest.valid || !orphanReservationTurn)))
-  io.normalReserveAck.valid := normalService.valid
-  io.normalReserveAck.bits := normalService.bits
+  io.normalReserveRequest.ready := normalServiceAvailable && !normalRetryPending &&
+    !io.normalReserveDrain && normalClaimEligible
+  val normalRetryFire = normalRetryRequest && normalClaimEligible
+  val normalClaimFire = normalRetryFire || io.normalReserveRequest.fire
+  io.normalReserveAck := normalService
   val normalClaimToken = Wire(new MainpipeLeaseToken)
-  normalClaimToken.generation := Mux(normalCmo(io.normalReserveRequest.bits),
+  normalClaimToken.generation := Mux(normalCmo(normalClaimTask),
     Mux1H(normalSlotPickOH, mshrTaskGenerations(2)),
     Mux1H(normalSlotPickOH, mshrTaskGenerations(0))) + 1.U
   normalClaimToken.sequence := normalReservationSequence + 1.U
-  when(io.normalReserveRequest.fire) {
-    normalService.valid := true.B
-    normalService.bits.id := OHToUInt(normalSlotPickOH)
-    normalService.bits.task := io.normalReserveRequest.bits
-    normalService.bits.token := normalClaimToken
+  when(normalClaimFire) {
     normalReservationSequence := normalReservationSequence + 1.U
-    assert(!io.normalReserveRequest.bits.mshrTask && io.normalReserveRequest.bits.fromA,
+    assert(!normalClaimTask.mshrTask && normalClaimTask.fromA,
       "normal slot claims must come from the A/CMO Directory entrance")
   }
-  when(io.normalReserveConsume || io.normalReserveCancel) {
-    assert(normalService.valid && !(io.normalReserveConsume && io.normalReserveCancel),
+  when(io.normalReserveRequest.fire) {
+    assert(normalServiceAvailable, "A claim capture must use an empty registered service slot")
+    normalServiceSlots(normalServiceAllocate).valid := true.B
+    normalServiceSlots(normalServiceAllocate).bits.claimed := true.B
+    normalServiceSlots(normalServiceAllocate).bits.reservation.id := OHToUInt(normalSlotPickOH)
+    normalServiceSlots(normalServiceAllocate).bits.reservation.task := normalClaimTask
+    normalServiceSlots(normalServiceAllocate).bits.reservation.token := normalClaimToken
+    normalServiceAllocate := !normalServiceAllocate
+  }
+  when(normalRetryFire) {
+    assert(!normalCancelAck.valid && normalServiceHead.valid && !normalServiceHead.bits.claimed,
+      "A retry must retain its payload and observe its registered claim return")
+    normalServiceHead.bits.claimed := true.B
+    normalServiceHead.bits.reservation.id := OHToUInt(normalSlotPickOH)
+    normalServiceHead.bits.reservation.token := normalClaimToken
+  }
+  when(normalCancelAck.valid) {
+    val returnedOwner = VecInit(normalServiceSlots.map(service =>
+      service.valid && !service.bits.claimed &&
+        normalCancelAck.bits.asUInt === service.bits.reservation.asUInt))
+    assert(PopCount(returnedOwner) === 1.U,
+      "A canceled descriptor must survive its exact registered return acknowledgement")
+  }
+  when(io.normalReserveConsume.valid || io.normalReserveCancel.valid) {
+    assert(normalService.valid && !(io.normalReserveConsume.valid && io.normalReserveCancel.valid),
       "only a retained entrance claim can be consumed or canceled")
-    normalService.valid := false.B
+    val event = Mux(io.normalReserveConsume.valid, io.normalReserveConsume.bits, io.normalReserveCancel.bits)
+    assert(event.asUInt === normalService.bits.asUInt,
+      "A consume/cancel must carry complete payload, entry version, slot and token")
+    when(io.normalReserveConsume.valid) {
+      assert(!io.normalReserveDrain && normalServiceSelect === normalServiceRetire,
+        "A execution must consume the FIFO head after B claim drain")
+      normalServiceHead.valid := false.B
+      normalServiceRetire := !normalServiceRetire
+    }.otherwise {
+      normalServiceSelected.bits.claimed := false.B
+    }
+  }
+  when(io.normalReserveDrain) {
+    assert(!io.normalReserveRequest.fire && !normalRetryFire && !io.normalReserveConsume.valid,
+      "B claim drain must preserve all A descriptors without acquiring or executing claims")
   }
   val normalReservationDone = io.fromMainPipe.normalReservationDone
   val normalAllocTask = io.fromMainPipe.mshr_alloc_s3.bits.task
@@ -1088,23 +1150,24 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     normalAllocTask.set === normalApplyClaim.bits.set &&
     normalAllocTask.tag === normalApplyClaim.bits.tag &&
     normalAllocTask.sourceId === normalApplyClaim.bits.source &&
+    normalAllocTask.aRequestIdentity.asUInt === normalApplyClaim.bits.requestIdentity.asUInt &&
     normalCmo(normalAllocTask) === normalApplyCmo
   val normalReservationComplete = normalReservationDone.valid && normalReservationIdentityMatch
   when(normalReservationDone.valid) {
     assert(normalReservationIdentityMatch,
       "A apply must name its in-flight physical slot token and captured header")
   }
-  val normalReservationCancelOH = Mux(io.normalReserveCancel && normalService.valid,
+  val normalReservationCancelOH = Mux(io.normalReserveCancel.valid && normalService.valid,
     normalServiceSlotOH, 0.U(mshrsAll.W))
   val normalReservationCompleteOH = Mux(normalReservationComplete && !normalApplyCmo,
     normalApplySlotOH, 0.U(mshrsAll.W))
-  val normalReservationClaimOH = Mux(io.normalReserveRequest.fire &&
-      !normalCmo(io.normalReserveRequest.bits), normalSlotPickOH, 0.U(mshrsAll.W))
+  val normalReservationClaimOH = Mux(normalClaimFire &&
+      !normalCmo(normalClaimTask), normalSlotPickOH, 0.U(mshrsAll.W))
   val normalCmoCompleteOH = Mux(normalReservationComplete && normalApplyCmo,
     normalApplySlotOH, 0.U(mshrsAll.W))
   val normalCmoCancelOH = normalReservationCancelOH & Fill(mshrsAll, normalServiceCmo)
-  val normalCmoClaimOH = Mux(io.normalReserveRequest.fire &&
-      normalCmo(io.normalReserveRequest.bits), normalSlotPickOH, 0.U(mshrsAll.W))
+  val normalCmoClaimOH = Mux(normalClaimFire &&
+      normalCmo(normalClaimTask), normalSlotPickOH, 0.U(mshrsAll.W))
   normalPendingSlotOH := (normalPendingSlotOH &
     ~(normalReservationCancelOH & Fill(mshrsAll, !normalServiceCmo) |
       normalReservationCompleteOH)) | normalReservationClaimOH
@@ -1207,13 +1270,15 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     claims.zipWithIndex.foreach { case (claim, i) =>
       when(cancelOH(i)) {
         assert(claim.valid && !claim.bits.inFlight &&
-          claim.bits.token.asUInt === normalService.bits.token.asUInt,
+          claim.bits.token.asUInt === normalService.bits.token.asUInt &&
+          claim.bits.requestIdentity.asUInt === normalService.bits.task.aRequestIdentity.asUInt,
           "A cancellation must name its unconsumed physical slot claim")
       }
       when(completeOH(i) || cancelOH(i)) { claim.valid := false.B }
-      when(io.normalReserveConsume && normalServiceSlotOH(i) && normalServiceCmo === cmo.B) {
+      when(io.normalReserveConsume.valid && normalServiceSlotOH(i) && normalServiceCmo === cmo.B) {
         assert(claim.valid && !claim.bits.inFlight &&
-          claim.bits.token.asUInt === normalService.bits.token.asUInt,
+          claim.bits.token.asUInt === normalService.bits.token.asUInt &&
+          claim.bits.requestIdentity.asUInt === normalService.bits.task.aRequestIdentity.asUInt,
           "A entrance must consume its own unfilled slot claim")
         claim.bits.inFlight := true.B
       }
@@ -1221,9 +1286,10 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
         assert(!claim.valid, "A admission must choose an unowned physical slot")
         claim.valid := true.B
         claim.bits.token := normalClaimToken
-        claim.bits.set := io.normalReserveRequest.bits.set
-        claim.bits.tag := io.normalReserveRequest.bits.tag
-        claim.bits.source := io.normalReserveRequest.bits.sourceId
+        claim.bits.requestIdentity := normalClaimTask.aRequestIdentity
+        claim.bits.set := normalClaimTask.set
+        claim.bits.tag := normalClaimTask.tag
+        claim.bits.source := normalClaimTask.sourceId
         claim.bits.inFlight := false.B
       }
       when(claim.valid) {
@@ -1235,6 +1301,24 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       }
     }
   }
+  normalServiceSlots.foreach { service =>
+    when(service.valid && service.bits.claimed) {
+      val reservation = service.bits.reservation
+      val owner = Mux(normalCmo(reservation.task),
+        cmoSlotClaims(reservation.id), normalSlotClaims(reservation.id))
+      assert(owner.valid && !owner.bits.inFlight &&
+        owner.bits.token.asUInt === reservation.token.asUInt &&
+        owner.bits.requestIdentity.asUInt === reservation.task.aRequestIdentity.asUInt &&
+        owner.bits.set === reservation.task.set && owner.bits.tag === reservation.task.tag &&
+        owner.bits.source === reservation.task.sourceId,
+        "every queued A service must retain its exact unconsumed physical slot")
+    }
+  }
+  val allAClaims = normalSlotClaims ++ cmoSlotClaims
+  assert(PopCount(allAClaims.map(_.valid)) ===
+    PopCount(normalServiceSlots.map(e => e.valid && e.bits.claimed)) +&
+      PopCount(allAClaims.map(e => e.valid && e.bits.inFlight)),
+    "A slot ownership must partition exactly into service and committed owners")
   val snoopCredit = allocationCredit(srContextCount +& pipeContextCount +&
     io.contextReservation.asUInt +& replaceReserveGrant.asUInt +&
     cmoAlloc.asUInt +& io.snoopAdmission.fire.asUInt)

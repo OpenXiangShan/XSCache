@@ -29,6 +29,8 @@ import utility._
 
 class ReqEntry(entries: Int = 4)(implicit p: Parameters) extends L2Bundle() {
   val valid    = Bool()
+  val selected = Bool()
+  val waitEarlier = UInt(entries.W)
   val rdy      = Bool()
   val task     = new TaskBundle()
   val timer    = UInt(timestampBits.W) // for prefetch controller analysis
@@ -64,7 +66,6 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   val io = IO(new Bundle() {
     val in          = Flipped(DecoupledIO(new TaskBundle))
     val out         = DecoupledIO(new TaskBundle)
-    val issueCommit = Input(Bool())
     val mshrInfo  = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo)))
     val snoopInfo = Vec(mshrsAll, Flipped(ValidIO(new MSHRInfo)))
     val aMergeTask = ValidIO(new AMergeTask)
@@ -96,12 +97,18 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   io.ATag := admitted.bits.tag
   io.ASet := admitted.bits.set
 
-  val buffer = RegInit(VecInit(Seq.fill(entries)(0.U.asTypeOf(new ReqEntry))))
+  val buffer = RegInit(VecInit(Seq.fill(entries)(0.U.asTypeOf(new ReqEntry(entries)))))
   val issueArb = Module(new TwoLevelRRArbiter(new TaskBundle, entries))
   ArbPerf(issueArb, "issueArb")
-  val issueHold = RegInit(0.U.asTypeOf(new RequestIssue(entries)))
-  val issueHoldValid = RegInit(false.B)
-  val issueHoldCommitted = RegInit(false.B)
+  require(entries <= 256)
+  val entryVersions = RegInit(VecInit(Seq.fill(entries)(0.U(8.W))))
+  val admissionSequence = RegInit(0.U(16.W))
+  val issueSlots = RegInit(VecInit(Seq.fill(2)(0.U.asTypeOf(Valid(new RequestIssue(entries))))))
+  val issueAllocate = RegInit(false.B)
+  val issueRetire = RegInit(false.B)
+  val issueAvailable = !issueSlots(issueAllocate).valid
+  val issueHold = issueSlots(issueRetire).bits
+  val issueHoldValid = issueSlots(issueRetire).valid
 
   /* ======== Enchantment ======== */
   val NWay = cacheParams.ways
@@ -234,7 +241,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
 
   val insertOH = MaskToOH(buffer.map(!_.valid))
   val alloc = !full && admitted.valid && !prefetchBlocked(in) && !dup && !mergeA
-  buffer.zip(insertOH.asBools).foreach { case (entry, sel) =>
+  buffer.zip(insertOH.asBools).zipWithIndex.foreach { case ((entry, sel), index) =>
     when(alloc && sel){
       val mpBlock = Cat(io.mainPipeBlock).orR
       val pipeBlockOut = io.out.fire && sameSet(in, io.out.bits)
@@ -242,9 +249,15 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
       val s1Block      = pipeBlockOut || probeBlock
 
       entry.valid   := true.B
+      entry.selected := false.B
+      entry.waitEarlier := VecInit(buffer.map(e => e.valid && e.task.set === in.set)).asUInt
+      entryVersions(index) := entryVersions(index) + 1.U
       // when Addr-Conflict / Same-Addr-Dependent / MainPipe-Block / noFreeWay-in-Set, entry not ready
       entry.rdy     := !conflict(in) && !mpBlock && !s1Block && !noFreeWay(in)// && !Cat(depMask).orR
       entry.task    := admitted.bits
+      entry.task.aRequestIdentity.entry := index.U
+      entry.task.aRequestIdentity.version := entryVersions(index) + 1.U
+      entry.task.aRequestIdentity.sequence := admissionSequence
       entry.waitMP  := Cat(
         s1Block,
         io.mainPipeBlock(0),
@@ -259,17 +272,20 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
     }
   }
 
+  when(alloc) { admissionSequence := admissionSequence + 1.U }
+
   /* ======== Issue ======== */
   issueArb.io.in.zip(buffer).foreach { case (in, e) =>
-    in.valid := e.valid && e.rdy
+    in.valid := e.valid && e.rdy && !e.selected && !e.waitEarlier.orR
     in.bits := e.task
   }
-  issueArb.io.out.ready := !issueHoldValid
+  issueArb.io.out.ready := issueAvailable
 
   /* ======== Update rdy and masks ======== */
   buffer.zipWithIndex.foreach { case (e, i) =>
     when(e.valid) {
       e.timer := e.timer + 1.U
+      e.waitEarlier := e.waitEarlier & VecInit(buffer.map(_.valid)).asUInt
 
       val waitMSReqUpdate = WireInit(e.waitMSReq)
       val waitMSVicUpdate = WireInit(e.waitMSVic)
@@ -299,7 +315,7 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
       e.waitMSVic := waitMSVicUpdate
 //      e.depMask := depMaskUpdate
       e.rdy     := !waitMSReqUpdate.orR && !waitMSVicUpdate.orR && !snoopConflict(e.task) && !e.waitMP && !s1_Block && !noFreeWay(e.task) &&
-        !prefetchBlockedByMSHR(e.task)
+        !prefetchBlockedByMSHR(e.task) && !(e.waitEarlier & VecInit(buffer.map(_.valid)).asUInt).orR
     }
   }
 
@@ -310,48 +326,46 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
   val issueHoldEntryWaitMP = Mux1H(issueHold.idOH, buffer.map(_.waitMP.orR))
   val issueHoldEntryReady = Mux1H(issueHold.idOH, buffer.map(_.rdy))
   val issueHoldTask = issueHold.task
-  // Live conflicts update local rdy D; they never bypass its FF to revoke a retained output.
-  val issueHoldCurrent = issueHoldValid && issueHoldOwnerValid &&
-    issueHoldEntryReady &&
-    !issueHoldEntryWaitMSReq && !issueHoldEntryWaitMSVic && !issueHoldEntryWaitMP
-  // Every output passes through issueHold Q, including when downstream is already ready.
+  // Captured payload and identity belong to an entry until the concrete claim
+  // accepts them. Eligibility cancellation before that edge unlocks the entry.
+  val issueIdentityMatches = Mux1H(issueHold.idOH, buffer.map(e =>
+    e.task.aRequestIdentity.asUInt === issueHold.task.aRequestIdentity.asUInt))
+  val issueHoldCurrent = issueHoldValid && issueHoldOwnerValid && issueIdentityMatches &&
+    issueHoldEntryReady && !issueHoldEntryWaitMSReq && !issueHoldEntryWaitMSVic && !issueHoldEntryWaitMP
   val issueHoldCapture = issueArb.io.out.fire
-  val issueHoldCancel = issueHoldValid && !issueHoldCommitted && !issueHoldCurrent
+  val issueHoldCancel = issueHoldValid && !issueHoldCurrent
   val issueHoldFire = io.out.fire
-
-  io.out.valid := issueHoldValid && (issueHoldCommitted || issueHoldCurrent)
+  io.out.valid := issueHoldCurrent
   io.out.bits := issueHoldTask
-
-  when (issueHoldCapture) {
-    issueHold.task := issueArb.io.out.bits
-    issueHold.idOH := issueArb.io.chosenOH
-    issueHoldValid := true.B
-    issueHoldCommitted := false.B
-  }.elsewhen (issueHoldFire || issueHoldCancel) {
-    issueHoldValid := false.B
-    issueHoldCommitted := false.B
-  }.elsewhen(io.issueCommit) {
-    issueHoldCommitted := true.B
+  when(issueHoldCapture) {
+    assert(issueAvailable, "A capture must use an empty registered descriptor slot")
+    issueSlots(issueAllocate).valid := true.B
+    issueSlots(issueAllocate).bits.task := issueArb.io.out.bits
+    issueSlots(issueAllocate).bits.idOH := issueArb.io.chosenOH
+    issueAllocate := !issueAllocate
+  }
+  when(issueHoldFire || issueHoldCancel) {
+    issueSlots(issueRetire).valid := false.B
+    issueRetire := !issueRetire
+  }
+  buffer.zipWithIndex.foreach { case (entry, index) =>
+    when(issueHoldCapture && issueArb.io.chosenOH(index)) {
+      assert(entry.valid && !entry.selected, "A entry may have only one captured descriptor")
+      entry.selected := true.B
+    }
+    when((issueHoldFire || issueHoldCancel) && issueHold.idOH(index)) {
+      assert(entry.valid && entry.selected && issueIdentityMatches,
+        "A claim/cancel must name the retained entry version")
+      entry.selected := false.B
+      when(issueHoldFire) { entry.valid := false.B }
+    }
   }
   when(issueHoldValid) {
-    assert(PopCount(issueHold.idOH) === 1.U && issueHoldOwnerValid,
-      "a retained RequestBuffer owner must stay allocated until output fire")
-  }
-  when(io.issueCommit) {
-    assert(issueHoldCurrent && !issueHoldCommitted && !io.out.fire,
-      "RequestArb must commit one eligible retained RequestBuffer owner")
-  }
-
-  buffer.zip(issueHold.idOH.asBools).foreach {
-    case (e, y) =>
-      when (issueHoldFire && y) {
-        e.valid := false.B
-      }
+    assert(PopCount(issueHold.idOH) === 1.U && issueHoldOwnerValid && issueIdentityMatches,
+      "a captured A descriptor must retain its complete entry identity until claim")
   }
   when(issueHoldFire) {
-    assert(PopCount(issueHold.idOH) === 1.U && issueHoldOwnerValid &&
-      (issueHoldCommitted || issueHoldEntryReady),
-      "a RequestBuffer issue must consume its registered or committed owner")
+    assert(issueHoldEntryReady, "A ownership transfers only with registered entry eligibility")
   }
 
   io.pfStatInMSHR.pfReleaseFromReqBuffer := issueHoldFire && isPrefetchTask(issueHoldTask)
