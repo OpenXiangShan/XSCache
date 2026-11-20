@@ -350,7 +350,10 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
         "a channel Directory hit must match its retained task tag")
     }
   }
-  val retryDecision = io.replResp.bits.validHold &&
+  // Directory validHold stretches the previous response into the next cycle.
+  // Only the actual response event belongs to this aligned decision; a younger
+  // snoop context may reuse the same physical MSHR id for a different set.
+  val retryDecision = io.replResp.valid &&
     (io.replResp.bits.retry || io.fromMSHRCtl.replRespRetry)
   val normalDecision = decideNormal(task_s3_decide.bits,
     io.dirResp_s3, io.metaOnHit_s3, io.cmoHitInvalid)
@@ -367,7 +370,15 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     task_s3_decide.bits.opcode === Grant || task_s3_decide.bits.opcode === GrantData ||
       task_s3_decide.bits.opcode === AccessAckData || task_s3_decide.bits.opcode === HintAck
   )
-  val replRespForTask_decide = io.replResp.bits.validHold && refillDecision_decide &&
+  when(io.replResp.valid) {
+    assert(task_s3_decide.valid && refillDecision_decide &&
+      task_s3_decide.bits.mshrContext === 0.U && task_s3_decide.bits.replTask,
+      "a replacement event must belong to its aligned normal refill decision")
+    assert(io.replResp.bits.mshrId === task_s3_decide.bits.mshrId &&
+      io.replResp.bits.set === task_s3_decide.bits.set,
+      "a replacement event must match its aligned decision owner and set")
+  }
+  val replRespForTask_decide = io.replResp.valid && refillDecision_decide &&
     io.replResp.bits.mshrId === task_s3_decide.bits.mshrId &&
     io.replResp.bits.meta.state =/= INVALID && !io.replResp.bits.retry
   val commitReplWay_decide = refillDecision_decide &&
@@ -724,16 +735,16 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     !(req_s3.dsWen || req_s3.tagWen || req_s3.metaWen)
   val mshr_replace_capture_s3 = mshr_req_s3 && req_s3.replaceCapture
   val mshr_refill_to_release_copy_s3 = mshr_req_s3 && req_s3.refillToReleaseCopy
-  val replResp_valid_hold = s3Decision.bits.repl.bits.validHold
+  val replResp_valid = s3Decision.bits.repl.valid
   val retry = Mux(mshr_req_s3 && req_s3.mshrContext === 0.U,
     s3Decision.bits.normalRetry, s3Decision.bits.retry)
-  val need_repl = replResp_valid_hold && s3Decision.bits.repl.bits.meta.state =/= INVALID && req_s3.replTask
-  val grantReplResp_s3 = replResp_valid_hold && mshr_refill_s3 && !req_s3.refillOnly &&
+  val need_repl = replResp_valid && s3Decision.bits.repl.bits.meta.state =/= INVALID && req_s3.replTask
+  val grantReplResp_s3 = replResp_valid && mshr_refill_s3 && !req_s3.refillOnly &&
     req_s3.mshrContext === 0.U && req_s3.replTask && req_s3.grantInstallEn &&
     s3Decision.bits.repl.bits.mshrId === req_s3.mshrId
   val grantMergeInstall_s3 = task_s3.valid && grantReplResp_s3 && s3Decision.bits.grantInstall
   val grantVictimCap_s3 = grantMergeInstall_s3 && s3Decision.bits.repl.bits.meta.state =/= INVALID
-  val replRespForTask = replResp_valid_hold && mshr_req_s3 &&
+  val replRespForTask = replResp_valid && mshr_req_s3 &&
     s3Decision.bits.repl.bits.mshrId === req_s3.mshrId &&
     s3Decision.bits.repl.bits.meta.state =/= INVALID && !s3Decision.bits.repl.bits.retry
   val commitReplWay = mshr_refill_s3 && (req_s3.replTask || replRespForTask)
@@ -1161,7 +1172,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   /* ======== prefetch ======== */
   io.replaceRecord.foreach { u =>
     val refillVictim = task_s3.valid && mshr_req_s3 && mshr_refill_s3 && !retry && need_repl && req_s3.fromA
-    u.valid := refillVictim && replResp_valid_hold
+    u.valid := refillVictim && replResp_valid
     u.bits.reqSource := req_s3.reqSource
     u.bits.victimPAddr := Cat(s3Decision.bits.repl.bits.tag, req_s3.set, 0.U(offsetBits.W))
     u.bits.victimPfSource := s3Decision.bits.repl.bits.meta.prefetchSrc.getOrElse(PfSource.NoWhere.id.U)
