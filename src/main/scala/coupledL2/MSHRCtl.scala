@@ -1632,6 +1632,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
       Seq[MSHRContextBase](refill, snoop).zipWithIndex.foreach {
         case (m, context) =>
           m.io.id := i.U
+          m.io.readLineBlocked := false.B
           m.io.sinkCOwnerHold := sinkCProbeOwnerHold(context)(i)
           m.io.alloc.valid := selectedMSHROH(i) && io.fromMainPipe.mshr_alloc_s3.valid &&
           (allocIsSnoop === context.B) && !cmoAlloc
@@ -1644,6 +1645,33 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
           m.io.aMergeTask.valid := io.aMergeTask.valid && io.aMergeTask.bits.idOH(i) && !context.B
           m.io.aMergeTask.bits := io.aMergeTask.bits.task
       }
+
+      // An A claim can commit before an older replacement lookup identifies
+      // its dirty victim. Keep that claim, but serialize the lower read with
+      // the complete victim lifetime, including copyback after DBID response.
+      // Select the incoming allocation header so the first eligible TXREQ
+      // cannot bypass the conflict register using the previous slot occupant.
+      val readLineSet = Mux(refill.io.alloc.valid,
+        refill.io.alloc.bits.task.set, refill.io.status.bits.set)
+      val readLineTag = Mux(refill.io.alloc.valid,
+        refill.io.alloc.bits.task.tag, refill.io.status.bits.reqTag)
+      def readLineMatches(set: UInt, tag: UInt): Bool =
+        set === readLineSet && tag === readLineTag
+      val readVictimConflict = VecInit(replaceMshrs.map(m =>
+        m.io.info.valid && readLineMatches(m.io.info.bits.set, m.io.info.bits.tag)
+      )).asUInt.orR
+      val readVictimCaptureConflict = replRespNeedsReplaceCapture &&
+        readLineMatches(io.replResp.bits.set, io.replResp.bits.tag)
+      val readVictimAllocConflict = replaceAllocValid &&
+        readLineMatches(incomingVictim.set, incomingVictim.tag)
+      val readOrphanClaimConflict = orphanReleaseSlotClaim.valid &&
+        readLineMatches(orphanReleaseSlotClaim.bits.set, orphanReleaseSlotClaim.bits.tag)
+      val readOrphanReserveConflict = orphanReserveGrant &&
+        readLineMatches(orphanReserveRequest.bits.set, orphanReserveRequest.bits.tag)
+      refill.io.readLineBlocked := RegNext(
+        (refill.io.alloc.valid || refill.io.status.valid) &&
+          (readVictimConflict || readVictimCaptureConflict || readVictimAllocConflict ||
+            readOrphanClaimConflict || readOrphanReserveConflict), false.B)
 
       val rxdatForThisSlot = io.resps.rxdat.valid && io.resps.rxdat.mshrId === i.U
       val rxdatDBIDMismatch = refill.io.readDBID.valid &&

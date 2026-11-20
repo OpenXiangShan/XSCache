@@ -243,6 +243,7 @@ class MSHRIO(implicit p: Parameters) extends CoupledL2Bundle {
   val resps = new MSHRResps()
   val readDBID = Output(ValidIO(UInt(TXNID_WIDTH.W)))
   val readTxnEpoch = Output(UInt((TXNID_WIDTH - bankBits - 2 - mshrBits).W))
+  val readLineBlocked = Input(Bool())
   val nestedwb = Input(new NestedWriteback)
   val nestedwbData = Output(Bool())
   val nestedReleaseNeedsReplace = Output(Bool())
@@ -562,7 +563,17 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
   val retryReissue = !state.s_reissue.getOrElse(false.B) && !state.w_grant &&
     gotRetryAck && gotPCrdGrant
   val normalInitialIssue = !state.s_acquire && !readTxnInFlight
-  io.tasks.txreq.valid := normalInitialIssue || retryReissue
+  // The controller compares the allocation header before this context is live.
+  // Once offered, keep the request valid and its epoch stable until acceptance.
+  val readRequestOffered = RegInit(false.B)
+  val readRequestEligible = normalInitialIssue || retryReissue
+  io.tasks.txreq.valid := readRequestEligible &&
+    (!io.readLineBlocked || readRequestOffered)
+  when(io.alloc.valid || io.tasks.txreq.fire) {
+    readRequestOffered := false.B
+  }.elsewhen(io.tasks.txreq.valid) {
+    readRequestOffered := true.B
+  }
   val rcompack_valid = !state.s_rcompack.get && state.w_grant &&
     // For issue B, CompAck must not be sent until all transfers of read data have been received.
     // For issue C and afterwards, CompAck is allowed to be sent after at least one CompData packet is received.
