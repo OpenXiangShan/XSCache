@@ -27,11 +27,11 @@ import xscache.coupledL2.prefetch.PrefetchReq
 import utility.{MemReqSource, XSPerfAccumulate}
 import xscache.common.{AliasKey, PrefetchKey}
 
-// Per-bank lookahead for the head already driving TL A.bits. A.valid still
-// denotes a committed transfer and supplies the verdict registered for S2.
-class SpecMissAPreview extends Bundle {
-  val present = Bool()
-  val pending = Bool()
+// The FIFO head offered to S1 and the oldest registered speculative decision for this bank.
+class SpecMissAPreview[T <: Data](gen: T) extends Bundle {
+  val a = Decoupled(gen)
+  val speculative = Output(Bool())
+  val commit = Output(Bool())
 }
 
 class SinkA(implicit p: Parameters) extends L2Module {
@@ -39,7 +39,7 @@ class SinkA(implicit p: Parameters) extends L2Module {
     val a = Flipped(DecoupledIO(new TLBundleA(edgeIn.bundle)))
     val prefetchReq = prefetchOpt.map(_ => Flipped(DecoupledIO(new PrefetchReq)))
     val task = DecoupledIO(new TaskBundle)
-    val preview = Option.when(cacheParams.specMissPreview)(Input(new SpecMissAPreview))
+    val preview = Option.when(cacheParams.specMissPreview)(Flipped(new SpecMissAPreview(new TLBundleA(edgeIn.bundle))))
     val pendingTask = Output(Bool())
     val cmoAll = Option.when(cacheParams.enableL2Flush) (new IOCMOAll)
   })
@@ -57,8 +57,24 @@ class SinkA(implicit p: Parameters) extends L2Module {
   val wayVal = way.getOrElse(0.U)
   val cmoAllValid = stateVal === sCMOREQ
   val cmoAllBlock = stateVal === sCMOREQ || stateVal === sWAITLINE
-  val aPresent = io.preview.map(_.present && !cmoAllBlock).getOrElse(io.a.valid)
-  io.pendingTask := io.preview.map(_.pending && aPresent).getOrElse(false.B)
+  val request = Wire(Decoupled(chiselTypeOf(io.a.bits)))
+  io.preview match {
+    case Some(head) =>
+      // A stalled speculative head stays in the FIFO. Its registered decision
+      // is available on the retry, including after a deferred prefetch merge.
+      val retry = RegNext(head.a.valid && head.speculative && !head.a.ready, false.B)
+      val drop = retry && !head.commit
+      request.valid := head.a.valid && !drop
+      request.bits := head.a.bits
+      head.a.ready := request.ready || drop
+      io.pendingTask := request.valid && head.speculative && !retry && !cmoAllBlock
+      io.a.ready := true.B // The preview handshake already reserved capacity in S1.
+      when(RegNext(head.a.fire && head.speculative, false.B)) { assert(io.a.valid === head.commit) }
+    case None =>
+      request <> io.a
+      io.pendingTask := false.B
+  }
+  val aPresent = if (cacheParams.specMissPreview) request.valid && !cmoAllBlock else request.valid
   io.cmoAll.foreach { cmoAll => cmoAll.l2FlushDone := stateVal === sDONE }
   io.cmoAll.foreach { cmoAll => cmoAll.cmoAllBlock := cmoAllBlock }
 
@@ -147,15 +163,15 @@ class SinkA(implicit p: Parameters) extends L2Module {
     io.task.valid := aPresent && !cmoAllBlock || io.prefetchReq.get.valid || cmoAllValid
     io.task.bits := Mux(
       aPresent || cmoAllValid,
-      fromTLAtoTaskBundle(io.a.bits),
+      fromTLAtoTaskBundle(request.bits),
       fromPrefetchReqtoTaskBundle(io.prefetchReq.get.bits
     ))
-    io.a.ready := io.task.ready && !cmoAllBlock
+    request.ready := io.task.ready && !cmoAllBlock
     io.prefetchReq.get.ready := io.task.ready && !aPresent && !cmoAllValid
   } else {
     io.task.valid := aPresent && !cmoAllBlock || cmoAllValid
-    io.task.bits := fromTLAtoTaskBundle(io.a.bits) 
-    io.a.ready := io.task.ready && !cmoAllBlock
+    io.task.bits := fromTLAtoTaskBundle(request.bits)
+    request.ready := io.task.ready && !cmoAllBlock
   }
 
   /*

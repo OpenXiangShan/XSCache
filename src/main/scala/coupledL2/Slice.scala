@@ -36,7 +36,7 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
     override val out: OuterBundle = new OuterBundle
   })
   val io_pCrd = IO(Vec(mshrsAll, new PCrdQueryBundle))
-  val specPreview = Option.when(cacheParams.specMissPreview)(IO(Input(new SpecMissAPreview)))
+  val specPreview = Option.when(cacheParams.specMissPreview)(IO(Flipped(new SpecMissAPreview(chiselTypeOf(io.in.a.bits)))))
 
   val io_cdp_triggers = Option.when(hasCDP) (IO(ValidIO(new CDPDetectTask(dataBits=blockBits))))
 
@@ -110,11 +110,10 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   reqArb.io.msInfo := mshrCtl.io.msInfo
 
   reqBuf.io.in <> sinkA.io.task
-  // Each slice has exactly one A head in a cycle. The flow/slot capture
-  // strobes at this edge identify the only request this verdict may kill.
+  // Only the direct task or RequestBuffer slot captured as pending uses this decision.
   require(!cacheParams.specMissPreview || cacheParams.innerBuf.a.depth == 0)
-  val specCommitS2 = if (cacheParams.specMissPreview) RegNext(io.in.a.valid, false.B) else true.B
-  sinkA.io.preview.foreach(_ := specPreview.get)
+  val specCommitS2 = specPreview.map(_.commit).getOrElse(true.B)
+  sinkA.io.preview.foreach(_ <> specPreview.get)
   reqBuf.io.inPending := sinkA.io.pendingTask
   reqBuf.io.specCommitS2 := specCommitS2
   reqArb.io.sinkAPending := reqBuf.io.outPending
