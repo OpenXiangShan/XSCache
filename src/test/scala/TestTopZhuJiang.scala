@@ -329,7 +329,8 @@ object TestTopZhuJiangConfig {
       args,
       Seq(
         ChiselGeneratorAnnotation(() => lazyTop.module),
-        FirtoolOption("--disable-annotation-unknown")
+        FirtoolOption("--disable-annotation-unknown"),
+        FirtoolOption("--default-layer-specialization=enable")
       )
     )
 
