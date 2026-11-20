@@ -1917,7 +1917,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // Delay release until the final local tag/meta writes have registered. The
   // pending-until-accept flags must not hold the write or it could never proceed.
-  val hit_lock_write_hold = w_hit_lock_release || rxreq_hit_lock_accept ||
+  val hit_lock_write_hold = w_hit_lock_release ||
                             (s_hit_lock_release &&
                              (io.tshr_meta_write_en.asUInt.orR ||
                               io.tshr_tag_write_en))
