@@ -235,14 +235,13 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                  rxreq_unsatisfied_makeunique ||
                                  rxreq_unsatisfied_stashunique
 
-  val rxreq_hit_lock_conflict = rxreq_unsatisfied_unique &&
-                                dirResult_flowable.hit && io.repl_lock_conflict
-
   val rxreq_hit_lock_candidate = rxreq_unsatisfied_unique && dirResult_flowable.hit
 
-  val rxreq_hit_lock_accept = rxreq_unsatisfied_unique &&
-                              dirResult_flowable.hit && !io.repl_lock_conflict
-
+  // Miss-prefill decisions remain at entrance. Hit-lock candidates are registered
+  // so conflict resolution and ownership updates use the following cycle's locks.
+  val w_hit_lock_decision = RegInit(false.B)
+  val delayed_hit_lock_conflict = w_hit_lock_decision && io.repl_lock_conflict
+  val delayed_hit_lock_accept = w_hit_lock_decision && !io.repl_lock_conflict
   val p_hit_lock_way = Reg(UInt(wayBits.W))
 
   val p_prefill_miss = RegInit(false.B)
@@ -440,7 +439,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                         s_evict_dn_compack ||
                         w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds ||
                         w_evict_peer_commit_dir ||
-                        w_hit_lock_release || s_hit_lock_release
+                        w_hit_lock_decision || w_hit_lock_release || s_hit_lock_release
 
   val active = active_tailless || w_rd_up_compack
 
@@ -1295,14 +1294,17 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // Hold an unsatisfied initial-hit way until the original request's final
   // allocating response has been committed by a final allocating DirWb.
-  val hit_lock_response = w_hit_lock_release && (
-                            (p_rxreq_makeunique && dn_rxrsp_comp) ||
-                            ((p_rxreq_readunique || p_rxreq_stashunique) && (
-                              dn_rxdat_compdata_first ||
-                              dn_rxdat_datasepresp_first ||
-                              dn_rxrsp_comp
-                            ))
-                          )
+  val hit_lock_allocating_response = (p_rxreq_makeunique && dn_rxrsp_comp) ||
+                                     ((p_rxreq_readunique || p_rxreq_stashunique) && (
+                                       dn_rxdat_compdata_first ||
+                                       dn_rxdat_datasepresp_first ||
+                                       dn_rxrsp_comp
+                                     ))
+
+  assert(!(w_hit_lock_decision && hit_lock_allocating_response),
+    "Allocating response arrived before deferred hit-lock decision")
+
+  val hit_lock_response = w_hit_lock_release && hit_lock_allocating_response
 
   when (hit_lock_response) {
     w_hit_lock_release := false.B
@@ -1802,7 +1804,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                               rxreq_stashunique
                             )
 
-  val expect_replace = rxreq_hit_lock_conflict || expect_miss_replace
+  val expect_replace = delayed_hit_lock_conflict || expect_miss_replace
 
   // The peer refiller owns the conflicted old way. Conflict-hit prefill must
   // not require an old-line DirWb before starting its own ReplRd.
@@ -1823,9 +1825,14 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   when (rxreq_fire) {
     p_prefill_miss := expect_miss_replace
-    p_prefill_hit := rxreq_hit_lock_conflict
+    p_prefill_hit := false.B
     p_prefill_miss_meta := 0.U.asTypeOf(p_prefill_miss_meta)
     p_prefill_miss_meta.prefetch := expect_replace && (rxreq_stashshared || rxreq_stashunique)
+  }
+
+  when (delayed_hit_lock_conflict) {
+    p_prefill_hit := true.B
+    p_prefill_miss_meta.prefetch := p_rxreq_stashshared || p_rxreq_stashunique
   }
 
   // If the replacer picked an INVALID way whose stale tag aliases this very request (the line
@@ -1895,23 +1902,28 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.repl_en := s_repl
   io.repl_reset := rxreq_fire
 
-  io.repl_lock_candidate := rxreq_fire && rxreq_hit_lock_candidate
-  io.repl_lock_req := rxreq_fire && rxreq_hit_lock_accept
-  io.repl_lock_way := Mux(rxreq_fire, dirResult_flowable.way, p_hit_lock_way)
+  io.repl_lock_candidate := w_hit_lock_decision
+  io.repl_lock_req := delayed_hit_lock_accept
+  io.repl_lock_way := p_hit_lock_way
 
   io.repl_lock_release := s_hit_lock_release
 
-  when (rxreq_fire) {
-    when (rxreq_hit_lock_accept) {
-      p_hit_lock_way := dirResult_flowable.way
-    }
+  when (w_hit_lock_decision) {
+    w_hit_lock_decision := false.B
+    w_hit_lock_release := delayed_hit_lock_accept
   }
 
   when (rxreq_fire) {
-    w_hit_lock_release := rxreq_hit_lock_accept
+    w_hit_lock_decision := rxreq_hit_lock_candidate
+    when (rxreq_hit_lock_candidate) {
+      p_hit_lock_way := dirResult_flowable.way
+    }
+    w_hit_lock_release := false.B
     s_hit_lock_release := false.B
   }
 
+  assert(!(rxreq_fire && w_hit_lock_decision),
+    "RXREQ entered while a deferred hit-lock decision was still pending")
   assert(!(p_prefill_hit && (w_hit_lock_release || s_hit_lock_release)),
     "REQ vPipe conflict-hit prefill unexpectedly owns a hit-lock")
 
