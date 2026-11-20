@@ -39,6 +39,8 @@ class SinkA(implicit p: Parameters) extends L2Module {
     val a = Flipped(DecoupledIO(new TLBundleA(edgeIn.bundle)))
     val prefetchReq = prefetchOpt.map(_ => Flipped(DecoupledIO(new PrefetchReq)))
     val task = DecoupledIO(new TaskBundle)
+    val preview = Option.when(cacheParams.specMissPreview)(Input(new SpecMissAPreview))
+    val pendingTask = Output(Bool())
     val cmoAll = Option.when(cacheParams.enableL2Flush) (new IOCMOAll)
   })
   assert(!(io.a.valid && (io.a.bits.opcode === PutFullData ||
@@ -55,6 +57,8 @@ class SinkA(implicit p: Parameters) extends L2Module {
   val wayVal = way.getOrElse(0.U)
   val cmoAllValid = stateVal === sCMOREQ
   val cmoAllBlock = stateVal === sCMOREQ || stateVal === sWAITLINE
+  val aPresent = io.preview.map(_.present && !cmoAllBlock).getOrElse(io.a.valid)
+  io.pendingTask := io.preview.map(_.pending && aPresent).getOrElse(false.B)
   io.cmoAll.foreach { cmoAll => cmoAll.l2FlushDone := stateVal === sDONE }
   io.cmoAll.foreach { cmoAll => cmoAll.cmoAllBlock := cmoAllBlock }
 
@@ -140,16 +144,16 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task
   }
   if (prefetchOpt.nonEmpty) {
-    io.task.valid := io.a.valid && !cmoAllBlock || io.prefetchReq.get.valid || cmoAllValid
+    io.task.valid := aPresent && !cmoAllBlock || io.prefetchReq.get.valid || cmoAllValid
     io.task.bits := Mux(
-      io.a.valid || cmoAllValid,
+      aPresent || cmoAllValid,
       fromTLAtoTaskBundle(io.a.bits),
       fromPrefetchReqtoTaskBundle(io.prefetchReq.get.bits
     ))
     io.a.ready := io.task.ready && !cmoAllBlock
-    io.prefetchReq.get.ready := io.task.ready && !io.a.valid
+    io.prefetchReq.get.ready := io.task.ready && !aPresent && !cmoAllValid
   } else {
-    io.task.valid := io.a.valid && !cmoAllBlock || cmoAllValid
+    io.task.valid := aPresent && !cmoAllBlock || cmoAllValid
     io.task.bits := fromTLAtoTaskBundle(io.a.bits) 
     io.a.ready := io.task.ready && !cmoAllBlock
   }
