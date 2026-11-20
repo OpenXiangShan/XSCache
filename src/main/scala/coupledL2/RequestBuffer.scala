@@ -223,13 +223,24 @@ class RequestBuffer(flow: Boolean = true, entries: Int = 4)(implicit p: Paramete
 
   // statistics io
   val latePrefetchRes = latePrefetch(in) // demand request hit entry of pf
-  io.pfStatInMSHR.hitPf := latePrefetchRes._1 && io.in.valid && !sameAddr(in, RegNext(in))
-  io.pfStatInMSHR.hitPfReqSrc := latePrefetchRes._2
-  io.pfStatInMSHR.hitPfLatency := latePrefetchRes._3
+  if (cacheParams.specMissPreview) {
+    // Count an accepted demand once, with its own verdict, source and latency.
+    // A deferred merge counts on its confirmed retry, even at the same address.
+    val pendingS2 = RegNext(io.inPending, false.B)
+    io.pfStatInMSHR.hitPf := RegNext(latePrefetchRes._1 && io.in.fire, false.B) && (!pendingS2 || io.specCommitS2)
+    io.pfStatInMSHR.hitPfReqSrc := RegNext(latePrefetchRes._2)
+    io.pfStatInMSHR.hitPfLatency := RegNext(latePrefetchRes._3)
+    io.hasMergeA := io.aMergeTask.valid
+  } else {
+    val newAddr = !sameAddr(in, RegNext(in))
+    io.pfStatInMSHR.hitPf := latePrefetchRes._1 && io.in.valid && newAddr
+    io.pfStatInMSHR.hitPfReqSrc := latePrefetchRes._2
+    io.pfStatInMSHR.hitPfLatency := latePrefetchRes._3
+    io.hasMergeA := io.aMergeTask.valid && newAddr
+  }
   io.pfStatInMSHR.pfLate := io.in.valid && dup
   io.pfStatInMSHR.pfLateReqSrc := io.in.bits.reqSource
   io.pfStatInMSHR.pfLateHitReqSrc := dupHitSrc
-  io.hasMergeA := mergeA && io.in.valid && !sameAddr(in, RegNext(in))
 
   //!! TODO: we can also remove those that duplicate with mainPipe
 
