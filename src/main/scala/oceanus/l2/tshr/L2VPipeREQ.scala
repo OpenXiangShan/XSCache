@@ -473,7 +473,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
            (io.fromSA.SnpRespData0 || io.fromSA.SnpRespData2)),
     "TSHR @ %m REQ vPipe received SnpNone and SnpRespData together")
 
-  val sa_resp_last = sa_snpresp || sa_snpnone ||
+  val sa_resp_last = sa_snpresp ||
                      sa_snprespdata0 && w_snpresp0 && !w_snpresp2 ||
                      sa_snprespdata2 && !w_snpresp0 && w_snpresp2
 
