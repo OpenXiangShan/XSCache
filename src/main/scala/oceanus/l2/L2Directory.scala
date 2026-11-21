@@ -571,13 +571,17 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
       lock.set === requestSet(req) && lock.way === req.WAY(wayBits - 1, 0)
   })
   val requestReplCAMMatchVec = VecInit(io.toDir.map(req => replCAMMatch(requestSet(req))))
+  val requestReplCAMSelOHVec = VecInit(requestReplCAMMatchVec.map(matches => PriorityEncoderOH(matches)))
   val dirWbReplCAMIndexVec = VecInit(requestReplCAMMatchVec.map(matches => PriorityEncoder(matches)))
   // Candidate decode precedes the winner so final-commit readiness can gate the
   // DirWb grant without a combinational path from the grant back to itself.
+  // The one-hot row is the same priority-selected entry as the binary index;
+  // ownerCount==1 is evaluated per row instead of after a dynamic binary read.
   val dirWbFinalVec = if (useRRIPSram) {
-    VecInit(io.toDir.zipWithIndex.map { case (req, i) =>
-      dirWbUnlockVec(i) && requestReplCAMMatchVec(i).orR &&
-        replCAM.get(dirWbReplCAMIndexVec(i)).ownerCount === 1.U
+    val replCAMOwnerOneBits = VecInit(replCAM.get.map(_.ownerCount === 1.U)).asUInt
+    VecInit(io.toDir.indices.map { i =>
+      dirWbUnlockVec(i) &&
+        (requestReplCAMSelOHVec(i) & replCAMOwnerOneBits).orR
     })
   } else {
     VecInit(Seq.fill(nMSHR)(false.B))
@@ -716,6 +720,9 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
 
   val winIdx   = Mux(grantReplRd, winReplRd, Mux(grantDirWb, winDirWb, winDirRd))
   val winOH = Mux(grantReplRd, winReplRdOH, Mux(grantDirWb, winDirWbOH, winDirRdOH))
+  // Read snapshots do not consume a DirWb winner. Keeping that commit/grant
+  // cone out of the snapshot selection preserves every valid read's identity.
+  val readSnapshotWinOH = Mux(grantReplRd, winReplRdOH, winDirRdOH)
   val anyGrant = grantReplRd || grantDirWb || grantDirRd
   val winReq   = io.toDir(winIdx)
 
@@ -778,6 +785,10 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     io.toDir.toSeq.map(req => requestSet(req))
   )
   val reqTag = winReq.PADDR(paramL2.physicalAddrWidth - 1, offsetBits + setBits)
+  val dirWbTag = balancedOneHotMux(
+    winDirWbOH,
+    io.toDir.toSeq.map(req => req.PADDR(paramL2.physicalAddrWidth - 1, offsetBits + setBits))
+  )
 
   // Only a ReplRd CAM miss allocates an entry. S1 establishes valid/set and a
   // zero ownerCount; the allocating request still takes the backing read at S2
@@ -799,9 +810,9 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     if (useRRIPSram && useOriginSram) replCAM.get(dirWbReplCAMIndexVec(i)).origin.get else 0.U(ways.W)
   })
   val s1ReplCAMHit = balancedOr(io.toDir.indices.map { i =>
-    winOH(i) && requestReplCAMHitVec(i)
+    readSnapshotWinOH(i) && requestReplCAMHitVec(i)
   })
-  val s1ReplCAMIndex = balancedOneHotMux(winOH, dirWbReplCAMIndexVec.toSeq)
+  val s1ReplCAMIndex = balancedOneHotMux(readSnapshotWinOH, dirWbReplCAMIndexVec.toSeq)
   val s1ReplCAMAlloc = isReplRd && useRRIPSram.B && !s1ReplCAMHit
   val s1ReplCAMIndexOrAlloc = Mux(s1ReplCAMHit, s1ReplCAMIndex, replCAMFreeIndex)
   if (useRRIPSram) {
@@ -835,8 +846,8 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     dirReadData_s2(w).meta := metaReadData_s2(w)
   }
 
-  val s1ReplCAMRepl = balancedOneHotMux(winOH, requestReplCAMReplVec.toSeq)
-  val s1ReplCAMOrigin = balancedOneHotMux(winOH, requestReplCAMOriginVec.toSeq)
+  val s1ReplCAMRepl = balancedOneHotMux(readSnapshotWinOH, requestReplCAMReplVec.toSeq)
+  val s1ReplCAMOrigin = balancedOneHotMux(readSnapshotWinOH, requestReplCAMOriginVec.toSeq)
   val replState_s1 = Mux(s1ReplCAMHit, s1ReplCAMRepl,
     replFF.map(_(reqSet)).getOrElse(0.U(replBits.W)))
   val originState_s1 = Mux(s1ReplCAMHit && useOriginSram.B, s1ReplCAMOrigin,
@@ -1001,7 +1012,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   // DirWb: tag and bitmask partial meta writes at S1
   // ══════════════════════════════════════════════════════════════════
   val wbEntry = Wire(new L2Directory.DirEntry)
-  wbEntry.tag  := reqTag
+  wbEntry.tag  := dirWbTag
   wbEntry.meta := winReq.META
 
   val wbMetaMask = Wire(new L2Directory.Meta)
@@ -1029,7 +1040,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val tagWriteValidLaunch_s1 = RegNext(tagWriteValid, false.B)
   val metaWriteValidLaunch_s1 = RegNext(metaWriteValid, false.B)
   val tagWriteDataLaunch_s1 = RegInit(0.U(tagWidth.W))
-  tagWriteDataLaunch_s1 := dirWriteEntry.tag
+  tagWriteDataLaunch_s1 := Mux(initActive, initEntry.tag, dirWbTag)
   val metaWriteDataLaunch_s1 = RegInit(0.U.asTypeOf(new L2Directory.Meta))
   metaWriteDataLaunch_s1 := dirWriteEntry.meta
   val dirWriteSetLaunch_s1 = RegInit(0.U(setBits.W))
@@ -1412,13 +1423,14 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val dirWbUnlock = grantDirWb && Mux1H(winDirWbOH, dirWbUnlockVec)
   val dirWbOwnerRetire = dirWbUnlock &&
     blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U
-  val dirWbFinal = dirWbOwnerRetire && dirWbSelectedFinal
+  val dirWbFinal = grantDirWb &&
+    blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U &&
+    dirWbSelectedFinal
   val dirWbReplCAMMatchNow = VecInit((0 until nMSHR).map { camIndex =>
     balancedOr(io.toDir.indices.map { requester =>
       winDirWbOH(requester) && requestReplCAMMatchVec(requester)(camIndex)
     })
   })
-  val dirWbReplCAMIndexNow = balancedOneHotMux(winDirWbOH, dirWbReplCAMIndexVec.toSeq)
   pendClearApply := pendClearValid &&
     blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U
   if (useRRIPSram) {
@@ -1448,34 +1460,80 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
         !(s2_valid && s2_set === set) && !(s3_valid && s3_set === set) &&
         !(s4_valid && s4_set === set) && !relActive
 
-    val finalCandidateIndex = dirWbReplCAMIndexNow
-    val finalCandidateSet = replCAM.get(finalCandidateIndex).set
-    dirWbCommitBlocked := dirWbSelectedFinal &&
+    val replCAMCommitSafeBits = VecInit((0 until nMSHR).map { camIndex =>
+      commitSafe(camIndex.U, replCAM.get(camIndex).set)
+    }).asUInt
+
+    // A final owner's CAM row matches its request set. Evaluate every current
+    // hazard per CAM row and share it between final blocking and optional commit.
+    val dirWbCommitBlockedVec = VecInit(io.toDir.indices.map { i =>
+      dirWbFinalVec(i) &&
+        !(requestReplCAMSelOHVec(i) & replCAMCommitSafeBits).orR
+    })
+    dirWbCommitBlocked :=
       blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U &&
-      !commitSafe(finalCandidateIndex, finalCandidateSet)
+      balancedOr(io.toDir.indices.map { i =>
+        winDirWbOH(i) && dirWbCommitBlockedVec(i)
+      })
 
     val zeroOwnerCandidates = VecInit((0 until nMSHR).map { i =>
       replCAM.get(i).valid && !allocInFlight(i.U) && replCAM.get(i).ownerCount === 0.U
     }).asUInt
     val optionalCommit = grantDirWb && !dirWbFinal && zeroOwnerCandidates.orR
-    val commitIndex = Mux(dirWbFinal, dirWbReplCAMIndexNow, PriorityEncoder(zeroOwnerCandidates))
-    val commitSet = replCAM.get(commitIndex).set
+    val optionalCommitIndexOH = PriorityEncoderOH(zeroOwnerCandidates)
+    val optionalCommitSafe = (optionalCommitIndexOH & replCAMCommitSafeBits).orR
+
+    val finalCommitIndexOH = balancedOneHotMux(winDirWbOH, requestReplCAMSelOHVec.toSeq)
+    val finalCommitSet = balancedOneHotMux(
+      winDirWbOH,
+      io.toDir.toSeq.map(req => requestSet(req))
+    )
+    val finalCommitRepl = balancedOneHotMux(winDirWbOH, requestReplCAMReplVec.toSeq)
+    val finalCommitOrigin = if (useOriginSram) {
+      balancedOneHotMux(winDirWbOH, requestReplCAMOriginVec.toSeq)
+    } else {
+      0.U(ways.W)
+    }
+    val optionalCommitSet = balancedOneHotMux(
+      optionalCommitIndexOH,
+      VecInit(replCAM.get.map(_.set)).toSeq
+    )
+    val optionalCommitRepl = balancedOneHotMux(
+      optionalCommitIndexOH,
+      VecInit(replCAM.get.map(_.repl)).toSeq
+    )
+    val optionalCommitOrigin = if (useOriginSram) {
+      balancedOneHotMux(
+        optionalCommitIndexOH,
+        VecInit(replCAM.get.map(_.origin.get)).toSeq
+      )
+    } else {
+      0.U(ways.W)
+    }
+    val commitIndexOH = Mux(dirWbFinal, finalCommitIndexOH, optionalCommitIndexOH)
+    val commitSet = Mux(dirWbFinal, finalCommitSet, optionalCommitSet)
+    val commitRepl = Mux(dirWbFinal, finalCommitRepl, optionalCommitRepl)
+    val commitOrigin = Mux(dirWbFinal, finalCommitOrigin, optionalCommitOrigin)
 
     // A required final-owner commit takes priority over an unrelated zero-owner
     // candidate. Both use this one DirWb-window write site; an optional candidate
     // is simply skipped when its backing or pipeline hazards are not clear.
-    replCAMCommitFire := (dirWbFinal || optionalCommit) && commitSafe(commitIndex, commitSet)
+    replCAMCommitFire := dirWbFinal || (optionalCommit && optionalCommitSafe)
     when (dirWbFinal) {
       assert(replCAMCommitFire, "final-owner DirWb grant without its CAM commit")
     }
     assert(!(dirRelCommitFire && replCAMCommitFire),
       "DirRel commit overlapped a DirWb CAM commit")
     when (replCAMCommitFire) {
-      writeReplBacking(true.B, replCAM.get(commitIndex).repl, commitSet, Fill(ways, true.B))
+      writeReplBacking(true.B, commitRepl, commitSet, Fill(ways, true.B))
       if (useOriginSram) {
-        writeOriginBacking(true.B, replCAM.get(commitIndex).origin.get, commitSet, Fill(ways, true.B))
+        writeOriginBacking(true.B, commitOrigin, commitSet, Fill(ways, true.B))
       }
-      replCAM.get(commitIndex).valid := false.B
+      for (camIndex <- 0 until nMSHR) {
+        when (commitIndexOH(camIndex)) {
+          replCAM.get(camIndex).valid := false.B
+        }
+      }
     }
   }
 

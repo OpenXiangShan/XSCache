@@ -58,6 +58,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
     val tshr_paddr = Input(UInt(paramL2.physicalAddrWidth.W))
 
+    val tshr_dirResult_flowable = Input(new L2Directory.MetaReadResult)
     val tshr_dirResult = Input(new L2Directory.MetaReadResult)
 
     // Pulses when this TSHR deallocates; per-life bookkeeping registers that
@@ -142,6 +143,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     val L2EVT_opcode = Valid(UInt(paramCHI.reqOpcodeWidth.W))
   })
 
+  val dirResult_flowable = io.tshr_dirResult_flowable
   val dirResult = io.tshr_dirResult
 
   val dnTxnID = (io.consts.tshrId << log2Ceil(sliceNum)) | io.consts.sliceIdx
@@ -214,8 +216,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val rxevb_evictback = io.UpRXEVB.fire
 
   def satisfied(valid: Bool, state: UInt): (Bool, Bool) = (
-    valid && (dirResult.state >= state && dirResult.hit), 
-    valid && (dirResult.state < state || !dirResult.hit))
+    valid && (dirResult_flowable.state >= state && dirResult_flowable.hit),
+    valid && (dirResult_flowable.state < state || !dirResult_flowable.hit))
 
   def satisfied(opcode: CCHIOpcode, state: UInt): (Bool, Bool) =
     satisfied(rxreq_opcode.is(opcode), state)
@@ -233,14 +235,13 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                  rxreq_unsatisfied_makeunique ||
                                  rxreq_unsatisfied_stashunique
 
-  val rxreq_hit_lock_conflict = rxreq_unsatisfied_unique &&
-                                dirResult.hit && io.repl_lock_conflict
+  val rxreq_hit_lock_candidate = rxreq_unsatisfied_unique && dirResult_flowable.hit
 
-  val rxreq_hit_lock_candidate = rxreq_unsatisfied_unique && dirResult.hit
-
-  val rxreq_hit_lock_accept = rxreq_unsatisfied_unique &&
-                              dirResult.hit && !io.repl_lock_conflict
-
+  // Miss-prefill decisions remain at entrance. Hit-lock candidates are registered
+  // so conflict resolution and ownership updates use the following cycle's locks.
+  val w_hit_lock_decision = RegInit(false.B)
+  val delayed_hit_lock_conflict = w_hit_lock_decision && io.repl_lock_conflict
+  val delayed_hit_lock_accept = w_hit_lock_decision && !io.repl_lock_conflict
   val p_hit_lock_way = Reg(UInt(wayBits.W))
 
   val p_prefill_miss = RegInit(false.B)
@@ -347,10 +348,10 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val rxreq_client = io.fromClientTable
   val p_rxreq_client = io.fromClientTable
 
-  val rxreq_client_present = (rxreq_client.asUInt & dirResult.clients.asUInt).orR
+  val rxreq_client_present = (rxreq_client.asUInt & dirResult_flowable.clients.asUInt).orR
   val p_rxreq_client_present = (p_rxreq_client.asUInt & dirResult.clients.asUInt).orR
 
-  val rxreq_peer_present = (~rxreq_client.asUInt & dirResult.clients.asUInt).orR
+  val rxreq_peer_present = (~rxreq_client.asUInt & dirResult_flowable.clients.asUInt).orR
   val p_rxreq_peer_present = (~p_rxreq_client.asUInt & dirResult.clients.asUInt).orR
   // ----------------------------------------------------------------
 
@@ -438,7 +439,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                         s_evict_dn_compack ||
                         w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds ||
                         w_evict_peer_commit_dir ||
-                        w_hit_lock_release || s_hit_lock_release
+                        w_hit_lock_decision || w_hit_lock_release || s_hit_lock_release
 
   val active = active_tailless || w_rd_up_compack
 
@@ -449,12 +450,28 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // -- Interactions with Snoop Agent
   // decode upstream REQ opcodes to upstream SNP opcodes
   val sa_snpresp = io.fromSA.SnpResp
+  val sa_snpnone = io.fromSA.SnpNone
   val sa_snprespdata0 = io.fromSA.SnpRespData0
   val sa_snprespdata2 = io.fromSA.SnpRespData2
 
-  val sa_resp_decision = sa_snpresp ||
+  val sa_resp_decision = sa_snpresp || sa_snpnone ||
                          sa_snprespdata0 && w_snpresp0 && w_snpresp2 ||
                          sa_snprespdata2 && w_snpresp0 && w_snpresp2
+
+  val sa_resp_decision_nonflow = if (paramL2.hitFastPathDirRespFlow) {
+    sa_snpresp ||
+    RegNext(sa_snpnone, false.B) ||
+    sa_snprespdata0 && w_snpresp0 && w_snpresp2 ||
+    sa_snprespdata2 && w_snpresp0 && w_snpresp2
+  } else {
+    sa_resp_decision
+  }
+
+  assert(!(io.fromSA.SnpResp && io.fromSA.SnpNone),
+    "TSHR @ %m REQ vPipe received SnpResp and SnpNone together")
+  assert(!(io.fromSA.SnpNone &&
+           (io.fromSA.SnpRespData0 || io.fromSA.SnpRespData2)),
+    "TSHR @ %m REQ vPipe received SnpNone and SnpRespData together")
 
   val sa_resp_last = sa_snpresp ||
                      sa_snprespdata0 && w_snpresp0 && !w_snpresp2 ||
@@ -507,7 +524,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     CCHIOpcode.MakeUnique
   )
   val rxreq_aliasable = rxreq_readunique || rxreq_readshared || rxreq_makeunique
-  io.toSA.ALIAS := Mux(rxreq_aliasable, rxreq.TagAlias, dirResult.alias)
+  io.toSA.ALIAS := Mux(rxreq_aliasable, rxreq.TagAlias, dirResult_flowable.alias)
 
   io.toSA.IS_L2_EVICT := rxevb_evictback
 
@@ -519,11 +536,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     w_snpresp2 := true.B
   }
 
-  when (sa_snpresp || sa_snprespdata0) {
+  when (sa_snpresp || sa_snpnone || sa_snprespdata0) {
     w_snpresp0 := false.B
   }
 
-  when (sa_snpresp || sa_snprespdata2) {
+  when (sa_snpresp || sa_snpnone || sa_snprespdata2) {
     w_snpresp2 := false.B
   }
   // ----------------------------------------------------------------
@@ -1142,7 +1159,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // - MakeUnique related meta/tag updates
   val meta_wr_state_makeunique_UU_sat = active && p_rxreq_makeunique &&
-                                        sa_resp_decision &&
+                                        sa_resp_decision_nonflow &&
                                         dirResult.state === MetaState.US
 
   val meta_wr_state_makeunique_UU_unsat = active && p_rxreq_makeunique &&
@@ -1161,7 +1178,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // - ReadUnique related meta/tag updates
   val meta_wr_state_readunique_UU_sat = active && p_rxreq_readunique &&
-                                        sa_resp_decision &&
+                                        sa_resp_decision_nonflow &&
                                         dirResult.state === MetaState.US
 
   // 'Resp' not checked for this, because it was already constrained by CHI specification, and only goes to UU
@@ -1191,13 +1208,13 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // - ReadShared related meta/tag updates
   val meta_wr_state_readshared_UU_sat = active && p_rxreq_readshared &&
-                                        sa_resp_decision &&
+                                        sa_resp_decision_nonflow &&
                                         dirResult.state === MetaState.US &&
                                         !p_rxreq_peer_present &&
                                         configReadSharedPromotionFromUS
 
   val meta_wr_state_readshared_US_sat = active && p_rxreq_readshared &&
-                                        sa_resp_decision &&
+                                        sa_resp_decision_nonflow &&
                                         dirResult.state === MetaState.UU &&
                                         (configReadSharedDemotionFromUU || p_rxreq_peer_present)
 
@@ -1240,7 +1257,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                        io.fromSA.RESP === CCHIResp.UC_PD.U
 
   val meta_wr_state_readonce_US_sat = active && p_rxreq_readonce &&
-                                      sa_resp_decision &&
+                                      sa_resp_decision_nonflow &&
                                       dirResult.state === MetaState.UU &&
                                       dirResult.clients.asUInt.orR &&
                                       !sa_resp_unique
@@ -1293,14 +1310,17 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // Hold an unsatisfied initial-hit way until the original request's final
   // allocating response has been committed by a final allocating DirWb.
-  val hit_lock_response = w_hit_lock_release && (
-                            (p_rxreq_makeunique && dn_rxrsp_comp) ||
-                            ((p_rxreq_readunique || p_rxreq_stashunique) && (
-                              dn_rxdat_compdata_first ||
-                              dn_rxdat_datasepresp_first ||
-                              dn_rxrsp_comp
-                            ))
-                          )
+  val hit_lock_allocating_response = (p_rxreq_makeunique && dn_rxrsp_comp) ||
+                                     ((p_rxreq_readunique || p_rxreq_stashunique) && (
+                                       dn_rxdat_compdata_first ||
+                                       dn_rxdat_datasepresp_first ||
+                                       dn_rxrsp_comp
+                                     ))
+
+  assert(!(w_hit_lock_decision && hit_lock_allocating_response),
+    "Allocating response arrived before deferred hit-lock decision")
+
+  val hit_lock_response = w_hit_lock_release && hit_lock_allocating_response
 
   when (hit_lock_response) {
     w_hit_lock_release := false.B
@@ -1363,7 +1383,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   val meta_wr_dirty_evictback_clr = meta_wr_state_evictback_I
   // --------------------------------
 
-  val meta_wr_dirty_sa_set = sa_resp_decision && io.fromSA.PASSDIRTY
+  val meta_wr_dirty_sa_set = sa_resp_decision_nonflow && io.fromSA.PASSDIRTY
   // --------------------------------
 
   val meta_wr_state_UU = meta_wr_state_readunique_UU ||
@@ -1545,7 +1565,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                     dn_rxrsp_comp
 
   val ds_rd_readunique_unsat_early = rxreq_unsatisfied_readunique &&
-                                     dirResult.hit &&
+                                     dirResult_flowable.hit &&
                                      (rxreq.ExpCompData || !rxreq_client_present)
 
   val ds_rd_readunique_unsat = Mux(configReadUniqueHitSPreferReadDS,
@@ -1554,8 +1574,8 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val ds_rd_readunique = ds_rd_readunique_sat || ds_rd_readunique_unsat
 
-  val ds_rd_readshared = rxreq_readshared && dirResult.hit
-  val ds_rd_readonce = rxreq_readonce && dirResult.hit
+  val ds_rd_readshared = rxreq_readshared && dirResult_flowable.hit
+  val ds_rd_readonce = rxreq_readonce && dirResult_flowable.hit
 
   // *NOTE: If SA received SnpRespData from upstream, the DS Read would be dropped by Data Storage Proxy.
   val ds_rd_evictback = p_rxreq_evictback &&
@@ -1791,7 +1811,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   val expect_replace_readonce = if (configInclusiveReadOnce) rxreq_readonce else false.B
 
-  val expect_miss_replace = !dirResult.hit && (
+  val expect_miss_replace = !dirResult_flowable.hit && (
                               rxreq_readunique ||
                               rxreq_readshared ||
                               expect_replace_readonce ||
@@ -1800,7 +1820,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                               rxreq_stashunique
                             )
 
-  val expect_replace = rxreq_hit_lock_conflict || expect_miss_replace
+  val expect_replace = delayed_hit_lock_conflict || expect_miss_replace
 
   // The peer refiller owns the conflicted old way. Conflict-hit prefill must
   // not require an old-line DirWb before starting its own ReplRd.
@@ -1821,9 +1841,14 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   when (rxreq_fire) {
     p_prefill_miss := expect_miss_replace
-    p_prefill_hit := rxreq_hit_lock_conflict
+    p_prefill_hit := false.B
     p_prefill_miss_meta := 0.U.asTypeOf(p_prefill_miss_meta)
     p_prefill_miss_meta.prefetch := expect_replace && (rxreq_stashshared || rxreq_stashunique)
+  }
+
+  when (delayed_hit_lock_conflict) {
+    p_prefill_hit := true.B
+    p_prefill_miss_meta.prefetch := p_rxreq_stashshared || p_rxreq_stashunique
   }
 
   // If the replacer picked an INVALID way whose stale tag aliases this very request (the line
@@ -1893,29 +1918,34 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.repl_en := s_repl
   io.repl_reset := rxreq_fire
 
-  io.repl_lock_candidate := rxreq_fire && rxreq_hit_lock_candidate
-  io.repl_lock_req := rxreq_fire && rxreq_hit_lock_accept
-  io.repl_lock_way := Mux(rxreq_fire, dirResult.way, p_hit_lock_way)
+  io.repl_lock_candidate := w_hit_lock_decision
+  io.repl_lock_req := delayed_hit_lock_accept
+  io.repl_lock_way := p_hit_lock_way
 
   io.repl_lock_release := s_hit_lock_release
 
-  when (rxreq_fire) {
-    when (rxreq_hit_lock_accept) {
-      p_hit_lock_way := dirResult.way
-    }
+  when (w_hit_lock_decision) {
+    w_hit_lock_decision := false.B
+    w_hit_lock_release := delayed_hit_lock_accept
   }
 
   when (rxreq_fire) {
-    w_hit_lock_release := rxreq_hit_lock_accept
+    w_hit_lock_decision := rxreq_hit_lock_candidate
+    when (rxreq_hit_lock_candidate) {
+      p_hit_lock_way := dirResult_flowable.way
+    }
+    w_hit_lock_release := false.B
     s_hit_lock_release := false.B
   }
 
+  assert(!(rxreq_fire && w_hit_lock_decision),
+    "RXREQ entered while a deferred hit-lock decision was still pending")
   assert(!(p_prefill_hit && (w_hit_lock_release || s_hit_lock_release)),
     "REQ vPipe conflict-hit prefill unexpectedly owns a hit-lock")
 
   // Delay release until the final local tag/meta writes have registered. The
   // pending-until-accept flags must not hold the write or it could never proceed.
-  val hit_lock_write_hold = w_hit_lock_release || rxreq_hit_lock_accept ||
+  val hit_lock_write_hold = w_hit_lock_release ||
                             (s_hit_lock_release &&
                              (io.tshr_meta_write_en.asUInt.orR ||
                               io.tshr_tag_write_en))

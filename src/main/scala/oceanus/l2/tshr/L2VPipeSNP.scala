@@ -272,7 +272,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
   val do_dct_snprespdata0 = s_dct_resp0 && !s_home_resp0 && !s_home_resp2 &&
                             !w_snpresp0 && !w_snpresp2 && !w_ds_read && need_dct_txdat && no_tx_inflight
 
-  val do_meta_write = s_meta_write && (io.DnTXRSP.fire || fire_home_data0)
+  val do_meta_write = s_meta_write && (do_home_snpresp || do_home_snprespdata0)
   val do_sa_snpcompack = s_snpcompack && !(w_snpresp0 || w_snpresp2 || w_ds_read || s_home_resp0 || s_home_resp2 ||
                          s_dct_resp0 || s_dct_resp2)
 
@@ -295,8 +295,10 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
     s_snpcompack := io.toSA.SnpToClean
 
     w_ds_read := enter_need_local_ds_read && !io.ds_read_done
-    w_snpresp0 := enter_send_sa_uop && !io.fromSA.SnpResp
-    w_snpresp2 := enter_send_sa_uop && !io.fromSA.SnpResp
+    w_snpresp0 := enter_send_sa_uop &&
+                  !(io.fromSA.SnpResp || io.fromSA.SnpNone)
+    w_snpresp2 := enter_send_sa_uop &&
+                  !(io.fromSA.SnpResp || io.fromSA.SnpNone)
   }
 
   when (io.ds_read_done) {
@@ -312,7 +314,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
     p_sa_passdirty := io.fromSA.PASSDIRTY
   }
 
-  when (io.fromSA.SnpResp && !io.DnRXSNP.fire) {
+  when ((io.fromSA.SnpResp || io.fromSA.SnpNone) && !io.DnRXSNP.fire) {
     w_snpresp0 := false.B
     w_snpresp2 := false.B
     p_sa_passdirty := io.fromSA.PASSDIRTY
@@ -624,6 +626,14 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
     "TSHR @ %m SNP vPipe mixed SA data beats with a no-data SnpResp")
   assert(!(io.fromSA.SnpResp && (io.fromSA.SnpRespData0 || io.fromSA.SnpRespData2)),
     "TSHR @ %m SNP vPipe received SA SnpResp and SnpRespData together")
+  assert(!io.fromSA.SnpNone || w_snpresp0 || w_snpresp2 || enter_send_sa_uop,
+    "TSHR @ %m SNP vPipe received an unexpected SA SnpNone")
+  assert(!io.fromSA.SnpNone || enter_send_sa_uop || (w_snpresp0 && w_snpresp2),
+    "TSHR @ %m SNP vPipe mixed SA data beats with a no-data SnpNone")
+  assert(!(io.fromSA.SnpResp && io.fromSA.SnpNone),
+    "TSHR @ %m SNP vPipe received SnpResp and SnpNone together")
+  assert(!(io.fromSA.SnpNone && (io.fromSA.SnpRespData0 || io.fromSA.SnpRespData2)),
+    "TSHR @ %m SNP vPipe received SnpNone and SnpRespData together")
   when (io.fromSA.SnpRespData0 || io.fromSA.SnpRespData2) {
     assert(!rxsnp_snpMakeInvalid && !rxsnp_snpMakeInvalidStash,
       "TSHR @ %m SNP vPipe received data for a MakeInvalid SnoopAgent request")
