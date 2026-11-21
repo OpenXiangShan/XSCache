@@ -641,17 +641,6 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val rrDirWb  = RegInit(0.U(idxW.W))
   val rrDirRd  = RegInit(0.U(idxW.W))
 
-  def roundRobinNext(last: UInt, mask: UInt, n: Int): UInt = {
-    val w        = log2Ceil(n)
-    val doubled  = Cat(mask, mask)
-    val startPos = Mux(last === (n - 1).U, 0.U, last + 1.U)
-    val rotated  = (doubled >> startPos)(n - 1, 0)
-    val relIdx   = PriorityEncoder(rotated)
-    val absRaw   = startPos +& relIdx
-    val abs      = Mux(absRaw >= n.U, absRaw - n.U, absRaw)
-    abs(w - 1, 0)
-  }
-
   def roundRobinOneHot(last: UInt, mask: UInt, n: Int): UInt = {
     val w = log2Ceil(n)
     val start = Mux(last === (n - 1).U, 0.U(w.W), last + 1.U)
@@ -756,9 +745,12 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   // removes the separate R/W occupancy, not arbitration protection.
   // DirRel never allocates a CAM entry or increments ownerCount in either mode.
   val dirRelGrant = WireDefault(false.B)
+  val dirRelWinOH = WireDefault(0.U(nMSHR.W))
   val dirRelPath = if (useRRIPRelease) {
     val rrRel  = RegInit(0.U(idxW.W))
-    val winRel = roundRobinNext(rrRel, relVec.asUInt, nMSHR)
+    val winRelOH = roundRobinOneHot(rrRel, relVec.asUInt, nMSHR)
+    val winRel = oneHotToIndex(winRelOH, nMSHR)
+    dirRelWinOH := winRelOH
     when(dirRelGrant) { rrRel := winRel }
     Some((anyRel, io.toDir(winRel)))
   } else {
@@ -825,9 +817,13 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     }
   }
 
-  val dirRelSet = dirRelReq.PADDR(offsetBits + setBits - 1, offsetBits)
-  val dirRelReplCAMMatch = replCAMMatch(dirRelSet)
-  val dirRelReplCAMHit = dirRelReplCAMMatch.orR
+  val dirRelSet = balancedOneHotMux(
+    dirRelWinOH,
+    io.toDir.toSeq.map(req => requestSet(req))
+  )
+  val dirRelReplCAMHit = balancedOr(io.toDir.indices.map { i =>
+    dirRelWinOH(i) && requestReplCAMHitVec(i)
+  })
   val relNeedsOrigin = dirRelGrant && !dirRelReplCAMHit && useOriginSram.B
 
   readLaunchValid_s1 := isRead
@@ -855,7 +851,9 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val replReadValidLaunch_s1 = RegInit(false.B)
   replReadValidLaunch_s1 := isRead && !s1ReplCAMHit
   val replSramRead_s2 = replSRAM.map(_.io.r(replReadValidLaunch_s1, readLaunchSet_s1).resp.data.asUInt)
-  val originReadSet = Mux(relNeedsOrigin, dirRelSet, reqSet)
+  // The read set is significant only for a valid origin read. A CAM-hit DirRel
+  // launches no read, so its set need not wait for the CAM-hit decision.
+  val originReadSet = Mux(dirRelGrant, dirRelSet, reqSet)
   val originReadSetLaunch_s1 = RegInit(0.U(setBits.W))
   originReadSetLaunch_s1 := originReadSet
   originReadValidLaunch_s1 := (isRead && !s1ReplCAMHit) || relNeedsOrigin
