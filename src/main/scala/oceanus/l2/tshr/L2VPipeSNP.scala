@@ -272,7 +272,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
   val do_dct_snprespdata0 = s_dct_resp0 && !s_home_resp0 && !s_home_resp2 &&
                             !w_snpresp0 && !w_snpresp2 && !w_ds_read && need_dct_txdat && no_tx_inflight
 
-  val do_meta_write = s_meta_write && (io.DnTXRSP.fire || fire_home_data0)
+  val do_meta_write = s_meta_write && (do_home_snpresp || do_home_snprespdata0)
   val do_sa_snpcompack = s_snpcompack && !(w_snpresp0 || w_snpresp2 || w_ds_read || s_home_resp0 || s_home_resp2 ||
                          s_dct_resp0 || s_dct_resp2)
 
