@@ -1419,13 +1419,14 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val dirWbUnlock = grantDirWb && Mux1H(winDirWbOH, dirWbUnlockVec)
   val dirWbOwnerRetire = dirWbUnlock &&
     blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U
-  val dirWbFinal = dirWbOwnerRetire && dirWbSelectedFinal
+  val dirWbFinal = grantDirWb &&
+    blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U &&
+    dirWbSelectedFinal
   val dirWbReplCAMMatchNow = VecInit((0 until nMSHR).map { camIndex =>
     balancedOr(io.toDir.indices.map { requester =>
       winDirWbOH(requester) && requestReplCAMMatchVec(requester)(camIndex)
     })
   })
-  val dirWbReplCAMIndexNow = balancedOneHotMux(winDirWbOH, dirWbReplCAMIndexVec.toSeq)
   pendClearApply := pendClearValid &&
     blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U
   if (useRRIPSram) {
@@ -1455,12 +1456,15 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
         !(s2_valid && s2_set === set) && !(s3_valid && s3_set === set) &&
         !(s4_valid && s4_set === set) && !relActive
 
+    val replCAMCommitSafeBits = VecInit((0 until nMSHR).map { camIndex =>
+      commitSafe(camIndex.U, replCAM.get(camIndex).set)
+    }).asUInt
+
     // A final owner's CAM row matches its request set. Evaluate every current
-    // hazard per requester before winner selection instead of selecting the
-    // index/set and then serially evaluating commitSafe after the winner.
+    // hazard per CAM row and share it between final blocking and optional commit.
     val dirWbCommitBlockedVec = VecInit(io.toDir.indices.map { i =>
       dirWbFinalVec(i) &&
-        !commitSafe(dirWbReplCAMIndexVec(i), requestSet(io.toDir(i)))
+        !(requestReplCAMSelOHVec(i) & replCAMCommitSafeBits).orR
     })
     dirWbCommitBlocked :=
       blockRefillFaultMode =/= L2DirectoryBlockRefillFaultMode.NeverUnlock.U &&
@@ -1472,24 +1476,60 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
       replCAM.get(i).valid && !allocInFlight(i.U) && replCAM.get(i).ownerCount === 0.U
     }).asUInt
     val optionalCommit = grantDirWb && !dirWbFinal && zeroOwnerCandidates.orR
-    val commitIndex = Mux(dirWbFinal, dirWbReplCAMIndexNow, PriorityEncoder(zeroOwnerCandidates))
-    val commitSet = replCAM.get(commitIndex).set
+    val optionalCommitIndexOH = PriorityEncoderOH(zeroOwnerCandidates)
+    val optionalCommitSafe = (optionalCommitIndexOH & replCAMCommitSafeBits).orR
+
+    val finalCommitIndexOH = balancedOneHotMux(winDirWbOH, requestReplCAMSelOHVec.toSeq)
+    val finalCommitSet = balancedOneHotMux(
+      winDirWbOH,
+      io.toDir.toSeq.map(req => requestSet(req))
+    )
+    val finalCommitRepl = balancedOneHotMux(winDirWbOH, requestReplCAMReplVec.toSeq)
+    val finalCommitOrigin = if (useOriginSram) {
+      balancedOneHotMux(winDirWbOH, requestReplCAMOriginVec.toSeq)
+    } else {
+      0.U(ways.W)
+    }
+    val optionalCommitSet = balancedOneHotMux(
+      optionalCommitIndexOH,
+      VecInit(replCAM.get.map(_.set)).toSeq
+    )
+    val optionalCommitRepl = balancedOneHotMux(
+      optionalCommitIndexOH,
+      VecInit(replCAM.get.map(_.repl)).toSeq
+    )
+    val optionalCommitOrigin = if (useOriginSram) {
+      balancedOneHotMux(
+        optionalCommitIndexOH,
+        VecInit(replCAM.get.map(_.origin.get)).toSeq
+      )
+    } else {
+      0.U(ways.W)
+    }
+    val commitIndexOH = Mux(dirWbFinal, finalCommitIndexOH, optionalCommitIndexOH)
+    val commitSet = Mux(dirWbFinal, finalCommitSet, optionalCommitSet)
+    val commitRepl = Mux(dirWbFinal, finalCommitRepl, optionalCommitRepl)
+    val commitOrigin = Mux(dirWbFinal, finalCommitOrigin, optionalCommitOrigin)
 
     // A required final-owner commit takes priority over an unrelated zero-owner
     // candidate. Both use this one DirWb-window write site; an optional candidate
     // is simply skipped when its backing or pipeline hazards are not clear.
-    replCAMCommitFire := (dirWbFinal || optionalCommit) && commitSafe(commitIndex, commitSet)
+    replCAMCommitFire := dirWbFinal || (optionalCommit && optionalCommitSafe)
     when (dirWbFinal) {
       assert(replCAMCommitFire, "final-owner DirWb grant without its CAM commit")
     }
     assert(!(dirRelCommitFire && replCAMCommitFire),
       "DirRel commit overlapped a DirWb CAM commit")
     when (replCAMCommitFire) {
-      writeReplBacking(true.B, replCAM.get(commitIndex).repl, commitSet, Fill(ways, true.B))
+      writeReplBacking(true.B, commitRepl, commitSet, Fill(ways, true.B))
       if (useOriginSram) {
-        writeOriginBacking(true.B, replCAM.get(commitIndex).origin.get, commitSet, Fill(ways, true.B))
+        writeOriginBacking(true.B, commitOrigin, commitSet, Fill(ways, true.B))
       }
-      replCAM.get(commitIndex).valid := false.B
+      for (camIndex <- 0 until nMSHR) {
+        when (commitIndexOH(camIndex)) {
+          replCAM.get(camIndex).valid := false.B
+        }
+      }
     }
   }
 
