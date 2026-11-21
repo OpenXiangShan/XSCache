@@ -18,6 +18,57 @@ object L2DirectoryBlockRefillFaultMode {
 
 object L2Directory {
 
+  def roundRobinOneHot(last: UInt, mask: UInt, n: Int): UInt = {
+    require(n > 0)
+    require(last.getWidth == math.max(1, log2Ceil(n)) && mask.getWidth == n)
+    val w = math.max(1, log2Ceil(n))
+    val start = Mux(last === (n - 1).U, 0.U(w.W), last + 1.U)
+    val startOneHot = UIntToOH(start, n)
+    val beforeStart = ((1.U((n + 1).W) << start) - 1.U)(n - 1, 0)
+    val upper = Mux(last === (n - 1).U, 0.U(n.W), mask & ~beforeStart)
+    val firstUpper = upper & (~upper + 1.U)
+    val firstAny = mask & (~mask + 1.U)
+    Mux(upper.orR, firstUpper, Mux(mask.orR, firstAny, startOneHot))
+  }
+
+  def hierarchicalRoundRobinOneHot(last: UInt, mask: UInt, n: Int): UInt = {
+    require(n > 0)
+    val w = math.max(1, log2Ceil(n))
+    require(last.getWidth == w && mask.getWidth == n)
+    val groupCount = (n + 7) / 8
+    val groupW = math.max(1, log2Ceil(groupCount))
+    val lastPadded = last.pad(3 + groupW)
+    val lastGroup = if (groupCount == 1) 0.U(groupW.W) else lastPadded(3 + groupW - 1, 3)
+    val lastLane = lastPadded(2, 0)
+    val laneUpperMask = VecInit((0 until 8).map(i => i.U > lastLane)).asUInt
+    val groupMasks = (0 until groupCount).map { g =>
+      val groupWidth = math.min(8, n - g * 8)
+      val group = mask(g * 8 + groupWidth - 1, g * 8)
+      if (groupWidth == 8) group else Cat(0.U((8 - groupWidth).W), group)
+    }
+    val upperGroups = groupMasks.zipWithIndex.map { case (group, g) =>
+      Mux(g.U > lastGroup, group,
+        Mux(g.U === lastGroup, group & laneUpperMask, 0.U(8.W)))
+    }
+
+    def firstOne(groups: Seq[UInt]): UInt = {
+      val groupValid = VecInit(groups.map(_.orR)).asUInt
+      val groupOH = PriorityEncoderOH(groupValid)
+      val laneOH = groups.map(group => PriorityEncoderOH(group))
+      val selectedGroups = (0 until groupCount).map { g =>
+        laneOH(g) & Fill(8, groupOH(g))
+      }
+      Cat(selectedGroups.reverse)(n - 1, 0)
+    }
+
+    val upperFirst = firstOne(upperGroups)
+    val anyFirst = firstOne(groupMasks)
+    val start = Mux(last === (n - 1).U, 0.U(w.W), last + 1.U)
+    val startOneHot = UIntToOH(start, n)
+    Mux(upperGroups.map(_.orR).reduce(_ || _), upperFirst,
+      Mux(mask.orR, anyFirst, startOneHot))
+  }
+
   // Refill lock table entry: one slot per TSHR (indexed by TSHR ID), holding the
   // victim (set,way) picked by that TSHR's in-flight refill until its fill
   // commit lands. A TSHR holds at most one outstanding lock by construction
@@ -641,16 +692,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val rrDirWb  = RegInit(0.U(idxW.W))
   val rrDirRd  = RegInit(0.U(idxW.W))
 
-  def roundRobinOneHot(last: UInt, mask: UInt, n: Int): UInt = {
-    val w = log2Ceil(n)
-    val start = Mux(last === (n - 1).U, 0.U(w.W), last + 1.U)
-    val startOneHot = UIntToOH(start, n)
-    val beforeStart = ((1.U((n + 1).W) << start) - 1.U)(n - 1, 0)
-    val upper = Mux(last === (n - 1).U, 0.U(n.W), mask & ~beforeStart)
-    val firstUpper = upper & (~upper + 1.U)
-    val firstAny = mask & (~mask + 1.U)
-    Mux(upper.orR, firstUpper, Mux(mask.orR, firstAny, startOneHot))
-  }
+  import L2Directory.{hierarchicalRoundRobinOneHot, roundRobinOneHot}
 
   def oneHotToIndex(oneHot: UInt, n: Int): UInt = {
     val w = log2Ceil(n)
@@ -748,7 +790,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val dirRelWinOH = WireDefault(0.U(nMSHR.W))
   val dirRelPath = if (useRRIPRelease) {
     val rrRel  = RegInit(0.U(idxW.W))
-    val winRelOH = roundRobinOneHot(rrRel, relVec.asUInt, nMSHR)
+    val winRelOH = hierarchicalRoundRobinOneHot(rrRel, relVec.asUInt, nMSHR)
     val winRel = oneHotToIndex(winRelOH, nMSHR)
     dirRelWinOH := winRelOH
     when(dirRelGrant) { rrRel := winRel }
