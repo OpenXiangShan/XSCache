@@ -785,6 +785,10 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
     io.toDir.toSeq.map(req => requestSet(req))
   )
   val reqTag = winReq.PADDR(paramL2.physicalAddrWidth - 1, offsetBits + setBits)
+  val dirWbTag = balancedOneHotMux(
+    winDirWbOH,
+    io.toDir.toSeq.map(req => req.PADDR(paramL2.physicalAddrWidth - 1, offsetBits + setBits))
+  )
 
   // Only a ReplRd CAM miss allocates an entry. S1 establishes valid/set and a
   // zero ownerCount; the allocating request still takes the backing read at S2
@@ -1008,7 +1012,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   // DirWb: tag and bitmask partial meta writes at S1
   // ══════════════════════════════════════════════════════════════════
   val wbEntry = Wire(new L2Directory.DirEntry)
-  wbEntry.tag  := reqTag
+  wbEntry.tag  := dirWbTag
   wbEntry.meta := winReq.META
 
   val wbMetaMask = Wire(new L2Directory.Meta)
@@ -1036,7 +1040,7 @@ class Directory(implicit val p: Parameters) extends Module with HasL2Params {
   val tagWriteValidLaunch_s1 = RegNext(tagWriteValid, false.B)
   val metaWriteValidLaunch_s1 = RegNext(metaWriteValid, false.B)
   val tagWriteDataLaunch_s1 = RegInit(0.U(tagWidth.W))
-  tagWriteDataLaunch_s1 := dirWriteEntry.tag
+  tagWriteDataLaunch_s1 := Mux(initActive, initEntry.tag, dirWbTag)
   val metaWriteDataLaunch_s1 = RegInit(0.U.asTypeOf(new L2Directory.Meta))
   metaWriteDataLaunch_s1 := dirWriteEntry.meta
   val dirWriteSetLaunch_s1 = RegInit(0.U(setBits.W))
