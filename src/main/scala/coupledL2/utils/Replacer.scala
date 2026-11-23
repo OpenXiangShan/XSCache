@@ -129,6 +129,25 @@ class TrueLRU(n_ways: Int) extends ReplacementPolicy {
     nextState.zipWithIndex.tail.foldLeft((nextState.head.apply(n_ways-1,1),0)) { case ((pe,pi),(ce,ci)) => (Cat(ce.apply(n_ways-1,ci+1), pe), ci) }._1
   }
 
+  // Insert the touched way at a one-based position from LRU. Preserve
+  // the relative recency of all other ways.
+  def get_insert_state(state: UInt, touchWay: UInt, position: UInt): UInt = {
+    val recent = extractMRUVec(state)
+    val olderCount = position - 1.U
+    val ranks = (0 until n_ways).map { way =>
+      PopCount((0 until n_ways).filter(_ != way).map { other =>
+        val otherIsOlder = if (other < way) recent(other)(way) else !recent(way)(other)
+        otherIsOlder && touchWay =/= other.U
+      })
+    }
+    val olderThanInsert = ranks.map(_ < olderCount)
+    val next = for (i <- 0 until n_ways - 1; j <- i + 1 until n_ways) yield {
+      Mux(touchWay === i.U, !olderThanInsert(j),
+        Mux(touchWay === j.U, olderThanInsert(i), recent(i)(j)))
+    }
+    VecInit(next).asUInt
+  }
+
   def access(touch_way: UInt): Unit = {
     state_reg := get_next_state(state_reg, touch_way)
   }

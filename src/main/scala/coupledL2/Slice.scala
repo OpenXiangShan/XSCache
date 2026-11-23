@@ -54,6 +54,12 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
 
   /* Data path and control path */
   val directory = Module(new Directory())
+  directory.io.fdpInsertPosition.zip(io.fdpInsertPosition).foreach { case (dirPosition, position) =>
+    dirPosition := position
+  }
+  io.fdpEvents.zip(directory.io.fdpEvents).foreach { case (events, dirEvents) =>
+    events := dirEvents
+  }
   val dataStorage = Module(new DataStorage())
   val refillBuf = Module(new MSHRBuffer(wPorts = 2))
   val releaseBuf = Module(new MSHRBuffer(wPorts = 3))

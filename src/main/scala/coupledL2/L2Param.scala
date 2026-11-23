@@ -104,6 +104,8 @@ case class L2Param(
   hartId: Int = 0,
   // Prefetch
   prefetch: Seq[PrefetchParameters] = Nil,
+  enablePrefetchFeedback: Boolean = false,
+  enableFdpInsertion: Boolean = false,
   // L2 Flush
   enableL2Flush: Boolean = false,
   // AsyncBridge
@@ -153,6 +155,8 @@ case class L2Param(
   // both EnablePrivateClint and PrivateClintRange are from soc parameters.
   PrivateClintRange: Option[AddressSet] = None
 ) {
+  require(!enableFdpInsertion || replacement == "lru", "FDP insertion requires true LRU")
+
   def toCacheParams: CacheParameters = CacheParameters(
     name = name,
     sets = sets,

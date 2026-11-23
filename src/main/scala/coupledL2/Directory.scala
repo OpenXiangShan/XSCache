@@ -130,6 +130,12 @@ class PrefetchDbEntry(implicit p: Parameters) extends L2Bundle {
 }
 
 
+class FdpInsertionEvents extends Bundle {
+  val usefulEviction = Bool()
+  val demandMiss = Bool()
+  val pollutionMiss = Bool()
+}
+
 class Directory(implicit p: Parameters) extends L2Module {
 
   val io = IO(new Bundle() {
@@ -146,6 +152,8 @@ class Directory(implicit p: Parameters) extends L2Module {
     val replWayOH = Output(UInt(cacheParams.ways.W))
     val cmoHitInvalid = Output(Bool())
     val retryFastFwd = Output(Bool())
+    val fdpInsertPosition = Option.when(cacheParams.enableFdpInsertion)(Input(UInt(wayBits.W)))
+    val fdpEvents = Option.when(cacheParams.enableFdpInsertion)(Output(new FdpInsertionEvents))
   })
 
   def invalid_way_sel(metaVec: Seq[MetaEntry]) = {
@@ -420,6 +428,36 @@ class Directory(implicit p: Parameters) extends L2Module {
     (req_s3.replacerInfo.opcode === AcquirePerm || req_s3.replacerInfo.opcode === AcquireBlock)
   }
   val updateRefill = refillReqValid_s3 && !refillRetry
+  val prefetchFill = updateRefill && !hit_s3 && replacerInfo_s3.refill_prefetch
+
+  io.fdpEvents.foreach { events =>
+    // Divide the paper's 4096-bit filter across the L2 slices.
+    val hashBits = 12 - bankBits
+    require(hashBits > 0)
+    def filterIndex(tag: UInt): UInt = {
+      val localBlock = Cat(tag, set_s3).pad(2 * hashBits)
+      localBlock(hashBits - 1, 0) ^ localBlock(2 * hashBits - 1, hashBits)
+    }
+
+    val filterSize = 1 << hashBits
+    val filter = RegInit(0.U(filterSize.W))
+    val victim = io.replResp.bits.meta
+    val evicted = updateRefill && !hit_s3 && victim.state =/= MetaData.INVALID
+    val victimWasPrefetched = victim.prefetchSrc.map(_ =/= PfSource.NoWhere.id.U)
+      .getOrElse(victim.prefetch.getOrElse(false.B))
+    val evictedDemand = evicted && !victimWasPrefetched
+    val requested = filterIndex(req_s3.tag)
+    val remember = Mux(prefetchFill && evictedDemand,
+      UIntToOH(filterIndex(io.replResp.bits.tag), filterSize), 0.U)
+    val clear = Mux(prefetchFill, UIntToOH(requested, filterSize), 0.U)
+    filter := (filter | remember) & ~clear
+
+    events.usefulEviction := evicted && (!victimWasPrefetched || victim.accessed)
+    val demandMiss = reqValid_s3 && !refillReqValid_s3 && !hit_s3 &&
+      replacerInfo_s3.channel(0) && MemReqSource.isCPUReq(replacerInfo_s3.reqSource)
+    events.demandMiss := demandMiss
+    events.pollutionMiss := demandMiss && filter(requested)
+  }
   // update replacer when A/C hit or refill
   replacerWen := updateHit || updateRefill
 
@@ -488,6 +526,15 @@ class Directory(implicit p: Parameters) extends L2Module {
     val repl_init = Wire(Vec(ways, UInt(2.W)))
     repl_init.foreach(_ := 2.U(2.W))
     replacer_sram_opt.get.io.w(replacerWen, next_state_s3, set_s3, 1.U)
+  } else if (cacheParams.enableFdpInsertion) {
+    val lru = repl.asInstanceOf[TrueLRU]
+    val nextState = Mux(prefetchFill,
+      lru.get_insert_state(repl_state_s3, way_s3, io.fdpInsertPosition.get),
+      lru.get_next_state(repl_state_s3, way_s3))
+    replacer_sram_opt.get.io.w(replacerWen, nextState, set_s3, 1.U)
+    Seq(1, (ways / 4).max(1), (ways / 2).max(1)).distinct.foreach { position =>
+      XSPerfAccumulate(s"fdp_prefetch_insert_position_$position", prefetchFill && io.fdpInsertPosition.get === position.U)
+    }
   } else {
     val next_state_s3 = repl.get_next_state(repl_state_s3, way_s3)
     replacer_sram_opt.get.io.w(replacerWen, next_state_s3, set_s3, 1.U)

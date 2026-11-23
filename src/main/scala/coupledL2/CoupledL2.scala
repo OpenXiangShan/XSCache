@@ -981,6 +981,42 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
         hintFire(ch) := hintFireVec(ch)
       }
     }
+    if (cacheParams.enableFdpInsertion) {
+      val events = slices.map(_.io.fdpEvents.get)
+      val intervalEvictions = cacheParams.sets * cacheParams.ways * banks / 2
+      val evictions = RegInit(0.U(log2Ceil(intervalEvictions).W))
+      val misses = RegInit(0.U(40.W))
+      val polluted = RegInit(0.U(40.W))
+      val previousMisses = RegInit(0.U(48.W))
+      val previousPolluted = RegInit(0.U(48.W))
+      val midPosition = (cacheParams.ways / 2).max(1)
+      val quarterPosition = (cacheParams.ways / 4).max(1)
+      val position = RegInit(midPosition.U(wayBits.W))
+      val nextEvictions = evictions +& PopCount(events.map(_.usefulEviction))
+      val nextMisses = misses + PopCount(events.map(_.demandMiss))
+      val nextPolluted = polluted + PopCount(events.map(_.pollutionMiss))
+      // Eight fractional bits preserve small counts across the half-weight update.
+      val averageMisses = (previousMisses +& (nextMisses << 8)) >> 1
+      val averagePolluted = (previousPolluted +& (nextPolluted << 8)) >> 1
+      val intervalEnd = nextEvictions >= intervalEvictions.U
+
+      evictions := Mux(intervalEnd, 0.U, nextEvictions)
+      misses := Mux(intervalEnd, 0.U, nextMisses)
+      polluted := Mux(intervalEnd, 0.U, nextPolluted)
+      when(intervalEnd) {
+        previousMisses := averageMisses
+        previousPolluted := averagePolluted
+        // Pollution thresholds are 25% and 0.5%. Compare without division.
+        when(averageMisses =/= 0.U) {
+          position := Mux((averagePolluted << 2) > averageMisses, 1.U,
+            Mux(averagePolluted * 200.U > averageMisses, quarterPosition.U, midPosition.U))
+        }
+      }
+      slices.foreach(_.io.fdpInsertPosition.get := position)
+      XSPerfAccumulate("fdp_insertion_samples", intervalEnd)
+      XSPerfAccumulate("fdp_insertion_pollution_misses", PopCount(events.map(_.pollutionMiss)))
+    }
+
     // ==================== Prefetch replenish (after slice initilize)===================
     prefetcher.foreach{ p =>
       for ((f, s) <- p.pfFeedbackVec zip slices) {
