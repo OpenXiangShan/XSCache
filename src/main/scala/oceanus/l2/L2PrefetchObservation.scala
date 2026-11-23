@@ -19,7 +19,10 @@ case class L2ObservationArrival(fire: Bool, request: FlitREQ, reqSource: UInt,
 
 // Physical source buffers can contain several two-entry stages. These are
 // Scala observation handles only; no functional Bundle acquires new fields.
-case class L2ObservationFifo(enqueue: Bool, address: UInt, dequeue: Bool, source: Int, stages: Int = 1)
+// sourceBlocked is producer valid && !ready BEFORE the entire stage chain;
+// address remains that producer's current address, even without an enqueue.
+case class L2ObservationFifo(enqueue: Bool, address: UInt, dequeue: Bool, source: Int,
+  sourceBlocked: Bool, stages: Int = 1)
 
 object L2PrefetchObservation {
   val latencyBins = Seq(10, 11, 12, 14, 16, 20, 32, 64, 128, 192, 256, 512)
@@ -758,6 +761,24 @@ object L2PrefetchObservation {
         val secondReady = MuxLookup(second, false.B)(l2.config.slices.zip(accepts).map { case (n, r) => n.U -> r })
         c.event(s"M9_source${fifo.source}_collateral", counts(last) === 2.U && !read(fifo.dequeue) &&
           target(firstAddr) =/= second && secondReady)
+        // Intent (zy-pf-obs): same physical final-stage scope as M9, including
+        // a single valid head. This denominator counts source-cycles, not REQs.
+        c.event(s"M9_source${fifo.source}_head_block", counts(last) =/= 0.U && !read(fifo.dequeue))
+        // Observe the producer BEFORE the entire source buffer, not merely an
+        // inter-stage enqueue. I-cache can still accept upstream while its
+        // final stage is full. Compare complete physical line addresses.
+        val pendingAddr = read(fifo.address)
+        val samePaBackpressure = counts(last) === 2.U &&
+          (firstAddr >> 6) === (secondAddr >> 6) && read(fifo.sourceBlocked)
+        val pendingTarget = target(pendingAddr)
+        val pendingAccepts = l2.slices.map(slice => canAccept(slice, pendingAddr))
+        val pendingReady = MuxLookup(pendingTarget, false.B)(
+          l2.config.slices.zip(pendingAccepts).map { case (n, r) => n.U -> r })
+        c.event(s"M9b_source${fifo.source}_same_pa_backpressure", samePaBackpressure)
+        c.event(s"M9b_source${fifo.source}_third_same_pa", samePaBackpressure &&
+          (pendingAddr >> 6) === (firstAddr >> 6))
+        c.event(s"M9b_source${fifo.source}_different_slice_ready", samePaBackpressure &&
+          pendingTarget =/= target(firstAddr) && pendingReady)
       }
       // Intent (zy-pf-obs): resolve same-index writes explicitly. Independent
       // indices all update; a later slice/TSHR wins a direct-map collision.

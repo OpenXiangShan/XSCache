@@ -37,7 +37,8 @@ class PrefetchLifecycleTop(cfg: L2Configuration)(implicit p: Parameters) extends
     L2PrefetchObservation(module, io.t1p.zipWithIndex.map { case (port, i) =>
       L2ObservationArrival(port.UpREQ.fire, port.UpREQ.bits, io.pfTrain.get(i).reqSource)
     }, io.t1p.zipWithIndex.map { case (port, i) =>
-      L2ObservationFifo(port.UpREQ.fire, port.UpREQ.bits.Addr, queues(i).io.deq.fire, cfg.upstream.type1(i).nid)
+      L2ObservationFifo(port.UpREQ.fire, port.UpREQ.bits.Addr, queues(i).io.deq.fire, cfg.upstream.type1(i).nid,
+        port.UpREQ.valid && !port.UpREQ.ready)
     })
   }
 }

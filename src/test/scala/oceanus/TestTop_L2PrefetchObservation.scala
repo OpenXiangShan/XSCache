@@ -49,7 +49,7 @@ object TestTop_L2PrefetchObservation extends App {
     if (attach) L2PrefetchObservation(cache, arrival.zip(arrivalSource).map { case (a, src) =>
       L2ObservationArrival(a.valid, a.bits, src)
     }, arrival.zipWithIndex.map { case (a, lane) =>
-      L2ObservationFifo(a.valid, a.bits.Addr, io.t1p(lane).UpREQ.fire, upstream.type1(lane).nid)
+      L2ObservationFifo(a.valid, a.bits.Addr, io.t1p(lane).UpREQ.fire, upstream.type1(lane).nid, false.B)
     })
     XSLog.collect(GTimer(), true.B, clean, dump)
   }
