@@ -32,6 +32,7 @@ class ReplacerInfo(implicit p: Parameters) extends L2Bundle {
   val opcode = UInt(3.W)
   val reqSource = UInt(MemReqSource.reqSourceBits.W)
   val refill_prefetch = Bool()
+  val releaseToN = Option.when(cacheParams.enableDuelCeptron)(Bool())
 }
 
 trait HasTLChannelBits { this: Bundle =>
@@ -65,6 +66,7 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   val alias = aliasBitsOpt.map(_ => UInt(aliasBitsOpt.get.W)) // color bits in cache-alias issue
   val vaddr = vaddrBitsOpt.map(_ => UInt(vaddrBitsOpt.get.W)) // vaddr passed by client cache
   val pc = pcBitOpt.map(_ => UInt(pcBitOpt.get.W))    // PC (Program Counter) passed by client cache
+  val duelCeptron = Option.when(cacheParams.enableDuelCeptron)(Valid(new DuelCeptronContext))
   // from L1 load miss require 
   val isKeyword = isKeywordBitsOpt.map(_ => Bool())
   val opcode = UInt(4.W)                  // type of the task operation

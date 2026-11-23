@@ -312,6 +312,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.toMSHRCtl.mshr_alloc_s3.bits.state := alloc_state
   io.toMSHRCtl.mshr_alloc_s3.bits.task match { case task =>
     task := req_s3
+    task.duelCeptron.foreach(_ := dirResult_s3.duelCeptron.get)
     task.bufIdx := 0.U(bufIdxBits.W)
     task.mshrTask := false.B
     task.aliasTask.foreach(_ := cache_alias)

@@ -726,6 +726,7 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   }
   val mp_grant_task = {
     mp_grant.channel := req.channel
+    mp_grant.duelCeptron.foreach(_ := req.duelCeptron.get)
     mp_grant.tag := req.tag
     mp_grant.set := req.set
     mp_grant.off := req.off

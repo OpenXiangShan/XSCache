@@ -34,6 +34,8 @@ class SinkA(implicit p: Parameters) extends L2Module {
     val task = DecoupledIO(new TaskBundle)
     val cmoAll = Option.when(cacheParams.enableL2Flush) (new IOCMOAll)
   })
+  require(!cacheParams.enableDuelCeptron || io.a.bits.user.lift(PCKey).nonEmpty,
+    "DuelCeptron requires a negotiated load PC field")
   assert(!(io.a.valid && (io.a.bits.opcode === PutFullData ||
                           io.a.bits.opcode === PutPartialData)),
     "no Put");

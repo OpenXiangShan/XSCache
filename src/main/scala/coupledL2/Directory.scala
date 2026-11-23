@@ -78,6 +78,8 @@ class DirRead(implicit p: Parameters) extends L2Bundle {
   // dirResult.way must only be in the wayMask
   val wayMask = UInt(cacheParams.ways.W)
   val replacerInfo = new ReplacerInfo()
+  val duelCeptronPC = Option.when(cacheParams.enableDuelCeptron)(UInt(pcBitOpt.get.W))
+  val duelCeptron = Option.when(cacheParams.enableDuelCeptron)(Valid(new DuelCeptronContext))
   // dirRead when refill
   val refill = Bool()
   val mshrId = UInt(mshrBits.W)
@@ -94,6 +96,7 @@ class DirResult(implicit p: Parameters) extends L2Bundle {
   val meta = new MetaEntry()
   val error = Bool()
   val replacerInfo = new ReplacerInfo() // for TopDown usage
+  val duelCeptron = Option.when(cacheParams.enableDuelCeptron)(Valid(new DuelCeptronContext))
 }
 
 class ReplacerResult(implicit p: Parameters) extends L2Bundle {
@@ -424,10 +427,12 @@ class Directory(implicit p: Parameters) extends L2Module {
   replacerWen := updateHit || updateRefill
 
   // hit-Promotion, miss-Insertion for RRIP
-  // origin-bit marks whether the data_block is reused
+  // With DuelCeptron, 00 is first use without a hint, 01/10 carry SRRIP/BRRIP, and 11 is reuse.
+  private val enableDuelCeptron = cacheParams.enableDuelCeptron
+  private val originWidth = if (enableDuelCeptron) 2 else 1
   val origin_bit_opt = if(random_repl) None else
     Some(Module(new SplittedSRAM(
-      gen = Bool(),
+      gen = UInt(originWidth.W),
       set = sets,
       way = ways,
       setSplit = setBankCount,
@@ -438,15 +443,24 @@ class Directory(implicit p: Parameters) extends L2Module {
       hasSramCtl = hasSramCtl
     )))
   val origin_bits_r = origin_bit_opt.get.io.r(io.read.fire, io.read.bits.set).resp.data
-  val origin_bits_hold = Wire(Vec(ways, Bool()))
-  origin_bits_hold := RegEnable(origin_bits_r, reqValid_s2)
-  origin_bit_opt.get.io.w(replacerWen, hit_s3, set_s3, wayOH_s3)
+  val origin_bits_hold = RegEnable(origin_bits_r, reqValid_s2)
+  val originOnHit = Mux1H(hitOH, origin_bits_hold)
+  val originReused = if (enableDuelCeptron) originOnHit === 3.U else originOnHit.asBool
+  val originWriteData = WireDefault(if (enableDuelCeptron) Fill(2, hit_s3) else hit_s3.asUInt)
+  val originTagInstall = if (enableDuelCeptron) tagWen else false.B
+  val originUpdate = if (enableDuelCeptron) replacerWen && !(refillReqValid_s3 && refillRetry) else replacerWen
+  origin_bit_opt.get.io.w(
+    originUpdate || originTagInstall,
+    originWriteData,
+    Mux(originTagInstall, io.tagWReq.bits.set, set_s3),
+    Mux(originTagInstall, io.tagWReq.bits.wayOH, wayOH_s3)
+  )
   val rrip_req_type = WireInit(0.U(4.W))
   // [3]: 0-firstuse, 1-reuse;
   // [2]: 0-acquire, 1-release;
   // [1]: 0-non-prefetch, 1-prefetch;
   // [0]: 0-not-refill, 1-refill
-  rrip_req_type := Cat(Mux1H(hitOH, origin_bits_hold),
+  rrip_req_type := Cat(originReused,
     req_s3.replacerInfo.channel(2),
     (!refillReqValid_s3 && req_s3.replacerInfo.channel(0) && req_s3.replacerInfo.opcode === Hint) ||
       (req_s3.replacerInfo.channel(2) && Mux1H(wayOH_s3, metaAll_s3).prefetch.getOrElse(false.B)) ||
@@ -478,10 +492,68 @@ class Directory(implicit p: Parameters) extends L2Module {
     /* if set -> SDMs: use fix policy
        else if PSEL(MSB)==0: use srrip
        else if PSEL(MSB)==1: use brrip */
-    val repl_type = WireInit(false.B)
-    repl_type := Mux(match_a, false.B,
-                    Mux(match_b, true.B,
-                      Mux(PSEL(9)===0.U, false.B, true.B)))    // false.B - srrip, true.B - brrip
+    val followerBrrip = if (enableDuelCeptron) {
+      val predictor = Module(new DuelCeptron(pcBitOpt.get, fullAddressBits - 12))
+      val requestInfo = req_s1.replacerInfo
+      predictor.io.demand := io.read.fire && !req_s1.refill && requestInfo.channel(0) &&
+        requestInfo.reqSource === MemReqSource.CPULoadData.id.U &&
+        (requestInfo.opcode === AcquireBlock || requestInfo.opcode === Get)
+      predictor.io.acquire := requestInfo.opcode === AcquireBlock
+      predictor.io.pc := req_s1.duelCeptronPC.get
+      val lineAddress = Cat(req_s1.tag, req_s1.set, 0.U(offsetBits.W))
+      predictor.io.page := restoreAddressUInt(lineAddress, p(SliceIdKey).U(bankBits.max(1).W)) >> 12
+      io.resp.bits.duelCeptron.get := predictor.io.prediction
+
+      val refillCommitted = updateRefill && !hit_s3 && tagWen && metaWen &&
+        io.tagWReq.bits.set === set_s3 && io.metaWReq.bits.set === set_s3 &&
+        io.tagWReq.bits.wayOH === finalReplOH && io.metaWReq.bits.wayOH === finalReplOH &&
+        io.tagWReq.bits.wtag === req_s3.tag && io.metaWReq.bits.wmeta.state =/= MetaData.INVALID
+      val refillContext = req_s3.duelCeptron.get
+      val installContext = refillCommitted && refillContext.valid && !replacerInfo_s3.refill_prefetch &&
+        io.metaWReq.bits.wmeta.clients.orR
+      val leader = match_a || match_b
+      when (tagWen) {
+        originWriteData := Mux(installContext && !leader, Mux(refillContext.bits.predictBrrip, 2.U, 1.U), 0.U)
+      }
+
+      // Enumerate the same leader sets as the existing match_a/match_b comparators.
+      val lowMask = (1 << (setBits - half_setBits)) - 1
+      val leaderSets = (0 until sets).filter { set =>
+        val high = set >> half_setBits
+        val low = set & lowMask
+        high == low || high == (low ^ lowMask)
+      }
+      val wib = RegInit(VecInit(leaderSets.map { _ =>
+        VecInit(Seq.fill(ways)(0.U.asTypeOf(Valid(new DuelCeptronIndices))))
+      }))
+      val invalidate = metaWen && io.metaWReq.bits.wmeta.state === MetaData.INVALID
+      val wibSet = Mux(tagWen, io.tagWReq.bits.set, io.metaWReq.bits.set)
+      val wibWayOH = Mux(tagWen, io.tagWReq.bits.wayOH, io.metaWReq.bits.wayOH)
+      val wibSetMatches = VecInit(leaderSets.map(set => wibSet === set.U))
+      val wibRow = OHToUInt(wibSetMatches)
+      val wibWrite = (tagWen || invalidate) && wibSetMatches.asUInt.orR
+      val victimIndices = Mux1H(finalReplOH, wib(wibRow))
+      predictor.io.train.valid := refillCommitted && leader && victimIndices.valid &&
+        io.replResp.bits.meta.state =/= MetaData.INVALID
+      predictor.io.train.bits := victimIndices.bits
+      predictor.io.trainBrripLeader := match_b
+      for (way <- 0 until ways) {
+        when (wibWrite && wibWayOH(way)) {
+          wib(wibRow)(way).valid := installContext
+          when (installContext) {
+            wib(wibRow)(way).bits := refillContext.bits.indices
+          }
+        }
+      }
+
+      val releaseWithHint = updateHit && hitOH.orR && metaOnHit_s3.clients.orR &&
+        replacerInfo_s3.releaseToN.get && rrip_req_type === 4.U &&
+        (originOnHit === 1.U || originOnHit === 2.U)
+      Mux(releaseWithHint, originOnHit === 2.U, PSEL(9))
+    } else {
+      PSEL(9)
+    }
+    val repl_type = Mux(match_a, false.B, Mux(match_b, true.B, followerBrrip)) // false = SRRIP
 
     val next_state_s3 = repl.get_next_state(repl_state_s3, wayOH_s3, hit_s3, inv, repl_type, rrip_req_type)
 

@@ -10,7 +10,7 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tile.MaxHartIdBits
 import freechips.rocketchip.tilelink._
 import org.chipsalliance.cde.config._
-import xscache.coupledL2.{CoupledL2, EdgeInKey, L1Param, L2Param, L2ParamKey, L2ToL1Hint}
+import xscache.coupledL2.{CoupledL2, EdgeInKey, L1Param, L2Param, L2ParamKey, L2ToL1Hint, PCField}
 import cc.xiangshan.openncb._
 import cc.xiangshan.openncb.chi._
 import utility._
@@ -91,7 +91,8 @@ class TestTopOpenLLC(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, is
         channelBytes = TLChannelBeatBytes(l2Params.blockBytes),
         minLatency = 1,
         echoFields = Nil,
-        requestFields = Seq(AliasField(2)),
+        requestFields = Seq(AliasField(2)) ++ l2Params.clientCaches.head.pcBitOpt.map(PCField(_)) ++
+          (if (l2Params.enableDuelCeptron) Seq(ReqSourceField()) else Nil),
         responseKeys = l2Params.respKey
       )
     ))
@@ -241,11 +242,15 @@ class TestTopOpenLLC(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, is
 
     val l3 = Module(new OpenLLC()(new Config((site, here, up) => {
       case CHIIssue => issue
-      case OpenLLCParamKey => l3Params.copy(
-        clientCaches    = Seq.fill(numCores)(l2Params.copy(ways = 2, sets = 2)),
-        fullAddressBits = ADDR_WIDTH,
-        hartIds         = 0 until numCores
-      )
+      case OpenLLCParamKey =>
+        // Leave room for the L2 to fill its leader sets and select victims.
+        val snoopFilterClient = if (l2Params.enableDuelCeptron) l2Params.copy(ways = l2Params.ways * 2)
+          else l2Params.copy(ways = 2, sets = 2)
+        l3Params.copy(
+          clientCaches = Seq.fill(numCores)(snoopFilterClient),
+          fullAddressBits = ADDR_WIDTH,
+          hartIds = 0 until numCores
+        )
       case LogUtilsOptionsKey => LogUtilsOptions(
         false,
         here(OpenLLCParamKey).enablePerf,
@@ -342,6 +347,7 @@ class TestTopOpenLLC(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, is
 
 object TestTopOpenLLCHelper {
   def gen(fTop: Parameters => TestTopOpenLLC)(args: Array[String]) = {
+    val enableDuelCeptron = args.contains("--duelceptron")
     val FPGAPlatform    = false
     val enableChiselDB  = !FPGAPlatform && true
     val enableCHILog    = !FPGAPlatform && true
@@ -351,13 +357,14 @@ object TestTopOpenLLCHelper {
       case L2ParamKey => L2Param(
         ways                = 4,
         sets                = 128,
-        clientCaches        = Seq(L1Param(aliasBitsOpt = Some(2))),
+        clientCaches        = Seq(L1Param(aliasBitsOpt = Some(2), pcBitOpt = Option.when(enableDuelCeptron)(48))),
         // echoField        = Seq(DirtyField),
         enablePerf          = enablePerf,
         enableRollingDB     = enableChiselDB,
         enableMonitor       = enableChiselDB,
         enableTLLog         = enableChiselDB,
         enableCHILog        = enableCHILog,
+        enableDuelCeptron   = enableDuelCeptron,
         elaboratedTopDown   = enablePerf,
         FPGAPlatform        = FPGAPlatform,
 
@@ -385,7 +392,7 @@ object TestTopOpenLLCHelper {
 
     val top = DisableMonitors(p => LazyModule(fTop(p)))(config)
 
-    (new ChiselStage).execute(args, Seq(
+    (new ChiselStage).execute(args.filterNot(_ == "--duelceptron"), Seq(
       ChiselGeneratorAnnotation(() => top.module),
       FirtoolOption("--disable-annotation-unknown"),
       FirtoolOption("--default-layer-specialization=enable")

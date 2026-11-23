@@ -151,8 +151,13 @@ case class L2Param(
   hasSramCtl: Boolean = false,
 
   // both EnablePrivateClint and PrivateClintRange are from soc parameters.
-  PrivateClintRange: Option[AddressSet] = None
+  PrivateClintRange: Option[AddressSet] = None,
+  enableDuelCeptron: Boolean = false
 ) {
+  require(!enableDuelCeptron || replacement == "drrip", "DuelCeptron requires DRRIP")
+  require(!enableDuelCeptron || clientCaches.headOption.exists(_.pcBitOpt.exists(_ > 12)),
+    "DuelCeptron requires the load PC field")
+
   def toCacheParams: CacheParameters = CacheParameters(
     name = name,
     sets = sets,
