@@ -491,6 +491,7 @@ class Directory(implicit p: Parameters) extends L2Module {
 
   /* ======!! Replacement logic !!====== */
   /* ====== Read, choose replaceWay ====== */
+  val repl_state_s2 = WireInit(0.U(repl.nBits.W))
   val (repl_state_s3, replaceOH_s3) = if(random_repl) {
     when(io.tagWReq.fire){
       repl.miss
@@ -498,6 +499,7 @@ class Directory(implicit p: Parameters) extends L2Module {
     (0.U(repl.nBits.W), UIntToOH(repl.get_replace_way(0.U(repl.nBits.W)), ways))
   } else {
     val repl_sram_r = replacer_sram_opt.get.io.r(io.read.fire, io.read.bits.set).resp.data(0)
+    repl_state_s2 := repl_sram_r
     (RegEnable(repl_sram_r, 0.U(repl.nBits.W), reqValid_s2),
      RegEnable(repl.get_replace_OH(repl_sram_r), 0.U(ways.W), reqValid_s2))
   }
@@ -545,8 +547,6 @@ class Directory(implicit p: Parameters) extends L2Module {
     (req_s3.replacerInfo.opcode === AcquirePerm || req_s3.replacerInfo.opcode === AcquireBlock)
   }
   val updateRefill = refillReqValid_s3 && !refillRetry
-  // update replacer when A/C hit or refill
-  replacerWen := updateHit || updateRefill
 
   XSPerfAccumulate("dir_wen_replacer_updateHit_cnt", updateHit)
   XSPerfAccumulate("dir_wen_replacer_updateRefill_cnt", updateRefill)
@@ -568,6 +568,33 @@ class Directory(implicit p: Parameters) extends L2Module {
   val origin_bits_r = origin_bit_opt.get.io.r(io.read.fire, io.read.bits.set).resp.data
   val origin_bits_hold = Wire(Vec(ways, Bool()))
   origin_bits_hold := RegEnable(origin_bits_r, reqValid_s2)
+
+  val skipAHitReplacerWrite = if (cacheParams.replacement == "drrip" || cacheParams.replacement == "srrip") {
+    // A non-refill hit only promotes its own way: Acquire sets RRPV to zero,
+    // while Hint leaves RRPV unchanged. Both set that way's origin bit to one.
+    // Compare each SRAM way in S2, before the actual hit way is known, so no
+    // RRPV state computation or equality feeds the live read.ready path.
+    val aHitUnchanged_s2 = VecInit((0 until ways).map { w =>
+      origin_bits_r(w) && (req_s2.replacerInfo.opcode === Hint ||
+        repl_state_s2(2 * w + 1, 2 * w) === 0.U)
+    })
+    val aHitUnchanged_s3 = RegEnable(aHitUnchanged_s2,
+      0.U.asTypeOf(aHitUnchanged_s2), reqValid_s2)
+    // The preceding S3 write occurs after this request's SRAM read. Its
+    // whole-set RRPV snapshot may differ even when the hit way is unchanged;
+    // preserve the original write in that adjacent same-set window.
+    val priorSameSetWrite_s3 = RegEnable(replacerWen && set_s3 === req_s2.set,
+      false.B, reqValid_s2)
+    val unchangedAHit = updateHit && req_s3.replacerInfo.channel(0) &&
+      !req_s3.refill && !req_s3.cmoAll && Mux1H(hitOH, aHitUnchanged_s3)
+    XSPerfAccumulate("dir_wen_replacer_sameSetKeep_cnt", unchangedAHit && priorSameSetWrite_s3)
+    unchangedAHit && !priorSameSetWrite_s3
+  } else {
+    false.B
+  }
+  replacerWen := updateRefill || (updateHit && !skipAHitReplacerWrite)
+  XSPerfAccumulate("dir_wen_replacer_skipAHit_cnt", skipAHitReplacerWrite)
+
   origin_bit_opt.get.io.w(replacerWen, hit_s3, set_s3, wayOH_s3)
   val rrip_req_type = WireInit(0.U(4.W))
   // [3]: 0-firstuse, 1-reuse;
@@ -584,6 +611,10 @@ class Directory(implicit p: Parameters) extends L2Module {
   private val mbistPl = MbistPipeline.PlaceMbistPipeline(1, "L2Directory", mbist)
   if(cacheParams.replacement == "srrip"){
     val next_state_s3 = repl.get_next_state(repl_state_s3, wayOH_s3, hit_s3, inv, rrip_req_type)
+    when(skipAHitReplacerWrite) {
+      assert(next_state_s3 === repl_state_s3 && Mux1H(wayOH_s3, origin_bits_hold),
+        "a skipped RRIP hit must preserve RRPV and origin state")
+    }
     val repl_init = Wire(Vec(ways, UInt(2.W)))
     repl_init.foreach(_ := 2.U(2.W))
     replacer_sram_opt.get.io.w(replacerWen, next_state_s3, set_s3, 1.U)
@@ -612,6 +643,10 @@ class Directory(implicit p: Parameters) extends L2Module {
                       Mux(PSEL(9)===0.U, false.B, true.B)))    // false.B - srrip, true.B - brrip
 
     val next_state_s3 = repl.get_next_state(repl_state_s3, wayOH_s3, hit_s3, inv, repl_type, rrip_req_type)
+    when(skipAHitReplacerWrite) {
+      assert(next_state_s3 === repl_state_s3 && Mux1H(wayOH_s3, origin_bits_hold),
+        "a skipped RRIP hit must preserve RRPV and origin state")
+    }
 
     val repl_init = Wire(Vec(ways, UInt(2.W)))
     repl_init.foreach(_ := 2.U(2.W))
