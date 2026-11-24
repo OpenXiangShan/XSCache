@@ -972,7 +972,8 @@ class MSHR(implicit p: Parameters) extends MSHRContextBase {
       alias = Some(commitAliasFinal),
       prefetch = req_prefetch || dirResult.hit && meta_pft,
       pfsrc = PfSource.fromMemReqSource(req.reqSource),
-      accessed = req_acquire || req_get
+      accessed = req_acquire || req_get,
+      cdpPfDepth = req.cdpPfDepth.getOrElse(0.U)
     )
     when(nestedReleaseRefillPending) {
       mp_normal_refill_commit.meta.dirty := true.B

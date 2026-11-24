@@ -1467,10 +1467,9 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
     val hit_trigger_depth_s5  = RegNextN(hit_trigger_depth_s3, 2)
     val hit_trigger_pfsrc_s5  = RegNextN(hit_trigger_pfSrc_s3, 2)
 
-    val is_refill_trigger_s3 = task_s3.valid && (mshr_grantdata_s3 || mshr_hintack_s3)
-    val is_refill_trigger_s5 = RegNextN(is_refill_trigger_s3, 2)
-    val refill_trigger_data_s3  = Mux(req_s3.useProbeData, s3Decision.bits.release.bits.data, s3Decision.bits.refill.bits.data.data)
-    val refill_trigger_data_s5  = RegNextN(refill_trigger_data_s3, 2)
+    val is_refill_trigger_s3 = normalRefillDSWrite && !req_s3.corrupt
+    val is_refill_trigger_s5 = RegNextN(is_refill_trigger_s3, 2, Some(false.B))
+    val refill_trigger_data_s5  = RegNextN(io.toDS.wdata_s3.data, 2)
     val refill_trigger_depth_s5 = RegNextN(metaW_s3_mshr.cdpPfDepth.getOrElse(0.U), 2)
     val refill_trigger_pfsrc_s5 = RegNextN(metaW_s3_mshr.prefetchSrc.getOrElse(0.U), 2)
 
