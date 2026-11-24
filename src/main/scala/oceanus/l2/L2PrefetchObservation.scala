@@ -591,7 +591,9 @@ object L2PrefetchObservation {
           // writes have deterministic slice/TSHR priority, as in a direct map.
           val currentEvb = read(t.vPipeREQ.io.UpRXEVB)
           val refillerId = Mux(currentEvb.valid, currentEvb.bits.TshrId, read(t.vPipeREQ.p_rxevb.TshrId))
-          val refiller = slots((si.U * nt.U + refillerId)(log2Ceil(ns * nt) - 1, 0))
+          val refillerIndexWidth = log2Ceil(ns * nt)
+          val refillerIndex = (si * nt).U(refillerIndexWidth.W) + refillerId.pad(refillerIndexWidth)
+          val refiller = slots(refillerIndex(refillerIndexWidth - 1, 0))
           // Sampled sets have address[9:6] == 0. Index above those bits so
           // all 2,048 direct-map entries remain usable by sampled victims.
           val evictIndex = victim.paddr(20, 10)

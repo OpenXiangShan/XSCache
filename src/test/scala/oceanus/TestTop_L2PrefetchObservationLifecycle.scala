@@ -44,10 +44,11 @@ class PrefetchLifecycleTop(cfg: L2Configuration)(implicit p: Parameters) extends
 
 object TestTop_L2PrefetchObservationLifecycle extends App with ChiselSim {
   Constantin.init(false)
+  val tshrs = args.headOption.map(_.toInt).getOrElse(4)
   val cfg = new L2Configuration(8, true, 0 until 1, pfSrcID = 3, bopEnable = false,
     pfRecvEnable = true, pfCtrlEnable = true, pfTlbEnable = true, pfTrainEnable = true)
   val config = new Config((_, _, _) => {
-    case L2ParamsKey => L2Params(mshrSize = 4, sets = 16, ways = 8)
+    case L2ParamsKey => L2Params(mshrSize = tshrs, sets = 16, ways = 8)
     case CHIParametersKey => CHIParameters(issue = EnumCHIIssue.E, nodeIdWidth = 11,
       reqAddrWidth = 48, dataWidth = 256)
     case CCHIParametersKey => CCHIParameters(WayIndex_Width = 3)

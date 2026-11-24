@@ -38,21 +38,24 @@ object TestTop_L2PrefetchTSHRQuota extends App with ChiselSim {
   Constantin.init(false)
   implicit val simulator: HasSimulator = CDPAuditSimulator.bounded
   val limit = args.headOption.map(_.toInt).getOrElse(4)
+  val tshrs = args.lift(1).map(_.toInt).getOrElse(32)
+  val shared = tshrs - 3
+  require(shared > 0)
   val cap = if(limit<0) None else Some(limit)
   val p=new Config((_,_,_)=>{
-    case L2ParamsKey => L2Params(mshrSize=32,ways=8,sets=1024,prefetchMaxSharedTSHRs=cap)
+    case L2ParamsKey => L2Params(mshrSize=tshrs,ways=8,sets=1024,prefetchMaxSharedTSHRs=cap)
     case oceanus.chi.CHIParametersKey => oceanus.chi.CHIParameters(issue=oceanus.chi.EnumCHIIssue.E,nodeIdWidth=11,reqAddrWidth=48,dataWidth=256)
     case xscache.oceanus.compactchi.CCHIParametersKey => xscache.oceanus.compactchi.CCHIParameters()
     case LogUtilsOptionsKey => LogUtilsOptions(enableDebug=false,enablePerf=false,fpgaPlatform=false)
     case PerfCounterOptionsKey => PerfCounterOptions(enablePerfPrint=false,enablePerfDB=false,perfLevel=XSPerfLevel.VERBOSE,0)
   })
   simulate(new PrefetchQuotaHarness()(p)) {dut=>
-    val addresses=Array.fill[Option[BigInt]](32)(None)
+    val addresses=Array.fill[Option[BigInt]](tshrs)(None)
     def flag(x:Bool)=x.peek().litToBoolean
     def idle():Unit={
       dut.io.demand.valid.poke(false.B);dut.io.prefetch.valid.poke(false.B)
       dut.io.demand.bits.poke(0.U.asTypeOf(dut.io.demand.bits));dut.io.prefetch.bits.poke(0.U.asTypeOf(dut.io.prefetch.bits))
-      for(i<-0 until 32) {dut.io.slots(i).valid.poke(addresses(i).nonEmpty.B);dut.io.slots(i).bits.poke(0.U.asTypeOf(dut.io.slots(i).bits));dut.io.slots(i).bits.paddr.poke(addresses(i).getOrElse(BigInt(0)).U)}
+      for(i<-0 until tshrs) {dut.io.slots(i).valid.poke(addresses(i).nonEmpty.B);dut.io.slots(i).bits.poke(0.U.asTypeOf(dut.io.slots(i).bits));dut.io.slots(i).bits.paddr.poke(addresses(i).getOrElse(BigInt(0)).U)}
     }
     def drive(port:DecoupledIO[FlitREQ],pa:BigInt,pf:Boolean):Unit={
       port.valid.poke(true.B);port.bits.Addr.poke(pa.U);port.bits.SrcID.poke((if(pf)2 else 0).U)
@@ -62,18 +65,18 @@ object TestTop_L2PrefetchTSHRQuota extends App with ChiselSim {
       idle();pf.foreach(drive(dut.io.prefetch,_,true));demand.foreach(drive(dut.io.demand,_,false))
       assert((flag(dut.io.prefetch.ready)&&pf.nonEmpty)==expectedPF,s"PF quota ready limit=$limit pf=$pf")
       assert((flag(dut.io.demand.ready)&&demand.nonEmpty)==expectedDemand,s"demand progress limit=$limit")
-      val allocated=(0 until 32).filter(i=>flag(dut.io.allocation(i).alloc.REQ))
-      val reused=(0 until 32).filter(i=>flag(dut.io.allocation(i).reuse.REQ))
+      val allocated=(0 until tshrs).filter(i=>flag(dut.io.allocation(i).alloc.REQ))
+      val reused=(0 until tshrs).filter(i=>flag(dut.io.allocation(i).reuse.REQ))
       assert(allocated.size+reused.size==(if(expectedPF||expectedDemand)1 else 0))
-      assert((allocated++reused).forall(_<29),"REQ used reserved TSHR")
+      assert((allocated++reused).forall(_<shared),"REQ used reserved TSHR")
       val pa=if(expectedDemand)demand else if(expectedPF)pf else None
       dut.clock.step();allocated.foreach(i=>addresses(i)=pa);(allocated++reused).headOption
     }
     idle();dut.reset.poke(true.B);dut.clock.step(5);dut.reset.poke(false.B)
-    val budget=cap.getOrElse(29)
+    val budget=cap.getOrElse(shared)
     val slots=(0 until budget).map(i=>step(pf=Some(BigInt(0x10000+i*64)),expectedPF=true).get)
     step(pf=Some(0x20000))
-    if(budget<29) {
+    if(budget<shared) {
       val demandSlot=step(pf=Some(0x20000),demand=Some(0x30000),expectedDemand=true).get
       // A new prefetch must not bypass the cap by reusing a demand-origin slot.
       step(pf=Some(0x30000))
@@ -87,6 +90,26 @@ object TestTop_L2PrefetchTSHRQuota extends App with ChiselSim {
         step(pf=Some(0x20000),expectedPF=true)
       }
     }
-    println(s"PREFETCH_TSHR_QUOTA_RESULT pass=true limit=$limit tshrs=32 shared=29 pfHeld=$budget demandProgress=${budget<29} ownedReuse=${budget>0 && budget<29} demandReuseCounted=${budget>0 && budget<29} defaultUnlimited=${cap.isEmpty}")
+    if(cap.isEmpty) {
+      assert(slots == (0 until shared))
+      step(demand=Some(0x30000))
+      assert(step(pf=Some(0x10000),expectedPF=true).contains(slots.head))
+      assert(step(demand=Some(0x10000),expectedDemand=true).contains(slots.head))
+      idle();dut.io.slots(slots.head).bits.busy.REQ.poke(true.B)
+      drive(dut.io.demand,0x10000,false)
+      assert(!flag(dut.io.demand.ready))
+      assert(!dut.io.allocation.exists(slot=>flag(slot.alloc.REQ)||flag(slot.reuse.REQ)))
+      dut.clock.step()
+      for(reserved<-shared until tshrs) {
+        val pa=BigInt(0x40000+reserved*64)
+        addresses(reserved)=Some(pa)
+        step(pf=Some(pa))
+        step(demand=Some(pa))
+        addresses(reserved)=None
+      }
+      addresses(slots.last)=None
+      assert(step(demand=Some(0x30000),expectedDemand=true).contains(slots.last))
+    }
+    println(s"PREFETCH_TSHR_QUOTA_RESULT pass=true limit=$limit tshrs=$tshrs shared=$shared pfHeld=$budget demandProgress=${budget<shared} ownedReuse=${budget>0 && budget<shared} demandReuseCounted=${budget>0 && budget<shared} defaultUnlimited=${cap.isEmpty} capacityReuseReservedChecks=${cap.isEmpty}")
   }
 }
