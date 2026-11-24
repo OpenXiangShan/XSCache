@@ -190,11 +190,17 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   val channelDirReadAdmissionValid = channelDirReadAdmissionToken.valid
   // Two independent Q slots can fill while the other executes. Admission uses
   // only empty Q capacity, never current S1 fire or Directory ready. Preserve
-  // capture order when both slots are occupied.
+  // capture order by default when both slots are occupied. After an observed
+  // oldest-head stall, a registered one-cycle attempt may select the other
+  // lane. The selected head still checks every resource at its actual fire.
+  val s1BypassAttempt = RegInit(false.B)
+  val s1BypassUsed = RegInit(false.B)
+  val bothIngressHeads = mshrIngress.valid && channelDirReadAdmissionValid
+  val s1BypassActive = bothIngressHeads && s1BypassAttempt
   val mshrIngressOlder = capturedBefore(mshrIngressSlots(mshrIngressRetire).bits.order,
     channelDirReadAdmissionToken.order)
   mshr_task_s1.valid := mshrIngress.valid &&
-    (!channelDirReadAdmissionValid || mshrIngressOlder)
+    (!channelDirReadAdmissionValid || (mshrIngressOlder =/= s1BypassActive))
   mshr_task_s1.bits := mshrIngress.bits
   val channelDirReadAdmissionFire = Wire(Bool())
   val dirReadAdmissionValid = RegInit(false.B)
@@ -731,6 +737,33 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
 
   s2_ready  := !ds_mcp2_stall && !hint_stall && !blockAllEntrance
 
+  // Keep live Directory/MainPipe readiness out of head selection: a failed
+  // oldest attempt only changes a local Q for the following cycle. Retry the
+  // oldest after every failed alternate attempt, and allow at most one younger
+  // service until that oldest owner retires. This also bounds capture-order
+  // distance while one head is retained. A younger C must not overtake MSHR:
+  // its orphan apply may need that MSHR to make progress before global hold.
+  val otherHeadMayBypass = !mshrIngressOlder ||
+    channelDirReadAdmissionToken.source =/= 0.U
+  when(s1_fire) {
+    s1BypassAttempt := false.B
+    s1BypassUsed := s1BypassActive
+  }.elsewhen(s1BypassAttempt) {
+    s1BypassAttempt := false.B
+  }.elsewhen(bothIngressHeads && !s1BypassUsed && otherHeadMayBypass) {
+    s1BypassAttempt := true.B
+  }
+  when(s1BypassAttempt) {
+    assert(bothIngressHeads && !s1BypassUsed && otherHeadMayBypass,
+      "a registered bypass attempt must retain both heads and its unused allowance")
+  }
+  when(s1BypassActive && s1_fire) {
+    assert(mshrIngress.bits.set =/= channelTokenTask.set,
+      "a younger service must not cross a retained same-set predecessor")
+    assert(mshr_task_s1.valid || channelDirReadAdmissionToken.source =/= 0.U,
+      "a younger C decision must not overtake an older MSHR")
+  }
+
   val task_s2 = RegInit(0.U.asTypeOf(task_s1))
   task_s2.valid := s1_fire
   when(s1_fire) { task_s2.bits := task_s1.bits }
@@ -834,6 +867,48 @@ class RequestArb(implicit p: Parameters) extends L2Module with HasCHIOpcodes {
   }
 
   dontTouch(io)
+
+  // S1 denominators are selected-head valid cycles, not upstream sink stalls.
+  // Reason counters below overlap. The opportunity counter is exact only for
+  // a younger MSHR which needs no Directory read; channel/replacement ready
+  // cannot be inferred for the other bank from the selected port's ready.
+  val mshrHeadNeedsRead = mshrIngress.valid && mshrIngress.bits.fromA &&
+    mshrIngress.bits.replTask && (mshrIngress.bits.opcode === Grant ||
+      mshrIngress.bits.opcode === GrantData || mshrIngress.bits.opcode === AccessAckData ||
+      mshrIngress.bits.opcode === HintAck)
+  val mshrHeadCommitBlocked = mshrIngress.bits.mshrContext === 0.U &&
+    mshrIngress.bits.refillOnly && mshrIngress.bits.readRefillData &&
+    !mshrIngress.bits.replaceTask && io.blockRefillOnlyCommit
+  val mshrHeadWouldHint = mshrIngress.bits.fromA && (
+    mshrIngress.bits.opcode === Grant || mshrIngress.bits.opcode === GrantData ||
+      mshrIngress.bits.opcode === AccessAckData || mshrIngress.bits.opcode === CBOAck ||
+      mshrIngress.bits.mergeA && (mshrIngress.bits.aMergeTask.opcode === Grant ||
+        mshrIngress.bits.aMergeTask.opcode === GrantData))
+  val mshrHeadMcp2Blocked = prev_ds_fire &&
+    get_data_bank(mshrIngress.bits.set) === prev_ds_bank
+  val otherMshrReadyWithoutDir = mshrIngress.valid && !mshrHeadNeedsRead &&
+    !mshrHeadCommitBlocked && !(mshrHeadWouldHint && io.hint_s1QueueFull) &&
+    !mshrHeadMcp2Blocked && !blockAllEntrance
+  val s1Stall = task_s1.valid && !s1_fire
+  XSPerfAccumulate("reqarb_s1_valid_cycles", task_s1.valid)
+  XSPerfAccumulate("reqarb_s1_fire_cnt", s1_fire)
+  XSPerfAccumulate("reqarb_s1_stall_cycles", s1Stall)
+  XSPerfAccumulate("reqarb_s1_stall_global", s1Stall && blockAllEntrance)
+  XSPerfAccumulate("reqarb_s1_stall_mcp2", s1Stall && ds_mcp2_stall)
+  XSPerfAccumulate("reqarb_s1_stall_hint", s1Stall && hint_stall)
+  XSPerfAccumulate("reqarb_s1_stall_refill_commit", s1Stall && mshr_refillOnlyCommit_stall)
+  XSPerfAccumulate("reqarb_s1_stall_repl_capture", s1Stall && s1_needs_replRead && !dirReadAdmissionValid)
+  XSPerfAccumulate("reqarb_s1_stall_repl_set", s1Stall && s1_needs_replRead && io.fromMainPipe.blockG_s1)
+  XSPerfAccumulate("reqarb_s1_stall_dir", s1Stall && io.dirRead_s1.valid && !io.dirRead_s1.ready)
+  XSPerfAccumulate("reqarb_hol_oldest_blocked_other_present",
+    bothIngressHeads && !s1BypassActive && !s1_fire)
+  XSPerfAccumulate("reqarb_hol_other_mshr_ready_without_dir",
+    bothIngressHeads && !mshrIngressOlder && !s1BypassActive && !s1_fire && otherMshrReadyWithoutDir)
+  XSPerfAccumulate("reqarb_hol_bypass_attempt", s1BypassActive)
+  XSPerfAccumulate("reqarb_hol_bypass_stall", s1BypassActive && !s1_fire)
+  XSPerfAccumulate("reqarb_hol_bypass_service", s1BypassActive && s1_fire)
+  XSPerfAccumulate("reqarb_hol_bypass_mshr", s1BypassActive && s1_fire && mshr_task_s1.valid)
+  XSPerfAccumulate("reqarb_hol_bypass_channel", s1BypassActive && channelDirReadAdmissionFire)
 
   // Performance counters
   XSPerfAccumulate("mshr_req", s0_fire)

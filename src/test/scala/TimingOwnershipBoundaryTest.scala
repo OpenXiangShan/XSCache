@@ -1518,3 +1518,226 @@ object TestMSHRStageChain extends App with ChiselSim {
     println(s"PASS real MSHRCtl -> RequestArb: 16 Grant + 16 refill-commit full-payload/token transfers, longest initial service $issueRun/$pipeRun, exact source and Grant returns")
   }
 }
+
+// Real RequestArb at its documented ports. Source/Directory/MainPipe endpoints
+// are driven independently; no internal register is forced or replaced.
+object TestRequestArbHeadOfLine extends App with ChiselSim {
+  implicit val p: Parameters = PairMiterParameters.p.alterPartial {
+    case L2ParamKey => PairMiterParameters.p(L2ParamKey).copy(sets = 16, mshrs = 8)
+  }
+  simulate(new RequestArb) { d =>
+    def leaves(data: Data, path: String = "task"): Map[String, BigInt] = data match {
+      case r: Record => r.elements.toSeq.flatMap { case (k, v) => leaves(v, s"$path.$k") }.toMap
+      case v: Vec[_] => v.zipWithIndex.flatMap { case (x, i) => leaves(x, s"$path.$i") }.toMap
+      case b: Bool => Map(path -> b.peek().litValue)
+      case u: UInt => Map(path -> u.peek().litValue)
+      case _ => Map.empty
+    }
+    def zero(data: Data, inputsOnly: Boolean = false): Unit = data match {
+      case r: Record => r.elements.values.foreach(x => zero(x, inputsOnly))
+      case v: Vec[_] => v.foreach(x => zero(x, inputsOnly))
+      case x if !inputsOnly || DataMirror.directionOf(x) == ActualDirection.Input => x match {
+        case b: Bool => b.poke(false.B)
+        case u: UInt => u.poke(0.U)
+        case _ =>
+      }
+      case _ =>
+    }
+    type GrantOwner = (BigInt, BigInt, BigInt)
+    case class Expected(task: Map[String, BigInt], lease: (Int, Int), grant: Boolean,
+      snoop: Option[Map[String, BigInt]] = None)
+    val expected = scala.collection.mutable.Map.empty[BigInt, Expected]
+    val pipes = scala.collection.mutable.ArrayBuffer.empty[BigInt]
+    val active = scala.collection.mutable.Set.empty[GrantOwner]
+    val used = scala.collection.mutable.Set.empty[GrantOwner]
+    var pendingReturn: Option[GrantOwner] = None
+    var pendingC: Option[GrantOwner] = None
+    var sequence = 0; var cycle = 0
+    def grant(t: GrantReservationToken): GrantOwner =
+      (t.id.peek().litValue, t.generation.peek().litValue, t.channel.peek().litValue)
+    def driveGrant(t: GrantReservationToken, g: GrantOwner): Unit = {
+      t.id.poke(g._1.U); t.generation.poke(g._2.U); t.channel.poke(g._3.U)
+    }
+    def step(n: Int = 1): Unit = for (_ <- 0 until n) {
+      d.io.grantReservationReturn(0).valid.poke(pendingReturn.nonEmpty.B)
+      pendingReturn.foreach(g => driveGrant(d.io.grantReservationReturn(0).bits, g))
+      d.io.cDecisionDone.valid.poke(pendingC.nonEmpty.B)
+      pendingC.foreach(g => driveGrant(d.io.cDecisionDone.bits, g))
+      val returning = pendingReturn
+      pendingReturn = None; pendingC = None
+      if (d.io.grantReservation.valid.peek().litToBoolean) {
+        val g = grant(d.io.grantReservation.bits)
+        assert(!active(g)); active += g
+      }
+      if (d.io.taskToPipe_s2.valid.peek().litToBoolean) {
+        val t = d.io.taskToPipe_s2.bits; val tag = t.tag.peek().litValue
+        assert(expected.contains(tag) && !pipes.contains(tag), s"unknown/duplicate task $tag at $cycle")
+        val e = expected(tag)
+        assert(leaves(t) == e.task, s"changed full descriptor $tag at $cycle")
+        d.io.taskLeaseToken_s2.generation.expect(e.lease._1.U)
+        d.io.taskLeaseToken_s2.sequence.expect(e.lease._2.U)
+        d.io.taskSequence_s2.expect(sequence.U); sequence += 1
+        d.io.taskGrantReservationToken_s2.valid.expect(e.grant.B)
+        e.snoop match {
+          case Some(token) => assert(leaves(d.io.taskSnoopReservationToken_s2) == token)
+          case None => d.io.taskSnoopReservationToken_s2.valid.expect(false.B)
+        }
+        if (e.grant) {
+          val g = grant(d.io.taskGrantReservationToken_s2.bits)
+          assert(active(g) && !used(g), s"unknown/reused Grant token $g")
+          used += g; pendingReturn = Some(g)
+          if (g._3 == 4) pendingC = Some(g)
+        }
+        pipes += tag
+      }
+      returning.foreach(g => { assert(active(g) && used(g)); active -= g })
+      val cFire = d.io.sinkC.valid.peek().litToBoolean && d.io.sinkC.ready.peek().litToBoolean
+      val bFire = d.io.sinkB.valid.peek().litToBoolean && d.io.sinkB.ready.peek().litToBoolean
+      val aCapture = d.io.normalReserveConsume.valid.peek().litToBoolean
+      d.clock.step(); cycle += 1
+      if (cFire) d.io.sinkC.valid.poke(false.B)
+      if (bFire) d.io.sinkB.valid.poke(false.B)
+      if (aCapture) d.io.normalReserveAck.valid.poke(false.B)
+    }
+    def waitFor(test: => Boolean, label: String): Unit = {
+      var left = 80
+      while (!test && left > 0) { step(); left -= 1 }
+      assert(test, s"timeout $label at cycle $cycle pipes=$pipes")
+    }
+    def reset(): Unit = {
+      zero(d.io, inputsOnly = true)
+      expected.clear(); pipes.clear(); active.clear(); used.clear()
+      pendingReturn = None; pendingC = None; sequence = 0; cycle = 0
+      d.io.dirRead_s1.ready.poke(true.B)
+      d.reset.poke(true.B); d.clock.step(3); d.reset.poke(false.B); step(20)
+    }
+    def sendMshr(tag: Int, set: Int, commit: Boolean = false, repl: Boolean = false,
+      snoop: Boolean = false): Unit = {
+      val t = d.io.mshrTask.bits; zero(t)
+      t.mshrTask.poke(true.B); t.channel.poke((if (snoop) 2 else 1).U)
+      t.opcode.poke(if (snoop) ProbeAck else Grant)
+      t.set.poke(set.U); t.tag.poke(tag.U); t.sourceId.poke(3.U); t.mshrId.poke(3.U)
+      t.mshrContext.poke((if (snoop) 1 else 0).U)
+      t.refillOnly.poke(commit.B); t.readRefillData.poke(commit.B)
+      t.replTask.poke(repl.B); t.way.poke(1.U); t.meta.dirty.poke(true.B)
+      d.io.mshrLeaseToken.generation.poke(7.U)
+      d.io.mshrLeaseToken.sequence.poke((tag & 255).U)
+      expected(tag) = Expected(leaves(t), (7, tag & 255), !snoop)
+      d.io.mshrTask.valid.poke(true.B)
+      waitFor(d.io.mshrTask.ready.peek().litToBoolean, "MSHR admission")
+      step(); d.io.mshrTask.valid.poke(false.B)
+    }
+    def offerA(tag: Int, set: Int, id: Int = 0): Unit = {
+      val r = d.io.normalReserveAck.bits; zero(r)
+      r.id.poke(id.U); r.token.generation.poke(5.U); r.token.sequence.poke(tag.U)
+      val t = r.task
+      t.channel.poke(1.U); t.opcode.poke(Get); t.set.poke(set.U); t.tag.poke(tag.U)
+      t.sourceId.poke(id.U); t.aRequestIdentity.entry.poke(id.U)
+      t.aRequestIdentity.version.poke(3.U); t.aRequestIdentity.sequence.poke(tag.U)
+      val claim = d.io.normalClaimOwners(0)(id)
+      claim.valid.poke(true.B); claim.bits.inFlight.poke(true.B)
+      claim.bits.token.generation.poke(5.U); claim.bits.token.sequence.poke(tag.U)
+      claim.bits.requestIdentity.entry.poke(id.U); claim.bits.requestIdentity.version.poke(3.U)
+      claim.bits.requestIdentity.sequence.poke(tag.U)
+      claim.bits.set.poke(set.U); claim.bits.tag.poke(tag.U); claim.bits.source.poke(id.U)
+      expected(tag) = Expected(leaves(t).updated("task.mshrId", BigInt(id)), (5, tag), true)
+      d.io.normalReserveAck.valid.poke(true.B)
+    }
+    def sendA(tag: Int, set: Int, id: Int = 0): Unit = {
+      offerA(tag, set, id)
+      waitFor(d.io.normalReserveConsume.valid.peek().litToBoolean, "A capture"); step()
+    }
+    def offerC(tag: Int, set: Int): Unit = {
+      val t = d.io.sinkC.bits; zero(t)
+      t.channel.poke(4.U); t.opcode.poke(ReleaseData); t.set.poke(set.U); t.tag.poke(tag.U)
+      t.sourceId.poke(2.U); t.bufIdx.poke(2.U)
+      expected(tag) = Expected(leaves(t), (0, 0), true)
+      d.io.sinkC.valid.poke(true.B)
+    }
+    def finish(tags: Seq[Int]): Unit = {
+      waitFor(pipes.size == tags.size, "all pipeline tasks")
+      assert(pipes.toSeq == tags.map(BigInt(_)), s"wrong independent-owner service order: $pipes")
+      step(4); assert(active.isEmpty && pendingReturn.isEmpty)
+      d.io.setStatus.foreach(_.valid.expect(false.B))
+    }
+
+    reset()
+    d.io.blockRefillOnlyCommit.poke(true.B)
+    sendMshr(101, 2, commit = true); sendA(102, 3)
+    waitFor(pipes.contains(102), "A bypasses held refill commit")
+    assert(!pipes.contains(101))
+    sendA(103, 5, id = 1); step(8)
+    assert(pipes.toSeq == Seq(BigInt(102)), "a second younger service passed the same held owner")
+    d.io.blockRefillOnlyCommit.poke(false.B)
+    finish(Seq(102, 101, 103))
+    println("PASS held refill commit: independent A service, exact full payload/tokens, one-pass bound")
+
+    reset()
+    d.io.dirRead_s1.ready.poke(false.B)
+    sendA(111, 2); sendMshr(112, 3)
+    waitFor(pipes.contains(112), "no-read MSHR bypasses Directory-held A")
+    assert(!pipes.contains(111))
+    d.io.dirRead_s1.ready.poke(true.B); finish(Seq(112, 111))
+    println("PASS bank/port-held channel: no-read MSHR service without Directory permission")
+
+    reset()
+    d.io.fromMainPipe.blockG_s1.poke(true.B)
+    sendMshr(121, 2, repl = true); sendA(122, 3)
+    waitFor(d.io.dirRead_s1.valid.peek().litToBoolean &&
+      d.io.dirRead_s1.bits.tag.peek().litValue == 122, "alternate Directory attempt")
+    // Ready was high when the oldest stall was observed. Withdraw it at the
+    // actual younger port attempt: the previous observation is no permission.
+    d.io.dirRead_s1.ready.poke(false.B); step()
+    assert(pipes.isEmpty)
+    d.io.dirRead_s1.ready.poke(true.B)
+    waitFor(pipes.contains(122), "alternate fresh Directory ready")
+    d.io.dirRead_s1.ready.poke(false.B)
+    d.io.fromMainPipe.blockG_s1.poke(false.B)
+    waitFor(d.io.dirRead_s1.valid.peek().litToBoolean, "retained replacement capture")
+    d.io.dirRead_s1.bits.tag.expect(121.U); d.io.dirRead_s1.bits.refill.expect(true.B)
+    val heldRead = leaves(d.io.dirRead_s1.bits)
+    step(4); assert(pipes.toSeq == Seq(BigInt(122)) && leaves(d.io.dirRead_s1.bits) == heldRead)
+    d.io.dirRead_s1.ready.poke(true.B); finish(Seq(122, 121))
+    println("PASS replacement: same-set hold, fresh ready withdrawal/retry, retained command and lease")
+
+    reset()
+    d.io.blockRefillOnlyCommit.poke(true.B)
+    sendMshr(131, 2, commit = true); offerA(132, 2)
+    for (_ <- 0 until 8) { d.io.normalReserveConsume.valid.expect(false.B); step() }
+    assert(pipes.isEmpty)
+    d.io.blockRefillOnlyCommit.poke(false.B)
+    waitFor(!d.io.normalReserveAck.valid.peek().litToBoolean, "same-set A after older departure")
+    finish(Seq(131, 132))
+    println("PASS same-set descriptor cannot be admitted across held predecessor")
+
+    reset()
+    d.io.blockRefillOnlyCommit.poke(true.B)
+    sendMshr(141, 2, commit = true); offerC(142, 3); step(10)
+    assert(pipes.isEmpty, "younger C overtook a held MSHR")
+    d.io.sinkC.ready.expect(false.B)
+    d.io.blockRefillOnlyCommit.poke(false.B); finish(Seq(141, 142))
+    println("PASS younger C stays behind older MSHR and consumes its exact buffered descriptor")
+
+    reset()
+    d.io.blockRefillOnlyCommit.poke(true.B)
+    sendMshr(151, 2, commit = true)
+    val b = d.io.sinkB.bits; zero(b)
+    b.channel.poke(2.U); b.chiOpcode.get.poke(7.U)
+    b.set.poke(3.U); b.tag.poke(152.U); b.sourceId.poke(2.U)
+    b.txnID.get.poke(19.U)
+    val bt = d.io.snoopReservationToken; zero(bt)
+    bt.valid.poke(true.B); bt.slot.poke(6.U); bt.set.poke(3.U); bt.tag.poke(152.U)
+    bt.txnID.poke(19.U); bt.source.poke(2.U)
+    bt.generation.poke(9.U); bt.sequence.poke(21.U)
+    expected(152) = Expected(leaves(b), (0, 0), false, Some(leaves(bt)))
+    d.io.sinkB.valid.poke(true.B)
+    waitFor(!d.io.sinkB.valid.peek().litToBoolean, "B entry capture")
+    waitFor(d.io.bServiceConsume.valid.peek().litToBoolean, "reserved B bypass service")
+    assert(leaves(d.io.bServiceConsume.bits) == leaves(bt))
+    step(); waitFor(pipes.contains(152), "B pipeline advance")
+    assert(!pipes.contains(151))
+    d.io.blockRefillOnlyCommit.poke(false.B); finish(Seq(152, 151))
+    println("PASS reserved B forward progress with exact snoop token around held refill commit")
+    println("PASS RequestArb bounded cross-lane bypass: six directed ownership/resource scenarios")
+  }
+}
