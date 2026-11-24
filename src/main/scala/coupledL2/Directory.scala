@@ -79,6 +79,7 @@ class DirRead(implicit p: Parameters) extends L2Bundle {
   val wayMask = UInt(cacheParams.ways.W)
   val replacerInfo = new ReplacerInfo()
   val duelCeptronPC = Option.when(cacheParams.enableDuelCeptron)(UInt(pcBitOpt.get.W))
+  val duelCeptronLoadOffset = Option.when(cacheParams.enableDuelCeptron)(UInt(offsetBits.W))
   val duelCeptron = Option.when(cacheParams.enableDuelCeptron)(Valid(new DuelCeptronContext))
   // dirRead when refill
   val refill = Bool()
@@ -493,13 +494,14 @@ class Directory(implicit p: Parameters) extends L2Module {
        else if PSEL(MSB)==0: use srrip
        else if PSEL(MSB)==1: use brrip */
     val followerBrrip = if (enableDuelCeptron) {
-      val predictor = Module(new DuelCeptron(pcBitOpt.get, fullAddressBits - 12))
+      val predictor = Module(new DuelCeptron(pcBitOpt.get, fullAddressBits - 12, offsetBits))
       val requestInfo = req_s1.replacerInfo
       predictor.io.demand := io.read.fire && !req_s1.refill && requestInfo.channel(0) &&
         requestInfo.reqSource === MemReqSource.CPULoadData.id.U &&
         (requestInfo.opcode === AcquireBlock || requestInfo.opcode === Get)
       predictor.io.acquire := requestInfo.opcode === AcquireBlock
       predictor.io.pc := req_s1.duelCeptronPC.get
+      predictor.io.loadOffset := req_s1.duelCeptronLoadOffset.get
       val lineAddress = Cat(req_s1.tag, req_s1.set, 0.U(offsetBits.W))
       predictor.io.page := restoreAddressUInt(lineAddress, p(SliceIdKey).U(bankBits.max(1).W)) >> 12
       io.resp.bits.duelCeptron.get := predictor.io.prediction

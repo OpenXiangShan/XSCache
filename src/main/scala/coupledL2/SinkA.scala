@@ -36,6 +36,8 @@ class SinkA(implicit p: Parameters) extends L2Module {
   })
   require(!cacheParams.enableDuelCeptron || io.a.bits.user.lift(PCKey).nonEmpty,
     "DuelCeptron requires a negotiated load PC field")
+  require(!cacheParams.enableDuelCeptron || io.a.bits.user.lift(LoadOffsetKey).exists(_.getWidth == offsetBits),
+    "DuelCeptron requires a negotiated load offset field matching the cache line size")
   assert(!(io.a.valid && (io.a.bits.opcode === PutFullData ||
                           io.a.bits.opcode === PutPartialData)),
     "no Put");
@@ -87,6 +89,7 @@ class SinkA(implicit p: Parameters) extends L2Module {
     task.replTask := false.B
     task.vaddr.foreach(_ := a.user.lift(VaddrKey).getOrElse(0.U))
     task.pc.foreach(_ := a.user.lift(PCKey).getOrElse(0.U)) 
+    task.loadOffset.foreach(_ := a.user.lift(LoadOffsetKey).get)
     //miss acquire keyword
     task.isKeyword.foreach(_ := a.echo.lift(IsKeywordKey).getOrElse(false.B))
     task.mergeA := false.B

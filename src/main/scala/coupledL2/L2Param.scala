@@ -67,6 +67,11 @@ case class IsKeywordField() extends BundleField[Bool](IsKeywordKey, Output(Bool(
 case object PCKey extends ControlKey[UInt]("pc")
 case class PCField(width: Int) extends BundleField[UInt](PCKey, Output(UInt(width.W)), _ := 0.U(width.W))
 
+// Byte offset of the load that initiated the line-aligned AcquireBlock.
+case object LoadOffsetKey extends ControlKey[UInt]("loadOffset")
+case class LoadOffsetField(width: Int)
+  extends BundleField[UInt](LoadOffsetKey, Output(UInt(width.W)), _ := 0.U(width.W))
+
 case class L2Param(
   name: String = "L2",
   ways: Int = 4,
@@ -89,7 +94,7 @@ case class L2Param(
   echoField: Seq[BundleFieldBase] = Nil,
   reqField: Seq[BundleFieldBase] = Nil,
   respKey: Seq[BundleKeyBase] = Seq(IsHitKey),
-  reqKey: Seq[BundleKeyBase] = Seq(AliasKey, VaddrKey, PrefetchKey, ReqSourceKey, PCKey),
+  reqKey: Seq[BundleKeyBase] = Seq(AliasKey, VaddrKey, PrefetchKey, ReqSourceKey, PCKey, LoadOffsetKey),
   respField: Seq[BundleFieldBase] = Nil,
 
   innerBuf: TLBufferParams = TLBufferParams(),

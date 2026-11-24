@@ -23,6 +23,7 @@ import chisel3.util._
 class DuelCeptronIndices extends Bundle {
   val pc = UInt(8.W)
   val page = UInt(8.W)
+  val pcOffset = UInt(9.W)
 }
 
 class DuelCeptronContext extends Bundle {
@@ -30,12 +31,13 @@ class DuelCeptronContext extends Bundle {
   val indices = new DuelCeptronIndices
 }
 
-private[coupledL2] class DuelCeptron(pcBits: Int, pageBits: Int) extends Module {
+private[coupledL2] class DuelCeptron(pcBits: Int, pageBits: Int, offsetBits: Int) extends Module {
   val io = IO(new Bundle {
     val demand = Input(Bool())
     val acquire = Input(Bool())
     val pc = Input(UInt(pcBits.W))
     val page = Input(UInt(pageBits.W))
+    val loadOffset = Input(UInt(offsetBits.W))
     val prediction = Output(Valid(new DuelCeptronContext))
     val train = Input(Valid(new DuelCeptronIndices))
     val trainBrripLeader = Input(Bool())
@@ -43,13 +45,14 @@ private[coupledL2] class DuelCeptron(pcBits: Int, pageBits: Int) extends Module 
 
   private val pcWeights = RegInit(VecInit(Seq.fill(256)(0.S(9.W))))
   private val pageWeights = RegInit(VecInit(Seq.fill(256)(0.S(7.W))))
+  private val pcOffsetWeights = RegInit(VecInit(Seq.fill(512)(0.S(7.W))))
   private val lastPage = RegInit(0.U(pageBits.W))
   private val prevPage = RegInit(0.U(pageBits.W))
 
-  private def foldIndex(value: UInt): UInt = {
+  private def foldIndex(value: UInt, indexBits: Int): UInt = {
     val width = value.getWidth
-    val padded = value.pad((width + 7) / 8 * 8)
-    (0 until width by 8).map(bit => padded(bit + 7, bit)).reduce(_ ^ _)
+    val padded = value.pad((width + indexBits - 1) / indexBits * indexBits)
+    (0 until width by indexBits).map(bit => padded(bit + indexBits - 1, bit)).reduce(_ ^ _)
   }
 
   when (io.demand) {
@@ -58,17 +61,20 @@ private[coupledL2] class DuelCeptron(pcBits: Int, pageBits: Int) extends Module 
   }
 
   private val indices = Wire(new DuelCeptronIndices)
-  indices.pc := foldIndex(io.pc >> 12)
-  indices.page := foldIndex(prevPage ^ lastPage ^ io.page)
+  indices.pc := foldIndex(io.pc >> 12, indices.pc.getWidth)
+  indices.page := foldIndex(prevPage ^ lastPage ^ io.page, indices.page.getWidth)
+  indices.pcOffset := foldIndex(io.pc ^ io.loadOffset, indices.pcOffset.getWidth)
 
   private val predict_s1 = io.demand && io.acquire
   private val indices_s2 = RegEnable(indices, predict_s1)
   private val pcWeight_s2 = RegEnable(pcWeights(indices.pc), predict_s1)
   private val pageWeight_s2 = RegEnable(pageWeights(indices.page), predict_s1)
+  private val pcOffsetWeight_s2 = RegEnable(pcOffsetWeights(indices.pcOffset), predict_s1)
   private val predict_s2 = RegNext(predict_s1, false.B)
   io.prediction.valid := RegNext(predict_s2, false.B)
   io.prediction.bits.indices := RegEnable(indices_s2, predict_s2)
-  io.prediction.bits.predictBrrip := RegEnable((pcWeight_s2 +& pageWeight_s2) <= 0.S, predict_s2)
+  private val score_s2 = (pcWeight_s2 +& pageWeight_s2) +& pcOffsetWeight_s2
+  io.prediction.bits.predictBrrip := RegEnable(score_s2 <= 0.S, predict_s2)
 
   private def train(weights: Vec[SInt], index: UInt): Unit = {
     val weight = weights(index)
@@ -85,5 +91,6 @@ private[coupledL2] class DuelCeptron(pcBits: Int, pageBits: Int) extends Module 
   when (io.train.valid) {
     train(pcWeights, io.train.bits.pc)
     train(pageWeights, io.train.bits.page)
+    train(pcOffsetWeights, io.train.bits.pcOffset)
   }
 }

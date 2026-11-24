@@ -10,7 +10,7 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.tile.MaxHartIdBits
 import freechips.rocketchip.tilelink._
 import org.chipsalliance.cde.config._
-import xscache.coupledL2.{CoupledL2, EdgeInKey, L1Param, L2Param, L2ParamKey, L2ToL1Hint, PCField}
+import xscache.coupledL2.{CoupledL2, EdgeInKey, L1Param, L2Param, L2ParamKey, L2ToL1Hint, LoadOffsetField, PCField}
 import cc.xiangshan.openncb._
 import cc.xiangshan.openncb.chi._
 import utility._
@@ -92,7 +92,7 @@ class TestTopOpenLLC(numCores: Int = 1, numULAgents: Int = 0, banks: Int = 1, is
         minLatency = 1,
         echoFields = Nil,
         requestFields = Seq(AliasField(2)) ++ l2Params.clientCaches.head.pcBitOpt.map(PCField(_)) ++
-          (if (l2Params.enableDuelCeptron) Seq(ReqSourceField()) else Nil),
+          (if (l2Params.enableDuelCeptron) Seq(ReqSourceField(), LoadOffsetField(log2Ceil(l2Params.blockBytes))) else Nil),
         responseKeys = l2Params.respKey
       )
     ))

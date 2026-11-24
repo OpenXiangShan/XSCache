@@ -193,6 +193,7 @@ class RequestArb(implicit p: Parameters) extends L2Module
     toN := !task_s1.bits.mshrTask && task_s1.bits.fromC && isToN(task_s1.bits.param)
   }
   io.dirRead_s1.bits.duelCeptronPC.foreach(_ := task_s1.bits.pc.get)
+  io.dirRead_s1.bits.duelCeptronLoadOffset.foreach(_ := task_s1.bits.loadOffset.get)
   io.dirRead_s1.bits.duelCeptron.foreach(_ := task_s1.bits.duelCeptron.get)
   io.dirRead_s1.bits.refill := s1_needs_replRead
   io.dirRead_s1.bits.mshrId := task_s1.bits.mshrId

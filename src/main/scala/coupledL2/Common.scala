@@ -66,6 +66,7 @@ class TaskBundle(implicit p: Parameters) extends L2Bundle
   val alias = aliasBitsOpt.map(_ => UInt(aliasBitsOpt.get.W)) // color bits in cache-alias issue
   val vaddr = vaddrBitsOpt.map(_ => UInt(vaddrBitsOpt.get.W)) // vaddr passed by client cache
   val pc = pcBitOpt.map(_ => UInt(pcBitOpt.get.W))    // PC (Program Counter) passed by client cache
+  val loadOffset = Option.when(cacheParams.enableDuelCeptron)(UInt(offsetBits.W))
   val duelCeptron = Option.when(cacheParams.enableDuelCeptron)(Valid(new DuelCeptronContext))
   // from L1 load miss require 
   val isKeyword = isKeywordBitsOpt.map(_ => Bool())
