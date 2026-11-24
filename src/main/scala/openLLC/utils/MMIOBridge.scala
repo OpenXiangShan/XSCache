@@ -37,7 +37,7 @@ class MMIODiverger(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
 
   val mmioReqArb = Module(new FastArbiter(new CHIREQ(), numRNs))
   val mmioDatArb = Module(new FastArbiter(new CHIDAT(), numRNs))
-  val receiptQueue = Module(new Queue(new CHIRSP(), entries = numRNs, pipe = true, flow = true))
+  val receiptQueue = Module(new Queue(new CHIRSP(), entries = numRNs, pipe = false, flow = false))
 
   receiptQueue.io.enq.valid := io.out.uncache.tx.req.fire && io.out.uncache.tx.req.bits.opcode === ReadNoSnp
   receiptQueue.io.enq.bits := {

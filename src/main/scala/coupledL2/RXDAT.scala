@@ -64,6 +64,7 @@ class RXDAT(implicit p: Parameters) extends CoupledL2Module {
   /* Response to MSHR */
   io.in.valid := (first || last) && io.out.valid
   io.in.mshrId := io.out.bits.txnID
+  io.in.txnID := io.out.bits.txnID
   io.in.set := 0.U(setBits.W)
   io.in.tag := 0.U(tagBits.W)
 

@@ -69,7 +69,8 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
     val fromReqArb = Input(new Bundle() {
       val status_s1 = new PipeEntranceStatus
     })
-    val pipeStatusVec = Flipped(Vec(5, ValidIO(new PipeStatus)))
+    val pipelineReserve = Flipped(ValidIO(new GrantReservationToken))
+    val pipelineReturn = Flipped(Vec(3, ValidIO(new GrantReservationToken)))
     val toReqArb = Output(new Bundle() {
       val blockSinkReqEntrance = new BlockInfo()
       val blockMSHRReqEntrance = Bool()
@@ -118,6 +119,7 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   val inflightGrant = RegInit(VecInit(Seq.fill(grantBufInflightSize){
     0.U.asTypeOf(Valid(new InflightGrantEntry))
   }))
+  val inflight_full = Cat(inflightGrant.map(_.valid)).andR
 
   val dtaskOpcode = io.d_task.bits.task.opcode
   val mergeAtask = WireInit(0.U.asTypeOf(new TaskBundle()))
@@ -159,7 +161,8 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   val grantQueue_enq_isKeyword = Mux(io.d_task.bits.task.mergeA, mergeAtask.isKeyword.getOrElse(false.B), io.d_task.bits.task.isKeyword.getOrElse(false.B))
   // The following is organized in the order of data flow
   // =========== save d_task in queue[FIFO] ===========
-  grantQueue.io.enq.valid := io.d_task.valid && (dtaskOpcode =/= HintAck || io.d_task.bits.task.mergeA)
+  grantQueue.io.enq.valid := io.d_task.valid && io.d_task.ready &&
+    (dtaskOpcode =/= HintAck || io.d_task.bits.task.mergeA)
   grantQueue.io.enq.bits.task := Mux(io.d_task.bits.task.mergeA, mergeAtask, io.d_task.bits.task)
   grantQueue.io.enq.bits.task.isKeyword.foreach(_ := grantQueue_enq_isKeyword)
   //grantQueue.io.enq.bits.task.isKeyword.foreach(_ := io.d_task.bits.task.isKeyword.getOrElse(false.B))
@@ -169,11 +172,7 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   grantQueueData0.io.enq.bits.data := enqData(0)
   grantQueueData1.io.enq.valid := grantQueue.io.enq.valid
   grantQueueData1.io.enq.bits.data := enqData(1)
-  io.d_task.ready := true.B // GrantBuf should always be ready
-
-  val grantQueueCnt = grantQueue.io.count
   val full = !grantQueue.io.enq.ready
-  assert(!(full && io.d_task.valid), "GrantBuf full and RECEIVE new task, back pressure failed")
 
   // =========== dequeue entry and fire ===========
   require(beatSize == 2)
@@ -240,9 +239,9 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   }
   // TODO: this may not need 10 entries, but this does not take much space
   val pftQueueLen = 10
-  val pftRespQueue = prefetchOpt.map(_ => Module(new Queue(pftRespEntry, entries = pftQueueLen, flow = true)))
+  val pftRespQueue = prefetchOpt.map(_ => Module(new Queue(pftRespEntry, entries = pftQueueLen, flow = false)))
   prefetchOpt.map { _ =>
-    pftRespQueue.get.io.enq.valid := io.d_task.valid && dtaskOpcode === HintAck &&
+    pftRespQueue.get.io.enq.valid := io.d_task.valid && io.d_task.ready && dtaskOpcode === HintAck &&
       io.d_task.bits.task.fromL2pft.getOrElse(false.B)
     pftRespQueue.get.io.enq.bits.tag := io.d_task.bits.task.tag
     pftRespQueue.get.io.enq.bits.set := io.d_task.bits.task.set
@@ -257,8 +256,20 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
     resp.bits.pfSource := pftRespQueue.get.io.deq.bits.pfSource
     pftRespQueue.get.io.deq.ready := resp.ready
 
-    assert(pftRespQueue.get.io.enq.ready, "pftRespQueue should never be full, no back pressure logic")
   }
+  val taskNeedsQueue = dtaskOpcode =/= HintAck || io.d_task.bits.task.mergeA
+  val taskNeedsInflight = dtaskOpcode === Grant || dtaskOpcode === GrantData ||
+    io.d_task.bits.task.mergeA
+  val taskNeedsPrefetch = dtaskOpcode === HintAck &&
+    io.d_task.bits.task.fromL2pft.getOrElse(false.B)
+  val grantQueueReady = grantQueue.io.enq.ready &&
+    grantQueueData0.io.enq.ready && grantQueueData1.io.enq.ready
+  val prefetchQueueReady = prefetchOpt.map(_ => pftRespQueue.get.io.enq.ready).getOrElse(true.B)
+  io.d_task.ready := (!taskNeedsQueue || grantQueueReady) &&
+    (!taskNeedsInflight || !inflight_full) &&
+    (!taskNeedsPrefetch || prefetchQueueReady)
+  assert(!(full && io.d_task.fire && taskNeedsQueue),
+    "GrantBuf accepted a queued task without FIFO credit")
   // If no prefetch, there never should be HintAck
   // assert(prefetchOpt.nonEmpty.B || !io.d_task.valid || dtaskOpcode =/= HintAck)
 
@@ -271,7 +282,6 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
     entry.bits.set    := io.d_task.bits.task.set
     entry.bits.tag    := io.d_task.bits.task.tag
   }
-  val inflight_full = Cat(inflightGrant.map(_.valid)).andR
   assert(!(inflight_full & (io.d_task.fire && (dtaskOpcode === Grant || dtaskOpcode === GrantData || io.d_task.bits.task.mergeA))), "inflightGrant entries overflow")
 
   // report status to SourceB to block same-addr Probe
@@ -287,34 +297,94 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
     inflightGrant(io.e.bits.sink).valid := false.B
   }
 
-  io.e.ready := true.B
+  val eOwnerValid = VecInit((0 until grantBufInflightSize).map { i =>
+    io.e.bits.sink === i.U && inflightGrant(i).valid
+  }).asUInt.orR
+  io.e.ready := eOwnerValid
 
-  // =========== handle blocking - capacity conflict ===========
-  // count the number of valid blocks + those in pipe that might use GrantBuf
-  // so that GrantBuffer will not exceed capacity [back pressure]
-  val noSpaceForSinkReq = PopCount(VecInit(io.pipeStatusVec.tail.map { case s =>
-    s.valid && (s.bits.fromA || s.bits.fromC)
-  }).asUInt) + grantQueueCnt >= mshrsAll.U
-  val noSpaceWaitSinkEForSinkReq = PopCount(VecInit(io.pipeStatusVec.tail.map { case s =>
-    s.valid && s.bits.fromA
-  }).asUInt) + PopCount(VecInit(inflightGrant.map(x => x.valid))) >= mshrsAll.U
-  // for timing consideration, drop s1 info, so always reserve one entry for it
-  val noSpaceForMSHRReq = PopCount(VecInit(io.pipeStatusVec.tail.map { case s =>
-    s.valid && (s.bits.fromA || s.bits.fromC)
-  }).asUInt) + grantQueueCnt >= (mshrsAll-1).U
-  val noSpaceWaitSinkEForMSHRReq = PopCount(VecInit(io.pipeStatusVec.tail.map { case s =>
-    s.valid && s.bits.fromA
-  }).asUInt) + PopCount(VecInit(inflightGrant.map(x => x.valid))) >= (mshrsAll - 1).U
-  // pftRespQueue also requires back pressure to ensure that it will not exceed capacity
-  // Ideally, it should only block Prefetch from entering MainPipe
-  // But since it is extremely rare that pftRespQueue of 10 would be full, we just block all Entrance here, simpler logic
-  // TODO: consider optimize this
-  val noSpaceForSinkPft = prefetchOpt.map(_ => PopCount(VecInit(io.pipeStatusVec.tail.map { case s =>
-    s.valid && s.bits.fromA
-  }).asUInt) + pftRespQueue.get.io.count >= pftQueueLen.U)
-  val noSpaceForMSHRPft = prefetchOpt.map(_ => PopCount(VecInit(io.pipeStatusVec.tail.map { case s =>
-    s.valid && s.bits.fromA
-  }).asUInt) + pftRespQueue.get.io.count >= (pftQueueLen-1).U)
+  // Reserve capacity at admission and return it only on queue/table transfer or a no-D terminal event.
+  // Preserve every terminal identity and every simultaneous return delta.
+  def eventCount(add: Bool, remove: UInt, capacity: Int, name: String): UInt = {
+    val used = RegInit(0.U(log2Ceil(capacity + 1).W))
+    val next = (used +& add.asUInt) - remove
+    when(add || remove.orR) {
+      assert(used >= remove, s"$name underflow")
+      assert(next <= capacity.U, s"$name overflow")
+      used := next
+    }
+    used
+  }
+  val reserveGrant = io.pipelineReserve.valid &&
+    (io.pipelineReserve.bits.fromA || io.pipelineReserve.bits.fromC)
+  val returnGrant = PopCount(io.pipelineReturn.map(event => event.valid &&
+    (event.bits.fromA || event.bits.fromC)))
+  val reserveA = io.pipelineReserve.valid && io.pipelineReserve.bits.fromA
+  val returnA = PopCount(io.pipelineReturn.map(event => event.valid && event.bits.fromA))
+  val grantReservations = eventCount(reserveGrant, returnGrant, mshrsAll, "grant reservations")
+  val ackReservations = eventCount(reserveA, returnA, grantBufInflightSize, "A reservations")
+  val reservationOwners = RegInit(VecInit(Seq.fill(mshrsAll)(
+    0.U.asTypeOf(Valid(new GrantReservationToken)))))
+  reservationOwners.zipWithIndex.foreach { case (owner, i) =>
+    val returns = io.pipelineReturn.map(event => event.valid && event.bits.id === i.U)
+    assert(PopCount(returns) <= 1.U,
+      "distinct terminal stages must return distinct GrantBuffer token owners")
+    io.pipelineReturn.zip(returns).foreach { case (event, matches) =>
+      when(matches) {
+        assert(owner.valid && event.bits.asUInt === owner.bits.asUInt,
+          "GrantBuffer return must match its exact reserved slot/generation/channel")
+        owner.valid := false.B
+      }
+    }
+    when(reserveGrant && io.pipelineReserve.bits.id === i.U) {
+      assert(!owner.valid && !VecInit(returns).asUInt.orR,
+        "a GrantBuffer promise must claim an idle registered token slot")
+      owner.valid := true.B
+      owner.bits := io.pipelineReserve.bits
+    }
+  }
+  assert(PopCount(reservationOwners.map(_.valid)) === grantReservations,
+    "grant reservation tally must equal its outstanding token owners")
+  assert(PopCount(reservationOwners.map(owner => owner.valid && owner.bits.fromA)) === ackReservations,
+    "A reservation tally must equal its outstanding token owners")
+
+  // Delay occupancy by one edge to align insertion with the registered reservation return.
+  val grantOccupied = RegNext(grantQueue.io.count, 0.U)
+  val ackOccupied = RegNext(PopCount(inflightGrant.map(_.valid)), 0.U)
+  val pftOccupied = prefetchOpt.map(_ => RegNext(pftRespQueue.get.io.count, 0.U))
+  val grantUsed = grantOccupied +& grantReservations
+  val ackUsed = ackOccupied +& ackReservations
+  assert(grantUsed <= mshrsAll.U, "grant promises exceed local capacity")
+  assert(ackUsed <= grantBufInflightSize.U, "GrantAck promises exceed local capacity")
+  def registeredCredit(used: UInt, capacity: Int): UInt = {
+    val credit = RegInit(0.U(log2Ceil(capacity + 1).W))
+    credit := Mux(used >= capacity.U, 0.U, capacity.U - used)
+    credit
+  }
+  val grantCredit = registeredCredit(grantUsed, mshrsAll)
+  val ackCredit = registeredCredit(ackUsed, grantBufInflightSize)
+  // At edge n the credit snapshot includes reservations through n-3. The
+  // receipt Q and its delay hold n-1/n-2; debit exactly those newer promises.
+  // Current terminal returns never replenish admission in the same cycle.
+  val previousReserve = RegNext(io.pipelineReserve, 0.U.asTypeOf(io.pipelineReserve))
+  val recentReserves = Seq(io.pipelineReserve, previousReserve)
+  val grantDebits = PopCount(recentReserves.map(event => event.valid &&
+    (event.bits.fromA || event.bits.fromC)))
+  val ackDebits = PopCount(recentReserves.map(event => event.valid && event.bits.fromA))
+  assert(grantDebits <= grantCredit,
+    "newer grant promises must fit within the retained credit snapshot")
+  assert(ackDebits <= ackCredit,
+    "newer A promises must fit within the retained credit snapshot")
+  val noSpaceForSinkReq = grantCredit <= grantDebits
+  val noSpaceWaitSinkEForSinkReq = ackCredit <= ackDebits
+  val noSpaceForMSHRReq = grantCredit <= (grantDebits +& 1.U)
+  val noSpaceWaitSinkEForMSHRReq = ackCredit <= (ackDebits +& 1.U)
+  val pftCredit = pftOccupied.map { occupied =>
+    val used = occupied +& ackReservations
+    assert(used <= pftQueueLen.U, "prefetch promises exceed local capacity")
+    registeredCredit(used, pftQueueLen)
+  }
+  val noSpaceForSinkPft = pftCredit.map(_ <= ackDebits)
+  val noSpaceForMSHRPft = pftCredit.map(_ <= (ackDebits +& 1.U))
 
   io.toReqArb.blockSinkReqEntrance.blockA_s1 := noSpaceForSinkReq || noSpaceWaitSinkEForSinkReq || noSpaceForSinkPft.getOrElse(false.B)
   io.toReqArb.blockSinkReqEntrance.blockB_s1 := Cat(inflightGrant.map(g => g.valid &&
@@ -323,6 +393,7 @@ class GrantBuffer(implicit p: Parameters) extends L2Module {
   // A-replace related rprobe is handled in SourceB
   io.toReqArb.blockSinkReqEntrance.blockC_s1 := noSpaceForSinkReq
   io.toReqArb.blockSinkReqEntrance.blockG_s1 := false.B // this is not used
+  io.toReqArb.blockSinkReqEntrance.blockAll_s1 := false.B
   io.toReqArb.blockMSHRReqEntrance := noSpaceForMSHRReq || noSpaceWaitSinkEForMSHRReq || noSpaceForMSHRPft.getOrElse(false.B)
 
   // =========== XSPerf ===========

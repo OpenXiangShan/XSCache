@@ -410,9 +410,10 @@ class MMIOBridgeImp(outer: MMIOBridge) extends LazyModuleImp(outer)
   io.rx.dat.ready := Cat(entries.zipWithIndex.map { case (entry, i) =>
     entry.io.chi.rx.dat.ready && io.rx.dat.bits.txnID === i.U
   }).orR
-  io.rx.rsp.ready := true.B
-  assert(!io.rx.rsp.valid || Cat(entries.zipWithIndex.map { case (entry, i) =>
-    entry.io.chi.rx.rsp.ready && io.rx.rsp.bits.txnID === i.U }).orR)
+  io.rx.rsp.ready := Cat(entries.zipWithIndex.map { case (entry, i) =>
+    entry.io.chi.rx.rsp.ready && io.rx.rsp.bits.txnID === i.U
+  }).orR
+  assert(!io.rx.rsp.valid || io.rx.rsp.ready)
 
   dontTouch(io)
   dontTouch(bus)

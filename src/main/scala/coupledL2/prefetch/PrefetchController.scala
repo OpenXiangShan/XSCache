@@ -46,7 +46,7 @@ class PrefetchFeedbackBundle(implicit p: Parameters) extends PrefetchBundle {
   val busContention = Valid(new BusContentionBundle())
 }
 class PrefetchControllerIO(implicit p: Parameters) extends PrefetchBundle {
-  // FIXME lyq: epoch 方式：isDemand, isDemandTrain(miss/pfhit)
+  // FIXME: Epoch mode uses isDemand and isDemandTrain (miss/prefetch hit).
   val isDemandTrain = Input(Bool())
   val pfFeedbackVec = Input(Vec(banks, new PrefetchFeedbackBundle()))
   val l2PfFbCtrl = Output(new L2PfFeedbackCtrl)
@@ -179,7 +179,7 @@ class PrefetchController(implicit p: Parameters) extends PrefetchModule {
   val phtValid = RegInit(VecInit(Seq.fill(banks)(VecInit(Seq.fill(PHT_ENTRIES)(false.B)))))
   val phtTag = RegInit(VecInit(Seq.fill(banks)(VecInit(Seq.fill(PHT_ENTRIES)(0.U(PHT_TAG_BITS.W))))))
   val phtPfId = RegInit(VecInit(Seq.fill(banks)(VecInit(Seq.fill(PHT_ENTRIES)(0.U(log2Ceil(PF_NUM).W))))))
-  // TODO lyq: 一些信息感觉不需要分 bank 存储？因为地址是不会重合的？
+  // TODO: Check whether address uniqueness permits sharing this state across banks.
 
   // io alias
   val replaceRecord = io.pfFeedbackVec.map(x => x.replaceRecord)

@@ -1540,7 +1540,8 @@ class CDPPrefetcher(implicit p: Parameters) extends CDPModule {
       buf.io.enq(j).bits := req.bits
 
       if (j > 0) {
-        buf.io.enq(j).bits.pfVAddr := req.bits.pfVAddr + (j * blockBytes).U
+        buf.io.enq(j).bits.pfVAddr :=
+          BOPAddressAdd(req.bits.pfVAddr, j.S, log2Ceil(blockBytes))
       }
     }
 
