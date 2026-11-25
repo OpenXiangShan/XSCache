@@ -284,6 +284,9 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       --l2-hitfp-dir-flow <0|1> fire REQ on the directory response (1, default)
       --l2-hitfp-early-inactive <0|1>
                                 predict proxy write-FSM inactivation (1, default)
+      --l2-enable-sticky-data <0|1>
+                                issue upstream CompData only when both halves are
+                                ready; no Custom L1 Hint output is generated
       --llc-sets <n>            OpenLLC sets per bank, 64 by default (power of two)
       --llc-ways <n>            OpenLLC ways per bank, 4 by default (power of two)
       --llc-banks <n>           OpenLLC banks, 1 by default (power of two)
@@ -317,6 +320,7 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
   var l2HitfpDsRespIssue = true
   var l2HitfpDirRespFlow = true
   var l2HitfpEarlyInactive = true
+  var l2EnableStickyData = false
   var llcSets = 64
   var llcWays = 4
   var llcBanks = 1
@@ -351,6 +355,7 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       case "--l2-hitfp-ds-issue" => l2HitfpDsRespIssue = args(i + 1) == "1"; i += 2
       case "--l2-hitfp-dir-flow" => l2HitfpDirRespFlow = args(i + 1) == "1"; i += 2
       case "--l2-hitfp-early-inactive" => l2HitfpEarlyInactive = args(i + 1) == "1"; i += 2
+      case "--l2-enable-sticky-data" => l2EnableStickyData = args(i + 1) == "1"; i += 2
       case "--llc-sets" => llcSets = args(i + 1).toInt; i += 2
       case "--llc-ways" => llcWays = args(i + 1).toInt; i += 2
       case "--llc-banks" => llcBanks = args(i + 1).toInt; i += 2
@@ -387,7 +392,8 @@ Usage: TestTop_L2OpenLLC [<--option> <values>]
       hitFastPathDsRespFlow = l2HitfpDsRespFlow,
       hitFastPathDsRespIssue = l2HitfpDsRespIssue,
       hitFastPathDirRespFlow = l2HitfpDirRespFlow,
-      hitFastPathEarlyInactive = l2HitfpEarlyInactive
+      hitFastPathEarlyInactive = l2HitfpEarlyInactive,
+      enableStickyData = l2EnableStickyData
     )
     case CHIParametersKey => CHIParameters (
       issue = EnumCHIIssue.E,

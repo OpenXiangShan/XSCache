@@ -44,6 +44,11 @@ import utility.Code
   *   - hitFastPathEarlyInactive: resolve the proxies' write FSMs one cycle
   *     early via an exact free-at-edge prediction of the REQ vPipe.
   *
+  * enableCustomL1Hint and enableStickyData are elaboration-time controls for
+  * atomic pair-ready upstream CompData issue and default off. The current
+  * implementation has no Custom L1 Hint output or Hint scheduling hardware;
+  * enableCustomL1Hint is reserved for the later scheduler integration.
+  *
   * These are case-class defaults, not the release-top overrides. Top_L2Top uses
   * 8 ways, 1024 sets, 32 TSHRs by default, ECC enabled, and MBIST enabled.
   */
@@ -71,6 +76,8 @@ case class L2Params(
     hitFastPathDirRespFlow: Boolean = true,
     hitFastPathEarlyInactive: Boolean = true,
     hitFastPathDsRespIssue: Boolean = true,
+    enableCustomL1Hint: Boolean = false,
+    enableStickyData: Boolean = false,
 ) {
     require(Seq("dirrel-high", "rr", "dirrel-low").contains(dirRelArbitration),
       s"DirRel arbitration must be dirrel-high, rr, or dirrel-low: $dirRelArbitration")

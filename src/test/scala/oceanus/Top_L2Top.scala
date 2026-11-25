@@ -98,6 +98,9 @@ Usage: Top_L2Top [<--option> <values>]
       --l2-hitfp-dir-flow <0|1> fire REQ on the directory response (1, default)
       --l2-hitfp-early-inactive <0|1>
                                 predict proxy write-FSM inactivation (1, default)
+      --l2-enable-sticky-data <0|1>
+                                issue upstream CompData only when both halves are
+                                ready; no Custom L1 Hint output is generated
       --perf                    enable all performance counters (XSPerf) and
                                 expose the log dump/clean pins; off by default
   """
@@ -127,6 +130,7 @@ Usage: Top_L2Top [<--option> <values>]
   var hitfpDsRespIssue = true
   var hitfpDirRespFlow = true
   var hitfpEarlyInactive = true
+  var enableStickyData = false
 
   def parseBoolean(option: String, value: String): Boolean = {
     require(value == "0" || value == "1", s"$option expects 0 or 1, got $value")
@@ -162,6 +166,8 @@ Usage: Top_L2Top [<--option> <values>]
       (hitfpDirRespFlow = parseBoolean("--l2-hitfp-dir-flow", value), i)
     case (Array("--l2-hitfp-early-inactive", value), i) =>
       (hitfpEarlyInactive = parseBoolean("--l2-hitfp-early-inactive", value), i)
+    case (Array("--l2-enable-sticky-data", value), i) =>
+      (enableStickyData = parseBoolean("--l2-enable-sticky-data", value), i)
   }
 
   varArgsToDrop.map(_._2).foreach(i => {
@@ -201,7 +207,8 @@ Usage: Top_L2Top [<--option> <values>]
       hitFastPathDsRespFlow = hitfpDsRespFlow,
       hitFastPathDsRespIssue = hitfpDsRespIssue,
       hitFastPathDirRespFlow = hitfpDirRespFlow,
-      hitFastPathEarlyInactive = hitfpEarlyInactive
+      hitFastPathEarlyInactive = hitfpEarlyInactive,
+      enableStickyData = enableStickyData
     )
     case CHIParametersKey => CHIParameters (
       issue = EnumCHIIssue.E,
