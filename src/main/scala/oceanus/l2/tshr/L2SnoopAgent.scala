@@ -160,6 +160,7 @@ class L2SnoopAgent(val sliceNum: Int)(implicit val p: Parameters) extends Module
   val servicePreserveClient = RegInit(false.B)
 
   val seenData0 = RegInit(false.B)
+  val seenData2 = RegInit(false.B)
   val passDirtyReg = RegInit(false.B)
 
   val uopValids = Seq(io.uopFromSNP.valid, io.uopFromREQ.valid)
@@ -229,7 +230,7 @@ class L2SnoopAgent(val sliceNum: Int)(implicit val p: Parameters) extends Module
   // Upstream RXDAT DataID carries a packed beat index ({0,1} for the two 256-bit halves), not the CHI chunk index {0,2}
   val datBeat2 = datMatch && io.UpRXDAT.bits.DataID === 1.U
 
-  val done = rspMatch || (datBeat2 && seenData0)
+  val done = rspMatch || (datBeat0 && seenData2) || (datBeat2 && seenData0)
   val invalidatingService = serviceOpcode === CCHIOpcode.SnpMakeInvalid.U || serviceOpcode === CCHIOpcode.SnpToInvalid.U
   // Alias back-invalidation preserves ownership through the subsequent grant; other invalidating completions clear it.
   val clear_client_en = done && invalidatingService && !servicePreserveClient
@@ -327,9 +328,15 @@ class L2SnoopAgent(val sliceNum: Int)(implicit val p: Parameters) extends Module
     passDirtyReg := io.UpRXDAT.bits.Resp(2)
   }
 
+  when (datBeat2) {
+    seenData2 := true.B
+    passDirtyReg := io.UpRXDAT.bits.Resp(2)
+  }
+
   when (done) {
     busy := false.B
     seenData0 := false.B
+    seenData2 := false.B
     passDirtyReg := false.B
     serviceFromSNP := false.B
     serviceFromREQ := false.B
@@ -385,9 +392,12 @@ class L2SnoopAgent(val sliceNum: Int)(implicit val p: Parameters) extends Module
     s"L2SnoopAgent @ %m: service latched multiple sources")
   assert(!busy || PopCount(Seq(serviceFromSNP, serviceFromREQ)) === 1.U,
     s"L2SnoopAgent @ %m: service did not retain its source")
-  assert(!(datBeat2 && !seenData0),
-    s"L2SnoopAgent @ %m: SnpRespData DataID 2 arrived before DataID 0")
-  assert(!(datBeat2 && passDirtyReg =/= io.UpRXDAT.bits.Resp(2)),
+  assert(!(datBeat0 && seenData0),
+    s"L2SnoopAgent @ %m: duplicated SnpRespData DataID 0")
+  assert(!(datBeat2 && seenData2),
+    s"L2SnoopAgent @ %m: duplicated SnpRespData DataID 2")
+  assert(!(((datBeat0 && seenData2) || (datBeat2 && seenData0)) &&
+           passDirtyReg =/= io.UpRXDAT.bits.Resp(2)),
     "L2SnoopAgent: SnpRespData PassDirty changed between data beats")
   assert(!(io.uopFromSNP.valid && !armedSNP && holdCountSNP >= 4.U),
     s"L2SnoopAgent @ %m: SNP uop input valid stayed high after acceptance; deassert before reusing the request")
