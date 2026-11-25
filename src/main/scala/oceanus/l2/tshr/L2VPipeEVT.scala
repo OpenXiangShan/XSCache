@@ -73,16 +73,14 @@ class L2VPipeEVT(
   val pReqWay = Reg(UInt(4.W))
   val pEntState = Reg(UInt(2.W)) // entrance-time directory state (assertion use only)
   val dataArmed = RegInit(false.B)
+  val seenData0 = RegInit(false.B)
+  val seenData2 = RegInit(false.B)
   val dirHit = RegInit(false.B)
   val inflightEvict = RegInit(false.B)
   val commitPending = RegInit(false.B) // WriteBackFull meta commit deferred past a peer meta.state write
 
   io.EVT_active := inflightEvict
   io.EVT_data_pending := pIsWbFull && (state === sSendCompDBIDResp || state === sWaitData)
-  io.evtDataReadyOut := RegNext(io.UpRXDAT.valid &&
-    io.UpRXDAT.bits.TxnID === io.consts.tshrId &&
-    io.UpRXDAT.bits.Opcode === CCHIOpcode.CopyBackWrData.U &&
-    io.UpRXDAT.bits.DataID === 1.U, false.B) // upstream DataID: packed beat index {0,1}
 
   io.free := state === sIdle
 
@@ -111,7 +109,15 @@ class L2VPipeEVT(
       io.UpRXDAT.bits.Opcode === CCHIOpcode.CopyBackWrData.U
   val isBeat0 = copyBackWrDataMatch && io.UpRXDAT.bits.DataID === 0.U
   val isBeat2 = copyBackWrDataMatch && io.UpRXDAT.bits.DataID === 1.U // upstream DataID: packed beat index {0,1}
-  val evtDataReady = RegNext(isBeat2, false.B)
+  val evtDataReady = RegNext((isBeat0 && seenData2) || (isBeat2 && seenData0), false.B)
+  io.evtDataReadyOut := evtDataReady
+
+  when (isBeat0) {
+    seenData0 := true.B
+  }
+  when (isBeat2) {
+    seenData2 := true.B
+  }
 
   // Commit stall: a REQ/SNP vPipe writing meta.state this cycle takes the slot
   // (peer writes are hard-timed single-cycle pulses from downstream data
@@ -133,6 +139,8 @@ class L2VPipeEVT(
     pEntState := dirResult.state
     dirHit := dirResult.hit
     dataArmed := false.B
+    seenData0 := false.B
+    seenData2 := false.B
     commitPending := false.B
     inflightEvict := true.B
     state := Mux(
@@ -232,7 +240,8 @@ class L2VPipeEVT(
   io.tshr_meta_write_en := metaMask
   io.tshr_meta_write_meta := newMeta
 
-  assert(!(copyBackWrDataMatch && evtDataReady), "EVT: unexpected extra CopyBackWrData after evtDataReady")
+  assert(!(isBeat0 && seenData0), "EVT: duplicated CopyBackWrData DataID 0")
+  assert(!(isBeat2 && seenData2), "EVT: duplicated CopyBackWrData DataID 2")
   assert(!(state === sWaitData && !dataArmed), "EVT: data arrived before CompDBIDResp armed reception")
   assert(!(wbCommitNow && pEntState === L2Directory.MetaState.S),
     "EVT: WriteBackFull must not originate from shared-clean directory state")
