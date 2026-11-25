@@ -409,18 +409,16 @@ class Directory(implicit p: Parameters) extends L2Module {
   io.replWayOH := finalReplOH
 
   /* ====== Update ====== */
-  // PLRU: update replacer only when A hit or refill, at stage 3
-  // RRIP: update replacer when A/C hit or refill
-  val updateHit = if(cacheParams.replacement == "drrip" || cacheParams.replacement == "srrip"){
-    reqValid_s3 && hit_s3 &&
-    ((req_s3.replacerInfo.channel(0) && (req_s3.replacerInfo.opcode === AcquirePerm || req_s3.replacerInfo.opcode === AcquireBlock || req_s3.replacerInfo.opcode === Hint)) ||
-     (req_s3.replacerInfo.channel(2) && (req_s3.replacerInfo.opcode === Release || req_s3.replacerInfo.opcode === ReleaseData)))
-  } else {
-    reqValid_s3 && hit_s3 && req_s3.replacerInfo.channel(0) &&
-    (req_s3.replacerInfo.opcode === AcquirePerm || req_s3.replacerInfo.opcode === AcquireBlock)
-  }
+  val isSRRIP = cacheParams.replacement == "srrip"
+  val isDRRIP = cacheParams.replacement == "drrip"
+  val opcode_s3 = replacerInfo_s3.opcode
+  // A DRRIP Hint hit leaves RRPV unchanged. Skip the write to avoid marking it as reuse and stalling a same-bank read.
+  val updateOnA = replacerInfo_s3.channel(0) &&
+    (opcode_s3 === AcquirePerm || opcode_s3 === AcquireBlock || (isSRRIP.B && opcode_s3 === Hint))
+  val updateOnC = (isSRRIP || isDRRIP).B && replacerInfo_s3.channel(2) &&
+    (opcode_s3 === Release || opcode_s3 === ReleaseData)
+  val updateHit = reqValid_s3 && hit_s3 && (updateOnA || updateOnC)
   val updateRefill = refillReqValid_s3 && !refillRetry
-  // update replacer when A/C hit or refill
   replacerWen := updateHit || updateRefill
 
   // hit-Promotion, miss-Insertion for RRIP
@@ -454,13 +452,13 @@ class Directory(implicit p: Parameters) extends L2Module {
     req_s3.refill
   )
   private val mbistPl = MbistPipeline.PlaceMbistPipeline(1, "L2Directory", mbist)
-  if(cacheParams.replacement == "srrip"){
+  if (isSRRIP) {
     val next_state_s3 = repl.get_next_state(repl_state_s3, wayOH_s3, hit_s3, inv, rrip_req_type)
     val repl_init = Wire(Vec(ways, UInt(2.W)))
     repl_init.foreach(_ := 2.U(2.W))
     replacer_sram_opt.get.io.w(replacerWen, next_state_s3, set_s3, 1.U)
 
-  } else if(cacheParams.replacement == "drrip"){
+  } else if (isDRRIP) {
     // Set Dueling
     val PSEL = RegInit(512.U(10.W)) //32-monitor sets, 10-bits psel
     // track monitor sets' hit rate for each policy
