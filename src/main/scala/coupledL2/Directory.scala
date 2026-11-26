@@ -190,7 +190,7 @@ class Directory(implicit p: Parameters) extends L2Module {
     when(predictor.io.deadWrite.valid) {
       deadBits.get(predictor.io.deadWrite.bits.set)(predictor.io.deadWrite.bits.way) := predictor.io.deadWrite.bits.dead
     }
-    assert(!predictor.io.samplerWrite || io.metaWReq.valid || io.tagWReq.valid || replacerWen,
+    assert(!predictor.io.samplerWrite || !io.read.ready,
       "Sampler write is not covered by Directory read exclusion")
     XSPerfAccumulate("sdbp_live_training", predictor.io.liveTraining)
     XSPerfAccumulate("sdbp_dead_training", predictor.io.deadTraining)
@@ -399,7 +399,12 @@ class Directory(implicit p: Parameters) extends L2Module {
   dontTouch(metaArray.io)
   dontTouch(tagArray.io)
 
-  io.read.ready := !io.metaWReq.valid && !io.tagWReq.valid && !replacerWen
+  val aHit_s3 = reqValid_s3 && hit_s3 && replacerInfo_s3.channel(0)
+  val sampledHintHit_s3 = if (sdbp.nonEmpty) {
+    aHit_s3 && replacerInfo_s3.opcode === Hint && SDBPHash.sampled(set_s3, sets, cacheParams.sdbp.samplerSets)
+  } else false.B
+  // A sampled Hint can still commit to the sampler even though it skips the TrueLRU write.
+  io.read.ready := !io.metaWReq.valid && !io.tagWReq.valid && !replacerWen && !sampledHintHit_s3
 
   /* ======!! Replacement logic !!====== */
   /* ====== Read, choose replaceWay ====== */
@@ -441,10 +446,9 @@ class Directory(implicit p: Parameters) extends L2Module {
     ((req_s3.replacerInfo.channel(0) && (req_s3.replacerInfo.opcode === AcquirePerm || req_s3.replacerInfo.opcode === AcquireBlock || req_s3.replacerInfo.opcode === Hint)) ||
      (req_s3.replacerInfo.channel(2) && (req_s3.replacerInfo.opcode === Release || req_s3.replacerInfo.opcode === ReleaseData)))
   } else {
-    reqValid_s3 && hit_s3 && req_s3.replacerInfo.channel(0) &&
-    (req_s3.replacerInfo.opcode === AcquirePerm || req_s3.replacerInfo.opcode === AcquireBlock ||
-      (cacheParams.replacement == "sdbp" || cacheParams.replacement == "lru").B &&
-        (req_s3.replacerInfo.opcode === Get || req_s3.replacerInfo.opcode === Hint))
+    aHit_s3 && (replacerInfo_s3.opcode === AcquirePerm || replacerInfo_s3.opcode === AcquireBlock ||
+      (cacheParams.replacement == "sdbp" || cacheParams.replacement == "lru").B && replacerInfo_s3.opcode === Get ||
+      (cacheParams.replacement == "lru").B && replacerInfo_s3.opcode === Hint)
   }
   val updateRefill = refillReqValid_s3 && !refillRetry
   // update replacer when A/C hit or refill
