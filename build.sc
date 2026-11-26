@@ -8,25 +8,33 @@ import $file.`rocket-chip`.common
 import $file.`rocket-chip`.cde.common
 import $file.`rocket-chip`.hardfloat.common
 
-val defaultScalaVersion = "2.13.17"
-
-def defaultVersions = Map(
-  "chisel"        -> mvn"org.chipsalliance::chisel:7.13.0",
-  "chisel-plugin" -> mvn"org.chipsalliance:::chisel-plugin:7.13.0"
-)
+object ivys {
+  val scala = "2.13.18"
+  val chiselCrossVersions = Map(
+    "xiangshan" -> (
+      mvn"cc.xiangshan::chisel:7.16.0-xiangshan-2",
+      mvn"cc.xiangshan:::chisel-plugin:7.16.0-xiangshan-2"
+    ),
+    "upstream" -> (
+      mvn"org.chipsalliance::chisel:7.16.0",
+      mvn"org.chipsalliance:::chisel-plugin:7.16.0"
+    )
+  )
+  def chiselKeys = chiselCrossVersions.keys.toSeq
+}
 
 val pwd = os.Path(sys.env("MILL_WORKSPACE_ROOT"))
 
-trait HasChisel extends SbtModule {
+trait HasChisel extends SbtModule with Cross.Module[String] {
   def chiselModule: Option[ScalaModule] = None
 
   def chiselPluginJar: T[Option[PathRef]] = None
 
-  def chiselIvy: Option[Dep] = Some(defaultVersions("chisel"))
+  def chiselIvy: Option[Dep] = Some(ivys.chiselCrossVersions(crossValue)._1)
 
-  def chiselPluginIvy: Option[Dep] = Some(defaultVersions("chisel-plugin"))
+  def chiselPluginIvy: Option[Dep] = Some(ivys.chiselCrossVersions(crossValue)._2)
 
-  override def scalaVersion = defaultScalaVersion
+  override def scalaVersion = ivys.scala
 
   override def scalacOptions = super.scalacOptions() ++
     Agg("-language:reflectiveCalls", "-Ymacro-annotations", "-Ytasty-reader")
@@ -36,8 +44,7 @@ trait HasChisel extends SbtModule {
   override def scalacPluginIvyDeps = super.scalacPluginIvyDeps() ++ Agg(chiselPluginIvy.get)
 }
 
-object rocketchip extends `rocket-chip`.common.RocketChipModule with HasChisel {
-
+trait RocketChip extends `rocket-chip`.common.RocketChipModule with HasChisel {
   val rcPath = pwd / "rocket-chip"
   override def millSourcePath = rcPath
 
@@ -45,58 +52,61 @@ object rocketchip extends `rocket-chip`.common.RocketChipModule with HasChisel {
 
   def json4sJacksonIvy = mvn"org.json4s::json4s-jackson:4.0.7"
 
-  object macros extends `rocket-chip`.common.MacrosModule with SbtModule {
-
-    def scalaVersion: T[String] = T(defaultScalaVersion)
-
+  trait Macros extends `rocket-chip`.common.MacrosModule with HasChisel {
+    def scalaVersion: T[String] = T(ivys.scala)
     def scalaReflectIvy = mvn"org.scala-lang:scala-reflect:${scalaVersion}"
   }
 
-  object cde extends `rocket-chip`.cde.common.CDEModule with ScalaModule {
-
-    def scalaVersion: T[String] = T(defaultScalaVersion)
-
+  trait CDE extends `rocket-chip`.cde.common.CDEModule with Cross.Module[String] {
+    def scalaVersion: T[String] = T(ivys.scala)
     override def millSourcePath = rcPath / "cde" / "cde"
   }
 
-  object hardfloat extends `rocket-chip`.hardfloat.common.HardfloatModule with HasChisel {
+  trait HardFloat extends `rocket-chip`.hardfloat.common.HardfloatModule with HasChisel {
+    def scalaVersion: T[String] = T(ivys.scala)
     override def millSourcePath = rcPath / "hardfloat" / "hardfloat"
   }
 
-  def macrosModule = macros
+  def macrosModule = macros(crossValue)
+  def cdeModule = cde(crossValue)
+  def hardfloatModule = hardfloat(crossValue)
 
-  def hardfloatModule = hardfloat
-
-  def cdeModule = cde
-
+  object macros extends Cross[Macros](ivys.chiselKeys)
+  object cde extends Cross[CDE](ivys.chiselKeys)
+  object hardfloat extends Cross[HardFloat](ivys.chiselKeys)
 }
 
-object utility extends HasChisel {
+object rocketchip extends Cross[RocketChip](ivys.chiselKeys)
+
+trait Utility extends HasChisel {
   override def millSourcePath = pwd / "utility"
 
-  override def moduleDeps = super.moduleDeps ++ Seq(rocketchip)
+  override def moduleDeps = super.moduleDeps ++ Seq(rocketchip(crossValue))
 
   override def ivyDeps = super.ivyDeps() ++ Agg(
     mvn"com.lihaoyi::sourcecode:0.4.4",
   )
 }
 
-object openNCB extends HasChisel {
+object utility extends Cross[Utility](ivys.chiselKeys)
+
+trait OpenNCB extends HasChisel {
   override def millSourcePath = pwd / "OpenNCB"
-  override def moduleDeps = super.moduleDeps ++ Seq(rocketchip)
+  override def moduleDeps = super.moduleDeps ++ Seq(rocketchip(crossValue))
 }
 
-object XSCache extends HasChisel with $file.common.XSCacheModule {
+object openNCB extends Cross[OpenNCB](ivys.chiselKeys)
 
-  override def millSourcePath = millOuterCtx.millSourcePath
+trait XSCache extends HasChisel with $file.common.XSCacheModule {
+  override def millSourcePath = pwd
 
-  override def moduleDeps = super.moduleDeps ++ Seq(zhujiangCompat)
+  override def moduleDeps = super.moduleDeps ++ Seq(zhujiangCompat(crossValue))
 
-  def rocketModule: ScalaModule = rocketchip
+  def rocketModule: ScalaModule = rocketchip(crossValue)
 
-  def utilityModule: ScalaModule = utility
+  def utilityModule: ScalaModule = utility(crossValue)
 
-  def openNCBModule: ScalaModule = openNCB
+  def openNCBModule: ScalaModule = openNCB(crossValue)
 
   object test extends SbtTests with TestModule.ScalaTest {
     override def sources = T.sources {
@@ -108,27 +118,31 @@ object XSCache extends HasChisel with $file.common.XSCacheModule {
   }
 
   object testtop extends Module {
-    object l2 extends HasChisel {
+    trait L2 extends HasChisel {
       override def millSourcePath = pwd
-      override def moduleDeps = super.moduleDeps ++ Seq(XSCache)
+      override def moduleDeps = super.moduleDeps ++ Seq(XSCache(crossValue))
       override def sources = T.sources {
         Seq(PathRef(pwd / "src" / "test" / "scala" / "TestTopL2.scala"))
       }
       override def scalacOptions = super.scalacOptions() ++ Agg("-deprecation", "-feature")
     }
 
-    object openllc extends HasChisel {
+    object l2 extends Cross[L2](ivys.chiselKeys)
+
+    trait OpenLLC extends HasChisel {
       override def millSourcePath = pwd
-      override def moduleDeps = super.moduleDeps ++ Seq(XSCache)
+      override def moduleDeps = super.moduleDeps ++ Seq(XSCache(crossValue))
       override def sources = T.sources {
         Seq(PathRef(pwd / "src" / "test" / "scala" / "TestTopOpenLLC.scala"))
       }
       override def scalacOptions = super.scalacOptions() ++ Agg("-deprecation", "-feature")
     }
 
-    object zhujiang extends HasChisel {
+    object openllc extends Cross[OpenLLC](ivys.chiselKeys)
+
+    trait Zhujiang extends HasChisel {
       override def millSourcePath = pwd
-      override def moduleDeps = super.moduleDeps ++ Seq(XSCache, zhujiangCompat)
+      override def moduleDeps = super.moduleDeps ++ Seq(XSCache(crossValue), zhujiangCompat(crossValue))
       override def sources = T.sources {
         Seq(
           PathRef(pwd / "src" / "test" / "scala" / "ZhuJiangBridge.scala"),
@@ -137,15 +151,18 @@ object XSCache extends HasChisel with $file.common.XSCacheModule {
       }
       override def scalacOptions = super.scalacOptions() ++ Agg("-deprecation", "-feature")
     }
+
+    object zhujiang extends Cross[Zhujiang](ivys.chiselKeys)
   }
 
   override def scalacOptions = super.scalacOptions() ++ Agg("-deprecation", "-feature")
-
 }
 
-object zhujiangCompat extends HasChisel {
+object XSCache extends Cross[XSCache](ivys.chiselKeys)
+
+trait ZhujiangCompat extends HasChisel {
   override def millSourcePath = pwd / "ZhuJiang"
-  override def moduleDeps = super.moduleDeps ++ Seq(rocketchip, utility)
+  override def moduleDeps = super.moduleDeps ++ Seq(rocketchip(crossValue), utility(crossValue))
   override def sources = T.sources {
     Seq(
       PathRef(millSourcePath / "src" / "main" / "scala"),
@@ -154,3 +171,5 @@ object zhujiangCompat extends HasChisel {
   }
   override def scalacOptions = super.scalacOptions() ++ Agg("-deprecation", "-feature")
 }
+
+object zhujiangCompat extends Cross[ZhujiangCompat](ivys.chiselKeys)
