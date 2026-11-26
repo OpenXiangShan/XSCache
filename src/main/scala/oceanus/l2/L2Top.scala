@@ -588,6 +588,11 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
         // overflow remains observable per source.
         queue.io.deq.ready := !config.prefetchIssueEnable.B || stale ||
           (isChosen && chosenFire) || sameAsChosen
+        if (L2PrefetchObservation.enabled) {
+          L2QueueDuplicateObservation.count(L2QueueDuplicateObservation.snapshot(queue),
+            s"pfobs_Q_pfQueue_slice${i}_src$source", queue.data.length,
+            stale = stale, sameAsChosen = sameAsChosen, issueOff = !config.prefetchIssueEnable.B)
+        }
       }
       when (chosenFire) {
         lastIssuedValid := true.B
@@ -614,9 +619,24 @@ class L2Top(val config: L2Configuration)(implicit val p: Parameters) extends Mod
       q.suggestName(s"recvFallback_$i")
       q.io.enq.valid := pfRecvReqs(i).valid && !pfRecvReqs(i).ready
       q.io.enq.bits := pfRecvReqs(i).bits
+      if (L2PrefetchObservation.enabled) {
+        L2QueueDuplicateObservation.count(L2QueueDuplicateObservation.snapshot(q),
+          s"pfobs_Q_recvFallback_slice$i", q.data.length, mixedSources = true)
+      }
       q
     }
   } else Nil
+
+  if (L2PrefetchObservation.enabled) pfRecvReqs.zipWithIndex.foreach { case (req, i) =>
+    val prefix = s"pfobs_Q_Recv_slice$i"
+    XSPerfAccumulate(s"${prefix}_direct", req.fire)
+    XSPerfAccumulate(s"${prefix}_fallback", req.valid && !req.ready)
+    for (source <- 0 until (1 << L2PfSource.Width)) {
+      val fromSource = L2PrefetchTxnID.decode(req.bits.TxnID) === source.U
+      XSPerfAccumulate(s"${prefix}_src${source}_direct", req.fire && fromSource)
+      XSPerfAccumulate(s"${prefix}_src${source}_fallback", req.valid && !req.ready && fromSource)
+    }
+  }
 
   when (bop.map(_.io.req.fire).getOrElse(false.B) || recvReqFire || vbopStub.map(_.io.req.fire).getOrElse(false.B) ||
     cdp.map(_.io.req.fire).getOrElse(false.B)) {
