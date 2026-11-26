@@ -1457,9 +1457,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.prefill_meta := p_prefill_miss_meta
 
   // --------------------------------
+  // A replacement commits pending-fill fields only when no newer local write
+  // exists. Registered masks cover earlier local updates; live SNP/EVT masks
+  // cover same-cycle updates. REQ state writes already stall EVT through
+  // peer_meta_write_state, so the live EVT state mask is excluded here to avoid
+  // a combinational loop.
   val repl_tshr_meta_wr = p_prefill_any && io.repl_done
-  // REQ state writes already stall EVT through peer_meta_write_state. Do not
-  // feed the live EVT state mask back here: that would form a combinational loop.
   val repl_state_in_local = io.tshr_meta_modified_mask.state || io.snp_meta_write_en.state
   val repl_dirty_in_local = io.tshr_meta_modified_mask.dirty ||
                             io.snp_meta_write_en.dirty || io.evt_meta_write_en.dirty
@@ -1470,6 +1473,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                             io.snp_meta_write_en.alias || io.evt_meta_write_en.alias
   val repl_prefetch_in_local = io.tshr_meta_modified_mask.prefetch ||
                                io.snp_meta_write_en.prefetch || io.evt_meta_write_en.prefetch
+
   val tshr_meta_wr_state_UU = meta_wr_state_UU && !p_prefill_miss
   val tshr_meta_wr_state_US = meta_wr_state_US && !p_prefill_miss
   val tshr_meta_wr_state_S = meta_wr_state_S && !p_prefill_miss
