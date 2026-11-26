@@ -24,13 +24,14 @@ import org.chipsalliance.cde.config.Parameters
 import xscache.coupledL2._
 import xscache.coupledL2.prefetch.PrefetchIO
 import utility.MemReqSource
-import xscache.chi.{DecoupledPortIO, HasCHIMsgParameters}
+import xscache.chi.{DecoupledPortIO, HasCHIMsgParameters, HasCHIOpcodes}
 
 class OuterBundle(implicit p: Parameters) extends DecoupledPortIO with BaseOuterBundle
 
 class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   with HasCoupledL2Parameters
-  with HasCHIMsgParameters {
+  with HasCHIMsgParameters
+  with HasCHIOpcodes {
 
   val io = IO(new BaseSliceIO[OuterBundle] {
     override val out: OuterBundle = new OuterBundle
@@ -70,6 +71,11 @@ class Slice()(implicit p: Parameters) extends BaseSlice[OuterBundle]
   val status_vec_toTX = reqArb.io.status_vec_toTX ++ mainPipe.io.status_vec_toTX
   txreq.io.pipeReq <> mainPipe.io.toTXREQ
   txreq.io.mshrReq <> mshrCtl.io.toTXREQ
+  mshrCtl.io.readRequestIssued.foreach { issued =>
+    val req = txreq.io.out
+    issued.valid := req.fire && (req.bits.opcode === ReadUnique || req.bits.opcode === ReadNotSharedDirty)
+    issued.bits := req.bits.txnID(mshrBits - 1, 0)
+  }
   txreq.io.pipeStatusVec := status_vec_toTX
   txreq.io.sliceId := io.sliceId
 

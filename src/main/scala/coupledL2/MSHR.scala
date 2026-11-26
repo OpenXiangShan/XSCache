@@ -48,6 +48,16 @@ class MSHRResps(implicit p: Parameters) extends CoupledL2Bundle {
   val rxdat = Flipped(ValidIO(new RespInfoBundle))
 }
 
+class ReadMissLatency(implicit p: Parameters) extends CoupledL2Bundle {
+  val reqSource = UInt(MemReqSource.reqSourceBits.W)
+  val allocToEnqueue = UInt(32.W)
+  val enqueueToIssue = UInt(32.W)
+  val issueToComplete = UInt(32.W)
+  val retried = Bool()
+  val mergedLoad = Bool()
+  val mergedLoadWait = UInt(32.W)
+}
+
 class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
   val io = IO(new Bundle() {
     val id = Input(UInt(mshrBits.W))
@@ -62,6 +72,8 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     val aMergeTask = Flipped(ValidIO(new TaskBundle))
     val replResp = Flipped(ValidIO(new ReplacerResult))
     val pCrd = new PCrdQueryBundle
+    val readRequestIssued = Option.when(cacheParams.enablePerf)(Input(Bool()))
+    val readMissLatency = Option.when(cacheParams.enablePerf)(ValidIO(new ReadMissLatency()))
   })
 
   require (chiOpt.isDefined)
@@ -1478,5 +1490,57 @@ class MSHR(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes {
     acquire_period.get.bits := timer - acquire_ts
     release_period.get.valid := release_finish && !RegNext(release_finish)
     release_period.get.bits := timer - release_ts
+
+    // Time the original data-bearing read, including any protocol retry.
+    // The Slice supplies the actual TXREQ dequeue handshake, after the queue.
+    val readEnqueue = acquire_start && req_valid && req.fromA && !dirResult.hit &&
+      (io.tasks.txreq.bits.opcode === ReadUnique || io.tasks.txreq.bits.opcode === ReadNotSharedDirty)
+    val readPending = RegInit(false.B)
+    val readIssued = RegInit(false.B)
+    val readRetried = RegInit(false.B)
+    val enqueueTime = Reg(UInt(32.W))
+    val issueTime = Reg(UInt(32.W))
+    val mergedLoad = RegInit(false.B)
+    val mergeTime = Reg(UInt(32.W))
+    val now = timer(31, 0)
+    val readComplete = readPending && readIssued && req_valid && acquire_finish
+    val loadMerge = req_valid && req_prefetch && io.aMergeTask.valid &&
+      io.aMergeTask.bits.reqSource === MemReqSource.CPULoadData.id.U
+
+    when(io.alloc.valid) {
+      readPending := false.B
+      readIssued := false.B
+      readRetried := false.B
+      mergedLoad := false.B
+    }
+    when(readEnqueue) {
+      readPending := true.B
+      enqueueTime := now
+    }
+    when(readPending && io.readRequestIssued.get) {
+      when(!readIssued) {
+        issueTime := now
+        readIssued := true.B
+      }.otherwise {
+        readRetried := true.B
+      }
+    }
+    when(loadMerge && !mergedLoad) {
+      mergedLoad := true.B
+      mergeTime := now
+    }
+    when(readComplete) {
+      readPending := false.B
+    }
+
+    val latency = io.readMissLatency.get
+    latency.valid := readComplete
+    latency.bits.reqSource := req.reqSource
+    latency.bits.allocToEnqueue := enqueueTime
+    latency.bits.enqueueToIssue := issueTime - enqueueTime
+    latency.bits.issueToComplete := now - issueTime
+    latency.bits.retried := readRetried
+    latency.bits.mergedLoad := mergedLoad
+    latency.bits.mergedLoadWait := now - mergeTime
   }
 }

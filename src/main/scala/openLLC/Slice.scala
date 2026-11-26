@@ -24,7 +24,7 @@ import freechips.rocketchip.diplomacy._
 import org.chipsalliance.cde.config.Parameters
 import xscache.chi._
 
-class Slice()(implicit p: Parameters) extends LLCModule {
+class Slice()(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   val io = IO(new Bundle() {
     val in = Flipped(new DecoupledPortIO)
     val out = new DecoupledNoSnpPortIO
@@ -131,6 +131,10 @@ class Slice()(implicit p: Parameters) extends LLCModule {
   responseUnit.io.rnRxrsp <> rxrspUp.io.out
   responseUnit.io.snRxdat <> rxdatDown.io.out
   responseUnit.io.snRxrsp <> rxrspDown.io.out
+  responseUnit.io.memoryReadIssued.foreach { issued =>
+    issued.valid := txDown.req.fire && txDown.req.bits.opcode === ReadNoSnp
+    issued.bits := txDown.req.bits.txnID
+  }
 
   snpUnit.io.in <> mainPipe.io.snoopTask_s4
   snpUnit.io.respInfo <> responseUnit.io.respInfo

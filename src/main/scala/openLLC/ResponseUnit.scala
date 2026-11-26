@@ -20,7 +20,7 @@ package xscache.openLLC
 import chisel3._
 import chisel3.util._
 import org.chipsalliance.cde.config.Parameters
-import utility.{FastArbiter}
+import utility.{FastArbiter, XSPerfAccumulate, XSPerfHistogram}
 import xscache.chi._
 import xscache.chi.CHICohStates._
 
@@ -65,6 +65,7 @@ class ResponseUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
     /* response from downstream memory */
     val snRxdat = Flipped(ValidIO(new RespWithData()))
     val snRxrsp = Flipped(ValidIO(new Resp()))
+    val memoryReadIssued = Option.when(cacheParams.enablePerf)(Flipped(ValidIO(UInt(TXNID_WIDTH.W))))
 
     /* fake CompData response from MemUnit */
     val bypassData = Flipped(Vec(beatSize, ValidIO(new RespWithData())))
@@ -353,6 +354,63 @@ class ResponseUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes 
 
   /* Performance Counter */
   if(cacheParams.enablePerf) {
+    // The downstream ReadNoSnp carries this response entry's reqID. Keep
+    // separate timestamps for the initial LLC allocation, actual memory-side
+    // request handshake and arrival of the last data beat.
+    val timestamp = RegInit(0.U(32.W))
+    timestamp := timestamp + 1.U
+    val allocTimes = Reg(Vec(mshrs.response, UInt(32.W)))
+    val issueTimes = Reg(Vec(mshrs.response, UInt(32.W)))
+    val dataTimes = Reg(Vec(mshrs.response, UInt(32.W)))
+    val memoryIssued = RegInit(VecInit(Seq.fill(mshrs.response)(false.B)))
+    val memoryCompleted = RegInit(VecInit(Seq.fill(mshrs.response)(false.B)))
+    val issued = io.memoryReadIssued.get
+    val issueMatches = buffer.map(e => e.valid && e.task.reqID === issued.bits)
+    XSPerfAccumulate("memory_read_issued", issued.valid)
+    XSPerfAccumulate("memory_read_issue_unmatched", issued.valid && !VecInit(issueMatches).asUInt.orR)
+    buffer.zipWithIndex.foreach { case (entry, i) =>
+      val allocated = (canAlloc_s4 && idOH_s4(i)) || (canAlloc_s6 && idOH_s6(i))
+      when(allocated) {
+        allocTimes(i) := timestamp
+        memoryIssued(i) := false.B
+        memoryCompleted(i) := false.B
+      }
+      when(issued.valid && issueMatches(i) && !memoryIssued(i)) {
+        issueTimes(i) := timestamp
+        memoryIssued(i) := true.B
+      }
+      when(memoryIssued(i) && !memoryCompleted(i) && entry.valid &&
+        memData.valid && memData.bits.opcode === CompData && memData.bits.txnID === entry.task.reqID &&
+        PopCount(entry.beatValids) === (beatSize - 1).U) {
+        dataTimes(i) := timestamp
+        memoryCompleted(i) := true.B
+      }
+    }
+    val chosen = txdatArb.io.chosen
+    val allocToResponse = timestamp - allocTimes(chosen)
+    def latencyHistogram(name: String, cycles: UInt, enable: Bool): Unit = {
+      XSPerfHistogram(name, cycles, enable, 0, 2000, 100, true, true)
+      Seq(500, 1000).foreach { threshold =>
+        XSPerfAccumulate(s"${name}_ge_${threshold}", enable && cycles >= threshold.U)
+      }
+    }
+    latencyHistogram("read_response_hit", allocToResponse, txdat.fire && !buffer(chosen).is_miss)
+    latencyHistogram("read_response_miss", allocToResponse, txdat.fire && buffer(chosen).is_miss)
+    // All three memory-path stages refer to exactly the same completed reads.
+    // Bypass and snoop responses still appear in read_response_{hit,miss}.
+    val memoryPath = txdat.fire && memoryCompleted(chosen)
+    val allocToIssue = issueTimes(chosen) - allocTimes(chosen)
+    val issueToData = dataTimes(chosen) - issueTimes(chosen)
+    val dataToResponse = timestamp - dataTimes(chosen)
+    latencyHistogram("memory_read_alloc_to_issue", allocToIssue, memoryPath)
+    latencyHistogram("memory_read_issue_to_data", issueToData, memoryPath)
+    latencyHistogram("memory_read_data_to_response", dataToResponse, memoryPath)
+    latencyHistogram("memory_read_total", allocToResponse, memoryPath)
+    val longMemoryRead = memoryPath && allocToResponse >= 1000.U
+    XSPerfAccumulate("memory_read_long_alloc_to_issue_sum", Mux(longMemoryRead, allocToIssue, 0.U))
+    XSPerfAccumulate("memory_read_long_issue_to_data_sum", Mux(longMemoryRead, issueToData, 0.U))
+    XSPerfAccumulate("memory_read_long_data_to_response_sum", Mux(longMemoryRead, dataToResponse, 0.U))
+
     val bufferTimer = RegInit(VecInit(Seq.fill(mshrs.response)(0.U(16.W))))
     buffer.zip(bufferTimer).zipWithIndex.map { case ((e, t), i) =>
         when(e.valid) { t := t + 1.U }

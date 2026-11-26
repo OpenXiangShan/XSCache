@@ -54,6 +54,7 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
 
     /* send reqs */
     val toTXREQ = DecoupledIO(new CHIREQ())
+    val readRequestIssued = Option.when(cacheParams.enablePerf)(Flipped(ValidIO(UInt(mshrBits.W))))
     val toTXRSP = DecoupledIO(new CHIRSP()) // TODO: unify with main pipe, which should be TaskBundle
     val toSourceB = DecoupledIO(new TLBundleB(edgeIn.bundle))
 
@@ -132,6 +133,9 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
   mshrs.zipWithIndex.foreach {
     case (m, i) =>
       m.io.id := i.U
+      m.io.readRequestIssued.foreach { issued =>
+        issued := io.readRequestIssued.get.valid && io.readRequestIssued.get.bits === i.U
+      }
       m.io.alloc.valid := selectedMSHROH(i) && io.fromMainPipe.mshr_alloc_s3.valid
       m.io.alloc.bits := io.fromMainPipe.mshr_alloc_s3.bits
       m.io.alloc.bits.task.isKeyword.foreach(_:= io.fromMainPipe.mshr_alloc_s3.bits.task.isKeyword.getOrElse(false.B))
@@ -229,6 +233,57 @@ class MSHRCtl(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcodes
     XSPerfHistogram("release_period", release_period, release_period_en, 100, 200, 10, true, true)
     XSPerfHistogram("release_period", release_period, release_period_en, 200, 1000, 100, true, true)
     XSPerfHistogram("release_period", release_period, release_period_en, 1000, 5000, 1000, true, false)
+
+    // All sums and latency thresholds use the same completed-read cohort.
+    // Count every completion, even if separate response channels finish two
+    // MSHRs in the same cycle.
+    val readLatencies = mshrs.map(_.io.readMissLatency.get)
+    val sourceClasses: Seq[(String, UInt => Bool)] = Seq(
+      "cpu_load" -> ((src: UInt) => src === MemReqSource.CPULoadData.id.U),
+      "cpu_store_atomic" -> ((src: UInt) =>
+        src === MemReqSource.CPUStoreData.id.U || src === MemReqSource.CPUAtomicData.id.U),
+      "l1_prefetch" -> ((src: UInt) => MemReqSource.isL1Prefetch(src)),
+      "l2_prefetch" -> ((src: UInt) => MemReqSource.isL2Prefetch(src)),
+      "other" -> ((src: UInt) =>
+        !MemReqSource.isCPUReq(src) && !MemReqSource.isL1Prefetch(src) && !MemReqSource.isL2Prefetch(src))
+    )
+    def accumulateLatencies(name: String, values: Seq[UInt], selected: Seq[Bool],
+                            thresholds: Seq[Int]): Unit = {
+      XSPerfAccumulate(s"${name}_sum", VecInit(values.zip(selected).map {
+        case (value, enable) => Mux(enable, value, 0.U)
+      }).reduceTree(_ +& _))
+      thresholds.foreach { threshold =>
+        XSPerfAccumulate(s"${name}_ge_${threshold}", PopCount(values.zip(selected).map {
+          case (value, enable) => enable && value >= threshold.U
+        }))
+      }
+    }
+    val queueThresholds = Seq(10, 30, 100, 300, 500, 1000)
+    val responseThresholds = Seq(100, 200, 300, 500, 1000, 2000)
+    val allocToEnqueue = readLatencies.map(_.bits.allocToEnqueue)
+    val enqueueToIssue = readLatencies.map(_.bits.enqueueToIssue)
+    val issueToComplete = readLatencies.map(_.bits.issueToComplete)
+    val acquireTotal = enqueueToIssue.zip(issueToComplete).map { case (queue, response) => queue +& response }
+    sourceClasses.foreach { case (name, matchesSource) =>
+      val prefix = s"read_miss_$name"
+      val selected = readLatencies.map(s => s.valid && matchesSource(s.bits.reqSource))
+      XSPerfAccumulate(s"${prefix}_sampled", PopCount(selected))
+      XSPerfAccumulate(s"${prefix}_retried", PopCount(readLatencies.zip(selected).map {
+        case (s, enable) => enable && s.bits.retried
+      }))
+      accumulateLatencies(s"${prefix}_alloc_to_enqueue", allocToEnqueue, selected, queueThresholds)
+      accumulateLatencies(s"${prefix}_enqueue_to_issue", enqueueToIssue, selected, queueThresholds)
+      accumulateLatencies(s"${prefix}_issue_to_complete", issueToComplete, selected, responseThresholds)
+      accumulateLatencies(s"${prefix}_acquire_total", acquireTotal, selected, responseThresholds)
+
+      val longReads = acquireTotal.zip(selected).map { case (total, enable) => enable && total >= 1000.U }
+      accumulateLatencies(s"${prefix}_long_enqueue_to_issue", enqueueToIssue, longReads, Seq.empty)
+      accumulateLatencies(s"${prefix}_long_issue_to_complete", issueToComplete, longReads, Seq.empty)
+    }
+    val mergedLoads = readLatencies.map(s => s.valid && s.bits.mergedLoad)
+    XSPerfAccumulate("read_miss_merged_load_sampled", PopCount(mergedLoads))
+    accumulateLatencies("read_miss_merged_load_wait", readLatencies.map(_.bits.mergedLoadWait),
+      mergedLoads, responseThresholds)
  
     val timers = RegInit(VecInit(Seq.fill(mshrsAll)(0.U(64.W))))
     for (((timer, m), i) <- timers.zip(mshrs).zipWithIndex) {
