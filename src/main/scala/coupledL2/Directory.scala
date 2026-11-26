@@ -133,7 +133,49 @@ class PrefetchDbEntry(implicit p: Parameters) extends L2Bundle {
 class FdpInsertionEvents extends Bundle {
   val usefulEviction = Bool()
   val demandMiss = Bool()
+  val sampledDemandMiss = Bool()
   val pollutionMiss = Bool()
+  val taggedPollutionMiss = Bool()
+}
+
+class FdpTaggedPollutionFilter(blockBits: Int, hashBits: Int) extends Module {
+  require(hashBits > 0 && blockBits > hashBits)
+  private val entries = 1 << hashBits
+  private val storedTagBits = blockBits - hashBits
+
+  val io = IO(new Bundle {
+    val demandMiss = Flipped(Valid(UInt(blockBits.W)))
+    val fill = Flipped(Valid(UInt(blockBits.W)))
+    val evictedDemand = Flipped(Valid(UInt(blockBits.W)))
+    val pollutionMiss = Output(Bool())
+    val aliasRejected = Output(Bool())
+  })
+
+  def storedTag(block: UInt): UInt = block(blockBits - 1, hashBits)
+  def index(block: UInt): UInt =
+    block(hashBits - 1, 0) ^ storedTag(block).pad(hashBits)(hashBits - 1, 0)
+
+  // The XOR index and the upper address bits uniquely identify the local block.
+  val valid = RegInit(0.U(entries.W))
+  val tags = Reg(Vec(entries, UInt(storedTagBits.W)))
+  val demandIndex = index(io.demandMiss.bits)
+  val demandTagMatches = tags(demandIndex) === storedTag(io.demandMiss.bits)
+  val validDemandSlot = io.demandMiss.valid && valid(demandIndex)
+  io.pollutionMiss := validDemandSlot && demandTagMatches
+  io.aliasRejected := validDemandSlot && !demandTagMatches
+
+  val fillIndex = index(io.fill.bits)
+  val clearOnFill = io.fill.valid && valid(fillIndex) && tags(fillIndex) === storedTag(io.fill.bits)
+  val consumed = Mux(io.pollutionMiss, UIntToOH(demandIndex, entries), 0.U)
+  val filled = Mux(clearOnFill, UIntToOH(fillIndex, entries), 0.U)
+  val victimIndex = index(io.evictedDemand.bits)
+  val remembered = Mux(io.evictedDemand.valid, UIntToOH(victimIndex, entries), 0.U)
+
+  // Keep fresh evidence even if it shares the slot cleared by this fill or miss.
+  valid := (valid & ~(consumed | filled)) | remembered
+  when(io.evictedDemand.valid) {
+    tags(victimIndex) := storedTag(io.evictedDemand.bits)
+  }
 }
 
 class Directory(implicit p: Parameters) extends L2Module {
@@ -431,32 +473,45 @@ class Directory(implicit p: Parameters) extends L2Module {
   val prefetchFill = updateRefill && !hit_s3 && replacerInfo_s3.refill_prefetch
 
   io.fdpEvents.foreach { events =>
-    // Divide the paper's 4096-bit filter across the L2 slices.
-    val hashBits = 12 - bankBits
-    require(hashBits > 0)
-    def filterIndex(tag: UInt): UInt = {
-      val localBlock = Cat(tag, set_s3).pad(2 * hashBits)
-      localBlock(hashBits - 1, 0) ^ localBlock(2 * hashBits - 1, hashBits)
-    }
-
-    val filterSize = 1 << hashBits
-    val filter = RegInit(0.U(filterSize.W))
     val victim = io.replResp.bits.meta
     val evicted = updateRefill && !hit_s3 && victim.state =/= MetaData.INVALID
     val victimWasPrefetched = victim.prefetchSrc.map(_ =/= PfSource.NoWhere.id.U)
       .getOrElse(victim.prefetch.getOrElse(false.B))
-    val evictedDemand = evicted && !victimWasPrefetched
-    val requested = filterIndex(req_s3.tag)
-    val remember = Mux(prefetchFill && evictedDemand,
-      UIntToOH(filterIndex(io.replResp.bits.tag), filterSize), 0.U)
-    val clear = Mux(prefetchFill, UIntToOH(requested, filterSize), 0.U)
-    filter := (filter | remember) & ~clear
+    val prefetchEvictsDemand = prefetchFill && evicted && !victimWasPrefetched && io.tagWReq.valid
 
     events.usefulEviction := evicted && (!victimWasPrefetched || victim.accessed)
     val demandMiss = reqValid_s3 && !refillReqValid_s3 && !hit_s3 &&
       replacerInfo_s3.channel(0) && MemReqSource.isCPUReq(replacerInfo_s3.reqSource)
     events.demandMiss := demandMiss
-    events.pollutionMiss := demandMiss && filter(requested)
+
+    val sampler = Module(new FdpPollutionSampler(setBits, tagBits))
+    sampler.io.demandMiss.valid := demandMiss
+    sampler.io.demandMiss.bits.set := set_s3
+    sampler.io.demandMiss.bits.tag := req_s3.tag
+    sampler.io.fill.valid := io.tagWReq.valid
+    sampler.io.fill.bits.set := io.tagWReq.bits.set
+    sampler.io.fill.bits.tag := io.tagWReq.bits.wtag
+    sampler.io.evictedDemand.valid := prefetchEvictsDemand
+    sampler.io.evictedDemand.bits.set := set_s3
+    sampler.io.evictedDemand.bits.tag := io.replResp.bits.tag
+    events.sampledDemandMiss := sampler.io.sampledDemandMiss
+    events.pollutionMiss := sampler.io.pollutionMiss
+
+    if (cacheParams.enableFdpTaggedFilter) {
+      // Divide the paper's 4096 comparison slots across the L2 slices.
+      val hashBits = 12 - bankBits
+      val filter = Module(new FdpTaggedPollutionFilter(tagBits + setBits, hashBits))
+      filter.io.demandMiss.valid := demandMiss
+      filter.io.demandMiss.bits := Cat(req_s3.tag, set_s3)
+      filter.io.fill.valid := io.tagWReq.valid
+      filter.io.fill.bits := Cat(io.tagWReq.bits.wtag, io.tagWReq.bits.set)
+      filter.io.evictedDemand.valid := prefetchEvictsDemand
+      filter.io.evictedDemand.bits := Cat(io.replResp.bits.tag, set_s3)
+      events.taggedPollutionMiss := filter.io.pollutionMiss
+      XSPerfAccumulate("fdp_filter_aliases_rejected", filter.io.aliasRejected)
+    } else {
+      events.taggedPollutionMiss := false.B
+    }
   }
   // update replacer when A/C hit or refill
   replacerWen := updateHit || updateRefill
@@ -503,10 +558,7 @@ class Directory(implicit p: Parameters) extends L2Module {
     val PSEL = RegInit(512.U(10.W)) //32-monitor sets, 10-bits psel
     // track monitor sets' hit rate for each policy
     // basic SDMs complement-selection policy: srrip--set_idx[group-:]==set_idx[group_offset-:]; brrip--set_idx[group-:]==!set_idx[group_offset-:]
-    val setBits = log2Ceil(sets)
-    val half_setBits = setBits >> 1
-    val match_a = set_s3(setBits-1,half_setBits)===set_s3(setBits-half_setBits-1,0)
-    val match_b = set_s3(setBits-1,half_setBits)===(~set_s3(setBits-half_setBits-1,0))
+    val (match_a, match_b) = DrripSampleSets.matches(set_s3, setBits)
     when(updateRefill && match_a && !hit_s3 && (PSEL=/=1023.U)){  //SDMs_srrip miss
       PSEL := PSEL + 1.U
     } .elsewhen(updateRefill && match_b && !hit_s3 && (PSEL=/=0.U)){ //SDMs_brrip miss

@@ -985,36 +985,80 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       val events = slices.map(_.io.fdpEvents.get)
       val intervalEvictions = cacheParams.sets * cacheParams.ways * banks / 2
       val evictions = RegInit(0.U(log2Ceil(intervalEvictions).W))
-      val misses = RegInit(0.U(40.W))
-      val polluted = RegInit(0.U(40.W))
-      val previousMisses = RegInit(0.U(48.W))
-      val previousPolluted = RegInit(0.U(48.W))
-      val midPosition = (cacheParams.ways / 2).max(1)
-      val quarterPosition = (cacheParams.ways / 4).max(1)
-      val position = RegInit(midPosition.U(wayBits.W))
       val nextEvictions = evictions +& PopCount(events.map(_.usefulEviction))
-      val nextMisses = misses + PopCount(events.map(_.demandMiss))
-      val nextPolluted = polluted + PopCount(events.map(_.pollutionMiss))
-      // Eight fractional bits preserve small counts across the half-weight update.
-      val averageMisses = (previousMisses +& (nextMisses << 8)) >> 1
-      val averagePolluted = (previousPolluted +& (nextPolluted << 8)) >> 1
       val intervalEnd = nextEvictions >= intervalEvictions.U
-
       evictions := Mux(intervalEnd, 0.U, nextEvictions)
-      misses := Mux(intervalEnd, 0.U, nextMisses)
-      polluted := Mux(intervalEnd, 0.U, nextPolluted)
-      when(intervalEnd) {
-        previousMisses := averageMisses
-        previousPolluted := averagePolluted
+
+      val midPosition = (cacheParams.ways / 2).max(1).U(wayBits.W)
+      val quarterPosition = (cacheParams.ways / 4).max(1).U(wayBits.W)
+      def pollutionFeedback(missCount: UInt, pollutionCount: UInt): (UInt, UInt, UInt, UInt) = {
+        val misses = RegInit(0.U(40.W))
+        val polluted = RegInit(0.U(40.W))
+        val previousMisses = RegInit(0.U(48.W))
+        val previousPolluted = RegInit(0.U(48.W))
+        val position = RegInit(midPosition)
+        val nextMisses = misses + missCount
+        val nextPolluted = polluted + pollutionCount
+        // Eight fractional bits preserve small counts across the half-weight update.
+        val averageMisses = (previousMisses +& (nextMisses << 8)) >> 1
+        val averagePolluted = (previousPolluted +& (nextPolluted << 8)) >> 1
         // Pollution thresholds are 25% and 0.5%. Compare without division.
-        when(averageMisses =/= 0.U) {
-          position := Mux((averagePolluted << 2) > averageMisses, 1.U,
-            Mux(averagePolluted * 200.U > averageMisses, quarterPosition.U, midPosition.U))
+        val nextPosition = Mux((averagePolluted << 2) > averageMisses, 1.U,
+          Mux(averagePolluted * 200.U > averageMisses, quarterPosition, midPosition))
+        val hasSample = intervalEnd && nextMisses =/= 0.U
+        misses := Mux(intervalEnd, 0.U, nextMisses)
+        polluted := Mux(intervalEnd, 0.U, nextPolluted)
+        when(hasSample) {
+          previousMisses := averageMisses
+          previousPolluted := averagePolluted
+          position := nextPosition
+        }
+        (position, Mux(hasSample, nextPosition, position), nextMisses, nextPolluted)
+      }
+
+      val allMissCount = PopCount(events.map(_.demandMiss))
+      val sampledMissCount = PopCount(events.map(_.sampledDemandMiss))
+      val sampledPollutionCount = PopCount(events.map(_.pollutionMiss))
+      val (position, sampledPosition, sampledMisses, sampledPollution) =
+        pollutionFeedback(sampledMissCount, sampledPollutionCount)
+      slices.foreach(_.io.fdpInsertPosition.get := position)
+
+      XSPerfAccumulate("fdp_insertion_samples", intervalEnd)
+      XSPerfAccumulate("fdp_insertion_empty_samples", intervalEnd && sampledMisses === 0.U)
+      XSPerfAccumulate("fdp_insertion_demand_misses", allMissCount)
+      XSPerfAccumulate("fdp_insertion_sampled_demand_misses", sampledMissCount)
+      XSPerfAccumulate("fdp_insertion_pollution_misses", sampledPollutionCount)
+
+      if (cacheParams.enableFdpTaggedFilter) {
+        val taggedPollutionCount = PopCount(events.map(_.taggedPollutionMiss))
+        val (_, taggedPosition, taggedMisses, taggedPollution) =
+          pollutionFeedback(allMissCount, taggedPollutionCount)
+        val comparable = intervalEnd && sampledMisses =/= 0.U
+        XSPerfAccumulate("fdp_tagged_pollution_misses", taggedPollutionCount)
+        XSPerfAccumulate("fdp_tagged_sampled_pollution_misses",
+          PopCount(events.map(e => e.taggedPollutionMiss && e.sampledDemandMiss)))
+        XSPerfAccumulate("fdp_insertion_compared_samples", comparable)
+        XSPerfAccumulate("fdp_insertion_disagreeing_samples", comparable && sampledPosition =/= taggedPosition)
+
+        if (cacheParams.enableRollingDB) {
+          val window = Wire(new Bundle {
+            val sampledDemandMisses = UInt(40.W)
+            val sampledPollutionMisses = UInt(40.W)
+            val taggedDemandMisses = UInt(40.W)
+            val taggedPollutionMisses = UInt(40.W)
+            val samplerInsertPosition = UInt(wayBits.W)
+            val taggedInsertPosition = UInt(wayBits.W)
+          })
+          window.sampledDemandMisses := sampledMisses
+          window.sampledPollutionMisses := sampledPollution
+          window.taggedDemandMisses := taggedMisses
+          window.taggedPollutionMisses := taggedPollution
+          window.samplerInsertPosition := sampledPosition
+          window.taggedInsertPosition := taggedPosition
+          val table = ChiselDB.createTable("L2FdpPollutionWindow", chiselTypeOf(window), basicDB = true)
+          table.log(window, intervalEnd, s"L2FdpHart${cacheParams.hartId}", clock, reset)
         }
       }
-      slices.foreach(_.io.fdpInsertPosition.get := position)
-      XSPerfAccumulate("fdp_insertion_samples", intervalEnd)
-      XSPerfAccumulate("fdp_insertion_pollution_misses", PopCount(events.map(_.pollutionMiss)))
     }
 
     // ==================== Prefetch replenish (after slice initilize)===================

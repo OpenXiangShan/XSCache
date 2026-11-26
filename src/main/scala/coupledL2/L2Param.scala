@@ -153,7 +153,10 @@ case class L2Param(
   hasSramCtl: Boolean = false,
 
   // both EnablePrivateClint and PrivateClintRange are from soc parameters.
-  PrivateClintRange: Option[AddressSet] = None
+  PrivateClintRange: Option[AddressSet] = None,
+
+  // Run a full-coverage tagged pollution filter alongside the FDP sampler for comparison.
+  enableFdpTaggedFilter: Boolean = false
 ) {
   require(!enableFdpInsertion || replacement == "lru", "FDP insertion requires true LRU")
 
