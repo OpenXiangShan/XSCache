@@ -136,6 +136,7 @@ class Slice()(implicit p: Parameters) extends LLCModule {
 
   snpUnit.io.in <> mainPipe.io.snoopTask_s4
   snpUnit.io.respInfo <> responseUnit.io.respInfo
+  snpUnit.io.memInfo <> memUnit.io.memInfo
   snpUnit.io.ack <> rxrspUp.io.out
 
   io.snpMask := txsnpUp.io.snpMask

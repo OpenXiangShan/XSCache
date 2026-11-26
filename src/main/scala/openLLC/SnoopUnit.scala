@@ -39,6 +39,9 @@ class SnoopUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
     /* block info from ResponseUnit */
     val respInfo = Flipped(Vec(mshrs.response, ValidIO(new ResponseInfo())))
 
+    /* block info from MemUnit: WriteNoSnpFull entries still waiting for their write data */
+    val memInfo = Flipped(Vec(mshrs.memory, ValidIO(new MemInfo())))
+
     /* CompAck from upstream RXRSP channel */
     val ack = Flipped(ValidIO(new Resp()))
 
@@ -65,8 +68,22 @@ class SnoopUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   )).asUInt
   def snpConflict(a: Task): Bool = snpConflictMask(a).orR
 
+  /**
+    * CHI E.b 2.8.3 / 4.11.2: after sending the completion of a CopyBack (CompDBIDResp to WriteCleanFull),
+    * the HN must not snoop the same line until it has received the WriteData. A WriteCleanFull leaves the
+    * requester in the snoop filter, so a later snoop-filter replacement can pick that line; hold such a
+    * replacement snoop while a MemUnit WriteNoSnpFull for the line still waits for its data.
+    * Request snoops are serialised at the RequestArb entrance (blockByMem). Only replacement snoops are held
+    * here: a CleanShared/CleanInvalid WriteNoSnpFull waits for the data of its own request snoop.
+    * The hold ends when all beats have arrived (w_datRsp), or when MemUnit drops the write on a beat without
+    * PassDirty (no dirty data to protect then).
+    */
+  def cbPending(a: Task): Bool = a.replSnp && VecInit(io.memInfo.map(m =>
+    m.valid && m.bits.opcode === WriteNoSnpFull && !m.bits.w_datRsp && Cat(m.bits.tag, m.bits.set) === Cat(a.tag, a.set)
+  )).asUInt.orR
+
   // flow not allowed when arbiter output is valid, or entries might starve
-  val canFlow = !snpConflict(in.bits) && !arbValid
+  val canFlow = !snpConflict(in.bits) && !cbPending(in.bits) && !arbValid
   val doFlow = canFlow && out.ready
 
   /* Alloc */
@@ -103,7 +120,7 @@ class SnoopUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   /* Issue */
   // once fired at issueArb, it is ok to enter TXSNP without conflict
   issueArb.io.in.zip(buffer).foreach { case (in, e) =>
-    in.valid := e.valid && e.ready
+    in.valid := e.valid && e.ready && !cbPending(e.task)
     in.bits := e.task
   }
   issueArb.io.out.ready := out.ready
