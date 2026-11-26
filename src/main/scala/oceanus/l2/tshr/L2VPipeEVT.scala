@@ -71,8 +71,6 @@ class L2VPipeEVT(
   val pSrcId = Reg(UInt(8.W))
   val pTxnId = Reg(UInt(8.W))
   val pTraceTag = Reg(UInt(1.W))
-  val pReqWay = Reg(UInt(4.W))
-  val pReqWayValid = RegInit(false.B)
   val pEntState = Reg(UInt(2.W)) // entrance-time directory state (assertion use only)
   val dataArmed = RegInit(false.B)
   val seenData0 = RegInit(false.B)
@@ -137,8 +135,6 @@ class L2VPipeEVT(
     pTxnId := io.UpRXEVT.bits.TxnID
     pSrcId := io.UpRXEVT.bits.SrcID
     pTraceTag := io.UpRXEVT.bits.TraceTag
-    pReqWay := evtReleaseWay
-    pReqWayValid := !io.prefill_meta_valid
     pEntState := dirResult.state
     dirHit := dirResult.hit
     dataArmed := false.B
@@ -195,8 +191,8 @@ class L2VPipeEVT(
   io.UpTXRSP.bits.RespErr := 0.U
   io.UpTXRSP.bits.Resp := 0.U
   io.UpTXRSP.bits.CBusy := 0.U
-  io.UpTXRSP.bits.WayValid := pReqWayValid
-  io.UpTXRSP.bits.Way := pReqWay
+  io.UpTXRSP.bits.WayValid := false.B
+  io.UpTXRSP.bits.Way := 0.U
   io.UpTXRSP.bits.TraceTag := pTraceTag
 
   // Commit against the LIVE TSHR meta: another vPipe (e.g. a stash refill, an
