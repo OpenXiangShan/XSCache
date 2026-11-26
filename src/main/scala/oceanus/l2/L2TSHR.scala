@@ -518,9 +518,24 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   snoopAgent.io.uopFromREQ.bits := vPipeREQ.io.toSA
   vPipeREQ.io.fromSA := snoopAgent.io.fromSAForREQ
 
+  // The pending allocation has no valid way before ReplRd completes. Forward
+  // its ownership; the SNP vPipe suppresses DS reads while this view is selected.
+  val snpDirResult = Wire(new L2Directory.MetaReadResult)
+  snpDirResult := dirResult
+  when (vPipeREQ.io.prefill_meta_valid) {
+    snpDirResult.state := Mux(meta_modified.state, dirResult.state, vPipeREQ.io.prefill_meta.state)
+    snpDirResult.dirty := Mux(meta_modified.dirty, dirResult.dirty, vPipeREQ.io.prefill_meta.dirty)
+    snpDirResult.clients.zipWithIndex.foreach { case (client, i) =>
+      client := Mux(meta_modified.clients(i), dirResult.clients(i), vPipeREQ.io.prefill_meta.clients(i))
+    }
+    snpDirResult.alias := Mux(meta_modified.alias, dirResult.alias, vPipeREQ.io.prefill_meta.alias)
+    snpDirResult.prefetch := Mux(meta_modified.prefetch, dirResult.prefetch, vPipeREQ.io.prefill_meta.prefetch)
+    snpDirResult.hit := Mux(meta_modified.state, dirResult.hit, true.B)
+  }
+
   // connections between TSHR local / RX and Snoop Agent
   snoopAgent.io.tshr_paddr := tshr_paddr
-  snoopAgent.io.tshr_dirResult := dirResult_with_fastpath
+  snoopAgent.io.tshr_dirResult := Mux(vPipeREQ.io.prefill_meta_valid, snpDirResult, dirResult_with_fastpath)
   snoopAgent.io.UpRXRSP := io.UpRXRSP
   snoopAgent.io.UpRXDAT := io.UpRXDAT
 
@@ -575,7 +590,8 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   // connections between TSHR local and SNP vPipe
   vPipeSNP.io.tshr_paddr := tshr_paddr
-  vPipeSNP.io.tshr_dirResult := dirResult
+  vPipeSNP.io.tshr_dirResult := snpDirResult
+  vPipeSNP.io.prefill_meta_valid := vPipeREQ.io.prefill_meta_valid
   vPipeSNP.io.tbuf_modified := tshr_buffer_modified
   vPipeSNP.io.tbuf_half0_ready := tshr_buffer_halfWritten_0_q || tshr_buffer_fullModified_q || vPipeSNP.io.ds_read_done
   vPipeSNP.io.tbuf_half2_ready := tshr_buffer_halfWritten_2_q || tshr_buffer_fullModified_q || vPipeSNP.io.ds_read_done
@@ -589,8 +605,10 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   // connections between TSHR local and REQ vPipe
   vPipeREQ.io.tshr_paddr := tshr_paddr
   vPipeREQ.io.tshr_dirResult := dirResult_with_fastpath
+  vPipeREQ.io.snp_meta_write_en := vPipeSNP.io.tshr_meta_write_en
   vPipeREQ.io.tshr_dealloc := tshr_dealloc
   vPipeREQ.io.tshr_meta_modified := meta_modified.asUInt.orR
+  vPipeREQ.io.tshr_meta_modified_mask := meta_modified
   vPipeREQ.io.tshr_tag_modified := tag_modified
   vPipeREQ.io.tbuf_modified := tshr_buffer_modified
   vPipeREQ.io.tbuf_data0_valid := tshr_buffer_halfWritten_0_q || tshr_buffer_fullModified_q || vPipeREQ.io.ds_rd_done
