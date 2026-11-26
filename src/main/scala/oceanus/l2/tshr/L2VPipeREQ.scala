@@ -64,6 +64,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     val prefill_meta = Output(new L2Directory.Meta)
     val tshr_meta_modified_mask = Input(new L2Directory.MetaWriteMask)
     val snp_meta_write_en = Input(new L2Directory.MetaWriteMask)
+    val evt_meta_write_en = Input(new L2Directory.MetaWriteMask)
 
     // Pulses when this TSHR deallocates; per-life bookkeeping registers that
     // are not part of the free state must be cleared on it, so that nothing
@@ -1457,19 +1458,25 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
   // --------------------------------
   val repl_tshr_meta_wr = p_prefill_any && io.repl_done
+  // REQ state writes already stall EVT through peer_meta_write_state. Do not
+  // feed the live EVT state mask back here: that would form a combinational loop.
   val repl_state_in_local = io.tshr_meta_modified_mask.state || io.snp_meta_write_en.state
-  val repl_dirty_in_local = io.tshr_meta_modified_mask.dirty || io.snp_meta_write_en.dirty
+  val repl_dirty_in_local = io.tshr_meta_modified_mask.dirty ||
+                            io.snp_meta_write_en.dirty || io.evt_meta_write_en.dirty
   val repl_clients_in_local = (io.tshr_meta_modified_mask.clients.asUInt |
-                               io.snp_meta_write_en.clients.asUInt).orR
-  val repl_alias_in_local = io.tshr_meta_modified_mask.alias || io.snp_meta_write_en.alias
-  val repl_prefetch_in_local = io.tshr_meta_modified_mask.prefetch || io.snp_meta_write_en.prefetch
+                               io.snp_meta_write_en.clients.asUInt |
+                               io.evt_meta_write_en.clients.asUInt).orR
+  val repl_alias_in_local = io.tshr_meta_modified_mask.alias ||
+                            io.snp_meta_write_en.alias || io.evt_meta_write_en.alias
+  val repl_prefetch_in_local = io.tshr_meta_modified_mask.prefetch ||
+                               io.snp_meta_write_en.prefetch || io.evt_meta_write_en.prefetch
   val tshr_meta_wr_state_UU = meta_wr_state_UU && !p_prefill_miss
   val tshr_meta_wr_state_US = meta_wr_state_US && !p_prefill_miss
   val tshr_meta_wr_state_S = meta_wr_state_S && !p_prefill_miss
   val tshr_meta_wr_state_I = meta_wr_state_I && !p_prefill_miss
 
-  // SNP writes only the local metadata. The replacement commit preserves those
-  // fields instead of overwriting them with the older pending-fill values.
+  // Preserve every local SNP/EVT field update instead of restoring older
+  // pending-fill values at the replacement commit.
   val tshr_meta_wr_state = !p_prefill_miss && (meta_wr_state_UU ||
                                           meta_wr_state_US ||
                                           meta_wr_state_S ||
@@ -1934,7 +1941,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                               io.tshr_tag_write_en))
 
   io.dir_wb_locked := w_unlock_dir || hit_lock_write_hold
-  io.ds_wb_locked := w_unlock_ds
+  io.ds_wb_locked := w_unlock_ds || p_prefill_miss
 
   // 1. Clean local Meta (to Directory) and TSHR Buffer (to Data Storage) modified state and 
   //    cancel all non-arbitered Directory & Data Storage write back for L2 Eviction
@@ -2119,9 +2126,19 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.L2EVT_opcode.bits := evictback_txreq_opcode
   // ----------------------------------------------------------------
 
+  val prefill_l1_grant_complete = io.prefill_meta_valid &&
+    p_prefill_miss_meta.clients.asUInt.orR &&
+    !w_s_rd_up_comp && !s_rd_up_comp &&
+    !w_s_rd_up_compdata0 && !s_rd_up_compdata0 &&
+    !w_s_rd_up_compdata2 && !s_rd_up_compdata2 &&
+    !w_rd_up_compack
+
+  // A post-grant WBFull can complete against the forwarded pending metadata.
+  // Before that point, and for other EVT opcodes, retain the original block.
+  io.blockRBE.EVT := p_prefill_miss && !(io.L1EVT_wbFull && prefill_l1_grant_complete)
+
   // Before the first data beat, an ordinary hit answers normally. Once data
   // transfer starts, hold SNP through the last beat and upstream CompAck.
-  io.blockRBE.EVT := p_prefill_miss
   io.blockRBE.SNP := w_rd_up_compack ||
                      ((dn_rd_decided || dn_rxdat_compdata || dn_rxdat_datasepresp) &&
                       (w_rd_dn_data0 || w_rd_dn_data2))
