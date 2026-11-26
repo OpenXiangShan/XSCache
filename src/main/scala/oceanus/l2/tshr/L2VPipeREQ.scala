@@ -2131,11 +2131,11 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   // ----------------------------------------------------------------
 
   val prefill_l1_grant_complete = io.prefill_meta_valid &&
-    p_prefill_miss_meta.clients.asUInt.orR &&
-    !w_s_rd_up_comp && !s_rd_up_comp &&
-    !w_s_rd_up_compdata0 && !s_rd_up_compdata0 &&
-    !w_s_rd_up_compdata2 && !s_rd_up_compdata2 &&
-    !w_rd_up_compack
+                                  p_prefill_miss_meta.clients.asUInt.orR &&
+                                  !w_s_rd_up_comp && !s_rd_up_comp &&
+                                  !w_s_rd_up_compdata0 && !s_rd_up_compdata0 &&
+                                  !w_s_rd_up_compdata2 && !s_rd_up_compdata2 &&
+                                  !w_rd_up_compack
 
   // A post-grant WBFull can complete against the forwarded pending metadata.
   // Before that point, and for other EVT opcodes, retain the original block.
