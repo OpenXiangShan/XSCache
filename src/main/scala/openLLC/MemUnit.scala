@@ -207,6 +207,7 @@ class MemUnit(implicit p: Parameters) extends LLCModule with HasCHIOpcodes {
   txdat.valid := txdatArb.io.out.valid
   txdat.bits := txdatArb.io.out.bits
   txdat.bits.task.chiOpcode := NonCopyBackWrData
+  txdat.bits.task.homeNID := 0.U
 
   /* Update state */
   when(txreq.fire && (!urgentRead.valid || bypass_ur)) {
