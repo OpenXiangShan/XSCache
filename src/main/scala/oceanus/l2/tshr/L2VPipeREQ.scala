@@ -60,6 +60,12 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
 
     val tshr_dirResult = Input(new L2Directory.MetaReadResult)
 
+    val prefill_meta_valid = Output(Bool())
+    val prefill_meta = Output(new L2Directory.Meta)
+    val tshr_meta_modified_mask = Input(new L2Directory.MetaWriteMask)
+    val snp_meta_write_en = Input(new L2Directory.MetaWriteMask)
+    val evt_meta_write_en = Input(new L2Directory.MetaWriteMask)
+
     // Pulses when this TSHR deallocates; per-life bookkeeping registers that
     // are not part of the free state must be cleared on it, so that nothing
     // leaks into the entry's next life.
@@ -135,9 +141,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     // downstream EvictBack CopyBackWrData issue so the L3 is never written
     // with the stale DS-read copy ahead of the L1's authoritative beats.
     val L1EVT_data_pending = Input(Bool())
-
-    // Incoming EVT is WriteBackFull; clean Evict may bypass conflict-hit prefill.
-    val L1EVT_wbFull = Input(Bool())
 
     val L2EVT_opcode = Valid(UInt(paramCHI.reqOpcodeWidth.W))
   })
@@ -1447,34 +1450,52 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     p_prefill_miss_meta.alias := p_rxreq.TagAlias
   }
 
+  io.prefill_meta_valid := p_prefill_miss && p_prefill_miss_meta.state =/= MetaState.I
+  io.prefill_meta := p_prefill_miss_meta
+
   // --------------------------------
+  // A replacement commits pending-fill fields only when no newer local write
+  // exists. Registered masks cover earlier local updates; live SNP/EVT masks
+  // cover same-cycle updates. REQ state writes already stall EVT through
+  // peer_meta_write_state, so the live EVT state mask is excluded here to avoid
+  // a combinational loop.
   val repl_tshr_meta_wr = p_prefill_any && io.repl_done
+  val repl_state_in_local = io.tshr_meta_modified_mask.state || io.snp_meta_write_en.state
+  val repl_dirty_in_local = io.tshr_meta_modified_mask.dirty ||
+                            io.snp_meta_write_en.dirty || io.evt_meta_write_en.dirty
+  val repl_clients_in_local = (io.tshr_meta_modified_mask.clients.asUInt |
+                               io.snp_meta_write_en.clients.asUInt |
+                               io.evt_meta_write_en.clients.asUInt).orR
+  val repl_alias_in_local = io.tshr_meta_modified_mask.alias ||
+                            io.snp_meta_write_en.alias || io.evt_meta_write_en.alias
+  val repl_prefetch_in_local = io.tshr_meta_modified_mask.prefetch ||
+                               io.snp_meta_write_en.prefetch || io.evt_meta_write_en.prefetch
+
   val tshr_meta_wr_state_UU = meta_wr_state_UU && !p_prefill_miss
   val tshr_meta_wr_state_US = meta_wr_state_US && !p_prefill_miss
   val tshr_meta_wr_state_S = meta_wr_state_S && !p_prefill_miss
   val tshr_meta_wr_state_I = meta_wr_state_I && !p_prefill_miss
 
-  // Miss-prefill defers local allocation until ReplRd completes. Conflict-hit
-  // prefill applies the allocating response immediately so later snoops see
-  // the actual local owner, then commits the latest local state at repl_done.
+  // Preserve every local SNP/EVT field update instead of restoring older
+  // pending-fill values at the replacement commit.
   val tshr_meta_wr_state = !p_prefill_miss && (meta_wr_state_UU ||
                                           meta_wr_state_US ||
                                           meta_wr_state_S ||
                                           meta_wr_state_I) ||
-                           repl_tshr_meta_wr
+                           repl_tshr_meta_wr && !repl_state_in_local
 
   val tshr_meta_wr_dirty = !p_prefill_miss && (meta_wr_dirty_set ||
                                           meta_wr_dirty_clr) ||
-                           repl_tshr_meta_wr
+                           repl_tshr_meta_wr && !repl_dirty_in_local
 
   val tshr_meta_wr_client = (!p_prefill_miss && (meta_wr_client_set ||
                                             meta_wr_client_clr) ||
-                             repl_tshr_meta_wr) && !p_rxreq_readonce
+                             repl_tshr_meta_wr && !repl_clients_in_local) && !p_rxreq_readonce
 
   val tshr_meta_wr_alias = (!p_prefill_miss && meta_wr_alias ||
-                            repl_tshr_meta_wr) && !p_rxreq_readonce
+                            repl_tshr_meta_wr && !repl_alias_in_local) && !p_rxreq_readonce
 
-  val tshr_meta_wr_prefetch = repl_tshr_meta_wr ||
+  val tshr_meta_wr_prefetch = repl_tshr_meta_wr && !repl_prefetch_in_local ||
                               (!p_prefill_miss && tshr_meta_wr_state && (
                                 p_rxreq_readshared || p_rxreq_readunique || p_rxreq_makeunique ||
                                 (p_prefill_hit && (p_rxreq_stashshared || p_rxreq_stashunique))
@@ -1921,7 +1942,7 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                               io.tshr_tag_write_en))
 
   io.dir_wb_locked := w_unlock_dir || hit_lock_write_hold
-  io.ds_wb_locked := w_unlock_ds
+  io.ds_wb_locked := w_unlock_ds || p_prefill_miss
 
   // 1. Clean local Meta (to Directory) and TSHR Buffer (to Data Storage) modified state and 
   //    cancel all non-arbitered Directory & Data Storage write back for L2 Eviction
@@ -2106,15 +2127,22 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
   io.L2EVT_opcode.bits := evictback_txreq_opcode
   // ----------------------------------------------------------------
 
-  // A related snoop is not permitted before downstream CompAck. By then the
-  // first response has cleared w_rd_dn_comp. While the miss-prefill allocation
-  // remains pending, hold the snoop so it cannot observe the stale local I state.
-  // p_prefill_miss stays asserted through the repl_done write edge and clears
-  // only when the pending tag/meta become locally visible, allowing the queued
-  // snoop to enter with the actual state and client ownership.
-  io.blockRBE.EVT := p_prefill_miss
-  io.blockRBE.SNP := w_rd_up_compack || s_repl ||
-                     (p_prefill_miss && !w_rd_dn_comp)
+  val prefill_l1_grant_complete = io.prefill_meta_valid &&
+                                  p_prefill_miss_meta.clients.asUInt.orR &&
+                                  !w_s_rd_up_comp && !s_rd_up_comp &&
+                                  !w_s_rd_up_compdata0 && !s_rd_up_compdata0 &&
+                                  !w_s_rd_up_compdata2 && !s_rd_up_compdata2 &&
+                                  !w_rd_up_compack
+
+  // EVT has a one-bit opcode: every queued EVT is either WBFull or clean Evict.
+  // Both can complete against forwarded metadata once the original grant completes.
+  io.blockRBE.EVT := p_prefill_miss && !prefill_l1_grant_complete
+
+  // Before the first data beat, an ordinary hit answers normally. Once data
+  // transfer starts, hold SNP through the last beat and upstream CompAck.
+  io.blockRBE.SNP := w_rd_up_compack ||
+                     ((dn_rd_decided || dn_rxdat_compdata || dn_rxdat_datasepresp) &&
+                      (w_rd_dn_data0 || w_rd_dn_data2))
   io.blockRBE.EVB := (active && !p_prefill_any) ||
                      w_s_evict_peer_unlock_dir || w_s_evict_peer_unlock_ds ||
                      w_evict_peer_commit_dir ||

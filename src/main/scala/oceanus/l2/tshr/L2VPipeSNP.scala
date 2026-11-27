@@ -40,6 +40,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
     val ds_wb_cancel = Output(Bool())
 
     val tbuf_modified = Input(Bool()) // TSHR buffer holds data written by a non-DS source (RXDAT)
+    val prefill_meta_valid = Input(Bool())
     val tbuf_half0_ready = Input(Bool()) // TSHR buffer half (DataID 0) holds valid data
     val tbuf_half2_ready = Input(Bool()) // TSHR buffer half (DataID 2) holds valid data
 
@@ -250,7 +251,7 @@ class L2VPipeSNP(clientComponents: Seq[CCHIComponent], val sliceNum: Int)(implic
   // stale until the pending DSBufWb commits, so no DS read may be issued in this window
   val enter_need_local_ds_read = io.DnRXSNP.fire && !io.ds_read_done && io.tshr_dirResult.state =/= L2Directory.MetaState.I &&
                                  (rxsnp_fwd || (!rxsnp_fwd && (io.DnRXSNP.bits.RetToSrc.get.asBool || io.tshr_dirResult.dirty))) && 
-                                 !rxsnp_do_not_read_ds && !io.tbuf_modified
+                                 !rxsnp_do_not_read_ds && !io.tbuf_modified && !io.prefill_meta_valid
   val enter_noop_meta_write = io.tshr_dirResult.state === L2Directory.MetaState.I
   val enter_need_meta_write = io.DnRXSNP.fire && (meta_write_shared || meta_write_invalid || rxsnp_snpCleanShared) &&
                               !enter_noop_meta_write

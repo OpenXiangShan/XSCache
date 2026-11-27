@@ -29,7 +29,8 @@ class L2VPipeEVT(
 
     val tshr_paddr = Input(UInt(paramL2.physicalAddrWidth.W))
     val tshr_dirResult = Input(new L2Directory.MetaReadResult)
-    val tshr_meta = Input(new L2Directory.Meta) // live TSHR meta (commit-time base)
+    val tshr_meta = Input(new L2Directory.Meta) // live commit-time view, including pending-fill metadata
+    val prefill_meta_valid = Input(Bool())
 
     // A REQ/SNP vPipe of this TSHR is writing meta.state this cycle. Peer meta
     // writes are hard-timed single-cycle pulses (downstream data arrival /
@@ -70,7 +71,6 @@ class L2VPipeEVT(
   val pSrcId = Reg(UInt(8.W))
   val pTxnId = Reg(UInt(8.W))
   val pTraceTag = Reg(UInt(1.W))
-  val pReqWay = Reg(UInt(4.W))
   val pEntState = Reg(UInt(2.W)) // entrance-time directory state (assertion use only)
   val dataArmed = RegInit(false.B)
   val seenData0 = RegInit(false.B)
@@ -98,7 +98,7 @@ class L2VPipeEVT(
   val evtReleaseWay = Mux(io.UpRXEVT.bits.WayValid,
     io.UpRXEVT.bits.Way(wayBits - 1, 0), dirResult.way)
   val evtRelease = evtAccept && (isEvict || isWbFull) &&
-    (io.UpRXEVT.bits.WayValid || dirResult.hit)
+    (io.UpRXEVT.bits.WayValid || dirResult.hit) && !io.prefill_meta_valid
   io.tshr_repl_release.foreach(_ := evtRelease)
   io.tshr_repl_way.foreach(_ := evtReleaseWay)
 
@@ -135,7 +135,6 @@ class L2VPipeEVT(
     pTxnId := io.UpRXEVT.bits.TxnID
     pSrcId := io.UpRXEVT.bits.SrcID
     pTraceTag := io.UpRXEVT.bits.TraceTag
-    pReqWay := evtReleaseWay
     pEntState := dirResult.state
     dirHit := dirResult.hit
     dataArmed := false.B
@@ -192,8 +191,8 @@ class L2VPipeEVT(
   io.UpTXRSP.bits.RespErr := 0.U
   io.UpTXRSP.bits.Resp := 0.U
   io.UpTXRSP.bits.CBusy := 0.U
-  io.UpTXRSP.bits.WayValid := true.B
-  io.UpTXRSP.bits.Way := pReqWay
+  io.UpTXRSP.bits.WayValid := false.B
+  io.UpTXRSP.bits.Way := 0.U
   io.UpTXRSP.bits.TraceTag := pTraceTag
 
   // Commit against the LIVE TSHR meta: another vPipe (e.g. a stash refill, an

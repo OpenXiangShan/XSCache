@@ -518,9 +518,34 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   snoopAgent.io.uopFromREQ.bits := vPipeREQ.io.toSA
   vPipeREQ.io.fromSA := snoopAgent.io.fromSAForREQ
 
+  // Pending ownership has no valid way before ReplRd completes. SNP and EVT
+  // consume this field-merged view; neither may use its way for a DS access.
+  val prefillDirResult = Wire(new L2Directory.MetaReadResult)
+  prefillDirResult := dirResult
+  when (vPipeREQ.io.prefill_meta_valid) {
+    prefillDirResult.state := Mux(meta_modified.state, dirResult.state, vPipeREQ.io.prefill_meta.state)
+    prefillDirResult.dirty := Mux(meta_modified.dirty, dirResult.dirty, vPipeREQ.io.prefill_meta.dirty)
+    prefillDirResult.clients.zipWithIndex.foreach { case (client, i) =>
+      client := Mux(meta_modified.clients(i), dirResult.clients(i), vPipeREQ.io.prefill_meta.clients(i))
+    }
+    prefillDirResult.alias := Mux(meta_modified.alias, dirResult.alias, vPipeREQ.io.prefill_meta.alias)
+    prefillDirResult.prefetch := Mux(meta_modified.prefetch, dirResult.prefetch, vPipeREQ.io.prefill_meta.prefetch)
+    prefillDirResult.hit := Mux(meta_modified.state, dirResult.hit, true.B)
+  }
+
+  val evtCommitMeta = Wire(new L2Directory.Meta)
+  evtCommitMeta := meta
+  when (vPipeREQ.io.prefill_meta_valid) {
+    evtCommitMeta.state := prefillDirResult.state
+    evtCommitMeta.dirty := prefillDirResult.dirty
+    evtCommitMeta.clients := prefillDirResult.clients
+    evtCommitMeta.alias := prefillDirResult.alias
+    evtCommitMeta.prefetch := prefillDirResult.prefetch
+  }
+
   // connections between TSHR local / RX and Snoop Agent
   snoopAgent.io.tshr_paddr := tshr_paddr
-  snoopAgent.io.tshr_dirResult := dirResult_with_fastpath
+  snoopAgent.io.tshr_dirResult := Mux(vPipeREQ.io.prefill_meta_valid, prefillDirResult, dirResult_with_fastpath)
   snoopAgent.io.UpRXRSP := io.UpRXRSP
   snoopAgent.io.UpRXDAT := io.UpRXDAT
 
@@ -563,8 +588,9 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   // connections between TSHR local and EVT vPipe
   vPipeEVT.io.tshr_paddr := tshr_paddr
-  vPipeEVT.io.tshr_dirResult := dirResult
-  vPipeEVT.io.tshr_meta := meta
+  vPipeEVT.io.tshr_dirResult := prefillDirResult
+  vPipeEVT.io.tshr_meta := evtCommitMeta
+  vPipeEVT.io.prefill_meta_valid := vPipeREQ.io.prefill_meta_valid
   vPipeEVT.io.peer_meta_write_state := vPipeREQ.io.tshr_meta_write_en.state ||
                                        vPipeSNP.io.tshr_meta_write_en.state
 
@@ -575,7 +601,8 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   // connections between TSHR local and SNP vPipe
   vPipeSNP.io.tshr_paddr := tshr_paddr
-  vPipeSNP.io.tshr_dirResult := dirResult
+  vPipeSNP.io.tshr_dirResult := prefillDirResult
+  vPipeSNP.io.prefill_meta_valid := vPipeREQ.io.prefill_meta_valid
   vPipeSNP.io.tbuf_modified := tshr_buffer_modified
   vPipeSNP.io.tbuf_half0_ready := tshr_buffer_halfWritten_0_q || tshr_buffer_fullModified_q || vPipeSNP.io.ds_read_done
   vPipeSNP.io.tbuf_half2_ready := tshr_buffer_halfWritten_2_q || tshr_buffer_fullModified_q || vPipeSNP.io.ds_read_done
@@ -589,8 +616,11 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
   // connections between TSHR local and REQ vPipe
   vPipeREQ.io.tshr_paddr := tshr_paddr
   vPipeREQ.io.tshr_dirResult := dirResult_with_fastpath
+  vPipeREQ.io.snp_meta_write_en := vPipeSNP.io.tshr_meta_write_en
+  vPipeREQ.io.evt_meta_write_en := vPipeEVT.io.tshr_meta_write_en
   vPipeREQ.io.tshr_dealloc := tshr_dealloc
   vPipeREQ.io.tshr_meta_modified := meta_modified.asUInt.orR
+  vPipeREQ.io.tshr_meta_modified_mask := meta_modified
   vPipeREQ.io.tshr_tag_modified := tag_modified
   vPipeREQ.io.tbuf_modified := tshr_buffer_modified
   vPipeREQ.io.tbuf_data0_valid := tshr_buffer_halfWritten_0_q || tshr_buffer_fullModified_q || vPipeREQ.io.ds_rd_done
@@ -622,8 +652,6 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   vPipeREQ.io.L1EVT_active := vPipeEVT.io.EVT_active
   vPipeREQ.io.L1EVT_data_pending := vPipeEVT.io.EVT_data_pending
-  vPipeREQ.io.L1EVT_wbFull := vPipeEVT.io.UpRXEVT.valid &&
-                              vPipeEVT.io.UpRXEVT.bits.Opcode === CCHIOpcode.WriteBackFull.U
 
   // connections between TX channels and TSHR local modules
   io.DnTXREQ <> vPipeREQ.io.DnTXREQ
