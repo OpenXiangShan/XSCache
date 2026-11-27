@@ -652,8 +652,6 @@ class L2TSHR(val sliceNum: Int, val tshrId: Int)(implicit val p: Parameters) ext
 
   vPipeREQ.io.L1EVT_active := vPipeEVT.io.EVT_active
   vPipeREQ.io.L1EVT_data_pending := vPipeEVT.io.EVT_data_pending
-  vPipeREQ.io.L1EVT_wbFull := rbeEVT.io.valid &&
-                              rbeEVT.io.out.bits.Opcode === CCHIOpcode.WriteBackFull.U
 
   // connections between TX channels and TSHR local modules
   io.DnTXREQ <> vPipeREQ.io.DnTXREQ

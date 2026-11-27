@@ -142,9 +142,6 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
     // with the stale DS-read copy ahead of the L1's authoritative beats.
     val L1EVT_data_pending = Input(Bool())
 
-    // Incoming EVT is WriteBackFull; clean Evict may bypass conflict-hit prefill.
-    val L1EVT_wbFull = Input(Bool())
-
     val L2EVT_opcode = Valid(UInt(paramCHI.reqOpcodeWidth.W))
   })
 
@@ -2137,9 +2134,9 @@ class L2VPipeREQ(clientComponents: Seq[CCHIComponent],
                                   !w_s_rd_up_compdata2 && !s_rd_up_compdata2 &&
                                   !w_rd_up_compack
 
-  // A post-grant WBFull can complete against the forwarded pending metadata.
-  // Before that point, and for other EVT opcodes, retain the original block.
-  io.blockRBE.EVT := p_prefill_miss && !(io.L1EVT_wbFull && prefill_l1_grant_complete)
+  // EVT has a one-bit opcode: every queued EVT is either WBFull or clean Evict.
+  // Both can complete against forwarded metadata once the original grant completes.
+  io.blockRBE.EVT := p_prefill_miss && !prefill_l1_grant_complete
 
   // Before the first data beat, an ordinary hit answers normally. Once data
   // transfer starts, hold SNP through the last beat and upstream CompAck.
