@@ -616,6 +616,7 @@ class MainPipe(implicit p: Parameters) extends CoupledL2Module with HasCHIOpcode
   io.sdbpCommit.bits.set := req_s3.set
   io.sdbpCommit.bits.way := Mux(io.tagWReq.valid, OHToUInt(io.tagWReq.bits.wayOH), dirResult_s3.way)
   io.sdbpCommit.bits.refill := io.tagWReq.valid
+  io.sdbpCommit.bits.hintHit := req_prefetch_s3 && dirResult_s3.hit
 
   sink_resp_s3_b_metaWen := metaW_valid_s3_b
   sink_resp_s3_b_meta := metaW_s3_b

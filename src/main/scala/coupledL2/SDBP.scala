@@ -106,6 +106,7 @@ class SDBPSamplerCommit extends Bundle {
   val signature = UInt(15.W)
   val source = SDBPSource()
   val dead = Bool()
+  val hintHit = Bool()
 }
 
 /** Register sampler: s1 snapshot, s2 lookup, s3 one-way commit. No event queue. */
@@ -167,7 +168,9 @@ class SDBPSampler(localSets: Int, l2Ways: Int, params: SDBPParams) extends Modul
     entry.signature := io.commit.bits.signature
     entry.source := io.commit.bits.source
     entry.dead := io.commit.bits.dead
-    lruState.foreach(state => state(index_s3) := lru.get.get_next_state(state_s3.get, selected_s3))
+    when(!(io.commit.bits.hintHit && hit_s3)) {
+      lruState.foreach(state => state(index_s3) := lru.get.get_next_state(state_s3.get, selected_s3))
+    }
     assert(selected_s3 < ways.U)
   }
   when(valid_s2) { assert(PopCount(hits) <= 1.U) }
@@ -188,6 +191,7 @@ class SDBPCommit(localSets: Int, l2Ways: Int) extends Bundle {
   val set = UInt(log2Ceil(localSets).W)
   val way = UInt(log2Ceil(l2Ways).W)
   val refill = Bool()
+  val hintHit = Bool()
 }
 
 /** s3 commits are produced by MainPipe only for real tag hits/installations. */
@@ -227,6 +231,7 @@ class SDBP(localSets: Int, l2Ways: Int, params: SDBPParams) extends Module {
   sampler.io.commit.bits.signature := metadata_s3.signature
   sampler.io.commit.bits.source := metadata_s3.source
   sampler.io.commit.bits.dead := dead
+  sampler.io.commit.bits.hintHit := io.commit.bits.hintHit
   predictor.io.training := sampler.io.training
   io.deadWrite.valid := io.commit.valid &&
     (io.commit.bits.refill || predictionValid_s3 || metadata_s3.source === SDBPSource.Demand)
