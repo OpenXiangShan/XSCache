@@ -31,7 +31,7 @@ private[coupledL2] object DrripSampleSets {
 }
 
 class FdpPollutionSampler(setBits: Int, tagBits: Int) extends Module {
-  private val bufferWays = 6
+  private val bufferWays = 8
   private val sampleSets = 1 << (setBits / 2 + 1)
   private val lru = new TrueLRU(bufferWays)
 

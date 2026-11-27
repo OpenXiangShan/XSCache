@@ -155,10 +155,13 @@ case class L2Param(
   // both EnablePrivateClint and PrivateClintRange are from soc parameters.
   PrivateClintRange: Option[AddressSet] = None,
 
-  // Run a full-coverage tagged pollution filter alongside the FDP sampler for comparison.
-  enableFdpTaggedFilter: Boolean = false
+  // Run a full-coverage tagged pollution filter alongside the FDP sampler.
+  enableFdpTaggedFilter: Boolean = false,
+  useFdpTaggedFeedback: Boolean = false
 ) {
   require(!enableFdpInsertion || replacement == "lru", "FDP insertion requires true LRU")
+  require(!useFdpTaggedFeedback || (enableFdpInsertion && enableFdpTaggedFilter),
+    "Tagged FDP feedback requires FDP insertion and the tagged filter")
 
   def toCacheParams: CacheParameters = CacheParameters(
     name = name,

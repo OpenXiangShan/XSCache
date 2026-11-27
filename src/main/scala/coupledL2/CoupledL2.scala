@@ -1019,9 +1019,8 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       val allMissCount = PopCount(events.map(_.demandMiss))
       val sampledMissCount = PopCount(events.map(_.sampledDemandMiss))
       val sampledPollutionCount = PopCount(events.map(_.pollutionMiss))
-      val (position, sampledPosition, sampledMisses, sampledPollution) =
+      val (samplerPosition, sampledPosition, sampledMisses, sampledPollution) =
         pollutionFeedback(sampledMissCount, sampledPollutionCount)
-      slices.foreach(_.io.fdpInsertPosition.get := position)
 
       XSPerfAccumulate("fdp_insertion_samples", intervalEnd)
       XSPerfAccumulate("fdp_insertion_empty_samples", intervalEnd && sampledMisses === 0.U)
@@ -1029,9 +1028,9 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
       XSPerfAccumulate("fdp_insertion_sampled_demand_misses", sampledMissCount)
       XSPerfAccumulate("fdp_insertion_pollution_misses", sampledPollutionCount)
 
-      if (cacheParams.enableFdpTaggedFilter) {
+      val insertPosition = if (cacheParams.enableFdpTaggedFilter) {
         val taggedPollutionCount = PopCount(events.map(_.taggedPollutionMiss))
-        val (_, taggedPosition, taggedMisses, taggedPollution) =
+        val (taggedFeedbackPosition, taggedPosition, taggedMisses, taggedPollution) =
           pollutionFeedback(allMissCount, taggedPollutionCount)
         val comparable = intervalEnd && sampledMisses =/= 0.U
         XSPerfAccumulate("fdp_tagged_pollution_misses", taggedPollutionCount)
@@ -1058,7 +1057,11 @@ class CoupledL2(implicit p: Parameters) extends LazyModule with HasCoupledL2Para
           val table = ChiselDB.createTable("L2FdpPollutionWindow", chiselTypeOf(window), basicDB = true)
           table.log(window, intervalEnd, s"L2FdpHart${cacheParams.hartId}", clock, reset)
         }
+        if (cacheParams.useFdpTaggedFeedback) taggedFeedbackPosition else samplerPosition
+      } else {
+        samplerPosition
       }
+      slices.foreach(_.io.fdpInsertPosition.get := insertPosition)
     }
 
     // ==================== Prefetch replenish (after slice initilize)===================
